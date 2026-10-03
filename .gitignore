@@ -1,0 +1,16 @@
+.vs/
+bin/
+obj/
+Library/
+node_modules/
+*.user
+*.suo
+ImportEarthLocation.UI/build/
+*.log
+*.tmp
+*.pid
+.env
+.env.*
+!.env.example
+*.nupkg
+*.snupkg

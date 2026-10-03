@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <GameManagedPath Condition="'$(GameManagedPath)' == ''">$(CSII_MANAGEDPATH)</GameManagedPath>
+    <GameManagedPath Condition="'$(GameManagedPath)' == ''">$(MSBuildProgramFiles32)\Steam\steamapps\common\Cities Skylines II\Cities2_Data\Managed</GameManagedPath>
+  </PropertyGroup>
+</Project>

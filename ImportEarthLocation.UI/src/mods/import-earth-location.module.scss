@@ -1,0 +1,78 @@
+.host { pointer-events: none; }
+.picker { position: fixed; top: 60rem; left: 50%; margin-left: -218rem; width: 436rem; z-index: 10002; pointer-events: auto; background: #10202d; border: 1rem solid #476b83; }
+.search { display: flex; gap: 8rem; margin-bottom: 8rem; }
+.search input { flex: 1; background: #172e3d; color: white; padding: 8rem; border: 1rem solid #4c7087; }
+.results { height: 100rem; margin-bottom: 8rem; }
+.results button { display: flex; width: 100%; padding: 6rem; color: white; background: #25475d; }
+.map { position: relative; width: 400rem; height: 260rem; overflow: hidden; background: #253e49; cursor: move; }
+.map img { position: absolute; width: 256rem; height: 256rem; pointer-events: none; }
+.footprint { position: absolute; border: 2rem solid #ffdb60; background: rgba(255, 219, 96, .1); pointer-events: none; }
+.reticle { position: absolute; left: 190rem; top: 113rem; color: #fff; font-size: 28rem; text-shadow: 1rem 1rem 2rem #000; pointer-events: none; }
+.attribution { position: absolute; bottom: 0; right: 0; background: #10202d; padding: 3rem; font-size: 10rem; color: white; }
+.mapError { position: absolute; top: 50rem; left: 15rem; right: 15rem; padding: 10rem; background: #10202d; color: #ffb3a9; }
+.coordinates { display: flex; gap: 8rem; }
+.coordinates .field { width: 196rem; }
+.launcher {
+  position: fixed; right: 230rem; bottom: 14rem; z-index: 9999; pointer-events: auto;
+  width: 44rem; height: 44rem; border-radius: 4rem; color: white;
+  background: rgba(20, 38, 51, .94); border: 1rem solid rgba(130, 174, 201, .7);
+}
+.launcher:hover { background: rgba(39, 79, 104, .98); }
+.panel {
+  position: fixed; top: 150rem; right: 16rem; width: 430rem; max-height: 760rem;
+  z-index: 9998; pointer-events: auto; background: #10202d; border: 1rem solid #476b83;
+}
+.panelBody { height: 690rem; }
+.notice { color: #9fd5ed; font-size: 13rem; margin-bottom: 10rem; }
+.section { padding: 12rem; }
+.field { display: flex; flex-direction: column; gap: 5rem; margin: 9rem 0; color: #d5e7f1; font-size: 13rem; }
+.field input {
+  height: 34rem; padding: 5rem 8rem; color: #f5fbff; background: #172e3d;
+  border: 1rem solid #4c7087; border-radius: 4rem; font-size: 14rem;
+}
+.field input:disabled { opacity: .55; }
+.sizeToggle { display: flex; width: 100%; height: 34rem; padding: 5rem 8rem; color: #f5fbff; background: #172e3d; border: 1rem solid #4c7087; border-radius: 4rem; font-size: 14rem; }
+.sizeLabel { flex: 1; text-align: left; }
+.sizePopup { z-index: 10001; pointer-events: auto; }
+.sizeMenu { background: #172e3d; border: 1rem solid #4c7087; padding: 4rem; }
+.sizeItem { display: flex; width: 100%; padding: 9rem; color: #f5fbff; background: #172e3d; font-size: 14rem; }
+.sizeItem:hover, .sizeItem:global(.selected) { background: #31576b; }
+.check { display: flex; align-items: center; margin-top: 12rem; padding: 0; background: transparent; border: none; color: #d5e7f1; font-size: 13rem; }
+.checkbox { display: flex; align-items: center; justify-content: center; width: 22rem; height: 22rem; margin-right: 8rem; border: 1rem solid #91bed5; border-radius: 3rem; background: #172e3d; color: #b7f5ff; font-size: 18rem; }
+.check:disabled { opacity: .55; }
+.configChoice { display: flex; align-items: center; min-height: 32rem; padding: 5rem 8rem; border-radius: 4rem; color: #e4edf3; background: #203746; font-size: 13rem; }
+.configChoice:hover { background: #31556c; }
+.configChoice:disabled { opacity: .45; pointer-events: none; }
+.configChoice:focus, .check:focus { outline: 2rem solid #f2d67a; outline-offset: 2rem; }
+.helper { color: #acbeca; font-size: 11rem; line-height: 1.4; }
+.actionButton { display: flex; align-items: center; justify-content: center; min-height: 36rem; padding: 8rem 14rem; border-radius: 4rem; border: 1rem solid transparent; font-size: 13rem; font-weight: 500; line-height: 1.35; text-align: center; white-space: normal; }
+.actionButton:focus { outline: 2rem solid #f2d67a; outline-offset: 2rem; }
+.primary { background: #16769a; color: #fff; border-color: #69cbe8; }
+.primary:hover { background: #2196be; }
+.primary:active { background: #105a76; }
+.secondary { background: #294d64; color: #eef7fc; border-color: #527992; }
+.secondary:hover { background: #376780; }
+.secondary:active { background: #203e50; }
+.utility { background: #34414a; color: #e3e9ed; border-color: #65737c; }
+.utility:hover { background: #4c5b65; }
+.utility:active { background: #28343c; }
+.danger { background: #8b302b; color: #fff; border-color: #e08076; }
+.danger:hover { background: #b0443b; }
+.danger:active { background: #68231f; }
+.actionButton:disabled { opacity: .4; pointer-events: none; }
+.status { color: #d7e3ea; font-size: 13rem; line-height: 1.35; }
+.summary { color: #a9e3b2; font-size: 12rem; margin-top: 8rem; white-space: pre-wrap; height: 120rem; }
+.error { color: #ffb3a9; background: rgba(112, 31, 24, .42); padding: 8rem; margin-top: 8rem; border-radius: 4rem; }
+.actions { display: flex; flex-wrap: wrap; gap: 7rem; margin-top: 12rem; }
+.actions button { flex: 1; min-width: 100rem; }
+.logViewport { height: 230rem; width: 100%; flex-shrink: 0; margin-top: 8rem; background: #0a151d; }
+.log { margin: 0; white-space: pre-wrap; font-size: 10rem; line-height: 1.35; color: #bdd0dc; padding: 8rem; }
+.confirmBackdrop {
+  position: fixed; top: 0; right: 0; bottom: 0; left: 0; display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, .72); z-index: 10003;
+}
+.confirmBox { display: flex; flex-direction: column; width: 460rem; max-width: 90%; max-height: 80%; min-height: 0; padding: 20rem; border-radius: 6rem; background: #1b2933; border: 1rem solid #b55b52; color: #eef5f8; }
+.confirmBox h3 { flex-shrink: 0; color: #ffb3a9; margin: 0 0 12rem; font-size: 18rem; white-space: normal; }
+.confirmBody { height: 210rem; min-height: 0; flex-shrink: 1; width: 100%; }
+.confirmBox p { margin: 0 8rem 12rem 0; font-size: 13rem; line-height: 1.5; white-space: normal; overflow-wrap: break-word; }
+.confirmFooter { flex-shrink: 0; border-top: 1rem solid #56646e; padding-top: 12rem; }

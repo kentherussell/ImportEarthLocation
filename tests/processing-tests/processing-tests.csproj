@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><GameManagedPath Condition="'$(GameManagedPath)' == ''">$(CSII_MANAGEDPATH)</GameManagedPath><GameManagedPath Condition="'$(GameManagedPath)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Cities Skylines II\Cities2_Data\Managed</GameManagedPath><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\ImportEarthLocation\Core\ImportModels.cs" Link="ImportModels.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Core\NetworkSelection.cs" Link="NetworkSelection.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Core\ImportSession.cs" Link="ImportSession.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Core\Numeric.cs" Link="Numeric.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Core\WaterLevels.cs" Link="WaterLevels.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Geo\GeoMath.cs" Link="GeoMath.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\NetworkProcessor.cs" Link="NetworkProcessor.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\NetworkNormalizer.cs" Link="NetworkNormalizer.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\OsmParser.cs" Link="OsmParser.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\ForestProcessor.cs" Link="ForestProcessor.cs" />
+    <Reference Include="Unity.Mathematics"><HintPath>$(GameManagedPath)\Unity.Mathematics.dll</HintPath></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(GameManagedPath)\UnityEngine.CoreModule.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

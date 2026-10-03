@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Configurations>Debug;Release</Configurations>
+    <RootNamespace>ImportEarthLocation</RootNamespace>
+    <AssemblyName>ImportEarthLocation</AssemblyName>
+    <Nullable>enable</Nullable>
+    <LangVersion>11</LangVersion>
+    <PublishConfigurationPath>Properties\PublishConfiguration.xml</PublishConfigurationPath>
+    <CSII_USERDATAPATH Condition="'$(CSII_USERDATAPATH)' == ''">$([System.IO.Path]::GetFullPath('$(LOCALAPPDATA)\..\LocalLow\Colossal Order\Cities Skylines II'))</CSII_USERDATAPATH>
+    <CSII_TOOLPATH Condition="'$(CSII_TOOLPATH)' == ''">$(CSII_USERDATAPATH)\.cache\Modding</CSII_TOOLPATH>
+  </PropertyGroup>
+
+  <Import Project="$(CSII_TOOLPATH)\Mod.props" />
+  <Import Project="$(CSII_TOOLPATH)\Mod.targets" />
+
+  <!-- Mod.props forces LangVersion 9.0; this project requires C# 11 (file-scoped namespaces, record structs). Must come after the imports to win. -->
+  <PropertyGroup>
+    <LangVersion>11</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Game"><Private>false</Private></Reference>
+    <Reference Include="Colossal.Core"><Private>false</Private></Reference>
+    <Reference Include="Colossal.Logging"><Private>false</Private></Reference>
+    <Reference Include="Colossal.IO.AssetDatabase"><Private>false</Private></Reference>
+    <Reference Include="Colossal.UI"><Private>false</Private></Reference>
+    <Reference Include="Colossal.UI.Binding"><Private>false</Private></Reference>
+    <Reference Include="Colossal.Localization"><Private>false</Private></Reference>
+    <Reference Include="Colossal.Mathematics"><Private>false</Private></Reference>
+    <Reference Include="Unity.Collections"><Private>false</Private></Reference>
+    <Reference Include="Unity.Entities"><Private>false</Private></Reference>
+    <Reference Include="Unity.Mathematics"><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.ImageConversionModule"><Private>false</Private></Reference>
+    <Reference Include="System.Net.Http"><Private>false</Private></Reference>
+    <Reference Include="System.Xml.Linq"><Private>false</Private></Reference>
+    <Reference Include="Newtonsoft.Json"><Private>false</Private></Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="$(ModPropsFile)" Link="Properties\Mod.props" />
+    <None Include="$(ModTargetsFile)" Link="Properties\Mod.targets" />
+  </ItemGroup>
+  <ItemGroup><EmbeddedResource Include="Data\cities.json" /></ItemGroup>
+
+  <!-- The UI is a separate webpack bundle. Build it with the C# project so a
+       successful Visual Studio build cannot deploy the DLL without the panel. -->
+  <Target Name="BuildUserInterface" BeforeTargets="Build">
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)\..\ImportEarthLocation.UI"
+          Command="npm run build"
+          EnvironmentVariables="CSII_USERDATAPATH=$(CSII_USERDATAPATH)" />
+  </Target>
+</Project>

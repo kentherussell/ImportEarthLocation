@@ -1,0 +1,14 @@
+* text=auto eol=lf
+*.cs text
+*.csproj text
+*.sln text eol=crlf
+*.ts text
+*.tsx text
+*.js text
+*.cjs text
+*.scss text
+*.json text
+*.md text
+*.xml text
+*.pubxml text
+*.png binary
