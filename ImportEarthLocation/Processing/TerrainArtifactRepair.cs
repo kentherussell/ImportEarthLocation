@@ -63,14 +63,18 @@ public static class TerrainArtifactRepair
             { lo = Math.Min(lo, p.H); hi = Math.Max(hi, p.H); if (p.X == x0 - 1) sides |= 1; if (p.X == x1 + 1) sides |= 2; if (p.Y == y0 - 1) sides |= 4; if (p.Y == y1 + 1) sides |= 8; }
             if (sides != 15 || hi - lo > Math.Max(30, spacing * 2))
                 throw new InvalidOperationException("DEM recovery: source ring lacks coherent support on all four sides.");
-            // Inverse-distance interpolation of actual adjacent valid samples; no zero or ocean assumption.
+            // Invalid values cannot be retained even inside protected features. Restore
+            // only this invalid footprint from its valid rim; finite protected samples
+            // remain untouched. A local plane prevents a constant-height slope stamp.
+            var plane = FitPlane(ring); var protectedInvalid = 0;
             foreach (var i in cluster)
             {
                 double sum = 0, weights = 0;
-                foreach (var p in ring) { var dx = p.X - i % width; var dy = p.Y - i / width; var weight = 1d / (dx * dx + dy * dy); sum += p.H * weight; weights += weight; }
-                raster[i] = (float)(sum / weights); repaired++;
+                foreach (var p in ring) { var dx = p.X - i % width; var dy = p.Y - i / width; var weight = 1d / (dx * dx + dy * dy); sum += (p.H - PlaneHeight(plane,p.X,p.Y)) * weight; weights += weight; }
+                raster[i] = (float)Math.Max(lo,Math.Min(hi,PlaneHeight(plane,i%width,i/width)+sum/weights)); repaired++;
+                if(protectedSample?.Invoke(i)==true) protectedInvalid++;
             }
-            report?.Invoke($"DEM MOSAIC REPAIR clusterCells={cluster.Count}; bounds={x0},{y0}..{x1},{y1}; ringSamples={ring.Count}; tileEdgesSupported=true; method=bounded-valid-ring-interpolation");
+            report?.Invoke($"DEM MOSAIC REPAIR clusterCells={cluster.Count}; bounds={x0},{y0}..{x1},{y1}; ringSamples={ring.Count}; protectedInvalidSamples={protectedInvalid}; finiteProtectedSamplesPreserved=true; tileEdgesSupported=true; method=bounded-plane-residual-interpolation");
         }
         // Multi-scale isolated extrema: all four opposing directions must return
         // to a consistent neighborhood. Long ridges/cliffs fail this criterion.
@@ -99,7 +103,12 @@ public static class TerrainArtifactRepair
                 for (var r = radius - 1; r <= radius; r++)
                     foreach (var d in directions)
                         neighbors[k++] = baseline[(y + d.Item2 * r) * width + x + d.Item1 * r];
-                Array.Sort(neighbors); var median = (neighbors[7] + neighbors[8]) * .5f;
+                var rim = new List<(int X,int Y,float H)>(16); k=0;
+                for(var r=radius-1;r<=radius;r++) foreach(var direction in directions)
+                    rim.Add((x+direction.Item1*r,y+direction.Item2*r,neighbors[k++]));
+                var plane=FitPlane(rim);
+                for(k=0;k<rim.Count;k++) neighbors[k]=(float)(rim[k].H-PlaneHeight(plane,rim[k].X,rim[k].Y));
+                Array.Sort(neighbors); var median=(float)PlaneHeight(plane,x,y)+(neighbors[7]+neighbors[8])*.5f;
                 var spread = neighbors[15] - neighbors[0]; var residual = value - median;
                 if (spread > Math.Max(12, spacing * .4f) || Math.Abs(residual) < Math.Max(threshold, spread * 6)) continue;
                 var component = new List<int> { i }; var componentSet = new HashSet<int> { i }; var supported = true;
@@ -111,7 +120,7 @@ public static class TerrainArtifactRepair
                     { supported = false; break; }
                     foreach (var next in new[] { current - 1, current + 1, current - width, current + width })
                     {
-                        if (sign * (baseline[next] - median) <= cutoff || !componentSet.Add(next)) continue;
+                        if (sign * (baseline[next] - PlaneHeight(plane,next%width,next/width)) <= cutoff || !componentSet.Add(next)) continue;
                         component.Add(next);
                     }
                 }
@@ -124,11 +133,22 @@ public static class TerrainArtifactRepair
                     foreach (var next in new[] { index - 1, index + 1, index - width, index + width })
                         maximumJump = Math.Max(maximumJump, Math.Abs(baseline[index] - baseline[next]));
                 if (maximumJump < Math.Max(30, spacing)) continue;
-                foreach (var index in component) { raster[index] = median; changed[index] = true; }
+                var rimMinimum=float.PositiveInfinity; var rimMaximum=float.NegativeInfinity;
+                foreach(var p in rim) { rimMinimum=Math.Min(rimMinimum,p.H); rimMaximum=Math.Max(rimMaximum,p.H); }
+                foreach (var index in component) { raster[index] = (float)Math.Max(rimMinimum,Math.Min(rimMaximum,PlaneHeight(plane,index%width,index/width))); changed[index] = true; }
                 if (residual > 0) spikes += component.Count; else pits += component.Count;
-                if (details++ < 25) report?.Invoke($"DEM ARTIFACT kind={(residual > 0 ? "spike" : "pit")}; sourceCell={x},{y}; sourceHeight={value:R}; surroundingMedian={median:R}; ringSpread={spread:R}; correctedClusterCells={component.Count}; maximumComponentJumpMeters={maximumJump:R}; localExtremumAndEnclosingSupport=true; suppliedProtectionRespected=true");
+                if (details++ < 25) report?.Invoke($"DEM ARTIFACT kind={(residual > 0 ? "spike" : "pit")}; sourceCell={x},{y}; sourceHeight={value:R}; surroundingPlaneHeight={median:R}; ringResidualSpread={spread:R}; correctedClusterCells={component.Count}; maximumComponentJumpMeters={maximumJump:R}; method=constrained-local-plane; localExtremumAndEnclosingSupport=true; suppliedProtectionRespected=true");
             }
         }
         report?.Invoke($"DEM ARTIFACT REPAIR invalidSamples={repaired}; isolatedSpikes={spikes}; isolatedPits={pits}; supportRadiusCells={radius}; ridgesRequireSurroundingSupport=true; noGlobalBiasRollback=true");
     }
+    private static (double X,double Y,double H,double Dx,double Dy) FitPlane(List<(int X,int Y,float H)> points)
+    {
+        double x=0,y=0,h=0; foreach(var p in points){x+=p.X;y+=p.Y;h+=p.H;} x/=points.Count;y/=points.Count;h/=points.Count;
+        double xx=0,yy=0,xy=0,xh=0,yh=0;
+        foreach(var p in points){var dx=p.X-x;var dy=p.Y-y;var dh=p.H-h;xx+=dx*dx;yy+=dy*dy;xy+=dx*dy;xh+=dx*dh;yh+=dy*dh;}
+        var determinant=xx*yy-xy*xy;
+        return Math.Abs(determinant)<1e-9 ? (x,y,h,0,0) : (x,y,h,(xh*yy-yh*xy)/determinant,(yh*xx-xh*xy)/determinant);
+    }
+    private static double PlaneHeight((double X,double Y,double H,double Dx,double Dy) plane,int x,int y)=>plane.H+(x-plane.X)*plane.Dx+(y-plane.Y)*plane.Dy;
 }

@@ -27,6 +27,7 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
     private static bool s_PreviewOnly, s_ClearingPreview;
     private static NativePreviewException? s_PreviewFailure;
     private static int s_SettledFrames;
+    public static int LastMutationTargets { get; private set; }
     private static ImportLog? s_Log;
     private static object? s_Context;
     private static Action<IReadOnlyList<Entity>>? s_BeforeApply;
@@ -39,6 +40,7 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
         if (!ImportSession.Matches(map, generation)) return;
         s_Map = map; s_Generation = generation;
         s_Requested = true;
+        LastMutationTargets=0;
         s_WaitFrames = 0;
         s_Failure = null;
         s_Recoverable=false;s_ArtifactStem=artifactStem;
@@ -167,12 +169,12 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
             if(temporary.Length>8192)throw new InvalidOperationException($"Native batch unexpectedly generated {temporary.Length} temporary nodes/edges/plants; unsafe commit refused.");
             s_Log?.DiagnosticRecords("last-native-temp-batch.ndjson",TempRecords(EntityManager,temporary.ToArray(),World.GetExistingSystemManaged<Game.Prefabs.PrefabSystem>()));
             if(s_ArtifactStem!=null)s_Log?.DiagnosticRecords(s_ArtifactStem+"-temp.ndjson",TempRecords(EntityManager,temporary.ToArray(),World.GetExistingSystemManaged<Game.Prefabs.PrefabSystem>()));
-            var originalTargets=new HashSet<Entity>();var originalMutations=0;
+            var originalTargets=new HashSet<Entity>();var mutationTargets=new HashSet<Entity>();var originalMutations=0;
             foreach(var entity in temporary)
             {
                 var temp=EntityManager.GetComponentData<Temp>(entity);
                 if(temp.m_Original==Entity.Null)continue;
-                originalMutations++;
+                if(mutationTargets.Add(temp.m_Original))originalMutations++;
                 // A delete companion to a qualified replacement is allowed;
                 // CaptureGeneratedNodes proves its replacement coverage.
                 if((temp.m_Flags&TempFlags.Delete)!=0)continue;
@@ -184,12 +186,21 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
                     throw new NativePreviewException("Native preview original has retired or changed component kind; regenerate before Apply.",0);
             }
             s_Log?.Diagnostic($"NATIVE APPLY WORKLOAD temporaryEntities={temporary.Length}; originalMutationTargets={originalMutations}; originalMutationLimit=64; rejectedBeforeApply={originalMutations>64}; downstreamLaneAcceptanceUnverified=true");
+            LastMutationTargets=originalMutations;
             // Existing graph matching proves ports/ownership, not downstream
             // native ECB capacity. Shrink an uncommitted regeneration burst,
             // including flags=0 updates, rather than Apply then retry it.
             if(originalMutations>64)
                 throw new NativePreviewException($"Native preview regenerates {originalMutations} existing entities; bounded limit64 requires smaller batch before Apply.",0);
             if(s_ArtifactStem!=null)s_Log?.DiagnosticRecords(s_ArtifactStem+"-mutation-contracts.ndjson",MutationRecords(EntityManager,temporary.ToArray()));
+            if(s_ArtifactStem!=null)
+            {
+                using var allPreviewQuery=EntityManager.CreateEntityQuery(ComponentType.ReadOnly<Temp>());
+                using var allPreview=allPreviewQuery.ToEntityArray(Allocator.Temp);
+                s_Log?.DiagnosticRecords(s_ArtifactStem+"-downstream-contracts.ndjson",MutationRecords(EntityManager,allPreview.ToArray()),32L*1024*1024);
+                s_Log?.Diagnostic($"NATIVE DOWNSTREAM CAPTURE artifact={s_ArtifactStem}; allTempsIncludingDeletedAndLanes={allPreview.Length}; frame={UnityEngine.Time.frameCount}; readOnly=true; nativeCommandBufferContentsUnavailable=true");
+                AuditLaneContracts(EntityManager,allPreview.ToArray(),temporary.ToArray());
+            }
             foreach(var entity in temporary)
             {
                 if(!EntityManager.HasComponent<Edge>(entity))continue;
@@ -257,6 +268,37 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
         }
     }
 
+    private static void AuditLaneContracts(EntityManager manager,IReadOnlyList<Entity> allPreview,IReadOnlyList<Entity> networks)
+    {
+        // Installed LaneSystem reads Lane/PrefabRef for each nonsecondary
+        // SubLane. Reject broken references before requesting native playback.
+        void RequireLane(Entity lane,string context)
+        {
+            if(manager.HasComponent<SecondaryLane>(lane))return;
+            if(!manager.Exists(lane)||!manager.HasComponent<Lane>(lane)||!manager.HasComponent<Game.Prefabs.PrefabRef>(lane))
+                throw new NativePreviewException($"Native lane contract incomplete ({context}, lane={lane}); rejected before Apply.",0);
+        }
+        foreach(var preview in allPreview)
+        {
+            if(!manager.HasComponent<Lane>(preview))continue;
+            var temp=manager.GetComponentData<Temp>(preview);
+            if(manager.HasComponent<Deleted>(preview)||(temp.m_Flags&TempFlags.Cancel)!=0)continue;
+            RequireLane(preview,"preview");
+            if(temp.m_Original!=Entity.Null)RequireLane(temp.m_Original,"original");
+            if(!manager.HasComponent<Owner>(preview))throw new NativePreviewException("Native lane has no owner contract; rejected before Apply.",0);
+            var owner=manager.GetComponentData<Owner>(preview).m_Owner;
+            if(!manager.Exists(owner))throw new NativePreviewException($"Native lane owner {owner} is unavailable; rejected before Apply.",0);
+        }
+        var visited=new HashSet<Entity>();
+        foreach(var preview in networks)
+        foreach(var owner in new[]{preview,manager.GetComponentData<Temp>(preview).m_Original})
+        {
+            if(manager.HasComponent<Deleted>(preview)||(manager.GetComponentData<Temp>(preview).m_Flags&TempFlags.Cancel)!=0)continue;
+            if(owner==Entity.Null||!visited.Add(owner)||!manager.HasBuffer<SubLane>(owner))continue;
+            foreach(var sub in manager.GetBuffer<SubLane>(owner,true))RequireLane(sub.m_SubLane,"owner-buffer");
+        }
+    }
+
     private static IEnumerable<object> MutationRecords(EntityManager manager,IReadOnlyList<Entity> temporary)
     {
         string Id(Entity e)=>$"{e.Index}:{e.Version}";
@@ -265,6 +307,8 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
         foreach(var entity in new[]{preview,manager.GetComponentData<Temp>(preview).m_Original})
         {
             if(entity==Entity.Null||!seen.Add(entity))continue;
+            if(!manager.Exists(entity))
+            {yield return new{entity=Id(entity),preview=Id(preview),exists=false,frame=UnityEngine.Time.frameCount};continue;}
             var connected=new List<string>();var lanes=new List<object>();
             if(manager.HasBuffer<ConnectedEdge>(entity))
                 foreach(var edge in manager.GetBuffer<ConnectedEdge>(entity,true))connected.Add(Id(edge.m_Edge));
@@ -278,6 +322,9 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
             if(manager.HasComponent<Composition>(entity))
             {var c=manager.GetComponentData<Composition>(entity);composition=new{edge=Id(c.m_Edge),start=Id(c.m_StartNode),end=Id(c.m_EndNode)};}
             yield return new{entity=Id(entity),preview=Id(preview),components,connectedEdges=connected,subLanes=lanes,composition,
+                exists=true,owner=manager.HasComponent<Owner>(entity)?Id(manager.GetComponentData<Owner>(entity).m_Owner):null,
+                temp=manager.HasComponent<Temp>(entity)?(object)manager.GetComponentData<Temp>(entity):null,
+                lane=manager.HasComponent<Lane>(entity)?(object)manager.GetComponentData<Lane>(entity):null,
                 deleted=manager.HasComponent<Deleted>(entity),frame=UnityEngine.Time.frameCount,downstreamLanePlaybackNotProven=true};
         }
     }

@@ -49,6 +49,8 @@ public static class NativeAirBridge
         }
         if (prefabEntity == Entity.Null) return "Air connections skipped: no verified native airplane outside-connection object prefab.";
         var placed = AirPlanner.Place(prepared.AirDestinations, half, Math.Max(a.y, b.y));
+        log.Count("Air perimeter candidates", placed.Count);
+        log.Count("Air perimeter spacing rejected", prepared.AirDestinations.Count - placed.Count);
         foreach(var requested in prepared.AirDestinations)
             log.Diagnostic($"AIR REQUEST name={requested.Name}; distanceKm={requested.DistanceKm:0.###}; bearingDegrees={requested.Bearing:0.###}; perimeterCandidate={placed.Any(p=>p.Name==requested.Name&&p.Bearing==requested.Bearing)}");
         using var query = manager.CreateEntityQuery(new EntityQueryDesc { All = new[] { ComponentType.ReadOnly<AirplaneStop>(), ComponentType.ReadOnly<Game.Objects.OutsideConnection>(), ComponentType.ReadOnly<Transform>() }, None = new[] { ComponentType.ReadOnly<Deleted>(), ComponentType.ReadOnly<Game.Tools.Temp>() } });
@@ -88,6 +90,8 @@ public static class NativeAirBridge
         }
         var report = $"Air connections created: {created}; skipped: {skipped}; native perimeter {half * 2 / 1000:0.###} km; minimum spacing 200 m. Native route initialization runs on the next game update.";
         NativeDiagnostics.AirApplied=created>0;
+        log.Count("Air connections created", created);
+        log.Count("Air connections skipped", skipped);
         log.Diagnostic($"AIR TOTAL requested={prepared.AirDestinations.Count}; perimeterCandidates={placed.Count}; created={created}; skipped={skipped}; functionalFlightsVerified=false");
         log.Info(report); return report;
     }

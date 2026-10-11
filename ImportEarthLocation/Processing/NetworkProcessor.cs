@@ -149,13 +149,8 @@ public static class NetworkProcessor
     {
         var u = Numeric.Clamp(x / width + 0.5d, 0d, 1d);
         var v = Numeric.Clamp(z / width + 0.5d, 0d, 1d);
-        // Follow the supplied raster rather than assuming every recovery/offline
-        // buffer has the native resolution. The native-size result is unchanged.
-        var resolution=(int)Math.Sqrt(heightmap.Length);
-        if(resolution<2||resolution*resolution!=heightmap.Length)throw new ArgumentException("Heightmap must be a nonempty square raster.",nameof(heightmap));
-        var px = (int)Math.Round(u * (resolution - 1));
-        var py = (int)Math.Round(v * (resolution - 1));
-        return heightmap[py * resolution + px] / (float)ushort.MaxValue * scale;
+        var resolution = TerrainSampling.Resolution(heightmap);
+        return (float)(TerrainSampling.Encoded(heightmap, resolution, u, v) / ushort.MaxValue * scale);
     }
 
     private static bool TryClassify(OsmWay way, ImportRequest request, out NetworkKind kind, out string classification)

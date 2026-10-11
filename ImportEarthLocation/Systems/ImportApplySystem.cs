@@ -43,6 +43,10 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
     private int _batchSizeLimit=NetworkBatchSize;
     private int _recoveryUntilIndex;
     private bool _mapChanged;
+    private List<IReadOnlyList<PreparedSegment>> _preflightBatches=new();
+    private int _preflightIndex;
+    private readonly HashSet<string> _attemptedInputs=new(StringComparer.Ordinal);
+    private int _preferredBatchSize=NetworkBatchSize;
     // Limit command-buffer pressure, not map coverage. Every section is submitted.
     private const int NetworkBatchSize = 32;
     private readonly Stopwatch _vegetationClock = new();
@@ -125,7 +129,9 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                 _submissionPlan=new NativeSubmissionPlan(prepared.Segments);
                 s_Log?.DiagnosticRecords("native-submission-order.ndjson",DiagnosticArtifacts.NetworkRecords(_submissionPlan.Sections));
                 s_Log?.Diagnostic($"NATIVE SCHEDULE sections={_submissionPlan.Sections.Count}; connectedSourceOrder=true; curvesChanged=false; omittedSections=0; maximumBatch={NetworkBatchSize}");
-                _networkBatch = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Take(_submissionPlan.Sections,NetworkBatchSize));
+                _preflightBatches=_submissionPlan.RiskPreflight(NetworkBatchSize);_preflightIndex=0;
+                _networkBatch = _preflightBatches.Count>0?_preflightBatches[0]:Array.Empty<PreparedSegment>();
+                s_Log?.Diagnostic($"NATIVE RISK PREFLIGHT clusters={_preflightBatches.Count}; originalMapUnchanged=true; nativeInteractionWithFutureCommittedGraphNotGuaranteed=true");
                 NetworkBatchCheckpoint("apply/definition-preflight",prepared,0);
                 _definitions = _networkPlacement.CreateDefinitions(_networkBatch, out _skipped);
                 if(_skipped>0)
@@ -144,7 +150,7 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                 foreach(var definition in _definitions!)EntityManager.DestroyEntity(definition);
                 _definitions=null;
                 NetworkCommitSystem.RequestCommit(prepared.Request.MapSessionId,prepared.Request.Generation,s_Log,
-                    NetworkBatchContext(prepared,0),temporary=>_networkPlacement!.CaptureGeneratedNodes(_networkBatch,temporary),
+                NetworkBatchContext(prepared,_preflightIndex*NetworkBatchSize),temporary=>_networkPlacement!.CaptureGeneratedNodes(_networkBatch,temporary),
                     _networkPlacement!.ArtifactStem,previewOnly:true);
                 _phase=10;return;
             }
@@ -171,7 +177,17 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                     return;
                 }
                 _recoveryAttempts=0;_batchSizeLimit=NetworkBatchSize;_recoveryUntilIndex=0;
+                _attemptedInputs.Clear();
+                if(++_preflightIndex<_preflightBatches.Count)
+                {
+                    _networkBatch=_preflightBatches[_preflightIndex];
+                    NetworkBatchCheckpoint("apply/definition-preflight",prepared,_preflightIndex*NetworkBatchSize);
+                    _definitions=_networkPlacement!.CreateDefinitions(_networkBatch,out _skipped);
+                    if(_skipped!=0)throw new InvalidOperationException("Risk preflight omitted required sections; original map retained.");
+                    _phase=9;return;
+                }
                 // Preview anchors were never committed. Discard all staged bindings.
+                _networkBatch=System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Take(_submissionPlan!.Sections,NetworkBatchSize));
                 _phase=11;
             }
             if(_phase==11)
@@ -289,7 +305,12 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                 }
                 s_Log?.Checkpoint("network/live-batch-verified",new { progress=_networkIndex,total=prepared.Segments.Count,waitFrames=_readbackFrames,downstreamElapsedFrames=elapsedFrames,sourceEntityLineage=true });
                 _recoveryAttempts=0;
-                if(_networkIndex>=_recoveryUntilIndex){_batchSizeLimit=NetworkBatchSize;_recoveryUntilIndex=0;}
+                _attemptedInputs.Clear();
+                var workload=NetworkCommitSystem.LastMutationTargets;
+                var suggested=workload>0?Math.Max(1,Math.Min(NetworkBatchSize,_networkBatch.Count*48/workload)):NetworkBatchSize;
+                _preferredBatchSize=Math.Min(suggested,Math.Min(NetworkBatchSize,_preferredBatchSize+4));
+                s_Log?.Diagnostic($"NATIVE ADAPTIVE BATCH verifiedSections={_networkBatch.Count}; distinctMutations={workload}; targetMutations=48; nextPreferredSections={_preferredBatchSize}; hardMutationGuard=64");
+                if(_networkIndex>=_recoveryUntilIndex){_batchSizeLimit=_preferredBatchSize;_recoveryUntilIndex=0;}
                 if (_networkIndex < prepared.Segments.Count)
                 {
                     if(!NetworkCommitSystem.CanStartExclusive(EntityManager,out var batchPreviewReason))throw new InvalidOperationException(batchPreviewReason);
@@ -376,7 +397,13 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                 _definitions=null;
                 Finish(); return;
             }
-            if(_mapChanged)message += " Replacement had already started; the map may be partial. Reload the original saved map before retrying. Do not save this partial import.";
+            if(_mapChanged)
+            {
+                s_Log?.Checkpoint("apply/partial-outcome",new{verifiedSourceSections=_networkPlacement?.VerifiedSections??0,requestedSourceSections=prepared.Segments.Count,
+                    queuedProgressNotVerification=_networkIndex,phase=_phase,rejectedArtifact=_networkPlacement?.ArtifactStem,
+                    rollbackAvailable=false,automaticApplyRetry=false,completionReported=false});
+                message += $" Replacement had already started; {_networkPlacement?.VerifiedSections??0}/{prepared.Segments.Count} source sections were verified before this failure. The map is partial, not complete. Reload the original saved map before retrying. Do not save this partial import.";
+            }
             s_Log?.Error(message);
             Failed?.Invoke(message);
             AbortMapWork();
@@ -397,17 +424,34 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
         if(!recoverable||_recoveryAttempts>=NativePreviewRecovery.MaximumAttempts)return false;
         var start=preflight?0:_networkIndex-_networkBatch.Count;
         var details=NetworkCommitSystem.PreviewFailure;
-        var gathered=_submissionPlan!.GatherPendingJunction(start,_networkBatch.Count,NetworkBatchSize,details?.Sources??Array.Empty<string>());
+        var gathered=preflight?0:_submissionPlan!.GatherPendingJunction(start,_networkBatch.Count,NetworkBatchSize,details?.Sources??Array.Empty<string>());
         var retryCount=gathered>0?gathered:NativePreviewRecovery.NextBatchSize(_networkBatch.Count,_recoveryAttempts,applied:false,recoverable:true);
+        if(gathered==0&&NetworkCommitSystem.LastMutationTargets>64&&_networkBatch.Count>1)
+            retryCount=Math.Max(1,Math.Min(_networkBatch.Count-1,_networkBatch.Count*48/NetworkCommitSystem.LastMutationTargets));
         if(retryCount==0)return false;
         _recoveryUntilIndex=Math.Max(_recoveryUntilIndex,start+_networkBatch.Count);
         _batchSizeLimit=retryCount;
         if(!preflight)_networkIndex-=_networkBatch.Count;
-        _networkBatch=System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Take(System.Linq.Enumerable.Skip(_submissionPlan.Sections,start),retryCount));
+        if(preflight)
+        {
+            // Partition the whole selected risk cluster; never silently skip its tail.
+            var original=_networkBatch;
+            _networkBatch=System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Take(original,retryCount));
+            _preflightBatches[_preflightIndex]=_networkBatch;
+            if(retryCount<original.Count)_preflightBatches.Insert(_preflightIndex+1,System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Skip(original,retryCount)));
+        }
+        else _networkBatch=System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Take(System.Linq.Enumerable.Skip(_submissionPlan!.Sections,start),retryCount));
+        if(_attemptedInputs.Contains(InputSignature(_networkBatch)))
+        {
+            if(!preflight&&retryCount>1)
+            {_networkBatch=new[]{_submissionPlan!.Sections[start]};retryCount=1;_batchSizeLimit=1;}
+            if(_attemptedInputs.Contains(InputSignature(_networkBatch)))
+            {s_Log?.Diagnostic($"NATIVE RECOVERY no novel input remains index={start}; way={details?.WayId}; sources={string.Join(",",details?.Sources??Array.Empty<string>())}; identicalPreviewNotRetried=true; applied=false");return false;}
+        }
         _recoveryAttempts++;_recoveryWaitFrames=0;
         var strategy=gathered>0?"pending-source-junction-arms":"smaller-peer-context";
         s_Log?.Warn($"Native preview rejected before commit; regenerating changed input, not reporting repair success: strategy={strategy}, attempt={_recoveryAttempts}, index={start}, sections={retryCount}. {failure}");
-        s_Log?.DiagnosticRecords("native-submission-order.ndjson",DiagnosticArtifacts.NetworkRecords(_submissionPlan.Sections));
+        s_Log?.DiagnosticRecords("native-submission-order.ndjson",DiagnosticArtifacts.NetworkRecords(_submissionPlan!.Sections));
         s_Log?.Checkpoint("network/recovery-choice",new{strategy,start,retryCount,preflight,way=details?.WayId,sources=details?.Sources,geometryChanged=false,applied=false,successNotYetVerified=true});
         NetworkBatchCheckpoint("network/pre-commit-recovery",prepared,start);
         Progress?.Invoke("Regenerating the affected road/rail junction before committing…");
@@ -416,10 +460,13 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
 
     private void NetworkBatchCheckpoint(string phase,PreparedImport prepared,int startIndex)
     {
+        _attemptedInputs.Add(InputSignature(_networkBatch));
         _networkPlacement?.BeginBatch(startIndex,_recoveryAttempts,_networkBatch.Count,
             phase=="apply/definition-preflight"||_phase==12||phase=="network/pre-commit-recovery"&&_phase==10);
         s_Log?.Checkpoint(phase,NetworkBatchContext(prepared,startIndex));
     }
+
+    private static string InputSignature(IReadOnlyList<PreparedSegment> sections)=>string.Join("|",System.Linq.Enumerable.Select(sections,s=>$"{s.Kind}:{s.WayId}:{s.StartNodeId}:{s.EndNodeId}:{s.CourseStart}:{s.CourseEnd}:{s.CourseControl1}:{s.CourseControl2}"));
 
     private void Finish()
     {
@@ -456,6 +503,11 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                 catch (Exception exception) { s_Log?.Diagnostic("AIR FAILURE: " + exception); reports.Add("Air connections skipped: " + exception.GetBaseException().Message); }
             }
             else reports.Add("Air connections: not requested.");
+            if(prepared.Request.CreateSeaConnections)
+            {
+                try { reports.Add(NativeSeaBridge.Assess(prepared,EntityManager,_prefabSystem,s_Log!)); }
+                catch(Exception exception) { s_Log?.Diagnostic("SEA ASSESSMENT FAILURE: "+exception); reports.Add("Sea assessment skipped safely; no shipping entities changed."); }
+            }
             Progress?.Invoke("Setting the map's climate…");
             s_Log?.Checkpoint("environment/climate",new { available=prepared.Climate!=null, mapChanged=_mapChanged });
             try { reports.Add(NativeClimateBridge.Apply(prepared, EntityManager, _prefabSystem, World.GetOrCreateSystemManaged<ClimateSystem>(), World.GetOrCreateSystemManaged<WindSimulationSystem>(), s_Log!)); }
@@ -481,7 +533,9 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
         _networkPlacement=null;_submissionPlan=null;_networkIndex=0;_networkBatch=Array.Empty<PreparedSegment>();
         _oldNetworks=Array.Empty<Entity>();_retirementFrames=0;_readbackFrames=0;_readbackStartFrame=0;_mapChanged=false;
         _recoveryAttempts=0;_recoveryWaitFrames=0;
+        _preflightBatches.Clear();_preflightIndex=0;_attemptedInputs.Clear();
         _batchSizeLimit=NetworkBatchSize;_recoveryUntilIndex=0;
+        _preferredBatchSize=NetworkBatchSize;
         _phase = 0;
         _created = 0;
         _skipped = 0;

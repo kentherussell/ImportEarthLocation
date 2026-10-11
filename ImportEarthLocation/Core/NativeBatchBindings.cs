@@ -5,8 +5,9 @@ using Unity.Mathematics;
 namespace ImportEarthLocation.Core;
 
 // Bind the generated graph BEFORE Apply. Native ground height is not an OSM
-// identity: require exact submitted curve ports, the selected asset and mode,
-// and a unique connected chain (native generation can subdivide a course).
+// identity: new attachments require exact submitted ports; regenerated routes
+// require established owners, bounded footprints, selected asset/mode and a
+// unique directed chain (native generation can subdivide a course).
 // Carry actual entity lineage through playback, never nearest-node snapping.
 public static class NativeBatchBindings
 {
@@ -38,6 +39,11 @@ public static class NativeBatchBindings
     {
         public float StartCenterBudget { get; init; }
         public float EndCenterBudget { get; init; }
+        public float ReconciliationTolerance { get; init; }
+        public bool ValidateCurveCorridor { get; init; }
+        // Only requalification of an already verified route between owned nodes.
+        // New source attachment retains the exact submitted-port contract.
+        public bool OwnedRoute { get; init; }
     }
     public sealed record Edge<T>(T Entity, T StartNode, T EndNode, float3 Start, float3 End, NetworkKind Kind, T Prefab) where T : notnull
     {
@@ -46,6 +52,8 @@ public static class NativeBatchBindings
         // center matching; drift without this native curve evidence is rejected.
         public float3? CurveStart { get; init; }
         public float3? CurveEnd { get; init; }
+        public float3? CurveControl1 { get; init; }
+        public float3? CurveControl2 { get; init; }
     }
     public sealed record Anchor<T>(T Entity, float3 Planned, float3 Generated) where T : notnull
     {
@@ -56,7 +64,7 @@ public static class NativeBatchBindings
         int SectionCount, IReadOnlyDictionary<T,float3> Nodes) where T : notnull;
 
     public static Batch<T> Match<T>(IReadOnlyList<Expected<T>> expected, IReadOnlyList<Edge<T>> generated,
-        IReadOnlyDictionary<string,T> committed) where T : notnull
+        IReadOnlyDictionary<string,T> committed, Action<object>? rejectedEvidence=null) where T : notnull
     {
         var starts = new Dictionary<(NetworkKind,T,float2),HashSet<T>>();
         var incident = new Dictionary<T,List<Edge<T>>>();
@@ -95,20 +103,29 @@ public static class NativeBatchBindings
         foreach(var item in expected)
         {
             var s=item.Section;List<Binding<T>>? match=null;var count=0;var visits=0;
+            var rejected=new Dictionary<string,int>(StringComparer.Ordinal);
+            var witnesses=new List<object>();
+            void Reject(string reason,float? observed=null,float? limit=null)
+            {
+                rejected[reason]=rejected.TryGetValue(reason,out var total)?total+1:1;
+                if(witnesses.Count<32)witnesses.Add(new{reason,observed,limit});
+            }
             var aKey=NativeEndpointPolicy.Identity(s,s.StartNodeId);var bKey=NativeEndpointPolicy.Identity(s,s.EndNodeId);
             var knownA=committed.TryGetValue(aKey,out var priorA);var knownB=committed.TryGetValue(bKey,out var priorB);
             if(anchors.TryGetValue(aKey,out var batchA)){knownA=true;priorA=batchA.Entity;}
             if(anchors.TryGetValue(bKey,out var batchB)){knownB=true;priorB=batchB.Entity;}
+            if(item.OwnedRoute&&(!knownA||!knownB))throw new NativePreviewException("Regenerated route requires both previously verified source owners.",s.WayId,aKey,bKey);
             var progress=new Dictionary<T,float>();var path=new List<Binding<T>>();var onPath=new HashSet<T>();
             // Legacy callers with no curve evidence still match source centers.
             var startPort=s.CourseStart.xz;
             var candidates=new HashSet<T>();
+            if(item.OwnedRoute&&incident.ContainsKey(priorA!))candidates.Add(priorA!);
             if(starts.TryGetValue((s.Kind,item.Prefab,startPort),out var portCandidates))candidates.UnionWith(portCandidates);
             if(starts.TryGetValue((s.Kind,item.Prefab,s.Start.xz),out var centerCandidates))
                 foreach(var node in centerCandidates)if(incident[node].Exists(e=>e.CurveStart==null&&e.CurveEnd==null))candidates.Add(node);
             foreach(var node in candidates)
             {
-                if(knownA&&!EqualityComparer<T>.Default.Equals(node,priorA!))continue;
+                if(knownA&&!EqualityComparer<T>.Default.Equals(node,priorA!)){Reject("start-owner");continue;}
                 Walk(node);
                 if(count>1)break;
             }
@@ -128,45 +145,89 @@ public static class NativeBatchBindings
                     {onPath.Remove(node);if(path.Count>0)path.RemoveAt(path.Count-1);continue;}
                     stack.Add((node,t,frame.Next+1));
                     var edge=incident[node][frame.Next];
-                    if(edge.Kind!=s.Kind||!EqualityComparer<T>.Default.Equals(edge.Prefab,item.Prefab))continue;
+                    if(edge.Kind!=s.Kind||!EqualityComparer<T>.Default.Equals(edge.Prefab,item.Prefab)){Reject("mode-or-prefab");continue;}
                     var forward=EqualityComparer<T>.Default.Equals(node,edge.StartNode);var next=forward?edge.EndNode:edge.StartNode;
-                    if(onPath.Contains(next))continue;
+                    if(s.OneWay&&!forward){Reject("direction");continue;}
+                    if(onPath.Contains(next)){Reject("cycle");continue;}
                     var curveEvidence=edge.CurveStart.HasValue&&edge.CurveEnd.HasValue;
                     var from=forward?edge.CurveStart??edge.Start:edge.CurveEnd??edge.End;
                     var point=forward?edge.CurveEnd??edge.End:edge.CurveStart??edge.Start;
                     var expectedStart=curveEvidence?s.CourseStart.xz:s.Start.xz;
                     var expectedEnd=curveEvidence?s.CourseEnd.xz:s.End.xz;
-                    if(path.Count==0&&!math.all(from.xz==expectedStart))continue;
-                    if(path.Count>0)
+                    if(!item.OwnedRoute&&path.Count==0&&!math.all(from.xz==expectedStart)){Reject("first-port",math.distance(from.xz,expectedStart),0);continue;}
+                    if(!item.OwnedRoute&&path.Count>0)
                     {
                         var previous=path[path.Count-1];
                         var previousPort=previous.Forward?previous.Generated.CurveEnd??previous.Generated.End:previous.Generated.CurveStart??previous.Generated.Start;
-                        if(math.distance(previousPort.xz,from.xz)>.05f)continue;
+                        if(math.distance(previousPort.xz,from.xz)>.05f){Reject("subdivision-port-continuity",math.distance(previousPort.xz,from.xz),.05f);continue;}
+                    }
+                    // Reconciled endpoint movement permits only a bounded
+                    // corridor around the intended cubic, not arbitrary detours.
+                    if(item.ValidateCurveCorridor||item.ReconciliationTolerance>.05f)
+                    {
+                        if(!edge.CurveControl1.HasValue||!edge.CurveControl2.HasValue||!math.all(math.isfinite(edge.CurveControl1.Value))||!math.all(math.isfinite(edge.CurveControl2.Value))){Reject("missing-finite-controls");continue;}
+                        var a=edge.CurveStart??edge.Start;var d=edge.CurveEnd??edge.End;
+                        var b=edge.CurveControl1.Value;var c=edge.CurveControl2.Value;
+                        var valid=true;
+                        for(var sample=1;sample<8;sample++)
+                        {
+                            var u=sample/8f;var v=1-u;
+                            var p=v*v*v*a+3*v*v*u*b+3*v*u*u*c+u*u*u*d;
+                            if(SubdivisionProgress(s,p.xz,Math.Max(.1f,Math.Min(32,item.ReconciliationTolerance)))<0){valid=false;break;}
+                        }
+                        if(!valid){Reject("curve-corridor");continue;}
                     }
                     // This bounded center-to-port allowance is NOT proximity
-                    // attachment: the port must match exactly, the node entity
-                    // must carry the correct owner, and all incidence is verified.
-                    var end=math.all(point.xz==expectedEnd);
+                    // attachment: new ports match exactly, regenerated endpoints
+                    // carry established owners, and all incidence is verified.
+                    var end=item.OwnedRoute?EqualityComparer<T>.Default.Equals(next,priorB!):math.all(point.xz==expectedEnd);
                     var fromBudget=path.Count==0?Budget(item.StartCenterBudget,s):CenterBudget(s);
                     var toBudget=end?Budget(item.EndCenterBudget,s):CenterBudget(s);
-                    if(curveEvidence&&(math.distance(positions[node].xz,from.xz)>fromBudget||math.distance(positions[next].xz,point.xz)>toBudget))continue;
-                    if(end&&knownB&&!EqualityComparer<T>.Default.Equals(next,priorB!))continue;
+                    if(curveEvidence)
+                    {
+                        var fromDistance=math.distance(positions[node].xz,from.xz);var toDistance=math.distance(positions[next].xz,point.xz);
+                        if(fromDistance>fromBudget){Reject("start-center-port-budget",fromDistance,fromBudget);continue;}
+                        if(toDistance>toBudget){Reject("end-center-port-budget",toDistance,toBudget);continue;}
+                    }
+                    if(end&&knownB&&!EqualityComparer<T>.Default.Equals(next,priorB!)){Reject("end-owner");continue;}
                     float nextT;
                     if(end)nextT=1;
                     else
                     {
-                        if(sourcePoints.Contains((s.Kind,point.xz))||owners.ContainsKey(next))continue;
-                        if(!progress.TryGetValue(next,out nextT))progress[next]=nextT=SubdivisionProgress(s,point.xz);
-                        if(nextT<0)continue;
+                        if(sourcePoints.Contains((s.Kind,point.xz))||owners.ContainsKey(next)){Reject("foreign-source-junction");continue;}
+                        if(!progress.TryGetValue(next,out nextT))progress[next]=nextT=SubdivisionProgress(s,point.xz,Math.Max(.05f,Math.Min(32,item.ReconciliationTolerance)));
+                        if(nextT<0){Reject("subdivision-corridor");continue;}
                     }
-                    if(nextT<=t+1e-6f)continue;
+                    if(nextT<=t+1e-6f){Reject("nonmonotone-course");continue;}
                     path.Add(new Binding<T>(s,edge,forward));
                     if(end){count++;match=new List<Binding<T>>(path);path.RemoveAt(path.Count-1);}
                     else{onPath.Add(next);stack.Add((next,nextT,0));}
                 }
             }
             if(count!=1||match==null)
+            {
+                var closest=new List<(float Distance,string Node,float3 Port)>();
+                foreach(var edge in generated)
+                {
+                    if(edge.Kind!=s.Kind||!EqualityComparer<T>.Default.Equals(edge.Prefab,item.Prefab))continue;
+                    void Near(T node,float3 port)
+                    {
+                        closest.Add((math.distance(port.xz,s.CourseStart.xz),node.ToString()??"",port));
+                        closest.Sort((a,b)=>a.Distance.CompareTo(b.Distance));
+                        if(closest.Count>8)closest.RemoveAt(8);
+                    }
+                    Near(edge.StartNode,edge.CurveStart??edge.Start);Near(edge.EndNode,edge.CurveEnd??edge.End);
+                }
+                var nearestPorts=new List<object>();
+                foreach(var port in closest)nearestPorts.Add(new{node=port.Node,horizontalDistanceMeters=port.Distance,position=DiagnosticArtifacts.Point(port.Port)});
+                rejectedEvidence?.Invoke(new{schemaVersion=2,way=s.WayId,start=s.StartNodeId,end=s.EndNodeId,
+                    kind=s.Kind.ToString(),qualifiedChains=count,candidateStartNodes=candidates.Count,knownA,knownB,
+                    graphEdges=generated.Count,visits,rejected,witnesses,witnessesBoundedAt=32,nearestPorts,item.ReconciliationTolerance,item.ValidateCurveCorridor,
+                    submittedStart=DiagnosticArtifacts.Point(s.CourseStart),submittedEnd=DiagnosticArtifacts.Point(s.CourseEnd),
+                    control1=DiagnosticArtifacts.Point(s.CourseControl1),control2=DiagnosticArtifacts.Point(s.CourseControl2),
+                    item.StartCenterBudget,item.EndCenterBudget,item.OwnedRoute,reason=candidates.Count==0?"no-qualified-start-owner-or-port":"missing-or-ambiguous-route"});
                 throw new NativePreviewException($"Native generated section {s.Kind} way {s.WayId} nodes {s.StartNodeId},{s.EndNodeId}: {count} qualified horizontal/asset/incidence chains. Unsafe missing or ambiguous graph; no proximity attachment attempted.",s.WayId,aKey,bKey);
+            }
             foreach(var part in match)
             {
                 if(!used.Add(part.Generated.Entity))throw new NativePreviewException("Multiple source sections resolve to the same native edge; incomplete coverage refused.",s.WayId,aKey,bKey);
@@ -190,7 +251,7 @@ public static class NativeBatchBindings
     // Tolerance is ONLY for anonymous native subdivision points on a submitted
     // cubic, not source endpoint matching or connecting nearby roads. Native
     // float subdivision introduces small rounding errors at map-scale values.
-    private static float SubdivisionProgress(PreparedSegment s,float2 point)
+    private static float SubdivisionProgress(PreparedSegment s,float2 point,float tolerance=.05f)
     {
         var a=s.CourseStart.xz;var b=s.CourseControl1.xz;var c=s.CourseControl2.xz;var d=s.CourseEnd.xz;
         float2 At(float t){var u=1-t;return u*u*u*a+3*u*u*t*b+3*u*t*t*c+t*t*t*d;}
@@ -204,7 +265,7 @@ public static class NativeBatchBindings
             var denominator=math.dot(first,first)+math.dot(p,second);if(Math.Abs(denominator)<1e-9f)break;
             best=math.clamp(best-math.dot(p,first)/denominator,0,1);
         }
-        return math.distance(At(best),point)<=.05f?best:-1;
+        return math.distance(At(best),point)<=tolerance?best:-1;
     }
 
     // Only an already-bound source identity may change the next course anchor.
@@ -235,6 +296,25 @@ public static class NativeBatchBindings
         }
         Verify(start,s.Start);Verify(end,s.End);
         var a=start?.Generated??s.Start;var b=end?.Generated??s.End;
+        return TranslateCourse(s,a,b);
+    }
+
+    // Preview movement is qualified against ORIGINAL source coordinates, not
+    // the previous preview displacement (which could authorize cumulative drift).
+    public static PreparedSegment RebaseOwnedPreview<T>(PreparedSegment s,Anchor<T>? start,Anchor<T>? end) where T:notnull
+    {
+        foreach(var anchor in new[]{start,end})
+            if(anchor!=null&&(!math.all(math.isfinite(anchor.Generated))||!math.all(math.isfinite(anchor.Planned))||
+                !math.isfinite(anchor.CenterLimit)||anchor.CenterLimit<=0||anchor.CenterLimit>32||math.distance(anchor.Generated.xz,anchor.Planned.xz)>anchor.CenterLimit))
+                throw new InvalidOperationException("Owned preview lacks original bounded source provenance.");
+        // This is evidence of an ALREADY submitted course. A moved owner center
+        // does not prove that its native curve port moved (Colorado retained it).
+        // Validate the center budget without changing the immutable course.
+        return s;
+    }
+
+    private static PreparedSegment TranslateCourse(PreparedSegment s,float3 a,float3 b)
+    {
         var da=a-s.Start;var db=b-s.End;
         return s with{Start=a,End=b,Control1=s.Control1.HasValue?s.Control1+da:s.CourseControl1-s.StartCurveOffset+da,
             Control2=s.Control2.HasValue?s.Control2+db:s.CourseControl2-s.EndCurveOffset+db,

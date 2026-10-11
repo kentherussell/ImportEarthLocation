@@ -47,6 +47,7 @@ public sealed record ImportRequest(
     public long Generation { get; init; }
     public bool ApplyGroundSurfaces { get; init; }
     public bool CreateAirConnections { get; init; }
+    public bool CreateSeaConnections { get; init; }
 }
 
 public sealed record MapSizeProfile(string Id, string Label, double WidthMeters, bool RequiresMapExt)
@@ -188,6 +189,7 @@ public sealed class PreparedImport
     public IReadOnlyList<AirDestination> AirDestinations { get; init; } = Array.Empty<AirDestination>();
     public ClimateNormals? Climate { get; init; }
     public WaterPlan? Water { get; init; }
+    public OceanMask? Ocean { get; init; }
     public ImportEarthLocation.Processing.OsmDataset? NetworkEvidence { get; init; }
     public string FeatureReport { get; set; } = "";
 }
@@ -225,7 +227,21 @@ public sealed record WaterPlan(bool Coastal, int Rivers, int Lakes, int Skipped,
     public IReadOnlyList<RiverSourcePlan> Sources { get; init; } = Array.Empty<RiverSourcePlan>();
     public float WaterCellSize { get; init; }
     public ushort[]? ConditionedHeightmap { get; init; }
+    // Geographic stage evidence is independent of whether a circular regulator fits.
+    public IReadOnlyList<WaterAreaStage> AreaStages { get; init; } = Array.Empty<WaterAreaStage>();
+    public IReadOnlyList<WaterReachStage> ReachStages { get; init; } = Array.Empty<WaterReachStage>();
+    public TerrainEditSet? BedEdits { get; init; }
+    public TerrainEditSet? FinalBedEdits { get; init; }
+    public ushort[]? PlannedBedHeightmap { get; init; }
+    public const string GeometryVersion = "geographic-stage-v2";
 }
+
+public sealed record WaterAreaStage(long BodyId, string Kind, float Level);
+public sealed record WaterReachStage(long BodyId, long WayId, float3 Start, float3 End,
+    float StartLevel, float EndLevel, float HalfWidth, long? PolygonId);
+public sealed record TerrainEditSet(string Producer, string Baseline, int Resolution, byte[] Mask);
+// 0 known land/barrier, 1 accepted directed ocean, 2 conflicting, 3 unseeded.
+public sealed record OceanMask(int Resolution,double WidthMeters,byte[] Classification,string Version);
 
 public sealed record ImportSummary(
     int RoadSegments,

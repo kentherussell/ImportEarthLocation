@@ -34,7 +34,7 @@ public static class RailCorridorConsolidator
         // Transferring switches can expose a short redundant triangle: the
         // direct axis and an identical two-edge approach. Re-consolidate the
         // canonical raw geometry before fitting curves, preserving all tails.
-        var result=source;
+        var result=ExactPhysicalDemands(source,log,token);
         for(var pass=0;pass<3;pass++)
         {
             var next=PreparePass(result,log,token);
@@ -42,6 +42,39 @@ public static class RailCorridorConsolidator
             result=next;
         }
         return result;
+    }
+    // Exact raw evidence only. Endpoint/prefab equality cannot establish that
+    // separately mapped tracks represent the same physical infrastructure.
+    private static IReadOnlyList<PreparedSegment> ExactPhysicalDemands(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
+    {
+        var result=new List<PreparedSegment>(source.Count);
+        var buckets=new Dictionary<(long,long,int,bool,bool),List<int>>();var merged=0;
+        foreach(var s in source)
+        {
+            token.ThrowIfCancellationRequested();var retained=-1;
+            var key=(s.StartNodeId,s.EndNodeId,s.Layer,s.Bridge,s.Tunnel);
+            if(s.Kind==NetworkKind.Rail&&s.RawSourceTags.Count>0&&s.OriginalGeometry.Count>=2&&s.Control1==null&&s.Control2==null)
+            {
+                if(buckets.TryGetValue(key,out var candidates))
+                    foreach(var index in candidates)
+                    {
+                        var prior=result[index];
+                        if(prior.Classification!=s.Classification||prior.OneWay!=s.OneWay||prior.Lanes!=s.Lanes||prior.PhysicalTracks!=s.PhysicalTracks||prior.RailService!=s.RailService||prior.Reference!=s.Reference)continue;
+                        if(prior.RawSourceTags.Count!=s.RawSourceTags.Count||s.RawSourceTags.Any(p=>!prior.RawSourceTags.TryGetValue(p.Key,out var value)||value!=p.Value))continue;
+                        if(prior.OriginalGeometry.Count!=s.OriginalGeometry.Count||!prior.OriginalGeometry.SequenceEqual(s.OriginalGeometry)||!math.all(prior.Start==s.Start)||!math.all(prior.End==s.End))continue;
+                        retained=index;break;
+                    }
+                if(retained<0)
+                {if(!buckets.TryGetValue(key,out candidates))buckets[key]=candidates=new();candidates.Add(result.Count);}
+            }
+            if(retained<0){result.Add(s);continue;}
+            var kept=result[retained];
+            var provenance=kept.SourceWayIds.Concat(s.SourceWayIds).Concat(new[]{kept.WayId,s.WayId}).Distinct().OrderBy(id=>id).ToArray();
+            result[retained]=kept with{SourceWayIds=provenance};merged++;
+            if(merged<=64)log.Diagnostic($"PROCESS exact-rail-demand retainedWay={kept.WayId}; equivalentWay={s.WayId}; rawTagsIdentical=true; originalGeometryIdentical=true; sourceNodesIdentical=true; provenanceCount={provenance.Length}; proximityMerge=false");
+        }
+        log.Count("Exact duplicate rail physical demands consolidated",merged);
+        return merged==0?source:result;
     }
     private static IReadOnlyList<PreparedSegment> PreparePass(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
     {

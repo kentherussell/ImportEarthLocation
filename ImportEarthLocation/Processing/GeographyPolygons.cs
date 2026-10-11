@@ -10,6 +10,8 @@ namespace ImportEarthLocation.Processing;
 
 public sealed record GeographicPolygon(long Id, IReadOnlyDictionary<string, string> Tags, List<float3[]> Outer, List<float3[]> Inner)
 {
+    public bool IsRelation { get; init; }
+    public long Identity => IsRelation ? -Id : Id;
     public bool Contains(float3 point) => Outer.Any(r => GeographyPolygons.Inside(point, r)) && !Inner.Any(r => GeographyPolygons.Inside(point, r));
 }
 public static class GeographyPolygons
@@ -17,19 +19,58 @@ public static class GeographyPolygons
     public static List<GeographicPolygon> Build(OsmDataset data, ImportRequest request, ImportLog log, CancellationToken token)
     {
         var polygons = new List<GeographicPolygon>(); var members = new HashSet<long>();
+        var fallbackHoles = new Dictionary<long, List<float3[]>>();
         foreach (var relation in data.Relations.OrderBy(r => r.Id))
         {
             token.ThrowIfCancellationRequested();
             if (!relation.Tags.TryGetValue("type", out var type) || type != "multipolygon") continue;
-            foreach (var member in relation.Members) members.Add(member.wayId);
-            try { polygons.Add(new GeographicPolygon(relation.Id, relation.Tags, Rings(relation.Members.Where(m => !m.inner).Select(m => m.wayId)), Rings(relation.Members.Where(m => m.inner).Select(m => m.wayId)))); }
-            catch (InvalidOperationException e) { log.Warn($"Skipped geographic polygon relation {relation.Id}: {e.Message}"); }
+            try
+            {
+                var outer = Rings(relation.Members.Where(m => !m.inner).Select(m => m.wayId));
+                if (outer.Count == 0) throw new InvalidOperationException("No outer polygon rings.");
+                var inner = Rings(relation.Members.Where(m => m.inner).Select(m => m.wayId));
+                polygons.Add(new GeographicPolygon(relation.Id, relation.Tags, outer, inner){IsRelation=true});
+                foreach (var member in relation.Members) members.Add(member.wayId);
+                log.Count("Geographic relations accepted");
+            }
+            catch (InvalidOperationException e)
+            {
+                log.Count("Geographic relations incomplete");
+                // Keep valid, independently tagged outer members available. Never turn a
+                // known island/hole into an outer polygon when its parent is incomplete.
+                foreach (var member in relation.Members.Where(m => m.inner)) members.Add(member.wayId);
+                try
+                {
+                    var holes = Rings(relation.Members.Where(m => m.inner).Select(m => m.wayId));
+                    foreach (var member in relation.Members.Where(m => !m.inner))
+                    {
+                        if (!fallbackHoles.TryGetValue(member.wayId, out var retained))
+                            fallbackHoles[member.wayId] = retained = new List<float3[]>();
+                        retained.AddRange(holes);
+                    }
+                }
+                catch (InvalidOperationException)
+                {
+                    // An unknown hole cannot safely be filled by recovering its parent.
+                    foreach (var member in relation.Members) members.Add(member.wayId);
+                    log.Count("Geographic fallback blocked by unresolved holes");
+                }
+                log.Warn($"Incomplete geographic polygon relation {relation.Id}: {e.Message} Independently tagged closed outer ways remain eligible; no missing ring is invented.");
+            }
         }
         foreach (var way in data.Ways.Values.OrderBy(w => w.Id))
         {
             token.ThrowIfCancellationRequested();
             if (members.Contains(way.Id) || way.NodeIds.Length < 4 || way.NodeIds[0] != way.NodeIds[way.NodeIds.Length - 1]) continue;
-            try { polygons.Add(new GeographicPolygon(way.Id, way.Tags, Rings(new[] { way.Id }), new List<float3[]>())); }
+            try
+            {
+                // Untagged relation geometry has no independent semantic meaning.
+                if (way.Tags.Count == 0) continue;
+                polygons.Add(new GeographicPolygon(way.Id, way.Tags, Rings(new[] { way.Id }),
+                    fallbackHoles.TryGetValue(way.Id, out var holes) ? holes : new List<float3[]>()));
+                if (fallbackHoles.ContainsKey(way.Id)) log.Count("Geographic relation members recovered");
+                log.Count("Geographic standalone ways accepted");
+            }
             catch (InvalidOperationException e) { log.Warn($"Skipped geographic polygon way {way.Id}: {e.Message}"); }
         }
         List<float3[]> Rings(IEnumerable<long> ids)

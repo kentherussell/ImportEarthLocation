@@ -90,6 +90,7 @@ public sealed class TerrainBridge
         { name = $"{Mod.Id}_Heightmap" };
 
         var nativeSamples = Resample(prepared.Heightmap, backup.width, backup.height);
+        log?.Diagnostic($"TERRAIN GRID interpolation=corner-aligned-bilinear-v1; preparedResolution={Processing.TerrainBuilder.Resolution}; nativeWidth={backup.width}; nativeHeight={backup.height}; requestedWidthMeters={prepared.Request.MapSize.WidthMeters:R}; nativeAreaX={mapSize.x:R}; nativeAreaZ={mapSize.y:R}; nativeOffsetX={mapCorner.x:R}; nativeOffsetZ={mapCorner.y:R}; encodedQuantizationMeters={prepared.HeightScaleMeters / ushort.MaxValue:R}; nativeResamplingRequired={backup.width != Processing.TerrainBuilder.Resolution || backup.height != Processing.TerrainBuilder.Resolution}; gridEquivalenceVerified=false");
         var bytes = new byte[nativeSamples.Length * sizeof(ushort)];
         Buffer.BlockCopy(nativeSamples, 0, bytes, 0, bytes.Length);
         texture.LoadRawTextureData(bytes);
@@ -143,21 +144,7 @@ public sealed class TerrainBridge
 
     private static ushort[] Resample(ushort[] input,int width,int height)
     {
-        var resolution=Processing.TerrainBuilder.Resolution;
-        if(width==resolution&&height==resolution)return input;
-        var result=new ushort[checked(width*height)];
-        for(var z=0;z<height;z++)
-        {
-            var sourceZ=z*(resolution-1d)/Math.Max(1,height-1);var z0=(int)sourceZ;var z1=Math.Min(z0+1,resolution-1);var tz=sourceZ-z0;
-            for(var x=0;x<width;x++)
-            {
-                var sourceX=x*(resolution-1d)/Math.Max(1,width-1);var x0=(int)sourceX;var x1=Math.Min(x0+1,resolution-1);var tx=sourceX-x0;
-                var a=input[z0*resolution+x0]*(1-tx)+input[z0*resolution+x1]*tx;
-                var b=input[z1*resolution+x0]*(1-tx)+input[z1*resolution+x1]*tx;
-                result[z*width+x]=(ushort)Math.Round(a*(1-tz)+b*tz);
-            }
-        }
-        return result;
+        return Processing.TerrainSampling.Resample(input,width,height);
     }
 
     private static Texture2D Capture(Texture source)

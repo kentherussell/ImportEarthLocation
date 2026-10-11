@@ -11,7 +11,7 @@ public static class NetworkRoadbed
 {
     public static ushort[] Refresh(ushort[] baseline,ushort[] previousRoadbed,ushort[] finalRaster,float scale,double width,
         IReadOnlyList<PreparedSegment> previousProfiles,IReadOnlyList<PreparedSegment> finalProfiles,
-        IEnumerable<float3[]> protectedAreas,IEnumerable<float3[]> protectedLines,ImportLog log,CancellationToken token)
+        IEnumerable<float3[]> protectedAreas,IEnumerable<float3[]> protectedLines,ImportLog log,CancellationToken token,TerrainEditSet? laterEdits=null)
     {
         if(baseline.Length!=previousRoadbed.Length||baseline.Length!=finalRaster.Length||previousProfiles.Count!=finalProfiles.Count)
             throw new InvalidOperationException("Final roadbed refresh requires the same terrain and complete source network.");
@@ -27,10 +27,12 @@ public static class NetworkRoadbed
         // change must not leave a floating/cut road, nor accumulate another cut
         // budget on top of the first pass. Preserve subsequent water edits exactly.
         var refreshed=Prepare(baseline,scale,width,finalProfiles,protectedAreas,protectedLines,log,token);
-        var waterEdits=0;
+        var waterEdits=0;var unclassifiedEdits=0;var conflictingSamples=0;
         for(var i=0;i<refreshed.Length;i++)
-        {if((i&4095)==0)token.ThrowIfCancellationRequested();if(finalRaster[i]==previousRoadbed[i])continue;refreshed[i]=finalRaster[i];waterEdits++;}
-        log.Diagnostic($"PROCESS final-roadbed refreshedGroundProfiles={changed}; laterWaterSamplesRetained={waterEdits}; immutableEarthworkBaseline=true; cutFillBudgetNotAccumulated=true; protectedRoofsRetained=true");
+        {if((i&4095)==0)token.ThrowIfCancellationRequested();if(finalRaster[i]==previousRoadbed[i])continue;if(refreshed[i]!=baseline[i]&&refreshed[i]!=finalRaster[i])conflictingSamples++;refreshed[i]=finalRaster[i];if(laterEdits?.Mask.Length==refreshed.Length&&laterEdits.Mask[i]!=0)waterEdits++;else unclassifiedEdits++;}
+        log.Diagnostic($"PROCESS final-roadbed refreshedGroundProfiles={changed}; laterWaterSamplesRetained={waterEdits}; unclassifiedLaterSamplesRetained={unclassifiedEdits}; producer={laterEdits?.Producer??"unknown"}; baseline={laterEdits?.Baseline??"unknown"}; immutableEarthworkBaseline=true; cutFillBudgetNotAccumulated=true; unknownEditsNotRelabeledWater=true");
+        log.Count("Terrain water support composition conflicts",conflictingSamples);
+        log.Diagnostic($"TERRAIN COMPOSITION conflictingSamples={conflictingSamples}; preservationPolicy=retain-explicit-later-edit; finalSupportAndRoofValidationRequired=true; unknownEditsPreservedNotCertified=true");
         return refreshed;
     }
 

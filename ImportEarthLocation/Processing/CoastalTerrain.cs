@@ -8,10 +8,12 @@ namespace ImportEarthLocation.Processing;
 
 public static class CoastalTerrain
 {
+    public sealed record CoastCoverage(int Width,int Height,int Zoom,int OriginX,int OriginY,
+        bool[] Ocean,bool[] Ambiguous,bool[] Unseeded,float[] ShoreDistance,int AcceptedComponents,int ConflictingComponents);
     // OSM coastline direction: land on left, sea on right. Missing or contradictory
     // coast coverage is not permission to flood-fill land from negative DEM height.
     public static void Shape(float[] heights, int width, int height, int zoom, int originX, int originY,
-        float spacing, OsmDataset? geography, CancellationToken token, Action<string>? report)
+        float spacing, OsmDataset? geography, CancellationToken token, Action<string>? report, Action<CoastCoverage>? capture = null)
     {
         if (geography == null) return;
         var barrier = new bool[heights.Length]; var seeds = new byte[heights.Length];
@@ -61,25 +63,65 @@ public static class CoastalTerrain
             token.ThrowIfCancellationRequested();
             if (!(relation.Tags.TryGetValue("natural", out var natural) && natural == "water" || relation.Tags.TryGetValue("landuse", out var landuse) && landuse == "reservoir")) continue;
             if (relation.Tags.TryGetValue("water", out var water) && (water == "sea" || water == "bay")) continue;
-            // Multipolygon tags belong to the relation; outer ways may be open and
-            // untagged. Protect their combined envelope, including the interior.
-            var outerNodes = relation.Members.Where(m => !m.inner && geography.Ways.ContainsKey(m.wayId))
-                .SelectMany(m => geography.Ways[m.wayId].NodeIds);
-            ExcludeEnvelope(outerNodes); protectedRelations++;
+            // Join relation rings by source-node identity, never by proximity.
+            // A failed relation retains the conservative envelope guard; only
+            // fully assembled rings can replace it with an exact hole-aware mask.
+            var outer=Join(relation.Members.Where(m=>!m.inner).Select(m=>m.wayId));
+            var inner=Join(relation.Members.Where(m=>m.inner).Select(m=>m.wayId));
+            if(outer!=null&&outer.Count>0&&inner!=null)
+            {
+                var outerPoints=outer.Select(Project).ToArray(); var innerPoints=inner.Select(Project).ToArray();
+                var all=outerPoints.SelectMany(p=>p).ToArray();
+                RasterExclude(all,(x,y)=>outerPoints.Any(p=>TerrainGeographyGuard.Inside(x,y,p))&&!innerPoints.Any(p=>TerrainGeographyGuard.Inside(x,y,p)));
+            }
+            else ExcludeEnvelope(relation.Members.Where(m=>!m.inner&&geography.Ways.ContainsKey(m.wayId)).SelectMany(m=>geography.Ways[m.wayId].NodeIds),false);
+            protectedRelations++;
         }
-        void ExcludeEnvelope(System.Collections.Generic.IEnumerable<long> nodeIds)
+        System.Collections.Generic.List<long[]>? Join(System.Collections.Generic.IEnumerable<long> ids)
         {
-            var points = nodeIds.Where(geography.Nodes.ContainsKey).Select(id => geography.Nodes[id])
-                .Where(p => !double.IsNaN(p.Longitude) && !double.IsInfinity(p.Longitude) && !double.IsNaN(p.Latitude) && !double.IsInfinity(p.Latitude)).ToArray();
+            var remaining=new System.Collections.Generic.List<System.Collections.Generic.List<long>>();
+            foreach(var id in ids) { if(!geography.Ways.TryGetValue(id,out var way)||way.NodeIds.Length<2||way.NodeIds.Any(n=>!geography.Nodes.ContainsKey(n)))return null;remaining.Add(way.NodeIds.ToList()); }
+            var rings=new System.Collections.Generic.List<long[]>();
+            while(remaining.Count>0)
+            {
+                token.ThrowIfCancellationRequested();
+                var chain=remaining[0];remaining.RemoveAt(0);
+                while(chain[0]!=chain[chain.Count-1])
+                {
+                    token.ThrowIfCancellationRequested();
+                    var matches=remaining.Where(r=>r[0]==chain[chain.Count-1]||r[r.Count-1]==chain[chain.Count-1]).ToArray();
+                    if(matches.Length!=1)return null;
+                    var next=matches[0];remaining.Remove(next);if(next[0]!=chain[chain.Count-1])next.Reverse();chain.AddRange(next.Skip(1));
+                }
+                if(chain.Count<4)return null;rings.Add(chain.ToArray());
+            }
+            return rings;
+        }
+        (double x,double y)[] Project(System.Collections.Generic.IEnumerable<long> nodeIds)=>nodeIds.Where(geography.Nodes.ContainsKey).Select(id=>geography.Nodes[id])
+            .Select(p=>(x:GeoMath.LongitudeToTileX(p.Longitude,zoom)*256-originX,y:GeoMath.LatitudeToTileY(p.Latitude,zoom)*256-originY)).ToArray();
+        void ExcludeEnvelope(System.Collections.Generic.IEnumerable<long> nodeIds,bool exact=true)
+        {
+            var points=Project(nodeIds).Where(p=>!double.IsNaN(p.x)&&!double.IsInfinity(p.x)&&!double.IsNaN(p.y)&&!double.IsInfinity(p.y)).ToArray();
             if (points.Length < 3) return;
-            var left = Math.Max(0, (int)Math.Floor(points.Min(p => GeoMath.LongitudeToTileX(p.Longitude, zoom) * 256 - originX)));
-            var right = Math.Min(width - 1, (int)Math.Ceiling(points.Max(p => GeoMath.LongitudeToTileX(p.Longitude, zoom) * 256 - originX)));
-            var top = Math.Max(0, (int)Math.Floor(points.Min(p => GeoMath.LatitudeToTileY(p.Latitude, zoom) * 256 - originY)));
-            var bottom = Math.Min(height - 1, (int)Math.Ceiling(points.Max(p => GeoMath.LatitudeToTileY(p.Latitude, zoom) * 256 - originY)));
-            for (var y = top; y <= bottom; y++) { token.ThrowIfCancellationRequested(); for (var x = left; x <= right; x++) excluded[y * width + x] = true; }
+            RasterExclude(points,(x,y)=>!exact||TerrainGeographyGuard.Inside(x,y,points));
+        }
+        void RasterExclude((double x,double y)[] points,Func<double,double,bool> contains)
+        {
+            if(points.Length<3||points.Any(p=>double.IsNaN(p.x)||double.IsInfinity(p.x)||double.IsNaN(p.y)||double.IsInfinity(p.y)))return;
+            var left=Math.Max(0,(int)Math.Floor(points.Min(p=>p.x)));var right=Math.Min(width-1,(int)Math.Ceiling(points.Max(p=>p.x)));
+            var top=Math.Max(0,(int)Math.Floor(points.Min(p=>p.y)));var bottom=Math.Min(height-1,(int)Math.Ceiling(points.Max(p=>p.y)));
+            for(var y=top;y<=bottom;y++){token.ThrowIfCancellationRequested();for(var x=left;x<=right;x++)if(contains(x,y))excluded[y*width+x]=true;}
         }
         var visited = new bool[heights.Length]; var ocean = new bool[heights.Length]; var queue = new int[heights.Length];
-        var accepted = 0; var ambiguous = 0;
+        var accepted = 0; var ambiguous = 0; var unseeded = 0;
+        long oceanCells=0,ambiguousCells=0,unseededCells=0,landCells=0;
+        var ambiguousMask=capture!=null ? new bool[heights.Length] : Array.Empty<bool>();
+        var unseededMask=capture!=null ? new bool[heights.Length] : Array.Empty<bool>();
+        var barrierSeeds=0;
+        // All barriers must be finished before seeds are accepted. Tight bends can
+        // place a valid side seed inside a later segment's barrier; it is not a
+        // trustworthy land/sea vote and must not poison component classification.
+        for(var i=0;i<seeds.Length;i++) if(barrier[i]&&seeds[i]!=0){seeds[i]=0;barrierSeeds++;}
         for (var seed = 0; seed < heights.Length; seed++)
         {
             if ((seed & 16383) == 0) token.ThrowIfCancellationRequested();
@@ -92,9 +134,13 @@ public static class CoastalTerrain
                 Add(x > 0 ? i - 1 : -1); Add(x + 1 < width ? i + 1 : -1); Add(y > 0 ? i - width : -1); Add(y + 1 < height ? i + width : -1);
                 void Add(int next) { if (next < 0 || visited[next] || barrier[next]) return; visited[next] = true; queue[count++] = next; }
             }
-            if (labels == 3) ambiguous++;
+            if (labels == 3) { ambiguous++; ambiguousCells+=count; }
+            if(labels==0){unseeded++;unseededCells+=count;}
+            if(labels==2)landCells+=count;
+            if(capture!=null && (labels==3||labels==0)) for(var k=0;k<count;k++)
+                if(labels==3)ambiguousMask[queue[k]]=true;else unseededMask[queue[k]]=true;
             if (labels != 1) continue;
-            accepted++; for (var k = 0; k < count; k++) ocean[queue[k]] = true;
+            accepted++; for (var k = 0; k < count; k++) if(!excluded[queue[k]]) {ocean[queue[k]] = true;oceanCells++;}
         }
         // Two-pass shoreline distance. No artificial slope toward the map's crop edge.
         var distance = new float[heights.Length];
@@ -148,7 +194,8 @@ public static class CoastalTerrain
                 heights[i] = -.5f; coastalRimRepairs++;
             }
         }
-        report?.Invoke($"DEM COAST model=oriented-coastline-offshore-profile; edges={coastEdges}; oceanComponents={accepted}; conflictingComponentsSkipped={ambiguous}; modeledSamples={changed}; coastalRimSamples={coastalRimRepairs}; maximumModeledDepthMeters=180; depthSlope=.015; distance=8-neighbor-chamfer; seedPolicy=nearest-shore-segment; mappedInlandWaterEnvelopesProtected=true; inlandWaterRelations={protectedRelations}; nonOceanLandPreserved=true; incompleteCoastCoverageMayLimitRepair=true; realBathymetryClaimed=false");
+        report?.Invoke($"DEM COAST model=oriented-coastline-offshore-profile; edges={coastEdges}; oceanComponents={accepted}; conflictingComponentsSkipped={ambiguous}; unseededComponents={unseeded}; acceptedOceanCells={oceanCells}; conflictingCells={ambiguousCells}; unseededCells={unseededCells}; provenLandCells={landCells}; discardedBarrierSeeds={barrierSeeds}; totalCells={heights.Length}; modeledSamples={changed}; coastalRimSamples={coastalRimRepairs}; maximumModeledDepthMeters=180; depthSlope=.015; distance=8-neighbor-chamfer; seedPolicy=nearest-shore-segment; mappedInlandWaterEnvelopesProtected=true; inlandWaterRelations={protectedRelations}; nonOceanLandPreserved=true; incompleteCoastCoverageMayLimitRepair=true; realBathymetryClaimed=false");
+        capture?.Invoke(new CoastCoverage(width,height,zoom,originX,originY,ocean,ambiguousMask,unseededMask,distance,accepted,ambiguous));
         void Mark(double x, double y, byte label, double ax, double ay, double bx, double by)
         {
             var ix = (int)Math.Round(x); var iy = (int)Math.Round(y);

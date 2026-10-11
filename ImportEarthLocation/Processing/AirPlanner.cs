@@ -12,7 +12,7 @@ namespace ImportEarthLocation.Processing;
 
 public static class AirPlanner
 {
-    public const string EligibilityVersion = "metadata-v1";
+    public const string EligibilityVersion = "nearest-exterior-v2";
     public static IReadOnlyList<AirDestination> Select(ImportRequest request, ImportLog log)
     {
         using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("ImportEarthLocation.Data.cities.json") ?? throw new InvalidOperationException("Bundled city dataset is unavailable.");
@@ -30,20 +30,25 @@ public static class AirPlanner
             if (populationValue < 0 || populationValue > int.MaxValue || rankValue < 0 || rankValue > 20) { rejected++; continue; }
             var population = (int)populationValue; var rank = (int)rankValue;
             if (!Data.LocationServices.Valid(lat, lon) || population < 0 || rank < 0) { rejected++; continue; }
-            if (lat >= bounds.South && lat <= bounds.North && lon >= bounds.West && lon <= bounds.East) continue;
+            var longitudeDelta = ((lon - request.Longitude + 540) % 360) - 180;
+            var halfLongitudeSpan = (bounds.East - bounds.West) / 2;
+            if (lat >= bounds.South && lat <= bounds.North && Math.Abs(longitudeDelta) <= halfLongitudeSpan) continue;
             var primary = capital || population >= 500000 || rank <= 3;
-            if (!primary && population < 250000 && rank > 4) continue;
             var a = request.Latitude * Math.PI / 180; var b = lat * Math.PI / 180; var dl = (lon - request.Longitude) * Math.PI / 180;
             var h = Math.Pow(Math.Sin((b - a) / 2), 2) + Math.Cos(a) * Math.Cos(b) * Math.Pow(Math.Sin(dl / 2), 2);
             var distance = 6371.0088 * 2 * Math.Asin(Math.Sqrt(Math.Min(1, Math.Max(0, h))));
             var bearing = (Math.Atan2(Math.Sin(dl) * Math.Cos(b), Math.Cos(a) * Math.Sin(b) - Math.Sin(a) * Math.Cos(b) * Math.Cos(dl)) * 180 / Math.PI + 360) % 360;
             candidates.Add(((string)row[0]!, (string)row[1]!, (string?)row[2] ?? "", distance, bearing, primary));
         }
-        var primaryCount = candidates.Count(c => c.primary);
-        var eligible = candidates.Where(c => primaryCount < 20 || c.primary).OrderBy(c => c.distance).ThenBy(c => c.name, StringComparer.Ordinal).ThenBy(c => c.country, StringComparer.Ordinal).Take(20).ToArray();
+        var eligible = candidates.OrderBy(c => c.distance).ThenBy(c => c.name, StringComparer.Ordinal).ThenBy(c => c.country, StringComparer.Ordinal).ThenBy(c => c.region, StringComparer.Ordinal).Take(20).ToArray();
         var duplicatedNames = new HashSet<string>(eligible.GroupBy(c => c.name).Where(g => g.Count() > 1).Select(g => g.Key));
         var result = eligible.Select(c => new AirDestination(duplicatedNames.Contains(c.name) ? string.Join(", ", new[] { c.name, c.region, c.country }.Where(s => s.Length > 0).Distinct()) : c.name, c.distance, c.bearing, float3.zero)).ToArray();
         log.Info($"Air destinations: {result.Length} eligible cities; {rejected} invalid records; {root["version"]}; {EligibilityVersion}. No runtime city lookup.");
+        log.Count("Air city records invalid", rejected);
+        log.Count("Air exterior cities eligible", candidates.Count);
+        log.Count("Air destinations selected", result.Length);
+        log.DiagnosticRecords("air-destination-selection.ndjson", eligible.Select((c, rank) => (object)new
+        { selectionVersion = EligibilityVersion, rank = rank + 1, c.name, c.country, c.region, c.distance, c.bearing }));
         return result;
     }
 

@@ -50,11 +50,27 @@ public sealed class TerrainTileClient
         var footprint=Footprint(zoom);
         long Count()=>Math.Max(0L,footprint.maxX-footprint.minX+1L)*Math.Max(0L,footprint.maxY-footprint.minY+1L);
         var preferredCount=Count();
+        // Match useful output detail when the SAME provider can fit the entire
+        // footprint. Budget includes coast masks, repair clones, decoded tiles and
+        // fixed output buffers; finer pixels are not a claim of finer source survey.
+        const long scratchBudgetBytes=768L*1024*1024;
+        var latitude=(bounds.North+bounds.South)*.5;
+        var outputSpacing=widthMeters/4095d;
+        double Spacing(int level)=>40075016.68557849*Math.Cos(latitude*Math.PI/180)/(256d*(1<<level));
+        long EstimatedBytes((int minX,int maxX,int minY,int maxY) f)=>
+            Math.Max(0L,f.maxX-f.minX+1L)*Math.Max(0L,f.maxY-f.minY+1L)*256L*256*40+96L*1024*1024;
+        while(zoom<15 && Spacing(zoom)>outputSpacing*1.5)
+        {
+            var finer=Footprint(zoom+1);
+            var finerCount=Math.Max(0L,finer.maxX-finer.minX+1L)*Math.Max(0L,finer.maxY-finer.minY+1L);
+            if(finerCount>MaximumTiles || EstimatedBytes(finer)>scratchBudgetBytes) break;
+            footprint=finer; zoom++;
+        }
         // Mercator ground resolution changes with latitude. Width-only zoom
         // selection must not turn a valid map into an arbitrary 100-tile error.
         // Retain the real boundary halo and choose the next same-provider level.
         while(Count()>MaximumTiles&&zoom>0){token.ThrowIfCancellationRequested();footprint=Footprint(--zoom);}
-        _log.Diagnostic($"DEM PLAN preferredZoom={preferredZoom}; preferredTiles={preferredCount}; selectedZoom={zoom}; selectedTiles={Count()}; maximumTiles={MaximumTiles}; zoomReduced={zoom!=preferredZoom}; boundaryHaloPixels=6; wholeBoundsRetained=true; newEndpoint=false");
+        _log.Diagnostic($"DEM PLAN preferredZoom={preferredZoom}; preferredTiles={preferredCount}; selectedZoom={zoom}; selectedTiles={Count()}; maximumTiles={MaximumTiles}; zoomReduced={zoom<preferredZoom}; zoomIncreased={zoom>preferredZoom}; sourceSpacingMeters={Spacing(zoom):R}; outputSpacingMeters={outputSpacing:R}; estimatedScratchBytes={EstimatedBytes(footprint)}; scratchBudgetBytes={scratchBudgetBytes}; memoryEstimateNotMeasurement=true; sourceSurveyResolutionUnknown=true; boundaryHaloPixels=6; wholeBoundsRetained=true; newEndpoint=false");
         var (minX,maxX,minY,maxY)=footprint;
         var coordinates = new List<(int x, int y)>();
         for (var y = minY; y <= maxY; y++)

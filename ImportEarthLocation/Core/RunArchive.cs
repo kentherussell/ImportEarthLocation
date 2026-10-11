@@ -22,14 +22,25 @@ public sealed class RunArchive
         DirectoryPath = Path.Combine(root, _started.ToString("yyyyMMddTHHmmssfffZ") + "-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(DirectoryPath);
         string? fingerprint = null;
+        var fingerprintStatus = "assembly-location-unavailable";
         if (File.Exists(assemblyPath))
         {
-            using var sha = SHA256.Create(); using var stream = File.OpenRead(assemblyPath);
-            fingerprint = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+            // Fingerprinting must not abort the complete diagnostic archive if
+            // a loader exposes an inaccessible or transient assembly location.
+            try
+            {
+                using var sha = SHA256.Create(); using var stream = File.OpenRead(assemblyPath);
+                fingerprint = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+                fingerprintStatus = "loaded-assembly-file-hashed";
+            }
+            catch(IOException){fingerprintStatus="assembly-file-unreadable";}
+            catch(UnauthorizedAccessException){fingerprintStatus="assembly-file-access-denied";}
         }
         File.WriteAllText(Path.Combine(DirectoryPath, "run.json"), JsonConvert.SerializeObject(new
         {
-            schemaVersion = 1, startedUtc = _started, assemblySha256 = fingerprint, settings, environment,
+            schemaVersion = 2, pipelineVersion = "owned-route-overlay-v2", startedUtc = _started,
+            assemblySha256 = fingerprint, assemblyFingerprintStatus = fingerprintStatus,
+            assemblyFileName = string.IsNullOrEmpty(assemblyPath)?null:Path.GetFileName(assemblyPath), settings, environment,
             evidence = "Recorded operations and counts are not proof of final native rendering or persistence. Read native readback messages separately."
         }, Formatting.Indented), Encoding.UTF8);
     }

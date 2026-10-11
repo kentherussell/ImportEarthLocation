@@ -60,4 +60,33 @@ public sealed class NativeSubmissionPlan
         for(var i=0;i<suffix.Count;i++)_sections[start+i]=suffix[i];
         return indices.Count;
     }
+
+    public List<IReadOnlyList<PreparedSegment>> RiskPreflight(int maximum)
+    {
+        var result=new List<IReadOnlyList<PreparedSegment>>();
+        if(_sections.Count==0)return result;
+        result.Add(_sections.GetRange(0,Math.Min(maximum,_sections.Count)));
+        var incident=new Dictionary<string,List<PreparedSegment>>(StringComparer.Ordinal);
+        foreach(var section in _sections)foreach(var id in new[]{section.StartNodeId,section.EndNodeId})
+        {
+            var key=NativeEndpointPolicy.Identity(section,id);
+            if(!incident.TryGetValue(key,out var arms))incident[key]=arms=new();arms.Add(section);
+        }
+        var ranked=new List<KeyValuePair<string,List<PreparedSegment>>>(incident);
+        ranked.Sort((a,b)=>Score(b.Value).CompareTo(Score(a.Value)));
+        int Score(List<PreparedSegment> arms)
+        {
+            var score=arms.Count*4;
+            foreach(var s in arms){if(s.Bridge||s.Tunnel)score+=3;if(Unity.Mathematics.math.distance(s.Start,s.End)<24)score+=4;if(s.StartNodeId<0||s.EndNodeId<0)score+=2;}
+            return score;
+        }
+        var covered=new HashSet<PreparedSegment>(result[0]);
+        foreach(var pair in ranked)
+        {
+            if(result.Count>=9)break;
+            if(pair.Value.Count>maximum||!System.Linq.Enumerable.Any(pair.Value,s=>!covered.Contains(s)))continue;
+            result.Add(pair.Value.ToArray());foreach(var s in pair.Value)covered.Add(s);
+        }
+        return result;
+    }
 }

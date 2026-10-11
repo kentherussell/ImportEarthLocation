@@ -58,22 +58,32 @@ public static class NativeSurfaceBridge
         log.Diagnostic($"SURFACE TARGETS local={Describe(local)}; world={Describe(world)}; encoding=nativeRG16");
         CheckTarget(local, terrain.playableArea, terrain.playableOffset);
         CheckTarget(world, terrain.worldSize, terrain.worldOffset);
-        var verified = 0;
+        var verified = 0; var committed = new List<string>(); var cleanup = new List<Action>();
+        log.Diagnostic($"SURFACE STAGING BUDGET targets=2; stagedGpuBytes={(long)local!.width * local.height * 2 + (long)world!.width * world.height * 2}; retainedExpectedBytes={(long)local.width * local.height * 2 + (long)world.width * world.height * 2}; atomicAcrossTargets=false");
         try
         {
-            ApplyTexture(local!, terrain.playableArea, terrain.playableOffset, "local");
-            ApplyTexture(world!, terrain.worldSize, terrain.worldOffset, "world");
+            var commitLocal = StageTexture(local!, terrain.playableArea, terrain.playableOffset, "local");
+            var commitWorld = StageTexture(world!, terrain.worldSize, terrain.worldOffset, "world");
+            log.Diagnostic("SURFACE STAGING allTargetsVerified=true; committedTargets=0; pairAtomic=false");
+            commitLocal(); commitWorld();
         }
-        finally { materials.ForceUpdateWholeSplatmap(); }
+        catch (Exception error)
+        {
+            log.Count("Surface application failures");
+            log.Diagnostic($"SURFACE OUTCOME complete=false; committedTargets={string.Join(",", committed)}; verifiedTargets={verified}; atomic=false; rollbackAvailable=false; failure={error}");
+            throw;
+        }
+        finally { foreach (var release in cleanup) release(); materials.ForceUpdateWholeSplatmap(); }
         NativeDiagnostics.SurfaceApplied = verified == 2;
         return "Ground surfaces applied through native paint shaders; both encoded texture copies verified. Appearance and save/reload still require game checks.";
 
-        void ApplyTexture(RenderTexture target, float2 area, float2 offset, string label)
+        Action StageTexture(RenderTexture target, float2 area, float2 offset, string label)
         {
             var scratch = new RenderTexture(target.descriptor) { name = "IEL native surface staging", enableRandomWrite = true };
             var brushTexture = new Texture2D(target.width, target.height, TextureFormat.RGBA32, false, true)
                 { filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
             var readback = new Texture2D(target.width, target.height, TextureFormat.RG16, false, true);
+            cleanup.Add(() => { scratch.Release(); UnityEngine.Object.Destroy(scratch); UnityEngine.Object.Destroy(brushTexture); UnityEngine.Object.Destroy(readback); });
             var previous = RenderTexture.active; var previousSrgb = GL.sRGBWrite;
             try
             {
@@ -134,9 +144,19 @@ public static class NativeSurfaceBridge
                 }
                 if (outsideChanges != 0 || defaultResidual != 0 || requested > 100 && painted == 0)
                     throw new InvalidOperationException($"Native surface staging failed verification: outsideChanges={outsideChanges}, DefaultResidual={defaultResidual}, requested={requested}, painted={painted}. Native target not replaced.");
+                log.Count("Surface targets staged and verified");
+                return () =>
+                {
+                var commitPrevious = RenderTexture.active; var commitSrgb = GL.sRGBWrite;
+                try
+                {
+                GL.sRGBWrite = false;
                 if (!target.IsCreated() && !target.Create()) throw new InvalidOperationException("Native paint target allocation failed.");
                 // Identical RG16 GPU formats: copy shader-encoded data without conversion.
                 Graphics.CopyTexture(scratch, target);
+                committed.Add(label);
+                log.Count("Surface texture copies committed");
+                log.Diagnostic($"SURFACE COMMIT target={label}; copyReturned=true; verificationPending=true; atomicAcrossTargets=false");
                 var actual = Read(target); var mismatched = 0;
                 for (var i = 0; i < selection.Length; i++)
                     if (expected[i * 2] != actual[i * 2] || expected[i * 2 + 1] != actual[i * 2 + 1]) mismatched++;
@@ -145,11 +165,14 @@ public static class NativeSurfaceBridge
                 log.Diagnostic($"SURFACE READBACK target={label}; comparedPixels={selection.Length}; mismatchedPixels={mismatched}; match={mismatched == 0}; gpuBytesHash={hash}; nativeShaderEncoding=true; rendererAppearanceVerified=false");
                 if (mismatched != 0) throw new InvalidOperationException("Native paint texture copy readback differs from the native shader result.");
                 NativeDiagnostics.RememberSurface(label, hash); verified++;
+                log.Count("Surface texture copies verified");
+                }
+                finally { RenderTexture.active = commitPrevious; GL.sRGBWrite = commitSrgb; }
+                };
             }
             finally
             {
                 GL.sRGBWrite = previousSrgb; RenderTexture.active = previous;
-                scratch.Release(); UnityEngine.Object.Destroy(scratch); UnityEngine.Object.Destroy(brushTexture); UnityEngine.Object.Destroy(readback);
             }
         }
     }

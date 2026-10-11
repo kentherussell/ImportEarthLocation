@@ -40,9 +40,11 @@ public sealed class ImportLog
             {
                 var root = System.IO.Path.Combine(UnityEngine.Application.persistentDataPath, "ModsData", Mod.Id, "diagnostics", "runs");
                 var loaded=AppDomain.CurrentDomain.GetAssemblies().Where(a=>!a.IsDynamic).Select(a=>a.GetName()).OrderBy(a=>a.Name,StringComparer.Ordinal).ToArray();
-                _archive = new RunArchive(root, request, typeof(ImportLog).Assembly.Location,new
+                string assemblyPath;try{assemblyPath=typeof(ImportLog).Assembly.Location;}catch{assemblyPath="";}
+                _archive = new RunArchive(root, request, assemblyPath,new
                 {
                     modBuildMvid=typeof(ImportLog).Assembly.ManifestModule.ModuleVersionId,
+                    engineBuildMvid=typeof(Game.Net.Node).Assembly.ManifestModule.ModuleVersionId,
                     gameVersion=UnityEngine.Application.version,unityVersion=UnityEngine.Application.unityVersion,
                     operatingSystem=Environment.OSVersion.VersionString,managedRuntime=Environment.Version.ToString(),
                     systemMemoryMb=UnityEngine.SystemInfo.systemMemorySize,loadedAssemblyCount=loaded.Length,

@@ -67,6 +67,9 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
     private bool _includeSecondary;
     private bool _applyGroundSurfaces;
     private bool _createAirConnections;
+    private ValueBinding<bool> _airConnectionsBinding = null!;
+    private ValueBinding<bool> _seaConnectionsBinding = null!;
+    private bool _createSeaConnections;
     private double _lastMapWidth;
     private CancellationTokenSource? _cancellation;
     private Task<DownloadBundle>? _downloadTask;
@@ -136,7 +139,10 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         AddBinding(new TriggerBinding<string>(BindingGroup, "setMapSize", value => { if (_busy.value) return; SetInput(ref _mapSizeId, value); _selectedMapSize.Update(_mapSizeId); }));
         AddBinding(new TriggerBinding<bool>(BindingGroup, "setIncludeSecondary", value => { if (_busy.value) return; _includeSecondary = value; _roadLevel = value ? RoadImportLevel.Secondary : RoadImportLevel.Primary; _roadLevelBinding.Update(NetworkSelection.Id(_roadLevel)); InvalidatePrepared(); new NetworkPreferences(_roadLevel,_importRail,_importForests).Save(_log); }));
         AddBinding(new TriggerBinding<bool>(BindingGroup, "setGroundSurfaces", value => { if (_busy.value) return; _applyGroundSurfaces = value; InvalidatePrepared(); }));
-        AddBinding(new TriggerBinding<bool>(BindingGroup, "setAirConnections", value => { if (_busy.value) return; _createAirConnections = value; InvalidatePrepared(); }));
+        AddBinding(_airConnectionsBinding = new ValueBinding<bool>(BindingGroup, "createAirConnections", _createAirConnections));
+        AddBinding(_seaConnectionsBinding = new ValueBinding<bool>(BindingGroup, "createSeaConnections", _createSeaConnections));
+        AddBinding(new TriggerBinding<bool>(BindingGroup, "setSeaConnections", value => { if (_busy.value) return; _createSeaConnections = value; _seaConnectionsBinding.Update(value); InvalidatePrepared(); }));
+        AddBinding(new TriggerBinding<bool>(BindingGroup, "setAirConnections", value => { if (_busy.value) return; _createAirConnections = value; _airConnectionsBinding.Update(value); InvalidatePrepared(); }));
         AddBinding(new TriggerBinding(BindingGroup, "prepare", StartPrepare));
         AddBinding(new TriggerBinding(BindingGroup, "cancel", CancelPrepare));
         AddBinding(new TriggerBinding(BindingGroup, "confirm", ConfirmApply));
@@ -269,7 +275,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         { Fail("Enter valid numeric latitude and longitude values."); return; }
 
         var request = new ImportRequest(latitude, longitude, MapSizeProfile.FromId(_mapSizeId), _includeSecondary)
-        { RoadLevel = _roadLevel, ImportRail = _importRail, ImportForests = _importForests, MapSessionId = ImportSession.Map, Generation = ImportSession.Begin(), ApplyGroundSurfaces = _applyGroundSurfaces, CreateAirConnections = _createAirConnections };
+        { RoadLevel = _roadLevel, ImportRail = _importRail, ImportForests = _importForests, MapSessionId = ImportSession.Map, Generation = ImportSession.Begin(), ApplyGroundSurfaces = _applyGroundSurfaces, CreateAirConnections = _createAirConnections,CreateSeaConnections=_createSeaConnections };
         var errors = InputValidator.Validate(request, MapExtDetector.HasVerifiedSizeApi).ToList();
         if (!MapExtDetector.TryGetCurrentMapWidth(out var actualWidth))
             errors.Add("The active MapExt map size could not be read; import is disabled to prevent a scale mismatch.");
@@ -586,7 +592,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         aligned=NetworkGeometrySafety.RepairFinalTunnelCover(aligned,terrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,log,token);
         aligned=CorridorProfiles.Prepare(aligned,log,token,WaterBodyPlanner.SurfaceSampler(water,polygons),finishOnly:true);
         aligned=NetworkGeometrySafety.RepairFinalTunnelCover(aligned,terrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,log,token);
-        terrain=terrain with{Heightmap=NetworkRoadbed.Refresh(networkTerrain.Heightmap,roadbedRaster,terrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,roadbedProfiles,aligned,protectedAreas,protectedLines,log,token)};
+        terrain=terrain with{Heightmap=NetworkRoadbed.Refresh(networkTerrain.Heightmap,roadbedRaster,terrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,roadbedProfiles,aligned,protectedAreas,protectedLines,log,token,water.FinalBedEdits)};
         NetworkGeometrySafety.ValidateEnvelope(aligned,bundle.Request.MapSize.WidthMeters,terrain.HeightScaleMeters,token);
         NetworkGeometrySafety.Validate(aligned,log,token,allowQualityWarnings:true);
         NetworkGeometrySafety.ValidateTunnelCover(aligned,terrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,token);
@@ -652,7 +658,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
             sections=NetworkGeometrySafety.RepairFinalTunnelCover(sections,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token);
             sections=CorridorProfiles.Prepare(sections,log,token,WaterBodyPlanner.SurfaceSampler(water,result.HabitatPolygons),finishOnly:true);
             sections=NetworkGeometrySafety.RepairFinalTunnelCover(sections,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token);
-            terrain=terrain with{Heightmap=NetworkRoadbed.Refresh(roadbedBaseline,roadbedRaster,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,roadbedProfiles,sections,result.ProtectedAreas,result.ProtectedLines,log,token)};
+            terrain=terrain with{Heightmap=NetworkRoadbed.Refresh(roadbedBaseline,roadbedRaster,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,roadbedProfiles,sections,result.ProtectedAreas,result.ProtectedLines,log,token,water.FinalBedEdits)};
             NetworkGeometrySafety.ValidateEnvelope(sections,request.MapSize.WidthMeters,terrain.HeightScaleMeters,token);
             NetworkGeometrySafety.Validate(sections,log,token,allowQualityWarnings:true);
             NetworkGeometrySafety.ValidateTunnelCover(sections,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,token);
@@ -744,6 +750,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
                 AirDestinations = result.Destinations,
                 Climate = result.Download.Climate,
                 Water = result.Water,
+                Ocean=result.Terrain.Ocean,
                 NetworkEvidence=result.NetworkData,
                 Warnings = warnings,
                 SourceWayCount = result.SourceWayCount

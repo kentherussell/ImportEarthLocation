@@ -14,7 +14,7 @@ public static class TerrainBuilder
     public const int Resolution = 4096;
 
     public sealed record Result(ushort[] Heightmap, float HeightScaleMeters, float SeaLevelMeters, float MinimumElevation, float MaximumElevation)
-    { public string ConditioningSummary { get; init; } = ""; }
+    { public string ConditioningSummary { get; init; } = ""; public OceanMask? Ocean { get; init; } }
 
     public static IReadOnlyList<TerrainTilePixels> DecodeOnMainThread(IReadOnlyList<TerrainTile> tiles, CancellationToken token = default)
     {
@@ -196,13 +196,14 @@ public static class TerrainBuilder
         var requiredWidth=cropRight-cropLeft+1;var requiredHeight=cropBottom-cropTop+1;
         var required=new float[checked(requiredWidth*requiredHeight)];
         for(var row=0;row<requiredHeight;row++)Array.Copy(source,(row+cropTop)*mosaicWidth+cropLeft,required,row*requiredWidth,requiredWidth);
-        var wholeProtection=geography==null?null:TerrainGeographyGuard.Build(geography,zoom,minX,minY,mosaicWidth,mosaicHeight,token);
+        var wholeProtection=geography==null?null:TerrainGeographyGuard.Build(geography,zoom,minX,minY,mosaicWidth,mosaicHeight,token,report:message=>log?.Diagnostic(message));
         bool[]? protection=null;
         if(wholeProtection!=null){protection=new bool[required.Length];for(var row=0;row<requiredHeight;row++)Array.Copy(wholeProtection,(row+cropTop)*mosaicWidth+cropLeft,protection,row*requiredWidth,requiredWidth);}
-        var landformProtection = geography == null ? null : TerrainGeographyGuard.Build(geography, zoom, minX, minY, mosaicWidth, mosaicHeight, token, landformsOnly: true);
+        var landformProtection = geography == null ? null : TerrainGeographyGuard.Build(geography, zoom, minX, minY, mosaicWidth, mosaicHeight, token, landformsOnly: true,report:message=>log?.Diagnostic(message));
+        CoastalTerrain.CoastCoverage? coastCoverage=null;
         TerrainArtifactRepair.Trace(required, requiredWidth, "source-before-coastal", message => log?.Diagnostic(message));
         CoastalTerrain.Shape(required, requiredWidth, requiredHeight, zoom, minX * 256 + cropLeft, minY * 256 + cropTop,
-            sourceSpacing, geography, token, message => log?.Diagnostic(message));
+            sourceSpacing, geography, token, message => log?.Diagnostic(message),coverage=>coastCoverage=coverage);
         TerrainArtifactRepair.Trace(required, requiredWidth, "after-coastal", message => log?.Diagnostic(message));
         TerrainArtifactRepair.Repair(required, requiredWidth, requiredHeight, sourceSpacing, token, message => log?.Diagnostic(message),
             landformProtection == null ? null : new Func<int, bool>(i => landformProtection[(i / requiredWidth + cropTop) * mosaicWidth + i % requiredWidth + cropLeft]));
@@ -279,7 +280,33 @@ public static class TerrainBuilder
         token.ThrowIfCancellationRequested();
         log?.Info($"DEM resampling/encoding validation passed: {minimum:0.0}–{maximum:0.0} m; Earth datum offset {seaLevel:0.0} m, quantization {scale/65535:0.###} m, underground headroom >=128 m; no interpolation overshoot or non-finite samples.");
 
-        return new Result(output, scale, seaLevel, minimum, maximum) { ConditioningSummary = conditioned.Metrics.ToString() };
+        OceanMask? ocean=null;
+        if(coastCoverage!=null)
+        {
+            const int maskSize=512;var labels=new byte[maskSize*maskSize];var accepted=0;var unknown=0;
+            for(var row=0;row<maskSize;row++)for(var column=0;column<maskSize;column++)
+            {
+                token.ThrowIfCancellationRequested();var latitude=bounds.South+(bounds.North-bounds.South)*row/(maskSize-1d);
+                var longitude=bounds.West+(bounds.East-bounds.West)*column/(maskSize-1d);
+                var x=(int)Math.Floor(GeoMath.LongitudeToTileX(longitude,zoom)*256)-coastCoverage.OriginX;
+                var y=(int)Math.Floor(GeoMath.LatitudeToTileY(latitude,zoom)*256)-coastCoverage.OriginY;
+                byte value=0;
+                if(x<0||y<0||x+1>=coastCoverage.Width||y+1>=coastCoverage.Height)value=3;
+                else
+                {
+                    var allSea=true;var conflicted=false;var unseeded=false;
+                    for(var dz=0;dz<=1;dz++)for(var dx=0;dx<=1;dx++)
+                    {var index=(y+dz)*coastCoverage.Width+x+dx;allSea&=coastCoverage.Ocean[index];conflicted|=coastCoverage.Ambiguous[index];unseeded|=coastCoverage.Unseeded[index];}
+                    value=allSea?(byte)1:conflicted?(byte)2:unseeded?(byte)3:(byte)0;
+                }
+                labels[row*maskSize+column]=value;if(value==1)accepted++;if(value>=2)unknown++;
+            }
+            ocean=new OceanMask(maskSize,requestWidth(bounds),labels,"directed-coast-v2");
+            log?.Diagnostic($"OCEAN HANDOFF resolution={maskSize}; acceptedSamples={accepted}; unknownSamples={unknown}; rowOrientation=south-to-north; registration=corner-aligned; classificationIsNotNativeNavigability=true");
+        }
+        return new Result(output, scale, seaLevel, minimum, maximum) { ConditioningSummary = conditioned.Metrics.ToString(),Ocean=ocean };
+
+        double requestWidth(GeoBounds b)=>2*Math.PI*6378137*Math.Cos((b.North+b.South)/2*Math.PI/180)*(b.East-b.West)/360;
     }
 
     private static float SampleTerrarium(IReadOnlyDictionary<(int x, int y), TerrainTilePixels> tiles, double tileX, double tileY)

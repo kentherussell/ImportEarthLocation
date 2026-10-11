@@ -21,6 +21,7 @@ public sealed class NativeNetworkPlacement
     private readonly ImportLog _log;
     public int RoadSections { get; private set; }
     public int RailSections { get; private set; }
+    public int VerifiedSections => _verifiedPaths.Count;
     private readonly HashSet<string> _isolatedEndpoints = new(StringComparer.Ordinal);
     private Dictionary<string,float> _nodeElevations = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Entity> _committedNodes = new(StringComparer.Ordinal);
@@ -33,10 +34,12 @@ public sealed class NativeNetworkPlacement
     private IReadOnlyList<NativeBatchBindings.Edge<Entity>> _touchedEdges=Array.Empty<NativeBatchBindings.Edge<Entity>>();
     private readonly Dictionary<(NetworkKind Kind,long WayId,long Start,long End),List<Entity>> _verifiedPaths=new();
     private Dictionary<Entity,Entity> _stagedEdgeChanges=new();
+    private readonly Dictionary<(NetworkKind Kind,long WayId,long Start,long End),List<Entity>> _stagedPaths=new();
     public string ArtifactStem { get; private set; } = "native-preflight";
     private NativeBatchBindings.Batch<Entity>? _generatedBatch;
     private Dictionary<string,Entity>? _stagedCommitted;
     private IReadOnlyList<PreparedSegment>? _source;
+    private readonly Dictionary<(NetworkKind Kind,long WayId,long Start,long End),PreparedSegment> _sourceRoutes=new();
     // A shared source node at a bridge/tunnel portal is a real connection. Grade-separated
     // crossings with different source node IDs remain isolated, even at coincident positions.
     private static string Identity(PreparedSegment segment, long node) => $"{segment.Kind}:{node}";
@@ -46,6 +49,7 @@ public sealed class NativeNetworkPlacement
         ArtifactStem=$"native-{(preflight?"preflight":"batch")}-{startIndex:D6}-{count:D3}-attempt-{attempt:D2}";
         _log.Diagnostic($"NATIVE COURSE POLICY artifact={ArtifactStem}; disableOverlapMergeBothEnds=true; subElevationStructuresOnly=true; committedEntityAttachmentRetained=true; preparedSourceTopologyAuthoritative=true; proximityAttachmentsAllowed=false");
         _generatedBatch=null;_stagedCommitted=null;_stagedEdges=null;_touchedEdges=Array.Empty<NativeBatchBindings.Edge<Entity>>();_stagedEdgeChanges.Clear();
+        _stagedPaths.Clear();
     }
 
     public NativeNetworkPlacement(EntityManager entityManager, PrefabSystem prefabSystem, ImportLog log)
@@ -116,13 +120,98 @@ public sealed class NativeNetworkPlacement
         if (roadTime > 0) _log.Time("Road apply", roadTime);
         if (railTime > 0) _log.Time("Rail apply", railTime);
         _log.DiagnosticRecords(ArtifactStem+"-expected.ndjson",ExpectedRecords());
+        CapturePlacementEvidence(definitions,"submitted");
         return definitions;
+    }
+
+    // Read-only evidence: never use nearby nodes to choose an attachment.
+    private void CapturePlacementEvidence(IReadOnlyList<Entity> definitions,string phase)
+    {
+        try
+        {
+            var records=new List<object>();
+            string Id(Entity e)=>$"{e.Index}:{e.Version}";
+            foreach(var definition in definitions)
+            {
+                var creation=_entityManager.GetComponentData<CreationDefinition>(definition);
+                var course=_entityManager.GetComponentData<NetCourse>(definition);
+                object Pos(CoursePos p)=>new{entity=Id(p.m_Entity),position=DiagnosticArtifacts.Point(p.m_Position),
+                    rotation=new{x=p.m_Rotation.value.x,y=p.m_Rotation.value.y,z=p.m_Rotation.value.z,w=p.m_Rotation.value.w},
+                    elevation=new{x=p.m_Elevation.x,y=p.m_Elevation.y},p.m_CourseDelta,p.m_SplitPosition,flags=p.m_Flags.ToString(),p.m_ParentMesh};
+                records.Add(new{kind="definition",entity=Id(definition),
+                    creation=new{prefab=Id(creation.m_Prefab),original=Id(creation.m_Original),owner=Id(creation.m_Owner),attached=Id(creation.m_Attached),flags=creation.m_Flags.ToString(),creation.m_RandomSeed},
+                    course=new{a=DiagnosticArtifacts.Point(course.m_Curve.a),b=DiagnosticArtifacts.Point(course.m_Curve.b),c=DiagnosticArtifacts.Point(course.m_Curve.c),d=DiagnosticArtifacts.Point(course.m_Curve.d),
+                        start=Pos(course.m_StartPosition),end=Pos(course.m_EndPosition),elevation=new{x=course.m_Elevation.x,y=course.m_Elevation.y},course.m_Length,course.m_FixedIndex},frame=UnityEngine.Time.frameCount});
+            }
+            using var query=_entityManager.CreateEntityQuery(ComponentType.ReadOnly<Node>());
+            using var nodes=query.ToEntityArray(Allocator.Temp);
+            var spatial=new Dictionary<(int X,int Z),List<Entity>>();
+            foreach(var node in nodes)
+            {
+                var p=_entityManager.GetComponentData<Node>(node).m_Position;
+                if(!math.all(math.isfinite(p)))continue;
+                var cell=((int)math.floor(p.x/64),(int)math.floor(p.z/64));
+                if(!spatial.TryGetValue(cell,out var bucket))spatial[cell]=bucket=new List<Entity>();
+                bucket.Add(node);
+            }
+            foreach(var expected in _submittedCourses)
+            foreach(var endpoint in new[]{(expected.Section.StartNodeId,expected.Section.Start),(expected.Section.EndNodeId,expected.Section.End)})
+            {
+                var source=Identity(expected.Section,endpoint.Item1);
+                _committedNodes.TryGetValue(source,out var intended);
+                var candidates=new List<(Entity Entity,float Distance)>();
+                var nearby=new HashSet<Entity>();
+                var center=((int)math.floor(endpoint.Item2.x/64),(int)math.floor(endpoint.Item2.z/64));
+                for(var x=-1;x<=1;x++)for(var z=-1;z<=1;z++)
+                    if(spatial.TryGetValue((center.Item1+x,center.Item2+z),out var bucket))foreach(var node in bucket)nearby.Add(node);
+                if(intended!=Entity.Null&&_entityManager.Exists(intended)&&_entityManager.HasComponent<Node>(intended))nearby.Add(intended);
+                foreach(var node in nearby)
+                {
+                    var position=_entityManager.GetComponentData<Node>(node).m_Position;
+                    var distance=math.distance(position.xz,endpoint.Item2.xz);
+                    if(distance<=64||node==intended)candidates.Add((node,distance));
+                }
+                candidates.Sort((a,b)=>a.Distance.CompareTo(b.Distance));
+                var recorded=0;
+                foreach(var candidate in candidates)
+                {
+                    if(recorded>=64&&candidate.Entity!=intended)continue;
+                    var node=candidate.Entity;var incidents=new List<object>();
+                    if(_entityManager.HasBuffer<ConnectedEdge>(node))
+                    foreach(var link in _entityManager.GetBuffer<ConnectedEdge>(node,true))
+                    {
+                        if(incidents.Count>=128)break;
+                        var edge=link.m_Edge;var exists=_entityManager.Exists(edge);
+                        incidents.Add(new{entity=Id(edge),exists,
+                            edge=exists&&_entityManager.HasComponent<Edge>(edge)?new{start=Id(_entityManager.GetComponentData<Edge>(edge).m_Start),end=Id(_entityManager.GetComponentData<Edge>(edge).m_End)}:null,
+                            curve=exists&&_entityManager.HasComponent<Curve>(edge)?CurveEvidence(_entityManager.GetComponentData<Curve>(edge).m_Bezier):null,
+                            prefab=exists&&_entityManager.HasComponent<PrefabRef>(edge)?Id(_entityManager.GetComponentData<PrefabRef>(edge).m_Prefab):null});
+                    }
+                    records.Add(new{kind="endpoint-neighborhood",source,expected.Section.WayId,intended=Id(intended),entity=Id(node),candidate.Distance,
+                        position=DiagnosticArtifacts.Point(_entityManager.GetComponentData<Node>(node).m_Position),deleted=_entityManager.HasComponent<Deleted>(node),
+                        temp=_entityManager.HasComponent<Temp>(node)?new{original=Id(_entityManager.GetComponentData<Temp>(node).m_Original),flags=_entityManager.GetComponentData<Temp>(node).m_Flags.ToString()}:null,
+                        incidents,candidatesFound=candidates.Count,truncated=candidates.Count>64,searchRadiusMeters=64,attachmentByProximity=false});
+                    recorded++;
+                }
+            }
+            _log.DiagnosticRecords(ArtifactStem+"-"+phase+"-placement-evidence.ndjson",records,32L*1024*1024);
+        }
+        catch(Exception error) when(error is not OutOfMemoryException)
+        { _log.Diagnostic($"NATIVE DIAGNOSTIC capture incomplete artifact={ArtifactStem}; phase={phase}; exception={error}"); }
     }
 
     public void Initialize(IReadOnlyList<PreparedSegment> source, Processing.OsmDataset? evidence)
     {
         _source = source;
+        _sourceRoutes.Clear();
+        foreach(var section in source)
+        {
+            var key=(section.Kind,section.WayId,section.StartNodeId,section.EndNodeId);
+            if(!_sourceRoutes.ContainsKey(key))_sourceRoutes[key]=section;
+            else _log.Count("Duplicate native source route keys observed");
+        }
         RoadSections=RailSections=0;
+        _stagedPaths.Clear();
         _nodeElevations=NativeEndpointPolicy.Elevations(source);
         _isolatedEndpoints.Clear(); _committedNodes.Clear(); _committedAnchors.Clear();_plannedPositions.Clear();_centerBudgets.Clear(); _verifiedEdges.Clear();_verifiedPaths.Clear();_stagedEdgeChanges.Clear();_stagedEdges=null;_touchedEdges=Array.Empty<NativeBatchBindings.Edge<Entity>>();_generatedBatch=null;_stagedCommitted=null;
         NativeNetworkDiagnostics.Remember(source,evidence);
@@ -182,18 +271,38 @@ public sealed class NativeNetworkPlacement
             if(!_entityManager.HasComponent<Curve>(entity))throw new InvalidOperationException("Native generated edge has no curve evidence; unsafe commit refused.");
             var curve=_entityManager.GetComponentData<Curve>(entity).m_Bezier;
             actual.Add(new NativeBatchBindings.Edge<Entity>(Target(entity),Target(edge.m_Start),Target(edge.m_End),
-                Position(edge.m_Start),Position(edge.m_End),road?NetworkKind.Road:NetworkKind.Rail,prefab){CurveStart=curve.a,CurveEnd=curve.d});
+                Position(edge.m_Start),Position(edge.m_End),road?NetworkKind.Road:NetworkKind.Rail,prefab){CurveStart=curve.a,CurveEnd=curve.d,CurveControl1=curve.b,CurveControl2=curve.c});
         }
         if(_submittedCourses.Count!=batch.Count)throw new InvalidOperationException("Submitted native course manifest is incomplete.");
         _stagedCommitted=NativeBatchBindings.RemapCommitted(_committedNodes,replacements);
+        // Reconcile only an already-owned node, never a nearby candidate. Native
+        // generation may adjust that node again while extending its road.
+        for(var i=0;i<_submittedCourses.Count;i++)
+        {
+            var item=_submittedCourses[i];var section=item.Section;
+            NativeBatchBindings.Anchor<Entity>? PreviewAnchor(long id)
+            {
+                var key=Identity(section,id);
+                if(!_stagedCommitted.TryGetValue(key,out var owner)||!previewPositions.TryGetValue(owner,out var position))return null;
+                if(!math.all(math.isfinite(position))||math.distance(position.xz,_plannedPositions[key].xz)>_centerBudgets[key])
+                    throw new NativePreviewException("Native owned junction moved beyond its original source footprint.",section.WayId,key);
+                return new NativeBatchBindings.Anchor<Entity>(owner,_plannedPositions[key],position){CenterLimit=_centerBudgets[key]};
+            }
+            var start=PreviewAnchor(section.StartNodeId);var end=PreviewAnchor(section.EndNodeId);
+            NativeBatchBindings.RebaseOwnedPreview(section,start,end);
+            var movement=Math.Max(start==null?0:math.distance(section.Start.xz,start.Generated.xz),end==null?0:math.distance(section.End.xz,end.Generated.xz));
+            if(movement>0)
+                _log.Diagnostic($"NATIVE OWNED MOVEMENT way={section.WayId}; centerMovementMeters={movement:R}; submittedCoursePreserved=true; artifact={ArtifactStem}; sourceFootprintChecked=true; unrelatedAttachmentAllowed=false");
+        }
         var relevant=new HashSet<Entity>();foreach(var edge in actual){relevant.Add(edge.StartNode);relevant.Add(edge.EndNode);}
         foreach(var section in batch)foreach(var id in new[]{section.StartNodeId,section.EndNodeId})
             if(_stagedCommitted.TryGetValue(Identity(section,id),out var known))relevant.Add(known);
         _log.DiagnosticRecords(ArtifactStem+"-owners.ndjson",OwnerRecords(relevant));
         _log.DiagnosticRecords(ArtifactStem+"-graph.ndjson",GraphRecords(actual));
-        try{_generatedBatch=NativeBatchBindings.Match(_submittedCourses,actual,_stagedCommitted);}
+        try{_generatedBatch=NativeBatchBindings.Match(_submittedCourses,actual,_stagedCommitted,MatchRejection);}
         catch(Exception error)
         {
+            CapturePlacementEvidence(Array.Empty<Entity>(),"rejected");
             _log.DiagnosticRecords(ArtifactStem+"-rejection-endpoints.ndjson",RejectionEndpoints(actual));
             _log.Checkpoint("native-batch/preview-rejected",new{artifactStem=ArtifactStem,sections=batch.Count,committedOwners=_committedNodes.Count,
                 exception=error.ToString(),recoverable=error is NativePreviewException,applied=false,
@@ -226,8 +335,7 @@ public sealed class NativeNetworkPlacement
             }
             if(!_entityManager.HasComponent<Edge>(entity)||!_verifiedEdges.TryGetValue(temp.m_Original,out var prior))continue;
             if((temp.m_Flags&TempFlags.Delete)!=0)continue;
-            if(!actualByEntity.TryGetValue(Target(entity),out var update)||update.Prefab!=prior.Prefab||update.Kind!=prior.Kind||
-                update.StartNode!=RemapNode(prior.StartNode)||update.EndNode!=RemapNode(prior.EndNode))
+            if(!actualByEntity.TryGetValue(Target(entity),out var update)||update.Prefab!=prior.Prefab||update.Kind!=prior.Kind)
                 throw PriorEdgeRejection(prior,$"Preview changed previously verified edge {temp.m_Original} asset or junction incidence; regeneration required.");
             updatedOriginals.Add(temp.m_Original);stagedEdges.Remove(temp.m_Original);stagedEdges[update.Entity]=update;touched.Add(update);
             if(temp.m_Original!=update.Entity)_stagedEdgeChanges[temp.m_Original]=update.Entity;
@@ -238,9 +346,89 @@ public sealed class NativeNetworkPlacement
             if(!_entityManager.HasComponent<Edge>(entity))continue;
             var temp=_entityManager.GetComponentData<Temp>(entity);
             if((temp.m_Flags&TempFlags.Delete)!=0&&_verifiedEdges.ContainsKey(temp.m_Original)&&!updatedOriginals.Contains(temp.m_Original))
-                throw PriorEdgeRejection(_verifiedEdges[temp.m_Original],$"Preview would remove previously verified edge {temp.m_Original} without qualified replacement coverage.");
+                stagedEdges.Remove(temp.m_Original);
         }
-        foreach(var binding in _generatedBatch.Edges)stagedEdges[binding.Generated.Entity]=binding.Generated;
+        // Complete overlay: Combine may create a replacement edge without a
+        // one-to-one original, including subdivisions not consumed by this batch.
+        // Omitting those edges manufactures missing prior routes.
+        foreach(var edge in actual)
+        {
+            stagedEdges[edge.Entity]=edge;
+            required[edge.StartNode]=edge.Start;required[edge.EndNode]=edge.End;
+            if(!System.Linq.Enumerable.Any(touched,e=>e.Entity==edge.Entity))touched.Add(edge);
+        }
+        var routeOwners=new Dictionary<string,Entity>(_stagedCommitted,StringComparer.Ordinal);
+        foreach(var anchor in _generatedBatch.Anchors)routeOwners[anchor.Key]=anchor.Value.Entity;
+        foreach(var key in new List<Entity>(stagedEdges.Keys))
+        {
+            var edge=stagedEdges[key];var start=RemapNode(edge.StartNode);var end=RemapNode(edge.EndNode);
+            stagedEdges[key]=edge with{StartNode=start,EndNode=end,
+                Start=previewPositions.TryGetValue(start,out var a)?a:edge.Start,
+                End=previewPositions.TryGetValue(end,out var b)?b:edge.End};
+        }
+        // Prove whole source-route coverage for EVERY changed/deleted original.
+        // Native subdivision boundaries may disappear; source junctions may not.
+        var changedOriginals=new HashSet<Entity>();
+        foreach(var entity in temporary)
+            if(_entityManager.HasComponent<Edge>(entity))
+            {var original=_entityManager.GetComponentData<Temp>(entity).m_Original;if(_verifiedEdges.ContainsKey(original))changedOriginals.Add(original);}
+        var changedNodes=new HashSet<Entity>(replacements.Keys);
+        foreach(var edge in _verifiedEdges.Values)
+        {
+            var start=RemapNode(edge.StartNode);var end=RemapNode(edge.EndNode);
+            if(previewPositions.TryGetValue(start,out var a)&&!math.all(a==edge.Start))changedNodes.Add(edge.StartNode);
+            if(previewPositions.TryGetValue(end,out var b)&&!math.all(b==edge.End))changedNodes.Add(edge.EndNode);
+        }
+        foreach(var path in _verifiedPaths)
+        {
+            if(!System.Linq.Enumerable.Any(path.Value,e=>changedOriginals.Contains(e)||
+                _verifiedEdges.TryGetValue(e,out var previous)&&(changedNodes.Contains(previous.StartNode)||changedNodes.Contains(previous.EndNode))))continue;
+            if(!_sourceRoutes.TryGetValue(path.Key,out var source))throw PriorEdgeRejection(_verifiedEdges[path.Value[0]],"Prior source route manifest unavailable; combination refused.");
+            NativeBatchBindings.Anchor<Entity> Owned(long id,float3 planned)
+            {
+                var key=Identity(source,id);var owner=_stagedCommitted[key];
+                var position=previewPositions.TryGetValue(owner,out var p)?p:_committedAnchors[key].Generated;
+                if(math.distance(position.xz,_plannedPositions[key].xz)>_centerBudgets[key])throw new NativePreviewException("Combined route junction exceeded original footprint.",source.WayId,key);
+                return new(owner,planned,position){CenterLimit=_centerBudgets[key]};
+            }
+            // Validate source-owner center movement independently of ports. A
+            // junction update may change its native curve while preserving its
+            // owned, directed route. Never translate the old prepared evidence.
+            Owned(source.StartNodeId,source.Start);Owned(source.EndNodeId,source.End);
+            var reconciled=source;
+            var tolerance=Math.Max(_centerBudgets[Identity(source,source.StartNodeId)],_centerBudgets[Identity(source,source.EndNodeId)]);
+            var prefab=_verifiedEdges[path.Value[0]].Prefab;
+            var low=math.min(math.min(reconciled.CourseStart.xz,reconciled.CourseEnd.xz),math.min(reconciled.CourseControl1.xz,reconciled.CourseControl2.xz))-new float2(tolerance+32);
+            var high=math.max(math.max(reconciled.CourseStart.xz,reconciled.CourseEnd.xz),math.max(reconciled.CourseControl1.xz,reconciled.CourseControl2.xz))+new float2(tolerance+32);
+            var candidates=new List<NativeBatchBindings.Edge<Entity>>();
+            foreach(var edge in stagedEdges.Values)
+                if(edge.Kind==source.Kind&&edge.Prefab==prefab&&math.all(edge.Start.xz>=low)&&math.all(edge.Start.xz<=high)&&math.all(edge.End.xz>=low)&&math.all(edge.End.xz<=high))candidates.Add(edge);
+            NativeBatchBindings.Batch<Entity> route;
+            try
+            {
+                route=NativeBatchBindings.Match(new[]{new NativeBatchBindings.Expected<Entity>(reconciled,prefab){StartCenterBudget=_centerBudgets[Identity(source,source.StartNodeId)],EndCenterBudget=_centerBudgets[Identity(source,source.EndNodeId)],ReconciliationTolerance=tolerance,ValidateCurveCorridor=true,OwnedRoute=true}},candidates,routeOwners,MatchRejection);
+            }
+            catch(NativePreviewException)
+            {
+                // Complete candidate controls are needed on failure, not tens
+                // of thousands of graph files during successful imports.
+                _log.DiagnosticRecords(ArtifactStem+"-prior-route-"+source.WayId+"-"+source.StartNodeId+"-"+source.EndNodeId+".ndjson",GraphRecords(candidates));
+                throw;
+            }
+            _stagedPaths[path.Key]=new List<Entity>(System.Linq.Enumerable.Select(route.Edges,b=>b.Generated.Entity));
+            foreach(var pair in route.Nodes)required[pair.Key]=pair.Value;
+            foreach(var binding in route.Edges)if(!System.Linq.Enumerable.Any(touched,e=>e.Entity==binding.Generated.Entity))touched.Add(binding.Generated);
+            var first=route.Edges[0];var last=route.Edges[route.Edges.Count-1];
+            var firstPort=first.Forward?first.Generated.CurveStart??first.Generated.Start:first.Generated.CurveEnd??first.Generated.End;
+            var lastPort=last.Forward?last.Generated.CurveEnd??last.Generated.End:last.Generated.CurveStart??last.Generated.Start;
+            var portMovement=Math.Max(math.distance(firstPort.xz,source.CourseStart.xz),math.distance(lastPort.xz,source.CourseEnd.xz));
+            var heightMovement=Math.Max(Math.Abs(firstPort.y-source.CourseStart.y),Math.Abs(lastPort.y-source.CourseEnd.y));
+            _log.Count("Native owned routes requalified");
+            _log.Diagnostic($"NATIVE ROUTE REQUALIFIED way={source.WayId}; previousEdges={path.Value.Count}; replacementEdges={route.Edges.Count}; sourceOwnersRetained=true; exactAsset=true; uniqueConnectedCoverage=true; ownedRoute=true; geometricEnvelopeMeters={tolerance:R}; endpointPortMovementMeters={portMovement:R}; endpointHeightMovementMeters={heightMovement:R}; structuralTerrainClearanceCertified=false; immutableSourceEvidence=true; artifact={ArtifactStem}");
+        }
+        // Retire anonymous subdivision nodes eliminated by an approved Combine.
+        var retainedNodes=new HashSet<Entity>();foreach(var e in stagedEdges.Values){retainedNodes.Add(e.StartNode);retainedNodes.Add(e.EndNode);}
+        foreach(var node in new List<Entity>(required.Keys))if(!retainedNodes.Contains(node)&&!System.Linq.Enumerable.Contains(_stagedCommitted.Values,node))required.Remove(node);
         _stagedEdges=stagedEdges;_touchedEdges=touched;
         // A preview can regenerate nodes from earlier verified batches. Retain
         // their center evidence too, not just anchors present in this batch.
@@ -307,7 +495,15 @@ public sealed class NativeNetworkPlacement
     {
         foreach(var e in graph)yield return new{entity=$"{e.Entity.Index}:{e.Entity.Version}",startNode=$"{e.StartNode.Index}:{e.StartNode.Version}",endNode=$"{e.EndNode.Index}:{e.EndNode.Version}",
             start=DiagnosticArtifacts.Point(e.Start),end=DiagnosticArtifacts.Point(e.End),mode=e.Kind.ToString(),prefab=$"{e.Prefab.Index}:{e.Prefab.Version}",
-            curveStart=e.CurveStart.HasValue?DiagnosticArtifacts.Point(e.CurveStart.Value):null,curveEnd=e.CurveEnd.HasValue?DiagnosticArtifacts.Point(e.CurveEnd.Value):null};
+            curveStart=e.CurveStart.HasValue?DiagnosticArtifacts.Point(e.CurveStart.Value):null,curveEnd=e.CurveEnd.HasValue?DiagnosticArtifacts.Point(e.CurveEnd.Value):null,
+            control1=e.CurveControl1.HasValue?DiagnosticArtifacts.Point(e.CurveControl1.Value):null,control2=e.CurveControl2.HasValue?DiagnosticArtifacts.Point(e.CurveControl2.Value):null};
+    }
+
+    private static object CurveEvidence(Bezier4x3 c)=>new{a=DiagnosticArtifacts.Point(c.a),b=DiagnosticArtifacts.Point(c.b),c=DiagnosticArtifacts.Point(c.c),d=DiagnosticArtifacts.Point(c.d)};
+    private void MatchRejection(object evidence)
+    {
+        _log.Count("Native matcher rejected attempts",1);
+        _log.DiagnosticRecords(ArtifactStem+"-matcher-rejection.ndjson",new[]{evidence});
     }
 
     private static IEnumerable<object> BindingRecords(NativeBatchBindings.Batch<Entity> batch)
@@ -401,6 +597,7 @@ public sealed class NativeNetworkPlacement
             _log.Diagnostic($"NATIVE PLAYBACK numericRoundedCenters={changedCenters-centerChanges.Count}; sourceRequalifiedCenters={centerChanges.Count}; curvePortAllowance=2-float-ULP-capped-.01m; sourceCenterAllowance=established-preview-footprint; liveCurvePortsVerified=true; assetsAndIncidenceVerified=true; proximityAttachment=false");
         }
         _verifiedEdges=_stagedEdges!;
+        foreach(var path in _stagedPaths)_verifiedPaths[path.Key]=path.Value;
         if(_stagedEdgeChanges.Count>0)foreach(var path in _verifiedPaths.Values)
             for(var i=0;i<path.Count;i++)if(_stagedEdgeChanges.TryGetValue(path[i],out var replacement))path[i]=replacement;
         foreach(var group in System.Linq.Enumerable.GroupBy(_generatedBatch.Edges,b=>(b.Section.Kind,b.Section.WayId,b.Section.StartNodeId,b.Section.EndNodeId)))
@@ -432,6 +629,12 @@ public sealed class NativeNetworkPlacement
         var sources=new List<string>();
         foreach(var pair in _committedNodes)if(pair.Value==edge.StartNode||pair.Value==edge.EndNode)sources.Add(pair.Key);
         long way=0;foreach(var pair in _verifiedPaths)if(pair.Value.Contains(edge.Entity)){way=pair.Key.WayId;break;}
+        foreach(var path in _verifiedPaths)
+            if(path.Value.Contains(edge.Entity))
+            {
+                var start=$"{path.Key.Kind}:{path.Key.Start}";var end=$"{path.Key.Kind}:{path.Key.End}";
+                if(!sources.Contains(start))sources.Add(start);if(!sources.Contains(end))sources.Add(end);
+            }
         _log.Diagnostic($"NATIVE PRIOR EDGE rejected={edge.Entity}; way={way}; sources={string.Join(",",sources)}; expectedStart={edge.StartNode}; expectedEnd={edge.EndNode}; expectedPrefab={edge.Prefab}; pendingJunctionRecoveryHasContext={sources.Count>0}");
         return new NativePreviewException(message,way,sources.ToArray());
     }

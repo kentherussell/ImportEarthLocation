@@ -47,8 +47,8 @@ public static class NativeWaterBridge
                 var nativeBank=plan.BankLevel;
                 foreach(var bankProbe in plan.BankProbes)nativeBank=Math.Min(nativeBank,TerrainUtils.SampleHeight(ref heights,bankProbe));
                 var unsafeReason=!math.isfinite(position.y)||!math.isfinite(target)||!math.isfinite(nativeBank)?"non-finite-native-height":
-                    Math.Abs(position.y-plan.Position.y)>1.5f?"native-bed-plan-mismatch":target>nativeBank-.25f+(plan.BodyKind=="river"?math.clamp(plan.SurfaceOffsetMeters,0,1):0)?"stage-above-bank-budget":
-                    plan.Radius<water.CellSize?"below-native-grid-size":Math.Abs((prepared.Water?.WaterCellSize??0)-water.CellSize)>.01f?"native-grid-changed":null;
+                    Math.Abs(position.y-plan.Position.y)>1.5f?"native-bed-plan-mismatch":target>nativeBank-.25f?"stage-above-bank-budget":
+                    plan.Radius<water.CellSize?"below-conservative-mod-source-size-policy":Math.Abs((prepared.Water?.WaterCellSize??0)-water.CellSize)>.01f?"native-grid-changed":null;
                 if (unsafeReason!=null)
                 { log.Warn($"River source {plan.WayId} skipped: native channel/bank or water grid differs from the safe plan.");log.Diagnostic($"WATER APPLY SKIP way={plan.WayId}; body={plan.BodyId}; nativeBed={position.y:R}; plannedBed={plan.Position.y:R}; target={target:R}; nativeBank={nativeBank:R}; radius={plan.Radius:R}; reason={unsafeReason}"); continue; }
                 // Recheck the entire circular footprint against native terrain, including longitudinal slope.

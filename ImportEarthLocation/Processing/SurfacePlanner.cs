@@ -25,10 +25,19 @@ public static class SurfacePlanner
             throw new ArgumentException("Surface preparation requires finite bounds and a square valid terrain raster.");
         token.ThrowIfCancellationRequested();
         var size = resolution * resolution; var cell = (float)(width / resolution);
-        var cover = new byte[size]; var priority = new byte[size]; var mapped = 0; var beachPolygons = 0; var beachSamples = 0;
+        var cover = new byte[size]; var priority = new byte[size]; var beachCoverage = new byte[size]; var urbanContext = new bool[size];
+        byte[]? beachSubsamples = null;
+        var mapped = 0; var beachPolygons = 0; var beachSamples = 0;
+        var provenance = new List<object>();
         foreach (var polygon in polygons.OrderBy(p => p.Id))
         {
+            // Land use is context, not proof that every square metre is paved.
+            var use = Tag(polygon.Tags, "landuse");
+            if (use == "residential" || use == "commercial" || use == "industrial" || use == "retail" || use == "construction" || use == "brownfield" || use == "cemetery")
+                Rasterize(polygon, resolution, width, (a, b) => { for (var i = a; i < b; i++) urbanContext[i] = true; }, token);
             var evidence = Classify(polygon.Tags); if (evidence.Cover == Cover.Unknown) continue;
+            if (provenance.Count < 32) provenance.Add(new { polygon.Id, physicalCover = evidence.Cover.ToString(), priority = evidence.Priority,
+                useContext = use, natural = Tag(polygon.Tags, "natural"), surface = Tag(polygon.Tags, "surface"), landcover = Tag(polygon.Tags, "landcover"), outerRings = polygon.Outer.Count, innerRings = polygon.Inner.Count });
             var beach = Tag(polygon.Tags, "natural") == "beach" && evidence.Cover == Cover.Sand;
             if (beach) beachPolygons++;
             void Fill(int start, int end)
@@ -42,16 +51,27 @@ public static class SurfacePlanner
                 { if (beach && cover[i] != (byte)Cover.Sand) beachSamples++; cover[i] = (byte)evidence.Cover; priority[i] = evidence.Priority; }
             }
             if (beach)
+            {
+                beachSubsamples ??= new byte[size]; var occupied = new List<int>();
                 // Sample narrow mapped beaches at quarter-cell spacing, then
                 // retain their footprint in the available native paint cell.
                 // No generic beach is invented along rocky or urban coastlines.
                 Rasterize(polygon, resolution * 4, width, (start, end) =>
                 {
-                    var row = start / (resolution * 4) / 4;
-                    var left = start % (resolution * 4) / 4;
-                    var right = ((end - 1) % (resolution * 4)) / 4 + 1;
-                    Fill(row * resolution + left, row * resolution + right);
+                    for (var sample = start; sample < end; sample++)
+                    {
+                        var i = sample / (resolution * 4) / 4 * resolution + sample % (resolution * 4) / 4;
+                        if (beachSubsamples[i] == 0) occupied.Add(i);
+                        beachSubsamples[i] = (byte)Math.Min(16, beachSubsamples[i] + 1);
+                    }
                 }, token);
+                foreach (var i in occupied)
+                {
+                    Fill(i, i + 1);
+                    if (cover[i] == (byte)Cover.Sand) beachCoverage[i] = Math.Max(beachCoverage[i], (byte)(beachSubsamples[i] * 255 / 16));
+                    beachSubsamples[i] = 0;
+                }
+            }
             else Rasterize(polygon, resolution, width, Fill, token);
             mapped++;
         }
@@ -101,7 +121,7 @@ public static class SurfacePlanner
                     { winner = GroundMaterial.Grass; strength = Math.Min(.86f, (vegetation - .24f) * 1.2f); certainty = (byte)Math.Max(100, Math.Min(210, 100 + 110 * vegetation)); }
                     else if (vegetation < -.24f)
                     { winner = GroundMaterial.DryGrass; strength = Math.Min(.82f, (-vegetation - .24f) * 1.35f); certainty = (byte)Math.Max(85, Math.Min(190, 85 - 100 * vegetation)); }
-                    else if (evidence == Cover.Unknown || evidence == Cover.Vegetation)
+                    else if (evidence == Cover.Vegetation || evidence == Cover.Unknown && !urbanContext[i])
                     {
                         // Subtle continuous grass variation, not isolated random brush pixels.
                         winner = exposure > .12f ? GroundMaterial.DryGrass : GroundMaterial.Grass;
@@ -150,7 +170,23 @@ public static class SurfacePlanner
         var desertGaps = desert ? BlendNarrowDesertGaps(material, intensity, cover, resolution, cell, width, context, sea, token) : 0;
         log.Diagnostic($"SURFACE DESERT GAP filledSamples={desertGaps}; maximumBracketReachMeters=100; explicitCoversProtected=true; wetGapsRetained=true");
         var finalDistance = BoundaryDistance(material, resolution, cell, token);
+        // Feather the original sandy footprint before adding exterior density.
+        // Otherwise the inward pass attenuates the already-faded outward band
+        // a second time, making compatible exterior sand effectively invisible.
         var sandTransition = NaturalSandTransition(material, intensity, finalDistance, resolution, cell, width, context, sea, token);
+        var outward = ExpandCompatibleSand(material, intensity, confidence, cover, urbanContext, resolution, cell, width, context, sea, token);
+        if (outward > 0) finalDistance = BoundaryDistance(material, resolution, cell, token);
+        for (var i = 0; i < size; i++)
+        {
+            if ((i & 65535) == 0) token.ThrowIfCancellationRequested();
+            if (beachCoverage[i] > 0 && material[i] == (byte)GroundMaterial.Sand)
+                intensity[i] = (byte)Math.Max(1, Math.Round(intensity[i] * beachCoverage[i] / 255d));
+        }
+        log.DiagnosticRecords("surface-evidence.ndjson", provenance);
+        log.Count("Surface fractional beach samples", beachCoverage.Count(v => v > 0 && v < 255));
+        log.Count("Surface outward ecotone samples", outward);
+        log.Count("Surface urban context samples", urbanContext.Count(v => v));
+        log.Diagnostic($"SURFACE PROVENANCE version=physical-use-policy-v2; urbanContextSamples={urbanContext.Count(v => v)}; fractionalBeachSamples={beachCoverage.Count(v => v > 0 && v < 255)}; beachEquivalentFullSamples={beachCoverage.Sum(v => (long)v) / 255d:R}; outwardEcotoneSamples={outward}; actualPavingProtected=true; landUseIsNotSubstrate=true");
         for (var i = 0; i < size; i++)
         {
             if ((i & 65535) == 0) token.ThrowIfCancellationRequested();
@@ -169,9 +205,9 @@ public static class SurfacePlanner
             string.Join(", ", Enumerable.Range(0, 5).Select(m => $"{Label((GroundMaterial)m)} {100d * counts[m] / size:0.#}%")) + ".";
         log.Info(report);
         log.Diagnostic($"SURFACE DESERT DECISIONS mappedCoverProtected={desertDecisions[0]}; submergedUnknown={desertDecisions[1]}; regionalGateClosedUnknown={desertDecisions[2]}; insufficientFlatness={desertDecisions[3]}; excessiveRoughness={desertDecisions[4]}; wetOrDrainageInfluenced={desertDecisions[5]}; eligibleUnknownSandSites={desertDecisions[6]}; beforeEcotone=true; exclusivePriorityCounts=true");
-        log.Diagnostic($"SURFACE ECOTONE model=terrain-aware-correlated-density; sandTransitionSamples={sandTransition.Samples}; transitionWidthMeters={sandTransition.MinWidth:0.#}..{sandTransition.MaxWidth:0.#}; sizeLimitedSandRegions={sandTransition.NarrowRegions}; mappedNonSandExpanded=false; cropEdgeFade=false; nativeExclusiveBrushes=true; appearanceVerified=false");
+        log.Diagnostic($"SURFACE ECOTONE model=terrain-aware-correlated-density; sandTransitionSamples={sandTransition.Samples}; transitionWidthMeters={sandTransition.MinWidth:0.#}..{sandTransition.MaxWidth:0.#}; sizeLimitedSandRegions={sandTransition.NarrowRegions}; mappedNonSandExpanded=false; cropEdgeFade=false; exteriorFadeAppliedOnce=true; nativeExclusiveBrushes=true; appearanceVerified=false");
         log.Diagnostic($"SURFACE BEACH sandyPolygons={beachPolygons}; footprintSamples={beachSamples}; samplingFactor=4; maximumFootprintExpansionMeters={cell:R}; genericCoastSandInvented=false");
-        log.Diagnostic($"SURFACE DESERT PRECEDENCE enabled={desert}; slopeAndLandCoverPaintOverridden=true; mappedWaterWetlandPavedUrbanProtected=true; mappedVegetationMayHaveSandUnderlay=true");
+        log.Diagnostic($"SURFACE DESERT PRECEDENCE enabled={desert}; slopeAndLandCoverPaintOverridden=true; mappedWaterWetlandActualPavingProtected=true; urbanUseAloneIsNotPaving=true; mappedVegetationMayHaveSandUnderlay=true");
         log.Diagnostic($"SURFACE PLAN resolution={resolution}; contextResolution={context.N}; mappedPolygons={mapped}; permanentWaterSeeds={context.PermanentSeeds}; intermittentWaterSeeds={context.WeakSeeds}; underwaterSamples={underwater}; desertSupported={desert}; inferredSandSamples={inferredSand}; paintOrderIndependent=true; climateInputs={climate!=null}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.###}; meanIntensity=" +
             string.Join(",", Enumerable.Range(1, 4).Select(m => $"{Label((GroundMaterial)m)}:{(counts[m] == 0 ? 0 : 100d * totalStrength[m] / counts[m] / 255):0.#}%")));
         var mask = new SurfaceMask(resolution, width, material, intensity, report) { Confidence = confidence, Transitions = transitions };
@@ -182,12 +218,11 @@ public static class SurfacePlanner
     {
         if (tags.ContainsKey("highway") || tags.ContainsKey("railway") || tags.ContainsKey("building")) return default;
         var natural = Tag(tags, "natural"); var landuse = Tag(tags, "landuse"); var surface = Tag(tags, "surface");
-        if (natural.Length == 0 && landuse.Length == 0 && Tag(tags, "landcover") != "sand" && Tag(tags, "area") != "yes" && !tags.ContainsKey("water") && !tags.ContainsKey("wetland") && Tag(tags, "waterway") != "riverbank") return default;
-        if (natural == "water" || tags.ContainsKey("water") || Tag(tags, "waterway") == "riverbank" || landuse == "reservoir") return new(Cover.NonSand, 255);
-        // Hard exclusions must precede surface tags: wetland+surface=mud and
-        // residential+surface=grass still retain their original land-use meaning.
+        if (natural.Length == 0 && landuse.Length == 0 && Tag(tags, "landcover").Length == 0 && surface.Length == 0 && Tag(tags, "area") != "yes" && !tags.ContainsKey("water") && !tags.ContainsKey("wetland") && Tag(tags, "waterway") != "riverbank") return default;
+        if (natural == "water" || natural == "bay" || tags.ContainsKey("water") || Tag(tags, "waterway") == "riverbank" || landuse == "reservoir") return new(Cover.NonSand, 255);
+        // Water/wetland and actual paving remain hard exclusions. District land
+        // use cannot suppress observed physical cover within that district.
         if (natural == "wetland" || tags.ContainsKey("wetland")) return new(Cover.Wetland, 255);
-        if (landuse == "residential" || landuse == "commercial" || landuse == "industrial" || landuse == "retail" || landuse == "construction" || landuse == "brownfield" || landuse == "cemetery") return new(Cover.NonSand, 255);
         if (surface == "asphalt" || surface == "concrete" || surface == "paved" || surface == "paving_stones" || surface == "cobblestone") return new(Cover.NonSand, 255);
         if (surface == "sand") return new(Cover.Sand, 255);
         if (surface == "rock" || surface == "stone" || surface == "gravel" || surface == "pebblestone" || surface == "shingle") return new(Cover.Rock, 255);
@@ -199,9 +234,9 @@ public static class SurfacePlanner
         if (natural == "beach") return surface.Length == 0 ? new(Cover.Sand, 235) : default;
         if (natural == "bare_rock" || natural == "scree" || natural == "shingle" || natural == "rock") return new(Cover.Rock, 240);
         if (natural == "mud" || natural == "bare_earth" || landuse == "quarry") return new(Cover.Earth, 240);
-        if (natural == "scrub") return new(Cover.Scrub, 200);
+        if (natural == "scrub" || Tag(tags, "landcover") == "scrub") return new(Cover.Scrub, 200);
         if (natural == "heath") return new(Cover.Heath, 190);
-        if (natural == "grassland" || natural == "wood" || landuse == "grass" || landuse == "meadow" || landuse == "forest" ||
+        if (Tag(tags, "landcover") == "grass" || Tag(tags, "landcover") == "trees" || natural == "grassland" || natural == "wood" || landuse == "grass" || landuse == "meadow" || landuse == "forest" ||
             landuse == "farmland" || landuse == "orchard" || landuse == "vineyard" || surface == "grass") return new(Cover.Vegetation, 170);
         return default;
     }
@@ -329,9 +364,10 @@ public static class SurfacePlanner
             foreach (var polygon in polygons.OrderBy(p => p.Id))
             {
                 var tags = polygon.Tags; var natural = Tag(tags, "natural");
-                if (natural != "water" && natural != "wetland" && !tags.ContainsKey("wetland") && !tags.ContainsKey("water") && Tag(tags, "waterway") != "riverbank" && Tag(tags, "landuse") != "reservoir") continue;
-                var river = Tag(tags, "water") == "river" || tags.ContainsKey("waterway"); var intermittent = Intermittent(tags); var range = natural == "wetland" || tags.ContainsKey("wetland") ? 240f : river ? 650f : 450f;
-                Rasterize(polygon, N, _width, (start, end) => { for (var i = start; i < end; i++) Seed(i, intermittent ? range * .4f : range, intermittent ? .28f : .95f, intermittent); }, token);
+                if (natural != "water" && natural != "bay" && natural != "wetland" && !tags.ContainsKey("wetland") && !tags.ContainsKey("water") && Tag(tags, "waterway") != "riverbank" && Tag(tags, "landuse") != "reservoir") continue;
+                var salt = Tag(tags, "water") == "sea" || Tag(tags, "water") == "bay" || natural == "bay" || Tag(tags, "salt") == "yes" || Tag(tags, "tidal") == "yes";
+                var river = Tag(tags, "water") == "river" || tags.ContainsKey("waterway"); var intermittent = Intermittent(tags); var range = salt ? 300f : natural == "wetland" || tags.ContainsKey("wetland") ? 240f : river ? 650f : 450f;
+                Rasterize(polygon, N, _width, (start, end) => { for (var i = start; i < end; i++) Seed(i, intermittent ? range * .4f : range, intermittent ? .28f : salt ? .18f : .95f, intermittent); }, token);
             }
             if (geography != null) foreach (var way in geography.Ways.Values.OrderBy(w => w.Id))
             {
@@ -440,6 +476,50 @@ public static class SurfacePlanner
             }
         }
         return filled;
+    }
+
+    private static int ExpandCompatibleSand(byte[] material, byte[] intensity, byte[] confidence, byte[] cover,
+        bool[] urban, int n, float cell, double width, Context context, float sea, CancellationToken token)
+    {
+        // Exclusive native brushes remain unchanged. Outward density approaches
+        // Base; this is not a claim of a continuous Sand/Grass weight blend.
+        var distance = new float[material.Length]; var heap = new MinHeap(); var sandy = 0;
+        for (var i = 0; i < distance.Length; i++)
+        {
+            distance[i] = float.PositiveInfinity;
+            if (material[i] != (byte)GroundMaterial.Sand) continue;
+            sandy++; var x = i % n; var z = i / n;
+            if (x > 0 && material[i - 1] != material[i] || x + 1 < n && material[i + 1] != material[i] ||
+                z > 0 && material[i - n] != material[i] || z + 1 < n && material[i + n] != material[i])
+            { distance[i] = 0; heap.Push(i, 0); }
+        }
+        var added = 0; var visits = 0; var budget = (int)Math.Min(material.Length * .01, sandy * .12);
+        while (heap.Count > 0)
+        {
+            if ((visits++ & 4095) == 0) token.ThrowIfCancellationRequested();
+            var entry = heap.Pop(); if (entry.Cost != distance[entry.Index]) continue;
+            var x = entry.Index % n; var z = entry.Index / n;
+            if (entry.Cost > 0)
+            {
+                var wx = (x + .5) * cell - width * .5; var wz = (z + .5) * cell - width * .5; var p = context.At(wx, wz);
+                var band = 35 + 45 * ValueNoise(wx / 180, wz / 180, 0x1e35a7u);
+                if (entry.Cost > band || p.Height <= sea || p.Wet > .35f || p.WeakWet > .35f || added >= budget) continue;
+                material[entry.Index] = (byte)GroundMaterial.Sand;
+                intensity[entry.Index] = (byte)Math.Round(120 * Smooth(1 - entry.Cost / (float)band));
+                confidence[entry.Index] = 120; added++;
+            }
+            for (var dz = -1; dz <= 1; dz++) for (var dx = -1; dx <= 1; dx++)
+            {
+                if (dx == 0 && dz == 0 || x + dx < 0 || x + dx >= n || z + dz < 0 || z + dz >= n) continue;
+                var next = (z + dz) * n + x + dx;
+                if (cover[next] != (byte)Cover.Unknown || urban[next] || confidence[next] >= 225 ||
+                    material[next] == (byte)GroundMaterial.Sand || material[next] == (byte)GroundMaterial.Dirt) continue;
+                var cost = entry.Cost + cell * (dx == 0 || dz == 0 ? 1 : 1.414214f);
+                if (cost > 80 || cost >= distance[next]) continue;
+                distance[next] = cost; heap.Push(next, cost);
+            }
+        }
+        return added;
     }
 
     private static (int Samples, float MinWidth, float MaxWidth, int NarrowRegions) NaturalSandTransition(
