@@ -39,8 +39,10 @@
 .sizeItem:hover, .sizeItem:global(.selected) { background: #31576b; }
 .check { display: flex; align-items: center; margin-top: 12rem; padding: 0; background: transparent; border: none; color: #d5e7f1; font-size: 13rem; }
 .checkbox { display: flex; align-items: center; justify-content: center; width: 22rem; height: 22rem; margin-right: 8rem; border: 1rem solid #91bed5; border-radius: 3rem; background: #172e3d; color: #b7f5ff; font-size: 18rem; }
+.radioIndicator { flex-shrink: 0; width: 18rem; height: 18rem; margin-right: 8rem; border: 1rem solid #91bed5; border-radius: 50%; background: transparent; }
+.radioSelected { background: #b7f5ff; border-color: #b7f5ff; }
 .check:disabled { opacity: .55; }
-.configChoice { display: flex; align-items: center; min-height: 32rem; padding: 5rem 8rem; border-radius: 4rem; color: #e4edf3; background: #203746; font-size: 13rem; }
+.configChoice { display: flex; align-items: center; min-height: 32rem; padding: 5rem 8rem; border-radius: 4rem; color: #e4edf3; background: #203746; font-size: 13rem; line-height: 1.4; }
 .configChoice:hover { background: #31556c; }
 .configChoice:disabled { opacity: .45; pointer-events: none; }
 .configChoice:focus, .check:focus { outline: 2rem solid #f2d67a; outline-offset: 2rem; }
@@ -69,7 +71,7 @@
 .log { margin: 0; white-space: pre-wrap; font-size: 10rem; line-height: 1.35; color: #bdd0dc; padding: 8rem; }
 .confirmBackdrop {
   position: fixed; top: 0; right: 0; bottom: 0; left: 0; display: flex; align-items: center; justify-content: center;
-  background: rgba(0, 0, 0, .72); z-index: 10003;
+  background: rgba(0, 0, 0, .72); z-index: 10003; pointer-events: auto;
 }
 .confirmBox { display: flex; flex-direction: column; width: 460rem; max-width: 90%; max-height: 80%; min-height: 0; padding: 20rem; border-radius: 6rem; background: #1b2933; border: 1rem solid #b55b52; color: #eef5f8; }
 .confirmBox h3 { flex-shrink: 0; color: #ffb3a9; margin: 0 0 12rem; font-size: 18rem; white-space: normal; }

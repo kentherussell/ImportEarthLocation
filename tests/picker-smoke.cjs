@@ -24,7 +24,15 @@ let inputs=nodes.filter(n=>n.type==='input');inputs[1].props.onChange({target:{v
 inputs=nodes.filter(n=>n.type==='input');inputs[1].props.onChange({target:{value:'44'}});inputs[2].props.onChange({target:{value:'16'}});nodes=render();button(nodes,'Use This Location').props.onSelect();assert.equal(commits.length,1);assert.deepStrictEqual(JSON.parse(JSON.stringify(commits[0])),{latitude:44,longitude:16,mapSize:'vanilla'});assert(!events.some(e=>e[0]==='prepare'||e[0]==='confirm'),'Picker must not start imports');
 nodes=render();nodes.find(n=>n.type==='input').props.onChange({target:{value:'Zadar'}});nodes=render();button(nodes,'Search').props.onSelect();nodes=render();const oldRevision=JSON.parse(events.filter(e=>e[0]==='searchPlace').at(-1)[1]).revision;
 nodes.find(n=>n.type==='input').props.onChange({target:{value:'Split'}});nodes=render();bindings.placeResults=JSON.stringify({revision:oldRevision,results:[{label:'stale city',latitude:1,longitude:2}]});nodes=render();assert(!nodes.some(n=>n.props?.children==='stale city'),'Stale search result shown');
-button(nodes,'Search').props.onSelect();nodes=render();const freshRevision=JSON.parse(events.filter(e=>e[0]==='searchPlace').at(-1)[1]).revision;assert(freshRevision>oldRevision);
+let prevented=false;const searchInput=nodes.find(n=>n.type==='input');
+const searchesBefore=events.filter(e=>e[0]==='searchPlace').length;
+searchInput.props.onKeyDown({key:'Enter',repeat:false,nativeEvent:{isComposing:true},preventDefault(){},stopPropagation(){}});
+assert.equal(events.filter(e=>e[0]==='searchPlace').length,searchesBefore,'IME Enter triggered a search');
+searchInput.props.onKeyDown({key:'Enter',repeat:false,nativeEvent:{isComposing:false},preventDefault(){prevented=true;},stopPropagation(){}});
+assert(prevented,'Enter search must suppress default key handling');
+nodes=render();const freshRevision=JSON.parse(events.filter(e=>e[0]==='searchPlace').at(-1)[1]).revision;assert(freshRevision>oldRevision);
+nodes.find(n=>n.type==='input').props.onKeyDown({key:'Enter',repeat:false,nativeEvent:{isComposing:false},preventDefault(){},stopPropagation(){}});
+assert.equal(events.filter(e=>e[0]==='searchPlace').length,searchesBefore+1,'Enter repeated an in-flight search');
 bindings.placeResults=JSON.stringify({revision:freshRevision,results:[{label:'fresh city',latitude:45,longitude:17}]});nodes=render();button(nodes,'fresh city').props.onSelect();nodes=render();assert.equal(nodes.filter(n=>n.type==='input')[1].props.value,'45.000000');assert.equal(commits.length,1,'Search must remain draft-only');
 for(const fn of [...timers.values()])fn();timers.clear();nodes=render();const tileRevision=JSON.parse(events.filter(e=>e[0]==='previewTiles').at(-1)[1]).revision;bindings.displayTiles=JSON.stringify({revision:tileRevision,tiles:{},error:true});nodes=render();assert(nodes.some(n=>n.props?.children==='Map preview unavailable. Enter coordinates manually.'));
 button(nodes,'Cancel').props.onSelect();assert.equal(commits.length,1);for(const hook of hooks)hook?.cleanup?.();assert(events.some(e=>e[0]==='cancelLocationServices'));

@@ -24,4 +24,12 @@ public static class NetworkSelection
     }
     public static string Summary(RoadImportLevel roads, bool rail) => $"Network import: Roads: {Label(roads)}; Rail: {(rail ? "Enabled" : "Disabled")}.";
     public static bool NativeDirectionMatches(bool oneWay, bool forwardOnly, bool backwardOnly) => oneWay ? forwardOnly && !backwardOnly : !forwardOnly && !backwardOnly;
+    public static string BasicRoadName(int lanes) => lanes >= 5 ? "Large Road" : lanes >= 3 ? "Medium Road" : "Small Road";
+    public static bool IsBasicVanillaRoad(string name)
+    {
+        if(name=="Small Road"||name=="Medium Road"||name=="Large Road"||name=="Highway")return true;
+        foreach(var prefix in new[]{"Small Road Oneway - ","Medium Road Oneway - ","Large Road Oneway - ","Highway Oneway - ","Highway Twoway - "})
+            for(var lanes=1;lanes<=6;lanes++)if(name==prefix+lanes+" lane"+(lanes==1?"":"s"))return true;
+        return false;
+    }
 }

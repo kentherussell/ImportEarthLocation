@@ -1,16 +1,43 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
   <ItemGroup>
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkEvidence.cs" Link="NetworkEvidence.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/TerrainConditioner.cs" Link="TerrainConditioner.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkContactPolicy.cs" Link="NetworkContactPolicy.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/CorridorProfiles.cs" Link="CorridorProfiles.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/TunnelCorridorPlanner.cs" Link="TunnelCorridorPlanner.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkFinishing.cs" Link="NetworkFinishing.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/RailJunctionRepair.cs" Link="RailJunctionRepair.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkLaneAlignment.cs" Link="NetworkLaneAlignment.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkGeometrySafety.cs" Link="NetworkGeometrySafety.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/NativeEndpointPolicy.cs" Link="NativeEndpointPolicy.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/NativeBatchBindings.cs" Link="NativeBatchBindings.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/NativePreviewRecovery.cs" Link="NativePreviewRecovery.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/NativeSubmissionPlan.cs" Link="NativeSubmissionPlan.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NativeChainCompactor.cs" Link="NativeChainCompactor.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/ConnectedRoadGrades.cs" Link="ConnectedRoadGrades.cs" />
     <Compile Include="../../ImportEarthLocation/Core/ImportModels.cs" Link="ImportModels.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/RunArchive.cs" Link="RunArchive.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/DiagnosticArtifacts.cs" Link="DiagnosticArtifacts.cs" />
     <Compile Include="../../ImportEarthLocation/Core/Numeric.cs" Link="Numeric.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NetworkSelection.cs" Link="NetworkSelection.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/NetworkStructure.cs" Link="NetworkStructure.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkWidthRepair.cs" Link="NetworkWidthRepair.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkRoadbed.cs" Link="NetworkRoadbed.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/RailVerticalProfiles.cs" Link="RailVerticalProfiles.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkContinuity.cs" Link="NetworkContinuity.cs" />
     <Compile Include="../../ImportEarthLocation/Core/ImportSession.cs" Link="ImportSession.cs" />
     <Compile Include="../../ImportEarthLocation/Geo/GeoMath.cs" Link="GeoMath.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkProcessor.cs" Link="NetworkProcessor.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkNormalizer.cs" Link="NetworkNormalizer.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkHardener.cs" Link="NetworkHardener.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/AvenueConsolidator.cs" Link="AvenueConsolidator.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/AvenueJunctionRepair.cs" Link="AvenueJunctionRepair.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/RailCorridorConsolidator.cs" Link="RailCorridorConsolidator.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkVerticalProfiles.cs" Link="NetworkVerticalProfiles.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/OsmParser.cs" Link="OsmParser.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/OsmParsedCache.cs" Link="OsmParsedCache.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/OsmRecovery.cs" Link="OsmRecovery.cs" />
     <Compile Include="../../ImportEarthLocation/Data/NetworkPreferences.cs" Link="NetworkPreferences.cs" />
     <Compile Include="../../ImportEarthLocation/Data/OverpassClient.cs" Link="OverpassClient.cs" />
     <Reference Include="Unity.Mathematics"><HintPath>$(GameManagedPath)/Unity.Mathematics.dll</HintPath></Reference>

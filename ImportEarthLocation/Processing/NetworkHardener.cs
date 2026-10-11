@@ -23,8 +23,17 @@ public static class NetworkHardener
     {
         var roads = source.Where(s=>s.Kind==NetworkKind.Road).ToList();
         var tracks = source.Where(s=>s.Kind==NetworkKind.Rail).ToList();
-        if (roads.Count > 0) { roads = RemoveCoincident(roads,log,token); roads = AssociateCorridors(roads,log,token); roads = ProtectCarriageways(roads,log,token); roads = ConstrainWidths(roads,token); roads = ReconnectBridges(roads,log,token); }
-        if (rail && tracks.Count > 0) tracks = SimplifyYards(tracks,log,token);
+        if (roads.Count > 0)
+        {
+            log.Diagnostic($"PROCESS road-consolidation duplicate-removal; sections={roads.Count}"); roads = RemoveCoincident(roads,log,token);
+            log.Diagnostic($"PROCESS road-consolidation divided-corridor-association; sections={roads.Count}"); roads = AssociateCorridors(roads,log,token);
+            log.Diagnostic($"PROCESS road-consolidation crossing-safety; sections={roads.Count}"); roads = ProtectCarriageways(roads,log,token);
+            log.Diagnostic($"PROCESS road-consolidation carriageway-widths; sections={roads.Count}"); roads = ConstrainWidths(roads,token);
+            log.Diagnostic($"PROCESS road-consolidation bridge-approaches; sections={roads.Count}"); roads = ReconnectBridges(roads,log,token);
+            log.Diagnostic($"PROCESS road-consolidation complete; sections={roads.Count}");
+        }
+        // Rail corridors are consolidated on raw topology before curve fitting.
+        // Do not run the old all-pairs yard deletion pass on fitted sections.
         return roads.Concat(rail ? tracks : Enumerable.Empty<PreparedSegment>()).ToArray();
     }
 
@@ -87,22 +96,28 @@ public static class NetworkHardener
         return paired;
     }
 
-    private static List<PreparedSegment> ConstrainWidths(List<PreparedSegment> paired, CancellationToken token)
+    public static List<PreparedSegment> ConstrainWidths(List<PreparedSegment> paired, CancellationToken token)
     {
         var pairedGrid=Index(paired,128);
+        var curveSamples=new float3[paired.Count][];var headings=new float2[paired.Count];
+        for(var i=0;i<paired.Count;i++)
+        {
+            token.ThrowIfCancellationRequested();headings[i]=Heading(paired[i]);if(paired[i].CorridorId==0)continue;
+            curveSamples[i]=new float3[17];for(var sample=0;sample<=16;sample++)curveSamples[i][sample]=NetworkNormalizer.Evaluate(paired[i],sample/16f);
+        }
         for(var i=0;i<paired.Count;i++)
         {
             token.ThrowIfCancellationRequested();var a=paired[i];if(a.CorridorId==0)continue;var limit=float.PositiveInfinity;
             foreach(var j in Neighbors(pairedGrid,(a.Start.xz+a.End.xz)*.5f,128))
             {
-                var b=paired[j];if(a.WayId==b.WayId||a.CorridorId!=b.CorridorId||!SameLevel(a,b)||math.dot(Heading(a),Heading(b))>-.9f)continue;
+                var b=paired[j];if(a.WayId==b.WayId||a.CorridorId!=b.CorridorId||!SameLevel(a,b)||math.dot(headings[i],headings[j])>-.9f)continue;
                 // A genuine shared source junction is handled by the native junction
                 // builder; its zero separation is not a carriageway width failure.
                 if(a.StartNodeId==b.StartNodeId||a.StartNodeId==b.EndNodeId||a.EndNodeId==b.StartNodeId||a.EndNodeId==b.EndNodeId)continue;
                 for(var sample=0;sample<=8;sample++)
                 {
-                    var point=NetworkNormalizer.Evaluate(a,sample/8f);var closest=float.PositiveInfinity;
-                    for(var step=1;step<=16;step++)closest=Math.Min(closest,NetworkNormalizer.DistanceToSegment(point,NetworkNormalizer.Evaluate(b,(step-1)/16f),NetworkNormalizer.Evaluate(b,step/16f)));
+                    var point=curveSamples[i][sample*2];var closest=float.PositiveInfinity;
+                    for(var step=1;step<=16;step++)closest=Math.Min(closest,NetworkNormalizer.DistanceToSegment(point,curveSamples[j][step-1],curveSamples[j][step]));
                     if(closest<40)limit=Math.Min(limit,Math.Max(0,closest-1));
                 }
             }
@@ -135,19 +150,13 @@ public static class NetworkHardener
         for(var index=0;index<source.Count;index++)
         {
             var s=source[index];if(!collisions.Contains(index)||s.SourceGeometry.Count<2){restored.Add(s);continue;}
-            log.Count("Carriageway fits reverted to source topology");
-            for(var p=1;p<s.SourceGeometry.Count;p++)
-            {
-                long InternalId(float3 point){unchecked{return -1-(long)(((ulong)s.WayId*104729UL ^ math.hash(point.xz))%(ulong)long.MaxValue);}}
-                var start=s.SourceGeometry[p-1];var end=s.SourceGeometry[p];
-                restored.Add(s with{Start=start,End=end,StartNodeId=p==1?s.StartNodeId:InternalId(start),EndNodeId=p==s.SourceGeometry.Count-1?s.EndNodeId:InternalId(end),Control1=null,Control2=null,SourceGeometry=new[]{start,end},HorizontalParent=null});
-            }
+            var refitted=NetworkNormalizer.Refit(s,token,.5f);
+            restored.AddRange(refitted);log.Count("Carriageway curves locally refitted");
+            log.Diagnostic($"CURVE RECOVERY way={s.WayId}; inputObservations={s.SourceGeometry.Count}; fittedSections={refitted.Count}; toleranceMeters=0.5; rawChordFallback=false; sharedOuterEndpointsRetained=true");
         }
         var unsafeIndices=Crossed(restored);
-        if(unsafeIndices.Count>0)log.Warn($"Horizontal network validation: {unsafeIndices.Count} carriageway sections still cross without shared source topology after restoring source geometry; omitted before placement.");
-        log.Count("Unsafe carriageway sections omitted",unsafeIndices.Count);
-        if(unsafeIndices.Count>0&&unsafeIndices.Count>restored.Count/2)throw new InvalidOperationException("Major horizontal network failure: conflicting carriageways remain after source-geometry fallback. Current map unchanged.");
-        return restored.Where((s,i)=>!unsafeIndices.Contains(i)).ToList();
+        if(unsafeIndices.Count>0){log.Count("Carriageway conflicts retained for review",unsafeIndices.Count);log.Warn($"{unsafeIndices.Count} carriageway sections still conflict after source-geometry repair; source topology retained, no sections deleted. Preparation continues; overlaps require review.");}
+        return restored;
     }
     private static bool Intersects(float2 a,float2 b,float2 c,float2 d)
     {
@@ -190,47 +199,6 @@ public static class NetworkHardener
         return result;
     }
 
-    private static List<PreparedSegment> SimplifyYards(List<PreparedSegment> source, ImportLog log, CancellationToken token)
-    {
-        var ways=source.GroupBy(s=>s.WayId).OrderBy(g=>g.Key).Select(g=>g.ToArray()).ToArray();
-        var eligible=ways.Where(g=>g.All(s=>s.RailService=="yard"||s.RailService=="siding"||s.RailService=="spur")&&!g.Any(s=>s.Bridge||s.Tunnel)).ToArray();
-        var removed=new HashSet<long>();var yardCount=0;var retained=0;var sourceCount=0;
-        float3 Mid(PreparedSegment[] group)=>NetworkNormalizer.Evaluate(group[group.Length/2],.5f);
-        bool Parallel(PreparedSegment[] a,PreparedSegment[] b)
-        {
-            if(a[0].WayId==b[0].WayId||!SameLevel(a[0],b[0])||math.abs(math.dot(Heading(a[0]),Heading(b[0])))<.98f)return false;
-            var heading=Heading(a[0]);var start=a[0].Start.xz;var length=math.distance(start,a[a.Length-1].End.xz);
-            var p=math.dot(b[0].Start.xz-start,heading);var q=math.dot(b[b.Length-1].End.xz-start,heading);
-            return length>20 && Math.Min(length,Math.Max(p,q))-Math.Max(0,Math.Min(p,q))>length*.7f && math.distance(Mid(a).xz,Mid(b).xz)<6;
-        }
-        var dense=new HashSet<long>(eligible.Where(a=>{var neighbors=eligible.Where(b=>Parallel(a,b)).ToArray();return neighbors.Length>=3 && (a.Any(s=>s.RailService=="yard")||neighbors.Any(b=>b.Any(s=>s.RailService=="yard")));}).Select(g=>g[0].WayId));
-        // Only redundant service tracks with an existing alternate topology path may be removed.
-        // Mainlines, ordinary double track, station throats and disconnected terminal spurs are untouched.
-        foreach(var group in eligible.Where(g=>dense.Contains(g[0].WayId)).OrderBy(g=>g[0].WayId))
-        {
-            token.ThrowIfCancellationRequested();var representative=group[0];
-            var close=eligible.Where(g=>!removed.Contains(g[0].WayId)&&Parallel(group,g)).ToArray();
-            if(close.Length==0)continue;
-            var axis=Heading(representative);var middle=Mid(group).xz;
-            var offsets=close.Select(g=>{var p=Mid(g).xz-middle;return axis.x*p.y-axis.y*p.x;}).ToArray();
-            // Preserve both outside tracks/yard envelope, regardless of source count.
-            if(!offsets.Any(v=>v<-.1f)||!offsets.Any(v=>v>.1f)){retained++;continue;}
-            sourceCount++;var start=group[0].StartNodeId;var end=group[group.Length-1].EndNodeId;
-            if(start==end||!AlternatePath(start,end,representative.WayId)) {retained++;continue;}
-            removed.Add(representative.WayId);yardCount++;
-        }
-        if(sourceCount>0){log.Count("Rail yard service tracks examined",sourceCount);log.Count("Redundant yard tracks removed",yardCount);log.Count("Yard tracks retained",retained);}
-        return source.Where(s=>!removed.Contains(s.WayId)).ToList();
-        bool AlternatePath(long start,long end,long excluded)
-        {
-            var adjacency=new Dictionary<long,List<long>>();
-            foreach(var s in source.Where(s=>s.WayId!=excluded&&!removed.Contains(s.WayId)))
-            { if(!adjacency.TryGetValue(s.StartNodeId,out var a))adjacency[s.StartNodeId]=a=new List<long>();a.Add(s.EndNodeId);if(!adjacency.TryGetValue(s.EndNodeId,out var b))adjacency[s.EndNodeId]=b=new List<long>();b.Add(s.StartNodeId); }
-            var seen=new HashSet<long>{start};var queue=new List<long>{start};var cursor=0;
-            while(cursor<queue.Count&&seen.Count<=2000){token.ThrowIfCancellationRequested();var n=queue[cursor++];if(n==end)return true;if(adjacency.TryGetValue(n,out var next))foreach(var v in next)if(seen.Add(v))queue.Add(v);}
-            return false;
-        }
-    }
     private static Dictionary<(int,int),List<int>> Index(List<PreparedSegment> source,float cell)
     {
         var index=new Dictionary<(int,int),List<int>>();for(var i=0;i<source.Count;i++){var s=source[i];var p=(s.Start.xz+s.End.xz)*.5f;var key=((int)Math.Floor(p.x/cell),(int)Math.Floor(p.y/cell));if(!index.TryGetValue(key,out var list))index[key]=list=new List<int>();list.Add(i);}return index;

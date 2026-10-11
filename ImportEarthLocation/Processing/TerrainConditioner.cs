@@ -11,6 +11,17 @@ public static class TerrainConditioner
 {
     public const string Version = "conservative-v1";
     public const float MaximumGeneralCorrection = 50f;
+    public static bool ValidEarthElevation(float value) => Finite(value) && value >= -12000 && value <= 10000;
+    public sealed record HeightEncoding(float BaseElevation, float Scale, float SeaLevel);
+    public static HeightEncoding EncodingFor(float minimum,float maximum)
+    {
+        // Absolute sample bounds, not an unrelated 12km total-span cutoff.
+        // Deep water plus land can legitimately span more than that cutoff.
+        if(!ValidEarthElevation(minimum)||!ValidEarthElevation(maximum)||maximum<minimum)
+            throw new InvalidOperationException($"DEM encoding: invalid validated elevation bounds ({minimum} to {maximum} m).");
+        var floor=Math.Min(-128f,minimum-128f);
+        return new HeightEncoding(floor,Math.Max(4096f,maximum-floor+10f),-floor);
+    }
     public sealed record Statistics(int Repaired, int Spikes, int Pits, int Noise, int SeamCandidates,
         int SeamsCorrected, double MeanAbsoluteChange, float MaximumChange, double MaterialPercent,
         double Bias, float Percentile95, double Seconds)
@@ -21,24 +32,27 @@ public static class TerrainConditioner
     public sealed record Result(float[] Elevations, Statistics Metrics);
 
     public static Result Condition(float[] source, int width, int height, float metersPerCell,
-        CancellationToken token, Func<int, bool>? protectedSample = null, int tileSize = 256)
+        CancellationToken token, Func<int, bool>? protectedSample = null, int tileSize = 256, Action<string>? progress = null,
+        int sourceOriginX = 0, int sourceOriginY = 0)
     {
         if (width < 3 || height < 3 || tileSize < 1 || source.Length != checked(width * height) || !Finite(metersPerCell) || metersPerCell <= 0)
             throw new InvalidOperationException("Terrain conditioning: invalid raster dimensions or spacing.");
         var clock = Stopwatch.StartNew();
+        progress?.Invoke($"source-validation begin; samples={source.Length}");
         var work = (float[])source.Clone();
         var missing = new List<int>();
         for (var i = 0; i < source.Length; i++)
         {
             if ((i & 16383) == 0) token.ThrowIfCancellationRequested();
             if (float.IsNaN(source[i])) missing.Add(i);
-            else if (!Finite(source[i]) || source[i] < -12000 || source[i] > 10000)
+            else if (!ValidEarthElevation(source[i]))
                 throw new InvalidOperationException($"DEM validation: invalid Earth elevation at raster cell {i} ({source[i]} m).");
         }
         // NoData is NOT zero. Limit each connected hole to four source cells and total missing to 0.01%.
         if (missing.Count > Math.Max(4, source.Length / 10000))
             throw new InvalidOperationException($"NoData repair: {missing.Count} unknown source samples exceed the bounded repair budget; ocean absence cannot be assumed without a water mask.");
         var missingSet = new HashSet<int>(missing);
+        progress?.Invoke($"NoData-repair begin; missingSamples={missing.Count}");
         foreach (var seed in missing)
         {
             if (!missingSet.Remove(seed)) continue;
@@ -72,15 +86,23 @@ public static class TerrainConditioner
         }
         // Whole-tile offsets are corruption, not terrain to beautify. A coherent real cliff is preserved.
         var seams = 0;
-        for (var boundary = tileSize; boundary < width; boundary += tileSize)
+        progress?.Invoke("tile-seam inspection begin");
+        // Cropping the mandatory footprint must not move the original tile grid.
+        // Inspect actual source tile seams, not every 256th cell of the crop.
+        var firstX = tileSize - ((sourceOriginX % tileSize + tileSize) % tileSize);
+        var firstY = tileSize - ((sourceOriginY % tileSize + tileSize) % tileSize);
+        for (var boundary = firstX; boundary < width; boundary += tileSize)
             seams += InspectSeam(source, width, height, boundary, true, token);
-        for (var boundary = tileSize; boundary < height; boundary += tileSize)
+        for (var boundary = firstY; boundary < height; boundary += tileSize)
             seams += InspectSeam(source, width, height, boundary, false, token);
         var spikes = 0; var pits = 0; var noise = 0;
         var residuals = new float[24];
+        progress?.Invoke($"noise/spike conditioning begin; rows={height}");
+        var nextProgress=clock.Elapsed.TotalSeconds+5;
         for (var y = 2; y < height - 2; y++)
         {
             token.ThrowIfCancellationRequested();
+            if(clock.Elapsed.TotalSeconds>=nextProgress){progress?.Invoke($"noise/spike conditioning rows={y}/{height}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.0}");nextProgress=clock.Elapsed.TotalSeconds+5;}
             for (var x = 2; x < width - 2; x++)
             {
                 var index = y * width + x; var original = source[index];

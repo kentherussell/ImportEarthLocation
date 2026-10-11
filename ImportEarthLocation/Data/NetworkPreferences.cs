@@ -5,7 +5,7 @@ using Newtonsoft.Json.Linq;
 
 namespace ImportEarthLocation.Data;
 
-public sealed record NetworkPreferences(RoadImportLevel Roads, bool Rail)
+public sealed record NetworkPreferences(RoadImportLevel Roads, bool Rail, bool Forests = true)
 {
     public static NetworkPreferences Defaults => new(RoadImportLevel.Primary,true);
     private static string FilePath => Path.Combine(UnityEngine.Application.persistentDataPath,"ModsSettings",Mod.Id,"network-settings.json");
@@ -18,7 +18,8 @@ public sealed record NetworkPreferences(RoadImportLevel Roads, bool Rail)
             var legacy=root["includeSecondaryRoads"]?.Type==JTokenType.Boolean && (bool)root["includeSecondaryRoads"]!;
             var roads=root["roadLevel"]?.Type==JTokenType.String?NetworkSelection.Parse((string?)root["roadLevel"]):root["roadLevel"]==null&&legacy?RoadImportLevel.Secondary:RoadImportLevel.Primary;
             var rail=root["importRail"]?.Type==JTokenType.Boolean?(bool)root["importRail"]!:true;
-            return new NetworkPreferences(roads,rail);
+            var forests=root["importForests"]?.Type==JTokenType.Boolean?(bool)root["importForests"]!:true;
+            return new NetworkPreferences(roads,rail,forests);
         }
         catch{return Defaults;}
     }
@@ -29,7 +30,7 @@ public sealed record NetworkPreferences(RoadImportLevel Roads, bool Rail)
         try
         {
             var path=FilePath;Directory.CreateDirectory(Path.GetDirectoryName(path)!);var temporary=path+".tmp";
-            File.WriteAllText(temporary,new JObject{["version"]=1,["roadLevel"]=NetworkSelection.Id(Roads),["importRail"]=Rail}.ToString(Newtonsoft.Json.Formatting.None));
+            File.WriteAllText(temporary,new JObject{["version"]=1,["roadLevel"]=NetworkSelection.Id(Roads),["importRail"]=Rail,["importForests"]=Forests}.ToString(Newtonsoft.Json.Formatting.None));
             if(File.Exists(path))File.Replace(temporary,path,null);else File.Move(temporary,path);
         }
         catch(Exception e){log.Warn("Network preference save failed; current choices still apply: "+e.Message);}

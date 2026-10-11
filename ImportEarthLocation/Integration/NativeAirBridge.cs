@@ -21,6 +21,7 @@ public static class NativeAirBridge
     public static string Apply(PreparedImport prepared, EntityManager manager, PrefabSystem prefabs, AirwaySystem airways, NameSystem names, ImportLog log)
     {
         // Read the actual native grid; do not assume MapExt's playable perimeter also changes airways.
+        log.Diagnostic($"AIR BEGIN requested={prepared.AirDestinations.Count}; stage=airway-grid");
         var grid = airways.GetAirwayData().airplaneMap;
         var field = typeof(AirwayHelpers.AirwayMap).GetField("m_GridSize", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
         if (!(field?.GetValue(grid) is int2 gridSize) || gridSize.x < 2 || gridSize.y < 2 || gridSize.x != gridSize.y)
@@ -32,7 +33,8 @@ public static class NativeAirBridge
         var half = Math.Abs(a.x);
         if (half <= 0 || half > prepared.Request.MapSize.WidthMeters / 2 + 10)
             return "Air connections skipped: native airway grid does not fit the selected map.";
-        Entity prefabEntity = Entity.Null; ObjectData objectData = default;
+        Entity prefabEntity = Entity.Null; ObjectData objectData = default; var selectedPrefabName="";
+        log.Diagnostic($"AIR stage=prefab-catalog; nativeGrid={gridSize}; perimeterHalfMeters={half:0.###}");
         foreach (var prefab in NativePrefabCatalog.Read<ObjectPrefab>(manager, prefabs))
         {
             if (!prefab.TryGet<Game.Prefabs.OutsideConnection>(out var connection) || connection.m_TransferType != OutsideConnectionTransferType.Air ||
@@ -43,10 +45,12 @@ public static class NativeAirBridge
             using var components = data.m_Archetype.GetComponentTypes(Allocator.Temp);
             var set = new HashSet<ComponentType>(); foreach (var component in components) set.Add(component);
             if (!new[] { ComponentType.ReadWrite<AirplaneStop>(), ComponentType.ReadWrite<Game.Routes.TakeoffLocation>(), ComponentType.ReadWrite<Game.Objects.OutsideConnection>(), ComponentType.ReadWrite<RandomLocalizationIndex>(), ComponentType.ReadWrite<Transform>(), ComponentType.ReadWrite<PrefabRef>() }.All(set.Contains)) continue;
-            prefabEntity = entity; objectData = data; break;
+            prefabEntity = entity; objectData = data; selectedPrefabName=prefab.name; log.Diagnostic($"AIR prefab={prefab.name}; transfer=Air; stop=Airplane; requiredArchetypeComponentsVerified=true"); break;
         }
         if (prefabEntity == Entity.Null) return "Air connections skipped: no verified native airplane outside-connection object prefab.";
         var placed = AirPlanner.Place(prepared.AirDestinations, half, Math.Max(a.y, b.y));
+        foreach(var requested in prepared.AirDestinations)
+            log.Diagnostic($"AIR REQUEST name={requested.Name}; distanceKm={requested.DistanceKm:0.###}; bearingDegrees={requested.Bearing:0.###}; perimeterCandidate={placed.Any(p=>p.Name==requested.Name&&p.Bearing==requested.Bearing)}");
         using var query = manager.CreateEntityQuery(new EntityQueryDesc { All = new[] { ComponentType.ReadOnly<AirplaneStop>(), ComponentType.ReadOnly<Game.Objects.OutsideConnection>(), ComponentType.ReadOnly<Transform>() }, None = new[] { ComponentType.ReadOnly<Deleted>(), ComponentType.ReadOnly<Game.Tools.Temp>() } });
         using var existing = query.ToComponentDataArray<Transform>(Allocator.Temp);
         var positions = new List<float3>(); foreach (var transform in existing) positions.Add(transform.m_Position);
@@ -56,7 +60,7 @@ public static class NativeAirBridge
             var entity = Entity.Null;
             try
             {
-                if (positions.Any(p => math.distance(p.xz, destination.Position.xz) < 200)) { skipped++; continue; }
+                if (positions.Any(p => math.distance(p.xz, destination.Position.xz) < 200)) { skipped++; log.Diagnostic($"AIR SKIP name={destination.Name}; reason=existing-connection-spacing; position={destination.Position}"); continue; }
                 var terrainHeight = NetworkProcessor.Sample(destination.Position.x, destination.Position.z, prepared.Heightmap, prepared.HeightScaleMeters, prepared.Request.MapSize.WidthMeters);
                 if (destination.Position.y < terrainHeight + 100) { skipped++; log.Warn($"Air destination {destination.Name} skipped: native airway altitude intersects high terrain."); continue; }
                 // Verified GenerateObjectsSystem uses ObjectData.m_Archetype + Transform + PrefabRef.
@@ -67,15 +71,24 @@ public static class NativeAirBridge
                 if (!manager.HasComponent<Created>(entity)) manager.AddComponentData(entity, default(Created));
                 if (!manager.HasComponent<Updated>(entity)) manager.AddComponentData(entity, default(Updated));
                 names.SetCustomName(entity, destination.Name);
+                try
+                {
+                    var actual=manager.GetComponentData<Transform>(entity).m_Position;
+                    log.Diagnostic($"AIR READBACK name={destination.Name}; requestedPosition={destination.Position}; actualPosition={actual}; positionMatch={math.distance(actual,destination.Position)<.01f}; prefabMatch={manager.GetComponentData<PrefabRef>(entity).m_Prefab==prefabEntity}; airplaneStop={manager.HasComponent<AirplaneStop>(entity)}; outsideConnection={manager.HasComponent<Game.Objects.OutsideConnection>(entity)}; takeoffLocation={manager.HasComponent<Game.Routes.TakeoffLocation>(entity)}; initializationStillPending=true");
+                }
+                catch(Exception diagnosticException){log.Diagnostic($"AIR READBACK unavailable name={destination.Name}: {diagnosticException}");}
                 positions.Add(destination.Position); created++;
+                NativeDiagnostics.RememberAir(destination.Name,selectedPrefabName,destination.Position);
             }
             catch (Exception exception)
             {
                 if (entity != Entity.Null) manager.DestroyEntity(entity);
-                skipped++; log.Warn($"Air destination {destination.Name} skipped: {exception.Message}");
+                skipped++; log.Warn($"Air destination {destination.Name} skipped: {exception.Message}"); log.Diagnostic($"AIR FAILURE name={destination.Name}: {exception}");
             }
         }
         var report = $"Air connections created: {created}; skipped: {skipped}; native perimeter {half * 2 / 1000:0.###} km; minimum spacing 200 m. Native route initialization runs on the next game update.";
+        NativeDiagnostics.AirApplied=created>0;
+        log.Diagnostic($"AIR TOTAL requested={prepared.AirDestinations.Count}; perimeterCandidates={placed.Count}; created={created}; skipped={skipped}; functionalFlightsVerified=false");
         log.Info(report); return report;
     }
 }
