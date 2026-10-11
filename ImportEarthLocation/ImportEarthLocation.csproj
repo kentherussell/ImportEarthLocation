@@ -21,6 +21,7 @@
   <ItemGroup>
     <Reference Include="Game"><Private>false</Private></Reference>
     <Reference Include="Colossal.Core"><Private>false</Private></Reference>
+    <Reference Include="Colossal.PSI.Common"><Private>false</Private></Reference>
     <Reference Include="Colossal.Logging"><Private>false</Private></Reference>
     <Reference Include="Colossal.IO.AssetDatabase"><Private>false</Private></Reference>
     <Reference Include="Colossal.UI"><Private>false</Private></Reference>
@@ -45,9 +46,16 @@
 
   <!-- The UI is a separate webpack bundle. Build it with the C# project so a
        successful Visual Studio build cannot deploy the DLL without the panel. -->
-  <Target Name="BuildUserInterface" BeforeTargets="Build">
+  <Target Name="BuildUserInterface" BeforeTargets="Build" Condition="'$(LocalVerificationOnly)' != 'true'">
     <Exec WorkingDirectory="$(MSBuildProjectDirectory)\..\ImportEarthLocation.UI"
           Command="npm run build"
           EnvironmentVariables="CSII_USERDATAPATH=$(CSII_USERDATAPATH)" />
+  </Target>
+  <!-- The stock targets deploy after every Build. Verification must be explicit
+       and must never replace the installed mod while this iteration is pending. -->
+  <Target Name="DeployWIP" AfterTargets="AfterBuild" Condition="'$(NeedBuild)' == 'true' and '$(LocalVerificationOnly)' != 'true'">
+    <ItemGroup><FilesToDeploy Include="$(OutDir)\**\*.*" /></ItemGroup>
+    <RemoveDir Directories="$(DeployDir)" />
+    <Copy SourceFiles="@(FilesToDeploy)" DestinationFiles="@(FilesToDeploy->'$(DeployDir)\%(RecursiveDir)%(Filename)%(Extension)')" />
   </Target>
 </Project>

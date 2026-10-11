@@ -4,6 +4,13 @@ namespace ImportEarthLocation.Processing;
 
 public static class ClimateMath
 {
+    // PRECTOTCORR is a monthly mean in mm/day, NOT twelve monthly totals.
+    public static float AnnualPrecipitation(float[] daily)
+    {
+        if(daily.Length!=12||Array.Exists(daily,v=>float.IsNaN(v)||float.IsInfinity(v)||v<0))return float.NaN;
+        var days=new[]{31,28,31,30,31,30,31,31,30,31,30,31};var total=0f;
+        for(var i=0;i<12;i++)total+=daily[i]*days[i];return total;
+    }
     // Meteorological 'from' bearings become east/north horizontal flow vectors.
     public static (float east, float north, float speed) PrevailingWind(float[] from, float[] speeds)
     {

@@ -1,4 +1,4 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><GameManagedPath Condition="'$(GameManagedPath)' == ''">$(CSII_MANAGEDPATH)</GameManagedPath><GameManagedPath Condition="'$(GameManagedPath)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Cities Skylines II\Cities2_Data\Managed</GameManagedPath><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
-  <ItemGroup><Compile Include="..\..\ImportEarthLocation\Data\OverpassClient.cs" Link="OverpassClient.cs" /><Compile Include="..\..\ImportEarthLocation\Core\NetworkSelection.cs" Link="NetworkSelection.cs" /></ItemGroup>
+  <ItemGroup><Compile Include="..\..\ImportEarthLocation\Data\OverpassClient.cs" Link="OverpassClient.cs" /><Compile Include="..\..\ImportEarthLocation\Data\CacheStore.cs" Link="CacheStore.cs" /><Compile Include="..\..\ImportEarthLocation\Core\NetworkSelection.cs" Link="NetworkSelection.cs" /><Compile Include="..\..\ImportEarthLocation\Processing\OsmParser.cs" Link="OsmParser.cs" /></ItemGroup>
 </Project>

@@ -17,6 +17,7 @@ public sealed class Mod : IMod
     public void OnLoad(UpdateSystem updateSystem)
     {
         Log.Info($"Loading {Id} {Version}");
+        Integration.NativeUiBootstrap.Initialize(this);
         Core.ImportSession.ChangeMap(Game.SceneFlow.GameManager.instance.gameMode == GameMode.Editor && !Game.SceneFlow.GameManager.instance.isGameLoading);
         updateSystem.UpdateAt<ImportEarthLocationUISystem>(SystemUpdatePhase.UIUpdate);
         updateSystem.UpdateAt<ImportApplySystem>(SystemUpdatePhase.PreTool);
@@ -25,6 +26,7 @@ public sealed class Mod : IMod
 
     public void OnDispose()
     {
+        Integration.NativeUiBootstrap.Reset();
         Core.ImportSession.ChangeMap(false);
         ImportApplySystem.AbortPending();
         NetworkCommitSystem.CancelPending();

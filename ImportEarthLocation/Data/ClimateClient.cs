@@ -17,7 +17,7 @@ public static class ClimateClient
         {
             var url = "https://power.larc.nasa.gov/api/temporal/climatology/point?parameters=T2M,PRECTOTCORR,WS10M,WD10M&community=SB&format=JSON&start=2001&end=2020&latitude=" +
                 request.Latitude.ToString("R", CultureInfo.InvariantCulture) + "&longitude=" + request.Longitude.ToString("R", CultureInfo.InvariantCulture);
-            var cache = new CacheStore();
+            var cache = new CacheStore(log);
             var bytes = await cache.ReadValidAsync("climate", url, "json", b => { try { Parse(b); return true; } catch { return false; } }, token).ConfigureAwait(false);
             if (bytes == null)
             {

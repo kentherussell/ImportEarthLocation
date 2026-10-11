@@ -1,22 +1,63 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <!-- The existing surface smoke can run independently of older water/network
+       fixtures while those subsystems are being iterated. No substitute stubs. -->
+  <PropertyGroup Condition="'$(SurfaceSmokeOnly)' == 'true'">
+    <DefineConstants>$(DefineConstants);SURFACE_SMOKE_ONLY</DefineConstants>
+  </PropertyGroup>
+  <!-- Test-only selection: no game build/deployment and no HTTP requests. -->
+  <PropertyGroup Condition="'$(WaterSmokeOnly)' == 'true'">
+    <DefineConstants>$(DefineConstants);WATER_SMOKE_ONLY</DefineConstants>
+  </PropertyGroup>
   <ItemGroup>
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkEvidence.cs" Link="NetworkEvidence.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/VegetationPlanner.cs" Link="VegetationPlanner.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/ForestProcessor.cs" Link="ForestProcessor.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkNormalizer.cs" Link="NetworkNormalizer.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/WaterBodyPlanner.cs" Link="WaterBodyPlanner.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkVerticalProfiles.cs" Link="NetworkVerticalProfiles.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/ConnectedRoadGrades.cs" Link="ConnectedRoadGrades.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/RiverBedSurface.cs" Link="RiverBedSurface.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/RailPrefabPolicy.cs" Link="RailPrefabPolicy.cs" />
     <Compile Include="../../ImportEarthLocation/Core/ImportModels.cs" Link="ImportModels.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/UiPackageDiscovery.cs" Link="UiPackageDiscovery.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/DiagnosticEvidence.cs" Link="DiagnosticEvidence.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/RunArchive.cs" Link="RunArchive.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/DiagnosticArtifacts.cs" Link="DiagnosticArtifacts.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NetworkSelection.cs" Link="NetworkSelection.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/NetworkStructure.cs" Link="NetworkStructure.cs" />
     <Compile Include="../../ImportEarthLocation/Core/Numeric.cs" Link="Numeric.cs" />
     <Compile Include="../../ImportEarthLocation/Core/WaterLevels.cs" Link="WaterLevels.cs" />
+    <Compile Include="../../ImportEarthLocation/Data/TerrainTileClient.cs" Link="TerrainTileClient.cs" />
+    <Compile Include="../../ImportEarthLocation/Data/CacheStore.cs" Link="CacheStore.cs" />
+    <Compile Include="../../ImportEarthLocation/Data/PublicHttpClient.cs" Link="PublicHttpClient.cs" />
     <Compile Include="../../ImportEarthLocation/Geo/GeoMath.cs" Link="GeoMath.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/AirPlanner.cs" Link="AirPlanner.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/WaterPlanner.cs" Link="WaterPlanner.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/ClimateMath.cs" Link="ClimateMath.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/TerrainConditioner.cs" Link="TerrainConditioner.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/TerrainGeographyGuard.cs" Link="TerrainGeographyGuard.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/GeographyPolygons.cs" Link="GeographyPolygons.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/SurfacePlanner.cs" Link="SurfacePlanner.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/SurfacePaint.cs" Link="SurfacePaint.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkProcessor.cs" Link="NetworkProcessor.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/OsmParser.cs" Link="OsmParser.cs" />
     <EmbeddedResource Include="../../ImportEarthLocation/Data/cities.json" LogicalName="ImportEarthLocation.Data.cities.json" />
     <Reference Include="Unity.Mathematics"><HintPath>$(GameManagedPath)/Unity.Mathematics.dll</HintPath></Reference>
     <Reference Include="UnityEngine.CoreModule"><HintPath>$(GameManagedPath)/UnityEngine.CoreModule.dll</HintPath></Reference>
     <Reference Include="Newtonsoft.Json"><HintPath>$(GameManagedPath)/Newtonsoft.Json.dll</HintPath></Reference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(SurfaceSmokeOnly)' == 'true'">
+    <Compile Remove="../../ImportEarthLocation/Processing/RiverBedSurface.cs" />
+    <Compile Remove="../../ImportEarthLocation/Processing/WaterPlanner.cs" />
+    <Compile Remove="../../ImportEarthLocation/Processing/NetworkProcessor.cs" />
+    <Compile Remove="../../ImportEarthLocation/Processing/NetworkVerticalProfiles.cs" />
+    <Compile Remove="../../ImportEarthLocation/Processing/ConnectedRoadGrades.cs" />
+    <Compile Remove="../../ImportEarthLocation/Processing/WaterBodyPlanner.cs" />
+    <Compile Remove="../../ImportEarthLocation/Processing/VegetationPlanner.cs" />
+    <Compile Remove="../../ImportEarthLocation/Processing/ForestProcessor.cs" />
+    <Compile Remove="../../ImportEarthLocation/Processing/NetworkNormalizer.cs" />
+    <Compile Remove="WaterTests.cs" />
+    <Compile Remove="EnvironmentChecks.cs" />
   </ItemGroup>
 </Project>

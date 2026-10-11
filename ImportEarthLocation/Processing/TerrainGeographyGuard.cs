@@ -9,7 +9,7 @@ namespace ImportEarthLocation.Processing;
 /// <summary>Conservative source-grid protection, not terrain shaping or water-level inference.</summary>
 public static class TerrainGeographyGuard
 {
-    public static bool[] Build(OsmDataset data, int zoom, int minTileX, int minTileY, int width, int height, CancellationToken token)
+    public static bool[] Build(OsmDataset data, int zoom, int minTileX, int minTileY, int width, int height, CancellationToken token, bool landformsOnly = false)
     {
         var mask = new bool[checked(width * height)];
         foreach (var way in data.Ways.Values.OrderBy(w => w.Id))
@@ -18,6 +18,9 @@ public static class TerrainGeographyGuard
             way.Tags.TryGetValue("natural", out var natural); way.Tags.TryGetValue("landuse", out var landuse);
             way.Tags.TryGetValue("waterway", out var waterway);
             var area = natural == "water" || landuse == "reservoir" || landuse == "quarry";
+            // A shoreline is not evidence supporting a corrupt spike. Keep its
+            // filtering protection, but allow bounded artifact repair there.
+            if (landformsOnly && natural != "cliff" && landuse != "quarry") continue;
             if (!area && natural != "coastline" && natural != "cliff" && natural != "beach" &&
                 waterway != "river" && waterway != "stream" && waterway != "riverbank") continue;
             var points = way.NodeIds.Where(data.Nodes.ContainsKey).Select(id => data.Nodes[id]).Select(n => (

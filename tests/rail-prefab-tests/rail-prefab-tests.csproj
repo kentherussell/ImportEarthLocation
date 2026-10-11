@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../ImportEarthLocation/Integration/PrefabResolver.cs" Link="PrefabResolver.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/RailPrefabPolicy.cs" Link="RailPrefabPolicy.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/NetworkSelection.cs" Link="NetworkSelection.cs" />
+  </ItemGroup>
+</Project>

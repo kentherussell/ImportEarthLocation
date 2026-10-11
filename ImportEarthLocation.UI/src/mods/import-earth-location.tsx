@@ -23,8 +23,12 @@ const log$ = bindValue<string>(group, "log", "");
 const location$ = bindValue<string>(group, "location", "{}");
 const roads$ = bindValue<string>(group, "roadLevel", "primary");
 const rail$ = bindValue<boolean>(group, "importRail", true);
+const forests$ = bindValue<boolean>(group, "importForests", true);
 const session$ = bindValue<string>(group, "mapSession", "");
 const actionRevision$ = bindValue<string>(group, "actionRevision", "0");
+const serviceUrl$ = bindValue<string>(group, "serviceUrl", "");
+const serviceStatus$ = bindValue<string>(group, "serviceStatus", "");
+const serviceRevision$ = bindValue<number>(group, "serviceRevision", 0);
 
 class ImportPanelBoundary extends React.Component<React.PropsWithChildren<{}>, { failed: boolean }> {
   state = { failed: false };
@@ -33,6 +37,7 @@ class ImportPanelBoundary extends React.Component<React.PropsWithChildren<{}>, {
 
   componentDidCatch(error: Error) {
     console.error("Import Earth Location panel failed:", error.message);
+    trigger(group, "frontendState", JSON.stringify({ event: "render-error", error: error.message }));
   }
 
   render() {
@@ -63,6 +68,7 @@ export const ImportEarthLocationContent = () => {
   const rawRoadLevel = useValue(roads$);
   const roadLevel = ["none", "highways", "primary", "secondary"].includes(rawRoadLevel) ? rawRoadLevel : "primary";
   const rail = useValue(rail$);
+  const forests = useValue(forests$);
   const mapSession = useValue(session$);
   const actionRevision = useValue(actionRevision$);
   const actionGate = useRef<string | null>(null);
@@ -73,7 +79,19 @@ export const ImportEarthLocationContent = () => {
   const [showLog, setShowLog] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const locationText = useValue(location$);
-  useEffect(() => { actionGate.current = null; setStarting(false); }, [busy, ready, status, error, actionRevision]);
+  const serviceUrl = useValue(serviceUrl$);
+  const serviceStatus = useValue(serviceStatus$);
+  const serviceRevision = useValue(serviceRevision$);
+  const [serviceOpen, setServiceOpen] = useState(false);
+  const [serviceDraft, setServiceDraft] = useState("");
+  useEffect(() => { setServiceDraft(serviceUrl); }, [serviceUrl]);
+  useEffect(() => { setServiceOpen(false); }, [serviceRevision]);
+  useEffect(() => { if (panelOpen && !serviceUrl && !busy) setServiceOpen(true); }, [panelOpen]);
+  useEffect(() => {
+    console.info("ImportEarthLocation UI mounted", { isEditor, mapSession });
+    if (mapSession) trigger(group, "frontendState", JSON.stringify({ event: "mounted", isEditor, mapSession }));
+  }, [isEditor, mapSession]);
+  useEffect(() => { actionGate.current = null; setStarting(false); }, [busy, ready, error, actionRevision]);
   useEffect(() => { setConfirming(false); setPickerOpen(false); setShowLog(false); actionGate.current = null; setStarting(false); }, [mapSession]);
   useEffect(() => { if (!ready) setConfirming(false); }, [ready]);
   useEffect(() => {
@@ -83,6 +101,7 @@ export const ImportEarthLocationContent = () => {
   const closePanel = () => {
     setConfirming(false);
     setPickerOpen(false);
+    setServiceOpen(false);
     trigger(group, "setPanelOpen", false);
   };
 
@@ -92,13 +111,14 @@ export const ImportEarthLocationContent = () => {
       if (event.key !== "Escape" && event.keyCode !== 27) return;
       event.preventDefault();
       event.stopPropagation();
-      if (pickerOpen) setPickerOpen(false);
+      if (serviceOpen) setServiceOpen(false);
+      else if (pickerOpen) setPickerOpen(false);
       else if (confirming) setConfirming(false);
       else closePanel();
     };
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [panelOpen, confirming, pickerOpen]);
+  }, [panelOpen, confirming, pickerOpen, serviceOpen]);
 
   if (!isEditor) return null;
 
@@ -127,6 +147,8 @@ export const ImportEarthLocationContent = () => {
             <Scrollable vertical className={styles.panelBody}>
             <div className={styles.section}>
               <div className={styles.notice}>Editor-only full-map import. Roads and rail are independently selectable.</div>
+              {!serviceUrl && <div className={styles.notice}>No personal data service configured. Public backup downloads could take hours. Set up a free NextGIS service for faster access.</div>}
+              <Button variant="flat" className={`${styles.actionButton} ${styles.utility}`} disabled={busy || starting} onSelect={() => { setServiceDraft(serviceUrl); setServiceOpen(true); }}>Configure data service…</Button>
               <Button variant="flat" className={`${styles.actionButton} ${styles.secondary}`} disabled={busy || starting} onSelect={() => setPickerOpen(true)}>Select location on map…</Button>
               <label className={styles.field}>
                 <span>Center latitude</span>
@@ -150,12 +172,15 @@ export const ImportEarthLocationContent = () => {
                 <span>Road import level</span>
                 {[["none", "None"], ["highways", "Highways only"], ["primary", "Primary roads & above"], ["secondary", "Secondary roads & above"]].map(([id,label]) =>
                   <Button key={id} variant="flat" className={styles.configChoice} focusKey={`iel-roads-${id}`} role="radio" aria-checked={roadLevel === id} selected={roadLevel === id} disabled={busy || starting} onSelect={() => trigger(group, "setRoadLevel", id)}>
-                    <span className={styles.checkbox}>{roadLevel === id ? "●" : "○"}</span><span>{label}</span>
+                    <span aria-hidden="true" className={`${styles.radioIndicator} ${roadLevel === id ? styles.radioSelected : ""}`} /><span>{label}</span>
                   </Button>)}
                 <span className={styles.helper}>Primary includes highways. Secondary includes primary and highways.</span>
               </div>
               <Button variant="flat" className={styles.check} focusKey="iel-rail" role="checkbox" aria-checked={rail} selected={rail} disabled={busy || starting} onSelect={() => trigger(group, "setImportRail", !rail)}>
                 <span className={styles.checkbox}>{rail ? "✓" : ""}</span><span>Import rail</span>
+              </Button>
+              <Button variant="flat" className={styles.check} focusKey="iel-forests" role="checkbox" aria-checked={forests} selected={forests} disabled={busy || starting} onSelect={() => trigger(group, "setImportForests", !forests)}>
+                <span className={styles.checkbox}>{forests ? "✓" : ""}</span><span>Import forests</span>
               </Button>
               <Button variant="flat" className={styles.check} role="checkbox" aria-checked={surfaces} selected={surfaces} disabled={busy} onSelect={() => {
                 setSurfaces(!surfaces); trigger(group, "setGroundSurfaces", !surfaces);
@@ -166,12 +191,12 @@ export const ImportEarthLocationContent = () => {
             </div>
 
             <div className={styles.section}>
-              <div className={styles.status}>{status}</div>
+              <div className={styles.status} role="status">{status}</div>
               {summary && <Scrollable vertical className={styles.summary}>{summary}</Scrollable>}
               {error && <div className={styles.error}>{error}</div>}
               <div className={styles.actions}>
                 {!ready && (
-                  <Button variant="flat" className={`${styles.actionButton} ${styles.primary}`} focusKey="iel-prepare" disabled={busy || starting} onSelect={() => { if(actionGate.current) return; actionGate.current = "prepare"; setStarting(true); setShowLog(true); trigger(group, "prepare"); }}>
+                  <Button variant="flat" className={`${styles.actionButton} ${styles.primary}`} focusKey="iel-prepare" disabled={busy || starting} onSelect={() => { if(actionGate.current) return; actionGate.current = "prepare"; setStarting(true); trigger(group, "prepare"); }}>
                     {busy ? "Preparing…" : "Prepare import"}
                   </Button>
                 )}
@@ -193,26 +218,44 @@ export const ImportEarthLocationContent = () => {
             </div>
 
             </Scrollable>
-            {confirming && (
-              <div className={styles.confirmBackdrop}>
-                <div className={styles.confirmBox}>
-                  <h3>Replace current map contents?</h3>
-                  <Scrollable vertical horizontal={false} className={styles.confirmBody}>
-                    <p>This replaces terrain and removes existing roads, rail, other networks, and water sources from the open map—even when new roads or rail are disabled. Optional forest trees are added where supported. The map file and name are not deleted.</p>
-                    <p><strong>Save a backup first.</strong> Once application starts it cannot be cancelled.</p>
-                  </Scrollable>
-                  <div className={`${styles.actions} ${styles.confirmFooter}`}>
-                    <Button variant="flat" focusKey="iel-confirm-cancel" className={`${styles.actionButton} ${styles.utility}`} onSelect={() => setConfirming(false)}>Cancel</Button>
-                    <Button variant="flat" focusKey="iel-confirm-replace" disabled={busy || starting} className={`${styles.actionButton} ${styles.danger}`} onSelect={() => { if(actionGate.current) return; actionGate.current = "confirm"; setStarting(true); setConfirming(false); trigger(group, "confirm"); }}>
-                      Replace map
-                    </Button>
-                  </div>
-                </div>
-              </div>
-            )}
           </Panel>
         )}
       </div>
+      {/* Keep viewport overlays outside Panel's native clipping/containing block. */}
+      {panelOpen && serviceOpen && <div className={styles.confirmBackdrop}>
+        <div className={styles.confirmBox} role="dialog" aria-modal="true" aria-labelledby="iel-service-title">
+          <h3 id="iel-service-title">Set up your data service</h3>
+          <Scrollable vertical horizontal={false} className={styles.confirmBody}>
+            <p>Sign up for free at nextgis.com. Go to Profile → Software and services → Services. Find Overpass API, create an API key if needed, and copy your service URL.</p>
+            <p>Without a service URL, public backup downloads could take hours. You can still continue using backups.</p>
+            <label className={styles.field}><span>NextGIS Overpass service URL</span><input type="password" autoComplete="off" value={serviceDraft} disabled={busy} placeholder="Paste your service URL" onChange={event => setServiceDraft(event.target.value)} /></label>
+            <p>The URL contains your personal key. It is saved locally, not included in import diagnostics. Leave it empty to use public backups.</p>
+            <div role="status">{serviceStatus}</div>
+          </Scrollable>
+          <div className={`${styles.actions} ${styles.confirmFooter}`}>
+            <Button variant="flat" className={`${styles.actionButton} ${styles.utility}`} onSelect={() => setServiceOpen(false)}>{serviceUrl ? "Cancel" : "Continue with backups"}</Button>
+            <Button variant="flat" className={`${styles.actionButton} ${styles.primary}`} disabled={busy} onSelect={() => trigger(group, "saveServiceUrl", serviceDraft)}>Save</Button>
+          </div>
+        </div>
+      </div>}
+      {panelOpen && confirming && (
+        <div className={styles.confirmBackdrop}>
+          <div className={styles.confirmBox} role="dialog" aria-modal="true" aria-labelledby="iel-confirm-title">
+            <h3 id="iel-confirm-title">Replace current map contents?</h3>
+            <Scrollable vertical horizontal={false} className={styles.confirmBody}>
+              <p>This replaces terrain and removes existing roads, rail, other networks, and water sources from the open map—even when new roads or rail are disabled. Optional forest trees are added where supported. The map file and name are not deleted.</p>
+              <p><strong>Save a backup first.</strong> Once application starts it cannot be cancelled.</p>
+              <p>The game may appear to freeze for up to 5 minutes while replacing the map, depending on its complexity. Please wait for it to finish.</p>
+            </Scrollable>
+            <div className={`${styles.actions} ${styles.confirmFooter}`}>
+              <Button variant="flat" focusKey="iel-confirm-cancel" className={`${styles.actionButton} ${styles.utility}`} onSelect={() => setConfirming(false)}>Cancel</Button>
+              <Button variant="flat" focusKey="iel-confirm-replace" disabled={busy || starting} className={`${styles.actionButton} ${styles.danger}`} onSelect={() => { if(actionGate.current) return; actionGate.current = "confirm"; setStarting(true); setConfirming(false); trigger(group, "confirm"); }}>
+                Replace map
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
       {panelOpen && pickerOpen && <LocationPicker mapExt={mapExt} initial={{ latitude: Number(latitude) || 0, longitude: Number(longitude) || 0, mapSize }} onClose={() => setPickerOpen(false)} onCommit={(value: Location) => {
         trigger(group, "commitLocation", JSON.stringify(value)); setPickerOpen(false);
       }} />}

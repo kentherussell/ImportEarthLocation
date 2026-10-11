@@ -7,10 +7,31 @@ void Check(bool value, string message) { if (!value) throw new Exception(message
 TerrainConditioner.Result Run(float[] source, Func<int,bool>? guard = null, int tileSize = 256) => TerrainConditioner.Condition(source, size, size, 30, default, guard, tileSize);
 void Reject(Action action, string message) { try { action(); } catch (InvalidOperationException) { return; } throw new Exception(message); }
 
+foreach(var bounds in new[]{(-11641.5f,643.8f),(-12000f,10000f),(-20f,3f),(0f,0f),(100f,900f)})
+{
+    var encoding=TerrainConditioner.EncodingFor(bounds.Item1,bounds.Item2);
+    Check(encoding.BaseElevation<=bounds.Item1-128&&encoding.BaseElevation+encoding.Scale>=bounds.Item2,
+        "Validated DEM bounds overflow terrain encoding");
+    Check(encoding.SeaLevel==-encoding.BaseElevation,"Sea level lost consistent zero-elevation datum");
+    foreach(var value in new[]{bounds.Item1,bounds.Item2,0f})
+    {
+        var encoded=Math.Round((value-encoding.BaseElevation)/encoding.Scale*65535);
+        var decoded=encoded/65535*encoding.Scale+encoding.BaseElevation;
+        Check(encoded>=0&&encoded<=65535&&Math.Abs(decoded-value)<=encoding.Scale/65535*.501,
+            "DEM encoding clips or loses more than half a quantization step");
+    }
+}
+foreach(var bounds in new[]{(float.NaN,10f),(-12001f,10f),(0f,10001f),(10f,0f)})
+    Reject(()=>TerrainConditioner.EncodingFor(bounds.Item1,bounds.Item2),"Invalid DEM bounds accepted");
+Console.WriteLine("PASS: Santa Catalina 12,285.3m span and full accepted elevation range encode without clipping; invalid samples remain rejected.");
+
 var slope = Raster((x,y) => 100 + x * .2f + y * .3f);
 var reference = (float[])slope.Clone();
 Check(Run(slope).Elevations.SequenceEqual(slope), "Planar slope was blurred");
 Check(reference.SequenceEqual(slope), "Original DEM was mutated");
+var progress=new List<string>();
+TerrainConditioner.Condition(reference,size,size,30,default,progress:progress.Add);
+Check(progress.Any(s=>s.Contains("source-validation"))&&progress.Any(s=>s.Contains("tile-seam"))&&progress.Any(s=>s.Contains("noise/spike")),"DEM calculation progress stages missing");
 slope[At(60,60)] += 30; slope[At(90,90)] -= 20;
 var repaired = Run(slope);
 Check(repaired.Metrics.Spikes == 1 && repaired.Metrics.Pits == 1, "Isolated artifacts not detected");

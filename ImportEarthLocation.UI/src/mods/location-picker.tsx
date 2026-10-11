@@ -85,14 +85,19 @@ export const LocationPicker = ({ initial, mapExt, onCommit, onClose }: { initial
   const nw = project(center.latitude + halfLat, center.longitude - halfLon, zoom);
   const se = project(center.latitude - halfLat, center.longitude + halfLon, zoom);
   const mapUnavailable = Math.abs(center.latitude) > 85.05112878 || tiles.error;
+  const search = () => {
+    if (searching || query.trim().length < 2) return;
+    const revision = nextRevision(); setSearchRevision(revision); setSearching(true);
+    trigger(group, "searchPlace", JSON.stringify({ revision, query }));
+  };
   return <Panel header="Select Earth location" className={styles.picker} onClose={onClose}>
     <div className={styles.section}>
       <div className={styles.search}><input aria-label="City or place" placeholder="City or place" value={query} onChange={e => {
         setQuery(e.target.value); setSearchRevision(nextRevision()); setSearching(false);
-      }} /><Button variant="flat" className={`${styles.actionButton} ${styles.secondary}`} disabled={searching || query.trim().length < 2} onSelect={() => {
-        const revision = nextRevision(); setSearchRevision(revision); setSearching(true);
-        trigger(group, "searchPlace", JSON.stringify({ revision, query }));
-      }}>Search</Button></div>
+      }} onKeyDown={e => {
+        if (e.key !== "Enter" || e.nativeEvent.isComposing || e.repeat) return;
+        e.preventDefault(); e.stopPropagation(); search();
+      }} /><Button variant="flat" className={`${styles.actionButton} ${styles.secondary}`} disabled={searching || query.trim().length < 2} onSelect={search}>Search</Button></div>
       {places.message && <div className={styles.notice}>{places.message}</div>}
       {places.results?.length > 0 && <Scrollable vertical className={styles.results}>{places.results.map((p: any, i: number) =>
         <Button key={i} variant="flat" className={`${styles.actionButton} ${styles.secondary}`} onSelect={() => recenter(p)}>{p.label}</Button>)}</Scrollable>}

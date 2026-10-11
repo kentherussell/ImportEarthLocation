@@ -14,6 +14,9 @@ public sealed class TerrainBridge
     private readonly WaterSystem _waterSystem;
     private readonly MethodInfo? _setTerrainProperties;
     private readonly MethodInfo? _replaceHeightmap;
+    private readonly MethodInfo? _setHeightmap;
+    private readonly MethodInfo? _setWorldHeightmap;
+    private readonly MethodInfo? _finalizeTerrain;
 
     public TerrainBridge(TerrainSystem terrainSystem, WaterSystem waterSystem)
     {
@@ -31,6 +34,10 @@ public sealed class TerrainBridge
             binder: null,
             types: new[] { typeof(Texture2D) },
             modifiers: null);
+        var flags=BindingFlags.Instance|BindingFlags.Public|BindingFlags.NonPublic;
+        _setHeightmap=typeof(TerrainSystem).GetMethod("SetHeightmap",flags,null,new[]{typeof(Texture2D)},null);
+        _setWorldHeightmap=typeof(TerrainSystem).GetMethod("SetWorldHeightmap",flags,null,new[]{typeof(Texture2D),typeof(bool)},null);
+        _finalizeTerrain=typeof(TerrainSystem).GetMethod("FinalizeTerrainData",flags,null,new[]{typeof(Texture2D),typeof(Texture2D),typeof(float2),typeof(float2),typeof(float2),typeof(float2),typeof(float2),typeof(float2)},null);
     }
 
     public bool CanApply(out string reason)
@@ -39,6 +46,7 @@ public sealed class TerrainBridge
         if (!_waterSystem.Loaded) { reason = "WaterSystem is not loaded; open a map in the editor first."; return false; }
         if (_replaceHeightmap == null) { reason = "The current CS2 TerrainSystem no longer exposes the expected ReplaceHeightmap hook."; return false; }
         if (_setTerrainProperties == null) { reason = "The current CS2 TerrainSystem no longer exposes the expected terrain-property hook."; return false; }
+        if(_setHeightmap==null||_setWorldHeightmap==null||_finalizeTerrain==null){reason="Native terrain replacement/transform recovery hooks are unavailable; map preserved.";return false;}
         reason = "";
         return true;
     }
@@ -53,41 +61,121 @@ public sealed class TerrainBridge
         return data.heights.IsCreated && data.heights.Length > 0 && data.resolution.x > 2 && data.resolution.z > 2;
     }
 
-    public void Apply(PreparedImport prepared)
+    public void Apply(PreparedImport prepared,ImportLog? log=null)
     {
         if (!CanApply(out var reason)) throw new InvalidOperationException(reason);
         if (prepared.Heightmap.Length != Processing.TerrainBuilder.Resolution * Processing.TerrainBuilder.Resolution)
             throw new InvalidOperationException("Prepared heightmap dimensions are invalid.");
 
-        var texture = new Texture2D(
-            Processing.TerrainBuilder.Resolution,
-            Processing.TerrainBuilder.Resolution,
+        // Snapshot the actual playable texture, not the CPU cascade (which may
+        // include backdrop data at a different resolution). Capture before any
+        // mutation or old-network deletion, and restore the same transforms.
+        var oldScale=_terrainSystem.heightScaleOffset;var oldSea=_waterSystem.SeaLevel;
+        var mapCorner=_terrainSystem.playableOffset;var mapSize=_terrainSystem.playableArea;
+        var worldCorner=_terrainSystem.worldOffset;var worldSize=_terrainSystem.worldSize;var worldRange=_terrainSystem.worldHeightMinMax;
+        var oldWorldAsset=_terrainSystem.worldMapAsset;var oldCulling=_waterSystem.UseActiveCellsCulling;
+        var backup=Capture(_terrainSystem.heightmap);Texture2D? worldBackup=null;
+        Texture2D? texture=null;var mutationStarted=false;
+        try
+        {
+        if(_terrainSystem.worldHeightmap!=null)worldBackup=Capture(_terrainSystem.worldHeightmap);
+        // Keep the existing native texture resolution. Changing it can destroy
+        // the world/backdrop heightmap, even if map dimensions are unchanged.
+        texture = new Texture2D(
+            backup.width,
+            backup.height,
             TextureFormat.R16,
             mipChain: false,
             linear: true)
         { name = $"{Mod.Id}_Heightmap" };
 
-        var bytes = new byte[prepared.Heightmap.Length * sizeof(ushort)];
-        Buffer.BlockCopy(prepared.Heightmap, 0, bytes, 0, bytes.Length);
+        var nativeSamples = Resample(prepared.Heightmap, backup.width, backup.height);
+        var bytes = new byte[nativeSamples.Length * sizeof(ushort)];
+        Buffer.BlockCopy(nativeSamples, 0, bytes, 0, bytes.Length);
         texture.LoadRawTextureData(bytes);
         // ReplaceHeightmap calls GetRawTextureData<ushort> to populate CPU heights.
         texture.Apply(updateMipmaps: false, makeNoLongerReadable: false);
 
-        // The private hook name and float2 payload are preflighted because this API is not public/stable.
-        var parameters = _setTerrainProperties!.GetParameters();
-        var arguments = parameters.Select(parameter =>
-            parameter.ParameterType == typeof(float2)
-                ? (object)new float2(prepared.HeightScaleMeters, 0f)
-                : parameter.HasDefaultValue ? parameter.DefaultValue : Activator.CreateInstance(parameter.ParameterType)).ToArray();
-        try
-        {
-            _setTerrainProperties.Invoke(_terrainSystem, arguments);
-            _terrainSystem.ReplaceHeightmap(texture);
+            mutationStarted=true;
+            // ReplaceHeightmap resets map/world corners to vanilla defaults.
+            // Use its verified internal stages with the loaded map transforms.
+            _setHeightmap!.Invoke(_terrainSystem,new object[]{texture});
+            RestoreWorldIfDestroyed();
+            Finalize(texture,new float2(prepared.HeightScaleMeters,0));
             _waterSystem.SeaLevel = WaterLevels.Effective(prepared.SeaLevelMeters);
+            _waterSystem.UseActiveCellsCulling=false;_waterSystem.TerrainWillChange();
+            if(math.any(math.abs(_terrainSystem.playableArea-mapSize)>.01f)||math.any(math.abs(_terrainSystem.playableOffset-mapCorner)>.01f)||math.any(math.abs(_terrainSystem.heightScaleOffset-new float2(prepared.HeightScaleMeters,0))>.001f))
+                throw new InvalidOperationException("Native terrain transforms did not match the approved map.");
+            log?.Diagnostic($"TERRAIN APPLY transformPreserved=true; mapSize={mapSize}; mapCorner={mapCorner}; scale={prepared.HeightScaleMeters:R}; nativeResolution={backup.width}x{backup.height}; backupCaptured=true; networkDeletionNotStarted=true; readbackNotVisualAcceptance=true");
+        }
+        catch(Exception error)
+        {
+            if(!mutationStarted)throw;
+            try
+            {
+                _setHeightmap!.Invoke(_terrainSystem,new object[]{backup});RestoreWorldIfDestroyed();Finalize(backup,oldScale);
+                _terrainSystem.worldMapAsset=oldWorldAsset;_waterSystem.SeaLevel=oldSea;_waterSystem.UseActiveCellsCulling=oldCulling;_waterSystem.TerrainWillChange();
+                log?.Diagnostic("TERRAIN ROLLBACK restored-playable-texture-and-transforms; oldNetworkDeletionNotStarted=true; fullGenerationRollback=false");
+            }
+            catch(Exception recovery)
+            {
+                log?.Diagnostic($"TERRAIN ROLLBACK FAILED original={error}; restore={recovery}; oldNetworksNotDeleted=true");
+                throw new InvalidOperationException("Native terrain replacement and restoration failed. Old networks were not deleted; reopen the saved map before another import.",error);
+            }
+            throw new InvalidOperationException("Native terrain replacement failed; prior terrain, transforms and sea level were restored. Old networks were not deleted.",error);
         }
         finally
         {
-            UnityEngine.Object.Destroy(texture);
+            if(texture!=null)UnityEngine.Object.Destroy(texture);UnityEngine.Object.Destroy(backup);if(worldBackup!=null)UnityEngine.Object.Destroy(worldBackup);
         }
+        void RestoreWorldIfDestroyed()
+        {
+            if(worldBackup==null||_terrainSystem.worldHeightmap!=null)return;
+            // true makes an owned GPU copy. false would retain our temporary CPU
+            // backup as the live world map and destroy it in the finally block.
+            _setWorldHeightmap!.Invoke(_terrainSystem,new object[]{worldBackup,true});
+            if(_terrainSystem.worldHeightmap==null)throw new InvalidOperationException("Native world terrain could not be restored.");
+            _terrainSystem.worldMapAsset=oldWorldAsset;
+        }
+        void Finalize(Texture2D map,float2 scale)
+        {_finalizeTerrain!.Invoke(_terrainSystem,new object?[]{map,worldBackup,scale,mapCorner,mapSize,worldCorner,worldSize,worldRange});}
+    }
+
+    private static ushort[] Resample(ushort[] input,int width,int height)
+    {
+        var resolution=Processing.TerrainBuilder.Resolution;
+        if(width==resolution&&height==resolution)return input;
+        var result=new ushort[checked(width*height)];
+        for(var z=0;z<height;z++)
+        {
+            var sourceZ=z*(resolution-1d)/Math.Max(1,height-1);var z0=(int)sourceZ;var z1=Math.Min(z0+1,resolution-1);var tz=sourceZ-z0;
+            for(var x=0;x<width;x++)
+            {
+                var sourceX=x*(resolution-1d)/Math.Max(1,width-1);var x0=(int)sourceX;var x1=Math.Min(x0+1,resolution-1);var tx=sourceX-x0;
+                var a=input[z0*resolution+x0]*(1-tx)+input[z0*resolution+x1]*tx;
+                var b=input[z1*resolution+x0]*(1-tx)+input[z1*resolution+x1]*tx;
+                result[z*width+x]=(ushort)Math.Round(a*(1-tz)+b*tz);
+            }
+        }
+        return result;
+    }
+
+    private static Texture2D Capture(Texture source)
+    {
+        if(source==null||source.width<=0||source.height<=0||(long)source.width*source.height>67_108_864)
+            throw new InvalidOperationException("Prior terrain cannot be captured safely; current map preserved.");
+        var cpu=new Texture2D(source.width,source.height,TextureFormat.R16,false,true);var old=RenderTexture.active;RenderTexture? temporary=null;
+        try
+        {
+            var render=source as RenderTexture;
+            if(render==null)
+            {temporary=RenderTexture.GetTemporary(source.width,source.height,0,RenderTextureFormat.R16,RenderTextureReadWrite.Linear);Graphics.Blit(source,temporary);render=temporary;}
+            if(!render.IsCreated())throw new InvalidOperationException("Prior terrain GPU texture is unavailable; current map preserved.");
+            RenderTexture.active=render;cpu.ReadPixels(new Rect(0,0,source.width,source.height),0,0,false);cpu.Apply(false,false);
+            if(cpu.GetRawTextureData().Length!=(long)source.width*source.height*2)throw new InvalidOperationException("Prior terrain R16 snapshot is invalid; current map preserved.");
+            return cpu;
+        }
+        catch{UnityEngine.Object.Destroy(cpu);throw;}
+        finally{RenderTexture.active=old;if(temporary!=null)RenderTexture.ReleaseTemporary(temporary);}
     }
 }
