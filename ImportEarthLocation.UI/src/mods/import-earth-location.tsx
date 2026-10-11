@@ -24,6 +24,8 @@ const location$ = bindValue<string>(group, "location", "{}");
 const roads$ = bindValue<string>(group, "roadLevel", "primary");
 const rail$ = bindValue<boolean>(group, "importRail", true);
 const forests$ = bindValue<boolean>(group, "importForests", true);
+const airConnections$ = bindValue<boolean>(group, "createAirConnections", false);
+const seaConnections$ = bindValue<boolean>(group, "createSeaConnections", false);
 const session$ = bindValue<string>(group, "mapSession", "");
 const actionRevision$ = bindValue<string>(group, "actionRevision", "0");
 const serviceUrl$ = bindValue<string>(group, "serviceUrl", "");
@@ -74,7 +76,8 @@ export const ImportEarthLocationContent = () => {
   const actionGate = useRef<string | null>(null);
   const [starting, setStarting] = useState(false);
   const [surfaces, setSurfaces] = useState(false);
-  const [airConnections, setAirConnections] = useState(false);
+  const airConnections = useValue(airConnections$);
+  const seaConnections = useValue(seaConnections$);
   const [confirming, setConfirming] = useState(false);
   const [showLog, setShowLog] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -186,8 +189,11 @@ export const ImportEarthLocationContent = () => {
                 setSurfaces(!surfaces); trigger(group, "setGroundSurfaces", !surfaces);
               }}><span className={styles.checkbox}>{surfaces ? "✓" : ""}</span><span>Apply real-world ground surfaces</span></Button>
               <Button variant="flat" className={styles.check} role="checkbox" aria-checked={airConnections} selected={airConnections} disabled={busy} onSelect={() => {
-                setAirConnections(!airConnections); trigger(group, "setAirConnections", !airConnections);
-              }}><span className={styles.checkbox}>{airConnections ? "✓" : ""}</span><span>Create air connections to nearby major cities</span></Button>
+                trigger(group, "setAirConnections", !airConnections);
+              }}><span className={styles.checkbox}>{airConnections ? "✓" : ""}</span><span>Create air connections to the nearest bundled cities</span></Button>
+              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={seaConnections} selected={seaConnections} disabled={busy} onSelect={() => trigger(group, "setSeaConnections", !seaConnections)}>
+                <span className={styles.checkbox}>{seaConnections ? "✓" : ""}</span><span>Assess sea connections (native support verification pending)</span>
+              </Button>
             </div>
 
             <div className={styles.section}>
