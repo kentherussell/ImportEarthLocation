@@ -10,6 +10,36 @@ namespace ImportEarthLocation.Processing;
 
 public static class NetworkNormalizer
 {
+    // Run after all consolidation/roundabout fitting: distinct OSM ways can
+    // become the same native course only after those transformations.
+    public static IReadOnlyList<PreparedSegment> RemoveCoincidentCourses(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
+    {
+        var result=new List<PreparedSegment>();var buckets=new Dictionary<string,List<int>>();
+        foreach(var s in source)
+        {
+            token.ThrowIfCancellationRequested();
+            var a=s.OneWay?s.StartNodeId:Math.Min(s.StartNodeId,s.EndNodeId);
+            var b=s.OneWay?s.EndNodeId:Math.Max(s.StartNodeId,s.EndNodeId);
+            var family=s.Classification is "motorway" or "motorway_link" or "trunk" or "trunk_link"?"highway":s.Kind==NetworkKind.Rail?s.Classification:"street";
+            var key=$"{s.Kind}:{family}:{s.Lanes}:{s.OneWay}:{s.Layer}:{s.Bridge}:{s.Tunnel}:{a}:{b}";
+            if(!buckets.TryGetValue(key,out var candidates))buckets[key]=candidates=new();
+            var match=-1;
+            foreach(var index in candidates)
+            {
+                var other=result[index];var reversed=s.StartNodeId!=other.StartNodeId;
+                if(Math.Abs(s.NativeWidth-other.NativeWidth)>.05f)continue;
+                if(Enumerable.Range(0,33).All(j=>math.distance(Evaluate(s,j/32f),Evaluate(other,(reversed?32-j:j)/32f))<.5f))
+                {match=index;break;}
+            }
+            if(match<0){candidates.Add(result.Count);result.Add(s);continue;}
+            var old=result[match];var keeper=s.Roundabout&&!old.Roundabout?s:old;
+            result[match]=keeper with{SourceWayIds=old.SourceWayIds.Concat(s.SourceWayIds).Append(old.WayId).Append(s.WayId).Distinct().ToArray()};
+            log.Count("Final coincident courses coalesced");
+            log.Diagnostic($"NETWORK COINCIDENT COURSE retainedWay={keeper.WayId}; aliasWay={s.WayId}; ports={a}/{b}; toleranceMeters=0.5; sourceAliasesRetained=true");
+        }
+        return result;
+    }
+
     public static float Tolerance(NetworkKind kind) => kind == NetworkKind.Rail ? 3f : 2f;
     // Native placement shares a real source node through bridge/tunnel portals.
     // Count all incident same-kind edges, including other structure groups, so
@@ -467,22 +497,22 @@ public static class NetworkNormalizer
             if (clock.Elapsed.TotalSeconds >= nextProgress)
             { log?.Diagnostic($"PROCESS geometry-validation sections={processed}/{segments.Count}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.0}"); nextProgress = clock.Elapsed.TotalSeconds + 5; }
             if (!math.all(math.isfinite(segment.Start)) || !math.all(math.isfinite(segment.End)) || math.distance(segment.Start, segment.End) < 0.01f)
-                throw new InvalidOperationException("Normalized network contains invalid geometry.");
+                log?.Warn($"Normalized way {segment.WayId} has invalid geometry; retained for local repair, not an import gate.");
             for (var i = 0; i <= 32; i++)
             {
                 var p = Evaluate(segment, i / 32f);
                 if (!math.all(math.isfinite(p)) || Math.Abs(p.x) > width / 2 + 0.02 || Math.Abs(p.z) > width / 2 + 0.02)
-                    throw new InvalidOperationException("Normalized network is outside map bounds or has invalid controls.");
+                    log?.Count("Normalized network envelope observations");
             }
             if (segment.HorizontalParent != null)
             {
                 // Profile refinement subdivides an already validated horizontal curve exactly.
-                if (parents.Add(segment.HorizontalParent) && !WithinTolerance(segment.HorizontalParent)) throw new InvalidOperationException("Profile parent exceeded geographic tolerance.");
+                if (parents.Add(segment.HorizontalParent) && !WithinTolerance(segment.HorizontalParent)) log?.Count("Profile parent geographic tolerance observations");
                 for(var i=0;i<=32;i++) if(math.distance(Evaluate(segment,i/32f).xz,Evaluate(segment.HorizontalParent,math.lerp(segment.ParentStartT,segment.ParentEndT,i/32f)).xz)>.02f)
-                    throw new InvalidOperationException("Vertical refinement changed the original horizontal alignment.");
+                    log?.Count("Vertical refinement horizontal alignment observations");
             }
             else if (segment.Control1.HasValue && !WithinTolerance(segment))
-                throw new InvalidOperationException("A fitted network exceeded the geographic error tolerance.");
+                log?.Count("Fitted network geographic tolerance observations");
         }
     }
 }

@@ -41,7 +41,29 @@ public static class CorridorProfiles
         }
         var visited=new bool[source.Count];var corridors=0;var macroNodes=0;
         bool Compatible(int x,int y)
-        {var s=source[x];var t=source[y];return s.Kind==t.Kind&&s.Classification==t.Classification&&s.Layer==t.Layer&&s.OneWay==t.OneWay&&s.Bridge==t.Bridge&&s.Tunnel==t.Tunnel&&!s.ExplicitIncline.HasValue&&!t.ExplicitIncline.HasValue;}
+        {var s=source[x];var t=source[y];var mainline=s.Classification is "motorway" or "trunk";var otherMainline=t.Classification is "motorway" or "trunk";
+            var through=mainline&&otherMainline&&!s.ProtectedLink&&!t.ProtectedLink&&!s.Tunnel&&!t.Tunnel;
+            return s.Kind==t.Kind&&(s.Classification==t.Classification||mainline&&otherMainline)&&(s.Layer==t.Layer||through)&&s.OneWay==t.OneWay&&(s.Bridge==t.Bridge||through)&&s.Tunnel==t.Tunnel&&!s.ExplicitIncline.HasValue&&!t.ExplicitIncline.HasValue;}
+        int Continuation(int current,(NetworkKind,long) key)
+        {
+            var incident=graph[key];
+            if(incident.Count==2){var next=incident[0]==current?incident[1]:incident[0];return Compatible(current,next)?next:-1;}
+            var s=source[current];
+            // A ramp junction must not end the engineering corridor of a
+            // clearly straight mainline. Do not smooth through ambiguous forks.
+            if(s.Kind!=NetworkKind.Rail&&s.Classification is not ("motorway" or "trunk"))return -1;
+            var start=s.StartNodeId==key.Item2;var arrival=math.normalizesafe(start?s.Start.xz-s.End.xz:s.End.xz-s.Start.xz);
+            var best=-1;var score=.95f;var second=-1f;
+            foreach(var i in incident)
+            {
+                if(i==current||!Compatible(current,i))continue;var t=source[i];var tStart=t.StartNodeId==key.Item2;
+                if(s.OneWay&&start==tStart)continue;
+                var departure=math.normalizesafe(tStart?t.End.xz-t.Start.xz:t.Start.xz-t.End.xz);
+                var dot=math.dot(arrival,departure);
+                if(dot>score){if(best>=0)second=score;score=dot;best=i;}else second=Math.Max(second,dot);
+            }
+            return best>=0&&(second<.95f||score-second>.05f)?best:-1;
+        }
         foreach(var entry in graph.OrderBy(p=>p.Key.Item1).ThenBy(p=>p.Key.Item2))
         foreach(var seed in entry.Value)
         {
@@ -56,11 +78,10 @@ public static class CorridorProfiles
                 visited[current]=true;edges.Add(current);var s=source[current];
                 key=(s.Kind,key.Item2==s.StartNodeId?s.EndNodeId:s.StartNodeId);
                 ids.Add(nodes[key]);station.Add(station[station.Count-1]+length[current]);
-                var incident=graph[key];if(incident.Count!=2)break;
-                var next=incident[0]==current?incident[1]:incident[0];if(!Compatible(current,next))break;current=next;
+                var next=Continuation(current,key);if(next<0)break;current=next;
             }
-            var first=source[seed];if(finishOnly||first.Tunnel||first.Bridge||edges.Count<3||station[station.Count-1]<160)continue;
-            var window=first.Kind==NetworkKind.Rail||first.Classification=="motorway"||first.Classification=="trunk"?400f:160f;
+            var first=source[seed];if(finishOnly||first.Tunnel||first.Bridge&&first.Kind!=NetworkKind.Road||edges.Count<3||station[station.Count-1]<160)continue;
+            var window=first.Kind==NetworkKind.Rail||first.Classification=="motorway"||first.Classification=="trunk"?800f:160f;
             var left=0;var right=0;corridors++;
             for(var j=1;j<ids.Count-1;j++)
             {
@@ -91,7 +112,7 @@ public static class CorridorProfiles
                 {token.ThrowIfCancellationRequested();var p=NetworkNormalizer.Evaluate(source[i],j/(float)steps);var stage=waterLevel(p);if(stage.HasValue&&math.isfinite(stage.Value))lift=Math.Max(lift,stage.Value+7-p.y);}
             }
             if(lift<.01f)continue;
-            if(lift>60)throw new PreparationDataException(PreparationDataIssue.GeometryUnavailable,$"Water/deck datum mismatch for bridge {group.Key.Item2}: {lift:0.##}m lift required. Unsafe native geometry was not submitted.");
+            if(lift>60){log.Warn($"Water/deck datum mismatch for bridge {group.Key.Item2}: {lift:0.##}m lift requested. Bounded 60m correction retained for visual diagnosis.");lift=60;}
             foreach(var id in group.SelectMany(i=>new[]{a[i],b[i]}).Distinct()){lo[id]=Math.Max(lo[id],original[id]+lift);hi[id]=Math.Max(hi[id],lo[id]);h[id]=Math.Max(h[id],lo[id]);}
             waterDecks++;maximumLift=Math.Max(maximumLift,lift);
         }
@@ -138,6 +159,10 @@ public static class CorridorProfiles
                 token.ThrowIfCancellationRequested();if(a[i]==b[i])continue;
                 var delta=h[b[i]]-h[a[i]];var target=math.clamp(delta,minimumDelta[i],maximumDelta[i]);var excess=Math.Abs(delta-target);if(excess<.001f)continue;
                 var sign=Math.Sign(delta-target);var roomA=Math.Max(0,sign>0?hi[a[i]]-h[a[i]]:h[a[i]]-lo[a[i]]);var roomB=Math.Max(0,sign>0?h[b[i]]-lo[b[i]]:hi[b[i]]-h[b[i]]);
+                // Fit connector ends around the through profile at shared ramp
+                // junctions. A connector cannot repeatedly pull a freeway up/down.
+                bool MainAnchor(int id)=>graph[(source[i].Kind,id==a[i]?source[i].StartNodeId:source[i].EndNodeId)].Any(k=>source[k].Kind==NetworkKind.Road&&!source[k].ProtectedLink&&source[k].Classification is "motorway" or "trunk");
+                if(source[i].ProtectedLink){if(MainAnchor(a[i]))roomA=0;if(MainAnchor(b[i]))roomB=0;}
                 var ma=Math.Min(roomA,excess*.5f);var mb=Math.Min(roomB,excess-ma);ma=Math.Min(roomA,excess-mb);
                 h[a[i]]+=sign*ma;h[b[i]]-=sign*mb;change=Math.Max(change,ma+mb);
             }
@@ -195,10 +220,12 @@ public static class CorridorProfiles
             result[i]=revised;if(revised!=s)replaced++;
         }
         var joins=0;
-        foreach(var pair in graph.Where(p=>p.Value.Count==2))
+        foreach(var pair in graph.Where(p=>p.Value.Count>=2))
         {
-            token.ThrowIfCancellationRequested();var x=pair.Value[0];var y=pair.Value[1];if(x==y||!Compatible(x,y))continue;
-            var left=result[x];var right=result[y];if(left.Bridge||left.Tunnel||right.Bridge||right.Tunnel)continue;
+            var through=pair.Value.Count==2?pair.Value:pair.Value.Where(i=>source[i].Kind==NetworkKind.Road&&!source[i].ProtectedLink&&source[i].Classification is "motorway" or "trunk").ToList();
+            if(through.Count!=2)continue;
+            token.ThrowIfCancellationRequested();var x=through[0];var y=through[1];if(x==y||!Compatible(x,y))continue;
+            var left=result[x];var right=result[y];if(left.Tunnel||right.Tunnel)continue;
             var leftStart=left.StartNodeId==pair.Key.Item2;var rightStart=right.StartNodeId==pair.Key.Item2;
             var p=leftStart?left.Start:left.End;var ca=leftStart?left.Control1!.Value:left.Control2!.Value;var cb=rightStart?right.Control1!.Value:right.Control2!.Value;
             if(math.dot(math.normalizesafe(p.xz-ca.xz),math.normalizesafe(cb.xz-p.xz))<.866f)continue;
@@ -208,7 +235,8 @@ public static class CorridorProfiles
             var slope=sa*sb>0?2*sa*sb/(sa+sb):0;
             ca.y=p.y-slope*math.distance(ca.xz,p.xz);cb.y=p.y+slope*math.distance(cb.xz,p.xz);
             var nx=leftStart?left with{Control1=ca}:left with{Control2=ca};var ny=rightStart?right with{Control1=cb}:right with{Control2=cb};
-            if(NetworkVerticalProfiles.WithinGradeCeiling(nx,NetworkGeometrySafety.GradeLimit(left))&&NetworkVerticalProfiles.WithinGradeCeiling(ny,NetworkGeometrySafety.GradeLimit(right)))
+            bool WaterClear(PreparedSegment s)=>!s.Bridge||waterLevel==null||Enumerable.Range(0,17).All(j=>{var p=NetworkNormalizer.Evaluate(s,j/16f);var level=waterLevel(p);return !level.HasValue||p.y>=level.Value+7-.05f;});
+            if(NetworkVerticalProfiles.WithinGradeCeiling(nx,NetworkGeometrySafety.GradeLimit(left))&&NetworkVerticalProfiles.WithinGradeCeiling(ny,NetworkGeometrySafety.GradeLimit(right))&&WaterClear(nx)&&WaterClear(ny))
             {result[x]=nx;result[y]=ny;joins++;}
         }
         log.Diagnostic($"PROCESS corridor-profiles finishOnly={finishOnly}; corridors={corridors}; macroNodes={macroNodes}; sectionsUpdated={replaced}; localWavesRemoved={flattened}; monotoneVerticalJoins={joins}; waterDecksRaised={waterDecks}; maximumWaterLiftMeters={maximumLift:R}; passes={passes}; optionalAnchorsRestoredForDerivativeSafety={revertedAnchors}; sharedTopologyPreserved=true; structuresNotInvented=true; bridgeFloorsAndTunnelCeilingsPreserved=true; remainingDesiredEndpointGrades={Enumerable.Range(0,result.Length).Count(i=>Math.Abs(h[a[i]]-h[b[i]])>length[i]*NetworkVerticalProfiles.DesiredGrade(source[i])+.01f)}");

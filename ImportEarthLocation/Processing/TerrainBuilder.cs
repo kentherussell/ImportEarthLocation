@@ -301,7 +301,7 @@ public static class TerrainBuilder
                 }
                 labels[row*maskSize+column]=value;if(value==1)accepted++;if(value>=2)unknown++;
             }
-            ocean=new OceanMask(maskSize,requestWidth(bounds),labels,"directed-coast-v2");
+            ocean=new OceanMask(maskSize,requestWidth(bounds),labels,"directed-coast-two-axis-v3");
             log?.Diagnostic($"OCEAN HANDOFF resolution={maskSize}; acceptedSamples={accepted}; unknownSamples={unknown}; rowOrientation=south-to-north; registration=corner-aligned; classificationIsNotNativeNavigability=true");
         }
         return new Result(output, scale, seaLevel, minimum, maximum) { ConditioningSummary = conditioned.Metrics.ToString(),Ocean=ocean };

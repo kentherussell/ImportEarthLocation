@@ -9,6 +9,8 @@ namespace ImportEarthLocation.Processing;
 
 public static class RoundaboutPlanner
 {
+    private static float[] _stockRadii=Array.Empty<float>();
+    public static void ConfigureStockRadii(IEnumerable<float> radii) => _stockRadii=radii.Distinct().OrderBy(r=>r).Take(3).ToArray();
     public static IReadOnlyList<PreparedSegment> Prepare(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
     {
         var rings=source.Where(s=>s.Roundabout&&s.Kind==NetworkKind.Road&&!s.Bridge&&!s.Tunnel).ToArray();
@@ -19,7 +21,10 @@ public static class RoundaboutPlanner
         foreach(var s in rings)foreach(var id in new[]{s.StartNodeId,s.EndNodeId})
         {if(!byNode.TryGetValue(id,out var list))byNode[id]=list=new();list.Add(s);}
         var visited=new HashSet<PreparedSegment>();var replacements=new Dictionary<PreparedSegment,PreparedSegment>();
+        var extraArcs=new Dictionary<PreparedSegment,List<PreparedSegment>>();
         var removed=new HashSet<PreparedSegment>();var remap=new Dictionary<long,(long id,float3 point,float radius)>();
+        var ringPositions=new Dictionary<long,float3>();
+        var circles=new Dictionary<long,(float3 center,float radius)>();
         var allIds=new HashSet<long>(source.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));var next=long.MinValue+2000000;
         var smooth=0;var compact=0;
         foreach(var seed in rings)
@@ -33,26 +38,63 @@ public static class RoundaboutPlanner
             var center=default(float3);
             foreach(var s in edges)center+=(s.Start+s.End)*.5f*math.distance(s.Start.xz,s.End.xz)/length;
             var radius=edges.Sum(s=>(math.distance(s.Start.xz,center.xz)+math.distance(s.End.xz,center.xz))*.5f*math.distance(s.Start.xz,s.End.xz))/length;
-            if(radius<3||edges.Any(s=>Math.Abs(math.distance(s.Start.xz,center.xz)-radius)>Math.Max(1.5f,radius*.12f)))continue;
+            if(radius<3)continue;
+            var circular=edges.All(s=>Math.Abs(math.distance(s.Start.xz,center.xz)-radius)<=Math.Max(2f,radius*.2f));
             var approaches=ids.SelectMany(id=>incident[id]).Where(s=>!group.Contains(s)).Distinct().ToArray();
-            if(radius<=18 && approaches.Length>=3 && approaches.Length<=6 && approaches.All(s=>s.Kind==NetworkKind.Road&&!s.OneWay&&!s.Bridge&&!s.Tunnel&&!s.ProtectedLink&&s.Layer==edges[0].Layer&&!(ids.Contains(s.StartNodeId)&&ids.Contains(s.EndNodeId))&&math.distance(s.Start.xz,s.End.xz)>radius+12))
+            var stockRadii=_stockRadii;
+            var stockRadius=stockRadii.Length==0?0:stockRadii.OrderBy(r=>Math.Abs(r-radius)).ThenByDescending(r=>r).First();
+            if(circular&&stockRadius>0&&radius<=stockRadii[stockRadii.Length-1] && approaches.Length>=3 && approaches.Length<=6 && approaches.All(s=>s.Kind==NetworkKind.Road&&!s.OneWay&&!s.Bridge&&!s.Tunnel&&!s.ProtectedLink&&s.Layer==edges[0].Layer&&!(ids.Contains(s.StartNodeId)&&ids.Contains(s.EndNodeId))&&math.distance(s.Start.xz,s.End.xz)>stockRadius+12))
             {
                 while(allIds.Contains(next))next++;var node=next++;allIds.Add(node);
-                foreach(var id in ids)remap[id]=(node,center,radius);
+                foreach(var id in ids)remap[id]=(node,center,stockRadius);
                 removed.UnionWith(group);compact++;
-                log.Diagnostic($"ROUNDABOUT native-node planned; sourceWays={string.Join(",",edges.Select(s=>s.WayId).Distinct())}; sourceRadiusMeters={radius:0.##}; approaches={approaches.Length}; nativeRadiusDerivedFromComposition=true");
+                log.Diagnostic($"ROUNDABOUT native-node planned; sourceWays={string.Join(",",edges.Select(s=>s.WayId).Distinct())}; sourceRadiusMeters={radius:0.##}; selectedStockCenterlineRadiusMeters={stockRadius}; approaches={approaches.Length}; nativeRadiusDerivedFromStockGeometry=true");
                 continue;
             }
             foreach(var s in edges)
             {
+                replacements[s]=s with{Classification="primary",OneWay=true,Lanes=2,Control1=math.lerp(s.Start,s.End,1f/3),Control2=math.lerp(s.Start,s.End,2f/3)};
+                if(!circular)
+                {
+                    var before=byNode[s.StartNodeId].First(e=>e!=s);var after=byNode[s.EndNodeId].First(e=>e!=s);
+                    var p=before.StartNodeId==s.StartNodeId?before.End:before.Start;var q=after.StartNodeId==s.EndNodeId?after.End:after.Start;
+                    var irregularReach=math.distance(s.Start.xz,s.End.xz)/3;
+                    var irregularStart=math.normalizesafe((s.End-p).xz);var irregularEnd=math.normalizesafe((q-s.Start).xz);
+                    replacements[s]=s with{Classification="primary",OneWay=true,Lanes=2,Control1=s.Start+new float3(irregularStart.x,0,irregularStart.y)*irregularReach,Control2=s.End-new float3(irregularEnd.x,0,irregularEnd.y)*irregularReach,SourceGeometry=new[]{s.Start,s.End}};smooth++;
+                    continue;
+                }
                 var a=s.Start.xz-center.xz;var b=s.End.xz-center.xz;var cross=a.x*b.y-a.y*b.x;
                 var angle=(float)Math.Acos(math.clamp(math.dot(math.normalizesafe(a),math.normalizesafe(b)),-1,1));
-                if(angle>.8f||angle<.001f)continue;
+                var start=center+new float3(math.normalizesafe(a).x*radius,s.Start.y-center.y,math.normalizesafe(a).y*radius);
+                var end=center+new float3(math.normalizesafe(b).x*radius,s.End.y-center.y,math.normalizesafe(b).y*radius);
+                ringPositions[s.StartNodeId]=start;ringPositions[s.EndNodeId]=end;
+                circles[s.StartNodeId]=(center,radius);circles[s.EndNodeId]=(center,radius);
+                if(angle<.001f)
+                {replacements[s]=replacements[s] with{Start=start,End=end,Control1=math.lerp(start,end,1f/3),Control2=math.lerp(start,end,2f/3)};continue;}
+                if(angle>(float)Math.PI/2+.001f)
+                {
+                    var ringSign=edges.Sum(e=>(e.Start.x-center.x)*(e.End.z-center.z)-(e.Start.z-center.z)*(e.End.x-center.x))>=0?1f:-1f;
+                    var arcSign=Math.Abs(cross)<.01f?ringSign:cross>=0?1f:-1f;
+                    var beginAngle=(float)Math.Atan2(a.y,a.x);var arcCount=(int)Math.Ceiling(angle/((float)Math.PI/2));
+                    var arcStart=start;var arcStartId=s.StartNodeId;var extras=new List<PreparedSegment>();
+                    for(var k=1;k<=arcCount;k++)
+                    {
+                        var theta=beginAngle+arcSign*angle*k/arcCount;
+                        var arcEnd=k==arcCount?end:center+new float3((float)Math.Cos(theta)*radius,math.lerp(start.y,end.y,k/(float)arcCount)-center.y,(float)Math.Sin(theta)*radius);
+                        var arcEndId=s.EndNodeId;if(k<arcCount){while(allIds.Contains(next))next++;arcEndId=next++;allIds.Add(arcEndId);circles[arcEndId]=(center,radius);}
+                        var va=arcStart.xz-center.xz;var vb=arcEnd.xz-center.xz;
+                        var at=math.normalizesafe(new float2(-va.y,va.x))*arcSign;var bt=math.normalizesafe(new float2(-vb.y,vb.x))*arcSign;
+                        var arcReach=4f/3*radius*(float)Math.Tan(angle/arcCount/4);
+                        var part=s with{Classification="primary",OneWay=true,Lanes=2,Start=arcStart,End=arcEnd,StartNodeId=arcStartId,EndNodeId=arcEndId,
+                            Control1=arcStart+new float3(at.x,0,at.y)*arcReach,Control2=arcEnd-new float3(bt.x,0,bt.y)*arcReach,SourceGeometry=new[]{arcStart,arcEnd}};
+                        if(k==1)replacements[s]=part;else extras.Add(part);arcStart=arcEnd;arcStartId=arcEndId;smooth++;
+                    }
+                    extraArcs[s]=extras;continue;
+                }
                 var sign=cross>=0?1f:-1f;var ta=math.normalizesafe(new float2(-a.y,a.x))*sign;var tb=math.normalizesafe(new float2(-b.y,b.x))*sign;
                 var reach=4f/3*radius*(float)Math.Tan(angle/4);
-                var c1=s.Start+new float3(ta.x,0,ta.y)*reach;var c2=s.End-new float3(tb.x,0,tb.y)*reach;
-                var candidate=s with{Control1=c1,Control2=c2,SourceGeometry=new[]{s.Start,s.End}};
-                if(!NetworkNormalizer.WithinTolerance(candidate))continue;
+                var c1=start+new float3(ta.x,0,ta.y)*reach;var c2=end-new float3(tb.x,0,tb.y)*reach;
+                var candidate=s with{Classification="primary",OneWay=true,Lanes=2,Start=start,End=end,Control1=c1,Control2=c2,SourceGeometry=new[]{start,end}};
                 replacements[s]=candidate;smooth++;
             }
         }
@@ -61,6 +103,7 @@ public static class RoundaboutPlanner
         {
             if(removed.Contains(original))continue;
             var s=replacements.TryGetValue(original,out var fitted)?fitted:original;
+            if(!original.Roundabout){if(ringPositions.TryGetValue(s.StartNodeId,out var ringStart))s=s with{Start=ringStart,Control1=null,Control2=null};if(ringPositions.TryGetValue(s.EndNodeId,out var ringEnd))s=s with{End=ringEnd,Control1=null,Control2=null};}
             if(remap.TryGetValue(s.StartNodeId,out var a))s=s with{StartNodeId=a.id,Start=a.point,StartRoundaboutRadius=a.radius,Control1=null,Control2=null,SourceGeometry=Array.Empty<float3>()};
             if(remap.TryGetValue(s.EndNodeId,out var b))s=s with{EndNodeId=b.id,End=b.point,EndRoundaboutRadius=b.radius,Control1=null,Control2=null,SourceGeometry=Array.Empty<float3>()};
             if(s.Kind==NetworkKind.Road&&!s.Bridge&&!s.Tunnel)
@@ -69,8 +112,48 @@ public static class RoundaboutPlanner
                 if(s.EndMiniRoundabout&&incident.TryGetValue(s.EndNodeId,out var endArms)&&endArms.Count>=3)s=s with{EndRoundaboutRadius=Math.Max(s.EndRoundaboutRadius,6)};
             }
             result.Add(s);
+            if(extraArcs.TryGetValue(original,out var extras))result.AddRange(extras);
         }
-        log.Diagnostic($"ROUNDABOUT PREPARATION curvedRingSections={smooth}; nativeSmallJunctions={compact}; taggedMiniApproaches={result.Count(s=>s.StartMiniRoundabout||s.EndMiniRoundabout)}; incompleteAndNonCircularRingsPreserved=true");
+        // Compact only degree-two circle nodes; never remove an approach attachment.
+        var compactedArcs=0;var compactedIrregular=0;
+        var arcRemoved=new HashSet<PreparedSegment>();
+        var degree=result.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}).GroupBy(n=>n).ToDictionary(g=>g.Key,g=>g.Count());
+        var outgoing=result.Where(s=>s.Roundabout).GroupBy(s=>s.StartNodeId).ToDictionary(g=>g.Key,g=>g.ToArray());
+        for(var i=0;i<result.Count;i++)
+        {
+            token.ThrowIfCancellationRequested();if(arcRemoved.Contains(result[i]))continue;
+            while(true)
+            {
+                var a=result[i];if(!a.Roundabout||degree[a.EndNodeId]!=2||!outgoing.TryGetValue(a.EndNodeId,out var nextArcs)||nextArcs.Length!=1)break;
+                var b=nextArcs[0];if(a==b||arcRemoved.Contains(b)||a.StartNodeId==b.EndNodeId)break;
+                if(!circles.TryGetValue(a.EndNodeId,out var circle))
+                {
+                    if(!a.Control1.HasValue||!b.Control2.HasValue||math.distance(a.Start.xz,b.End.xz)>160)break;
+                    var taIrregular=math.normalizesafe((a.Control1.Value-a.Start).xz);var tbIrregular=math.normalizesafe((b.End-b.Control2.Value).xz);
+                    if(math.dot(taIrregular,tbIrregular)<.6f)break;
+                    var irregularReach=math.distance(a.Start.xz,b.End.xz)/3;
+                    var originalPoints=a.SourceGeometry.Concat(b.SourceGeometry.Skip(1)).ToArray();
+                    var irregular=a with{End=b.End,EndNodeId=b.EndNodeId,Control1=a.Start+new float3(taIrregular.x,0,taIrregular.y)*irregularReach,Control2=b.End-new float3(tbIrregular.x,0,tbIrregular.y)*irregularReach,
+                        SourceWayIds=a.SourceWayIds.Concat(b.SourceWayIds).Distinct().ToArray(),OriginalGeometry=a.OriginalGeometry.Concat(b.OriginalGeometry).ToArray(),SourceGeometry=originalPoints};
+                    if(!NetworkNormalizer.WithinTolerance(irregular,3f))break;
+                    result[i]=irregular;outgoing[a.StartNodeId]=new[]{irregular};outgoing.Remove(b.StartNodeId);arcRemoved.Add(b);compactedIrregular++;continue;
+                }
+                var startVector=a.Start.xz-circle.center.xz;var endVector=b.End.xz-circle.center.xz;
+                var startAngle=(float)Math.Atan2(startVector.y,startVector.x);var endAngle=(float)Math.Atan2(endVector.y,endVector.x);
+                var firstDelta=a.End.xz-a.Start.xz;var sign=startVector.x*firstDelta.y-startVector.y*firstDelta.x>=0?1f:-1f;
+                var sweep=(endAngle-startAngle)*sign;while(sweep<0)sweep+=2*(float)Math.PI;
+                if(sweep>(float)Math.PI/2+.001f)break;
+                var reach=4f/3*circle.radius*(float)Math.Tan(sweep/4);
+                var ta=math.normalizesafe(new float2(-startVector.y,startVector.x))*sign;var tb=math.normalizesafe(new float2(-endVector.y,endVector.x))*sign;
+                var merged=a with{End=b.End,EndNodeId=b.EndNodeId,Control1=a.Start+new float3(ta.x,0,ta.y)*reach,Control2=b.End-new float3(tb.x,0,tb.y)*reach,
+                    SourceWayIds=a.SourceWayIds.Concat(b.SourceWayIds).Distinct().ToArray(),OriginalGeometry=a.OriginalGeometry.Concat(b.OriginalGeometry).ToArray(),SourceGeometry=new[]{a.Start,b.End}};
+                result[i]=merged;outgoing[a.StartNodeId]=new[]{merged};outgoing.Remove(b.StartNodeId);arcRemoved.Add(b);compactedArcs++;
+            }
+        }
+        result.RemoveAll(arcRemoved.Contains);
+        log.Count("Roundabout degree-two nodes simplified",compactedArcs);
+        log.Count("Irregular roundabout degree-two nodes simplified",compactedIrregular);
+        log.Diagnostic($"ROUNDABOUT PREPARATION curvedRingSections={smooth}; nativeSmallJunctions={compact}; circularizedRingNodes={ringPositions.Count}; taggedMiniApproaches={result.Count(s=>s.StartMiniRoundabout||s.EndMiniRoundabout)}; incompleteRingsPreserved=true; oversizedRingPalette=regular-oneway-two-lanes");
         return result;
     }
 }
@@ -105,7 +188,7 @@ public static class NetworkCutPlanner
         var result=source.ToArray();var inferred=0;var explicitCount=0;var taggedCuts=0;
         for(var index=0;index<result.Length;index++)
         {
-            token.ThrowIfCancellationRequested();var s=result[index];if(s.Bridge||s.Tunnel)continue;
+            token.ThrowIfCancellationRequested();var s=result[index];if(s.Kind==NetworkKind.Rail){result[index]=s with{ExplicitWallSides=NetworkSides.None,RetainingWallSides=NetworkSides.None,QuaySides=NetworkSides.None};continue;}if(s.Bridge||s.Tunnel)continue;
             var sides=s.ExplicitWallSides;var half=Math.Max(4,s.NativeWidth*.5f);var tests=9;
             foreach(var left in new[]{true,false})
             {

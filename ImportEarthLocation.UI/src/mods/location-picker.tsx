@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { bindValue, trigger, useValue } from "cs2/api";
-import { Button, Panel, Scrollable } from "cs2/ui";
+import { Button, Panel, Scrollable, Tooltip } from "cs2/ui";
 import styles from "./import-earth-location.module.scss";
 
 const group = "ImportEarthLocation";
@@ -125,8 +125,8 @@ export const LocationPicker = ({ initial, mapExt, onCommit, onClose }: { initial
         <label className={styles.field}>Latitude<input value={latitude} onChange={e => setLatitude(e.target.value)} onBlur={manual} /></label>
         <label className={styles.field}>Longitude<input value={longitude} onChange={e => setLongitude(e.target.value)} onBlur={manual} /></label>
       </div>
-      <div className={styles.actions}>{["vanilla", ...(mapExt ? ["mapext28", "mapext57"] : [])].map(id =>
-        <Button key={id} variant="flat" className={styles.configChoice} selected={id === size} onSelect={() => setSize(id)}>{mapWidth(id) / 1000} km</Button>)}</div>
+      <Tooltip tooltip="Other map sizes are not available in the alpha version." direction="up"><div className={styles.actions}>{["vanilla", ...(mapExt ? ["mapext28", "mapext57"] : [])].map(id =>
+        <Button key={id} variant="flat" className={styles.configChoice} disabled selected={id === size} onSelect={() => setSize(id)}>{mapWidth(id) / 1000} km</Button>)}</div></Tooltip>
       <div className={styles.notice}>Search: Photon / OpenStreetMap; fallback Open-Meteo / GeoNames. Terrain import currently supports latitudes ±85° and does not cross the date line.</div>
       {error && <div className={styles.error}>{error}</div>}
       <div className={styles.actions}><Button variant="flat" className={`${styles.actionButton} ${styles.primary}`} disabled={committing} onSelect={() => {

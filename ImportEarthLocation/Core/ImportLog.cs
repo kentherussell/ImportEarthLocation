@@ -20,6 +20,11 @@ public sealed class ImportLog
     private string? _archiveFailure;
     private readonly HashSet<string> _artifactWarnings = new(StringComparer.Ordinal);
     private double _artifactSeconds;
+    private volatile bool _diagnosticsEnabled;
+    public bool DiagnosticsEnabled { get=>_diagnosticsEnabled; set=>_diagnosticsEnabled=value; }
+    private readonly Dictionary<string,int> _normalRepeats=new(StringComparer.Ordinal);
+    private int _suppressedLines;
+    private static readonly System.Text.RegularExpressions.Regex Numbers=new(@"[-+]?\d+(?:\.\d+)?",System.Text.RegularExpressions.RegexOptions.Compiled);
 
     public void CloseArchive(string? state = null)
     {
@@ -32,10 +37,12 @@ public sealed class ImportLog
 
     public void BeginArchive(ImportRequest request)
     {
+        DiagnosticsEnabled=request.DiagnosticsEnabled;
         // Called on the game thread: workers never read Unity's persistent-data path.
         lock (_archiveGate) lock (_gate)
         {
             _archive = null; _archivePending.Clear(); _archiveFailure = null; _artifactWarnings.Clear(); _artifactSeconds=0;
+            if(!DiagnosticsEnabled)return;
             try
             {
                 var root = System.IO.Path.Combine(UnityEngine.Application.persistentDataPath, "ModsData", Mod.Id, "diagnostics", "runs");
@@ -60,6 +67,11 @@ public sealed class ImportLog
 
     public void FlushArchive(string? state = null)
     {
+        if(!DiagnosticsEnabled)
+        {
+            if(state!=null&&(state=="completed"||state.Contains("failed")||state.Contains("stopped")||state.Contains("unavailable")||state.Contains("interrupted")))ReportSuppressed();
+            return;
+        }
         string? failure=null;
         // Serialize archive lifecycle/writes separately from worker logging.
         // Disk I/O must not hold the metrics/progress lock.
@@ -84,6 +96,7 @@ public sealed class ImportLog
 
     private void Artifact(string label, Action<RunArchive> write)
     {
+        if(!DiagnosticsEnabled)return;
         string? failure = null;
         var clock=System.Diagnostics.Stopwatch.StartNew();double seconds;
         lock (_archiveGate)
@@ -121,7 +134,7 @@ public sealed class ImportLog
     public void CapturePrepared(PreparedImport prepared)
         => Artifact("prepared-plan", archive => { DiagnosticArtifacts.CapturePrepared(archive, prepared); Diagnostic("PREPARED ARTIFACTS network/height/water/vegetation/surface; see per-file truncation metadata; localOnly=true"); });
 
-    public void ResetMetrics() { lock (_gate) _metrics.Clear(); }
+    public void ResetMetrics() { lock (_gate) { _metrics.Clear();_normalRepeats.Clear();_suppressedLines=0; } }
     public void Clear() { lock (_gate) { _lines.Clear(); _lineHead=0; _metrics.Clear(); } Changed?.Invoke(); }
     public void Count(string name, int count = 1) { lock (_gate) { _metrics.TryGetValue(name, out var value); _metrics[name] = value + count; } }
     public void Time(string name, double seconds) { lock (_gate) _metrics[name + " time (s)"] = seconds; }
@@ -138,6 +151,7 @@ public sealed class ImportLog
     // diagnostic summaries, not every download or geometry message.
     public void Diagnostic(string message)
     {
+        if(!DiagnosticsEnabled)return;
         var tagged = "[IEL-DIAG] " + message;
         Info(tagged);
         UnityEngine.Debug.Log(tagged);
@@ -155,6 +169,13 @@ public sealed class ImportLog
 
     private void Add(string level, string message)
     {
+        // Keep important warnings/errors, but show only a few examples of a
+        // repeated per-source condition in normal mode. Full mode is unfiltered.
+        if(!DiagnosticsEnabled&&level!="ERROR")
+        {
+            var key=level+":"+Numbers.Replace(message.Length>240?message.Substring(0,240):message,"#");
+            lock(_gate){_normalRepeats.TryGetValue(key,out var count);_normalRepeats[key]=count+1;if(count>=3){_suppressedLines++;return;}}
+        }
         var line = $"{DateTime.Now:HH:mm:ss} [{level}] {message}";
         lock (_gate)
         {
@@ -167,5 +188,11 @@ public sealed class ImportLog
         else if (level == "WARN") Mod.Log.Warn(line);
         else Mod.Log.Info(line);
         Changed?.Invoke();
+    }
+
+    public void ReportSuppressed()
+    {
+        int count;lock(_gate){count=_suppressedLines;_suppressedLines=0;}
+        if(count>0)Info($"Omitted {count} repeated log entries. Enable diagnostics before preparation for full per-source details.");
     }
 }

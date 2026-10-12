@@ -86,13 +86,16 @@ public static class OsmRecovery
                 if(nodes.TryGetValue((segment.Kind,id),out var known))return known;
                 if(segment.SourceGeometry.Count>=2)
                 {var original=segment.SourceGeometry[start?0:segment.SourceGeometry.Count-1];if(math.all(math.isfinite(original)))return original;}
-                throw new InvalidOperationException($"Cannot recover {segment.Kind} way {segment.WayId} node {id}: no finite source anchor. Complete network retained; no section silently omitted.");
+                return new float3(float.NaN);
             }
             float3 Node(long id,float3 p)
             {var key=(segment.Kind,id); if(nodes.TryGetValue(key,out var saved))return saved; return nodes[key]=Bound(p);}
             var anchorsRecovered=!math.all(math.isfinite(segment.Start))||!math.all(math.isfinite(segment.End));
-            var a=Node(segment.StartNodeId,Recover(segment.StartNodeId,segment.Start,true)); var d=Node(segment.EndNodeId,Recover(segment.EndNodeId,segment.End,false));
-            if(math.distance(a,d)<.01f)throw new InvalidOperationException($"Cannot recover degenerate {segment.Kind} way {segment.WayId} ({segment.StartNodeId}-{segment.EndNodeId}); no disconnected subset will be applied.");
+            var recoveredStart=Recover(segment.StartNodeId,segment.Start,true);var recoveredEnd=Recover(segment.EndNodeId,segment.End,false);
+            if(!math.all(math.isfinite(recoveredStart))||!math.all(math.isfinite(recoveredEnd)))
+            {log.Count("Irrecoverable network sections omitted");log.Warn($"No finite source anchor for {segment.Kind} way {segment.WayId}; only this section omitted.");continue;}
+            var a=Node(segment.StartNodeId,recoveredStart);var d=Node(segment.EndNodeId,recoveredEnd);
+            if(math.distance(a,d)<.01f){log.Count("Degenerate network sections omitted");continue;}
             var changed=anchorsRecovered||math.distance(a,segment.Start)>.001f||math.distance(d,segment.End)>.001f;
             var c1=segment.Control1; var c2=segment.Control2;
             bool Valid(float3? p)=>!p.HasValue||math.all(math.isfinite(p.Value))&&Math.Abs(p.Value.x)<=half&&Math.Abs(p.Value.z)<=half;

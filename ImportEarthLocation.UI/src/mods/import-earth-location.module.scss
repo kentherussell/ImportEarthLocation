@@ -1,4 +1,11 @@
 .host { pointer-events: none; }
+.launcherHostInline { display: flex; align-items: center; flex-shrink: 0; margin-left: 4rem; pointer-events: auto; }
+.launcherHostFallback { position: fixed; right: 20rem; bottom: 90rem; z-index: 10005; pointer-events: auto; }
+.launcherButton { display: flex; align-items: center; justify-content: center; box-sizing: border-box; width: 44rem; height: 44rem; min-width: 44rem; max-width: 44rem; min-height: 44rem; max-height: 44rem; overflow: hidden; flex-shrink: 0; padding: 4rem; color: white; background: rgba(20, 38, 51, .94); border-radius: 4rem; pointer-events: auto; }
+.launcherButton:hover { background: rgba(75, 87, 97, .95); }
+.launcherButton:global(.selected) { background: #16769a; }
+.launcherIcon { display: block; width: 32rem; height: 32rem; min-width: 32rem; max-width: 32rem; min-height: 32rem; max-height: 32rem; flex-shrink: 0; object-fit: contain; pointer-events: none; }
+.sizeToggle:disabled { opacity: .45; pointer-events: none; }
 .picker { position: fixed; top: 60rem; left: 50%; margin-left: -218rem; width: 436rem; z-index: 10002; pointer-events: auto; background: #10202d; border: 1rem solid #476b83; }
 .search { display: flex; gap: 8rem; margin-bottom: 8rem; }
 .search input { flex: 1; background: #172e3d; color: white; padding: 8rem; border: 1rem solid #4c7087; }
@@ -13,7 +20,7 @@
 .coordinates { display: flex; gap: 8rem; }
 .coordinates .field { width: 196rem; }
 .launcher {
-  position: fixed; right: 230rem; bottom: 14rem; z-index: 9999; pointer-events: auto;
+  position: fixed; left: 50%; transform: translateX(-50%); bottom: 76rem; z-index: 9999; pointer-events: auto;
   width: 44rem; height: 44rem; border-radius: 4rem; color: white;
   background: rgba(20, 38, 51, .94); border: 1rem solid rgba(130, 174, 201, .7);
 }

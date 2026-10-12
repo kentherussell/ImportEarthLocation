@@ -66,33 +66,40 @@ public static class NativeVegetationPlacement
     {
         var definitions = new List<Entity>(count);
         var failures = 0;
+        var archetype=manager.CreateArchetype(ComponentType.ReadWrite<CreationDefinition>(),ComponentType.ReadWrite<ObjectDefinition>(),ComponentType.ReadWrite<Updated>());
+        var counts=new Dictionary<string,int>();
+        void Count(string name){counts.TryGetValue(name,out var value);counts[name]=value+1;}
         var palettes=Enum.GetValues(typeof(VegetationForm)).Cast<VegetationForm>().ToDictionary(form=>form,form=>prefabs.Where(p=>p.Form==form && !Placeholder(p.Name)).ToArray());
+        using var allocated=new NativeArray<Entity>(count,Allocator.Temp);
+        manager.CreateEntity(archetype,allocated);
         for (var i = start; i < start + count; i++)
         {
-            var entity = Entity.Null;
+            var entity = allocated[i-start];
             try
             {
                 var candidate=points[i];var point=candidate.Position;var seed=candidate.Seed;
                 var palette=palettes[candidate.Form];
                 // Unknown exact species may use a same-form stock asset, but a
                 // missing palm/conifer palette must not become unrelated foliage.
-                if(palette.Length==0){log.Count("Vegetation unavailable stock palette "+candidate.Form);continue;}
+                if(palette.Length==0){manager.DestroyEntity(entity);Count("Vegetation unavailable stock palette "+candidate.Form);continue;}
                 var selected=palette[seed%(uint)palette.Length];
-                entity = manager.CreateEntity();
-                manager.AddComponentData(entity, new CreationDefinition
+                // Allocate the final definition archetype once, avoiding three
+                // structural migrations per candidate. Native initialization is
+                // unchanged: these remain tool definitions, not raw Tree entities.
+                manager.SetComponentData(entity, new CreationDefinition
                 {
                     m_Prefab = selected.Entity, m_SubPrefab = Entity.Null, m_Original = Entity.Null,
                     m_Owner = Entity.Null, m_Attached = Entity.Null, m_Flags = 0, m_RandomSeed = (int)seed
                 });
-                manager.AddComponentData(entity, new ObjectDefinition
+                manager.SetComponentData(entity, new ObjectDefinition
                 {
                     m_Position = point, m_LocalPosition = float3.zero, m_Scale = new float3(1),
                     m_Rotation = quaternion.RotateY(seed / (float)uint.MaxValue * math.PI * 2), m_LocalRotation = quaternion.identity,
                     m_Elevation = 0, m_Intensity = 1, m_Age = 1, m_ParentMesh = -1, m_GroupIndex = -1, m_Probability = 100, m_PrefabSubIndex = -1
                 });
-                manager.AddComponentData(entity, default(Updated)); definitions.Add(entity);
-                log.Count("Vegetation definitions "+selected.Form);
-                log.Count("Vegetation definitions asset "+selected.Name);
+                definitions.Add(entity);
+                Count("Vegetation definitions "+selected.Form);
+                Count("Vegetation definitions asset "+selected.Name);
             }
             catch (Exception exception) when(exception is not OutOfMemoryException&&exception is not OperationCanceledException)
             {
@@ -102,6 +109,8 @@ public static class NativeVegetationPlacement
                 if (++failures <= 5) log.Warn($"Skipped tree candidate {i}: {exception.Message}");
             }
         }
+        foreach(var pair in counts)log.Count(pair.Key,pair.Value);
+        log.Diagnostic($"VEGETATION ALLOCATION requested={count}; definitions={definitions.Count}; bulkArchetypeAllocation=true; nativeInitializationPreserved=true");
         if (failures > 5) log.Warn($"Tree batch skipped {failures} candidates; additional individual warnings suppressed.");
         return definitions;
     }

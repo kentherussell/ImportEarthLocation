@@ -20,22 +20,33 @@ public static class NetworkProcessor
     {
         var segments = new List<PreparedSegment>();
         var dedupe = new HashSet<string>(StringComparer.Ordinal);
+        var tunnelPorts=new HashSet<long>(dataset.Ways.Values.Where(w=>w.Tags.TryGetValue("highway",out var c)&&(c=="motorway"||c=="trunk")&&IsYes(w.Tags,"tunnel")).SelectMany(w=>w.NodeIds));
+        var undergroundLinks=new HashSet<long>();
+        var links=dataset.Ways.Values.Where(w=>w.Tags.TryGetValue("highway",out var c)&&(c=="motorway_link"||c=="trunk_link")).ToArray();
+        var linkNodes=new HashSet<long>(tunnelPorts);
+        bool changed;do{changed=false;foreach(var link in links)if(!undergroundLinks.Contains(link.Id)&&link.NodeIds.Any(linkNodes.Contains))
+        {undergroundLinks.Add(link.Id);linkNodes.UnionWith(link.NodeIds);changed=true;}}while(changed);
         foreach (var way in dataset.Ways.Values.OrderBy(way => way.Id))
         {
             token.ThrowIfCancellationRequested();
-            if (!TryClassify(way, request, out var kind, out var classification) && !(dataset.SupportWayIds.Contains(way.Id) && way.Tags.TryGetValue("highway",out classification)))
+            if(undergroundLinks.Contains(way.Id)){log.Count("Underground highway links intentionally excluded");continue;}
+            if(way.Tags.TryGetValue("highway",out var policyClass)&&policyClass=="trunk_link"&&(request.RoadLevel&RoadImportLevel.Streets)==0)
+            {log.Count("Trunk links excluded without Streets");continue;}
+            if(way.Tags.TryGetValue("highway",out var excluded)&&NetworkSelection.IsExcludedStreetLink(excluded)){log.Count("Street links explicitly excluded");continue;}
+            // Support ways supply context only; they never override the selected road families.
+            if (!TryClassify(way, request, out var kind, out var classification))
             { if(request.RoadLevel != RoadImportLevel.None && way.Tags.ContainsKey("highway")) log.Count("Roads excluded by selected tier"); continue; }
             var oneWay = kind == NetworkKind.Road && ParseOneWay(way.Tags, classification);
             var lanes = ParseLanes(way.Tags, kind, oneWay, classification);
+            if(kind==NetworkKind.Rail&&way.Tags.TryGetValue("service",out var railService)&&railService is "yard" or "siding" or "spur")
+            {log.Count("Rail service branches intentionally excluded");continue;}
+            if(kind==NetworkKind.Road&&Reversible(way.Tags,classification))
+            {oneWay=false;lanes=2;log.Count("Reversible highways normalized to two way two lanes");}
             var bridge = IsYes(way.Tags, "bridge");
             var tunnel = IsYes(way.Tags, "tunnel") && (!way.Tags.TryGetValue("tunnel",out var tunnelType)||tunnelType!="building_passage");
             var layer = ParseLayer(way.Tags, bridge, tunnel);
-            // A trunk classification does not by itself prove limited-access operation.
-            // Explicit ordinary-road tags override it; never classify by route number.
-            if (kind == NetworkKind.Road && classification.StartsWith("trunk", StringComparison.OrdinalIgnoreCase) &&
-                ((way.Tags.TryGetValue("motorroad", out var motorroad) && motorroad == "no") ||
-                 (way.Tags.TryGetValue("expressway", out var expressway) && expressway == "no")))
-            { classification = classification.EndsWith("_link", StringComparison.OrdinalIgnoreCase) ? "primary_link" : "primary"; log.Count("Trunk sections mapped to ordinary roads by explicit tags"); }
+            // Asset family is now an explicit user policy, not inferred from expressway tags.
+            if(kind==NetworkKind.Road)log.Count(classification.StartsWith("motorway")||classification.StartsWith("trunk")?"Highway-family source ways":"Street-family source ways");
 
             for (var index = 0; index < way.NodeIds.Length - 1; index++)
             {
@@ -43,7 +54,10 @@ public static class NetworkProcessor
                 var endId = way.NodeIds[index + 1];
                 if (!dataset.Nodes.TryGetValue(startId, out var startNode) || !dataset.Nodes.TryGetValue(endId, out var endNode))
                 {
-                    throw new InvalidOperationException($"Required OSM way {way.Id} is missing node {(!dataset.Nodes.ContainsKey(startId)?startId:endId)}; map unchanged, complete dependency recovery required.");
+                    log.Count("Network segments with missing endpoints omitted");
+                    if(log.Metric("Network segments with missing endpoints omitted")<=25)
+                        log.Warn($"OSM way {way.Id} segment {startId}->{endId}: unavailable endpoint; adjacent valid segments retained, gap not fabricated.");
+                    continue;
                 }
 
                 var low = Math.Min(startId, endId);
@@ -177,6 +191,7 @@ public static class NetworkProcessor
 
     private static int ParseLanes(IReadOnlyDictionary<string, string> tags, NetworkKind kind, bool oneWay, string classification)
     {
+        if(Reversible(tags,classification))return 2;
         if (kind == NetworkKind.Rail) return tags.TryGetValue("tracks", out var tracks) && int.TryParse(tracks, out var count) ? Numeric.Clamp(count, 1, 2) : 1;
         var lanes=LaneCount(tags,"lanes");
         var forward=LaneCount(tags,"lanes:forward");var backward=LaneCount(tags,"lanes:backward");
@@ -198,7 +213,7 @@ public static class NetworkProcessor
             if(lanes==0&&(classification=="motorway"||classification=="trunk")&&NetworkEvidence.Measure(tags,"width") is float width)
                 lanes=Numeric.Clamp((int)Math.Round((width-2)/3.5f),1,6);
         }
-        return lanes>0?Numeric.Clamp(lanes,1,6):classification.EndsWith("_link",StringComparison.OrdinalIgnoreCase)?1:2;
+        return lanes>0?Numeric.Clamp(lanes,1,32):classification.EndsWith("_link",StringComparison.OrdinalIgnoreCase)?1:2;
     }
 
     private static int LaneCount(IReadOnlyDictionary<string,string> tags,string key) => tags.TryGetValue(key,out var value) &&
@@ -224,10 +239,10 @@ public static class NetworkProcessor
 
     private static bool ParseOneWay(IReadOnlyDictionary<string, string> tags, string classification)
     {
+        if(Reversible(tags,classification))return false;
         if (tags.TryGetValue("oneway", out var value)) return value is "yes" or "1" or "true" or "-1";
-        // A motorway_link can be a two-way connector; only motorway itself
-        // implies one-way traffic. Explicit oneway always takes precedence.
-        return classification.Equals("motorway", StringComparison.OrdinalIgnoreCase) || (tags.TryGetValue("junction", out var junction) && junction == "roundabout");
+        // Selected motorway/trunk links default to one-way; explicit oneway=no wins.
+        return classification.Equals("motorway", StringComparison.OrdinalIgnoreCase) || classification is "motorway_link" or "trunk_link" || (tags.TryGetValue("junction", out var junction) && junction == "roundabout");
     }
 
     private static int ParseLayer(IReadOnlyDictionary<string, string> tags, bool bridge, bool tunnel)
@@ -241,4 +256,9 @@ public static class NetworkProcessor
 
     private static bool IsYes(IReadOnlyDictionary<string, string> tags, string key) =>
         tags.TryGetValue(key, out var value) && value is not ("no" or "0" or "false");
+
+    private static bool Reversible(IReadOnlyDictionary<string,string> tags,string classification) =>
+        (classification.StartsWith("motorway",StringComparison.Ordinal)||classification.StartsWith("trunk",StringComparison.Ordinal))&&
+        (tags.TryGetValue("oneway",out var direction)&&direction is "reversible" or "alternating" ||
+         LaneCount(tags,"lanes:reversible")>0);
 }

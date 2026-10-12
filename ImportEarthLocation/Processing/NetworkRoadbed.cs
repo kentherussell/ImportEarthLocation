@@ -13,10 +13,11 @@ public static class NetworkRoadbed
         IReadOnlyList<PreparedSegment> previousProfiles,IReadOnlyList<PreparedSegment> finalProfiles,
         IEnumerable<float3[]> protectedAreas,IEnumerable<float3[]> protectedLines,ImportLog log,CancellationToken token,TerrainEditSet? laterEdits=null)
     {
-        if(baseline.Length!=previousRoadbed.Length||baseline.Length!=finalRaster.Length||previousProfiles.Count!=finalProfiles.Count)
-            throw new InvalidOperationException("Final roadbed refresh requires the same terrain and complete source network.");
-        var changed=0;
-        for(var i=0;i<finalProfiles.Count;i++)
+        if(baseline.Length!=previousRoadbed.Length||baseline.Length!=finalRaster.Length)
+        {log.Warn("Roadbed refresh raster registration mismatch; final raster retained, no whole-import failure.");return finalRaster;}
+        var changed=Math.Abs(previousProfiles.Count-finalProfiles.Count);
+        if(changed>0)log.Warn("Roadbed profiles changed during local recovery; refreshing the surviving network against the immutable terrain baseline.");
+        for(var i=0;i<Math.Min(previousProfiles.Count,finalProfiles.Count);i++)
         {
             token.ThrowIfCancellationRequested();var a=previousProfiles[i];var b=finalProfiles[i];if(NetworkStructure.IsStructure(b))continue;
             if(Math.Abs(a.CourseStart.y-b.CourseStart.y)>.01f||Math.Abs(a.CourseControl1.y-b.CourseControl1.y)>.01f||
@@ -85,7 +86,7 @@ public static class NetworkRoadbed
         foreach(var s in segments.Where(s=>!NetworkStructure.IsStructure(s)))
         {
             token.ThrowIfCancellationRequested();processed++;
-            var budget=Math.Min(60,Math.Max(NetworkVerticalProfiles.CutFillBudget(s),Math.Max(Math.Abs(s.StartElevation??0),Math.Abs(s.EndElevation??0))+2));
+            var budget=NetworkVerticalProfiles.CutFillBudget(s);
             var half=s.NativeWidth>0?s.NativeWidth*.5f:Math.Min(12,Math.Max(4,s.Lanes*1.75f));
             var steps=Math.Max(1,(int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(s)/(cell*.5f)));
             for(var i=0;i<=steps;i++)
@@ -113,7 +114,10 @@ public static class NetworkRoadbed
                     var side=math.dot(delta,leftNormal)>=0?NetworkSides.Left:NetworkSides.Right;
                     // Walls hold the outer bank; earth slopes occupy the available
                     // room. Use the same road height and a smooth bank transition.
-                    var wall=(s.RetainingWallSides&side)!=0;var sideRadius=half+(wall?cell*.75f:earthBlend);
+                    // Only evidenced walls justify a narrow, cliff-like shoulder.
+                    // Automatically inferred walls are not ground truth and must
+                    // not turn otherwise natural earthworks into vertical stamps.
+                    var wall=((s.ExplicitWallSides|s.QuaySides)&side)!=0;var sideRadius=half+(wall?cell*.75f:earthBlend);
                     if(distance>sideRadius)continue;
                     var id=z*n+x;if(protectedMask[id]){protectedSamples++;continue;}
                     var original=source[id]/65535f*scale;if(Math.Abs(nearest.y-original)>budget+.05f)
@@ -133,7 +137,17 @@ public static class NetworkRoadbed
                     // already have one solved elevation; no far stamp can pull
                     // the road core toward a different longitudinal height.
                     if(old.blend==0||distance<old.distance)
-                        targets[id]=(nearest.y,budget,weight,distance);
+                    {
+                        // Compose the outer edit, not just its raw centre height.
+                        // Switching nearest corridors must not discard a stronger
+                        // compatible feather and leave a seam between earthworks.
+                        if(old.blend>0&&distance>half&&old.distance>half&&Math.Abs(old.target-nearest.y)<cell)
+                        {
+                            var combined=old.blend+weight;
+                            targets[id]=((old.target*old.blend+nearest.y*weight)/combined,Math.Min(old.budget,budget),Math.Max(old.blend,weight),distance);
+                        }
+                        else targets[id]=(nearest.y,budget,weight,distance);
+                    }
                 }
             }
             if(clock.Elapsed.TotalSeconds>=nextProgress){log.Diagnostic($"PROCESS roadbed sections={processed}; affectedSamples={targets.Count}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.0}");nextProgress=clock.Elapsed.TotalSeconds+5;}

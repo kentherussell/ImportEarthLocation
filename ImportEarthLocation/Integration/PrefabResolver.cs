@@ -4,6 +4,7 @@ using System.Linq;
 using Game.Prefabs;
 using ImportEarthLocation.Core;
 using Unity.Entities;
+using Unity.Collections;
 
 namespace ImportEarthLocation.Integration;
 
@@ -144,7 +145,7 @@ public sealed class PrefabResolver
     public static string PaletteKey(PreparedSegment s) => $"{(IsHighway(s)?"highway":"road")}:{s.OneWay}:{s.Bridge}:{s.ConsolidatedAvenue}";
     // Ordinary one-way roads can contain six lanes (including turn lanes). Only
     // the one-way highway palette is capped at five. Snapshot and lookup must agree.
-    public static string SizedPaletteKey(PreparedSegment s) => s.Kind==NetworkKind.Rail ? $"rail:{s.Bridge}:{Numeric.Clamp(s.PhysicalTracks>0?s.PhysicalTracks:s.Lanes,1,2)}" : PaletteKey(s)+":"+Numeric.Clamp(s.Lanes,1,IsHighway(s)&&s.OneWay?5:6);
+    public static string SizedPaletteKey(PreparedSegment s) => s.Kind==NetworkKind.Rail ? $"rail:{s.Bridge}:{Numeric.Clamp(s.PhysicalTracks>0?s.PhysicalTracks:s.Lanes,1,2)}" : PaletteKey(s)+":"+Numeric.Clamp(s.Lanes,1,IsHighway(s)?(s.OneWay?5:8):(s.OneWay?3:6));
     public static PreparedSegment ApplyMetadata(PreparedSegment s,IReadOnlyDictionary<string,float> widths,IReadOnlyDictionary<string,float[]> offsets)
     {
         var key=SizedPaletteKey(s);
@@ -172,13 +173,14 @@ public sealed class PrefabResolver
     {
         _roadCatalog ??= NativePrefabCatalog.Read<RoadPrefab>(_prefabSystem.EntityManager,_prefabSystem).ToArray();
         var highway=IsHighway(segment);
-        foreach(var p in _roadCatalog.Where(p=>p.m_HighwayRules==highway&&NetworkSelection.IsBasicVanillaRoad(p.name))
+        foreach(var p in _roadCatalog.Where(p=>p.m_HighwayRules==highway&&AllowedPalette(p.name,highway,segment.OneWay))
             .OrderBy(p=>ReadWidth(_prefabSystem.GetEntity(p),segment.Bridge)).ThenBy(p=>p.name,StringComparer.Ordinal))
         {var entity=_prefabSystem.GetEntity(p);if(Suitable(entity,segment))return entity;}
         return Entity.Null;
     }
     public Dictionary<string,float> CaptureMinimumWidths()
     {
+        CaptureRoundaboutPalette();
         var result=new Dictionary<string,float>();
         foreach(var bridge in new[]{false,true})foreach(var tracks in new[]{1,2})
         {
@@ -189,7 +191,7 @@ public sealed class PrefabResolver
         {
             var s=new PreparedSegment(0,1,2,default,default,NetworkKind.Road,highway?"motorway":"primary",oneWay?1:2,oneWay,bridge,false,0){ConsolidatedAvenue=avenue};
             var entity=ResolveNarrowest(s);result[PaletteKey(s)]=entity==Entity.Null?float.PositiveInfinity:ReadWidth(entity,bridge);
-            for(var lanes=1;lanes<=(highway&&oneWay?5:6);lanes++)
+            for(var lanes=1;lanes<=(highway?(oneWay?5:8):(oneWay?3:6));lanes++)
             {
                 var requested=s with{Lanes=lanes};var sized=ResolveRoad(requested);
                 result[PaletteKey(s)+":"+lanes]=sized==Entity.Null?float.PositiveInfinity:ReadWidth(sized,bridge);
@@ -250,7 +252,7 @@ public sealed class PrefabResolver
     private static int NamedLaneCount(string name)
     {
         if(name=="Small Road")return 2;if(name=="Medium Road")return 4;if(name=="Large Road")return 6;
-        foreach(var count in Enumerable.Range(1,6))if(name.EndsWith($"- {count} lane{(count==1?"":"s")}",StringComparison.Ordinal))return count;
+        foreach(var count in Enumerable.Range(1,8))if(name.EndsWith($"- {count} lane{(count==1?"":"s")}",StringComparison.Ordinal))return count;
         return 0;
     }
 
@@ -260,7 +262,9 @@ public sealed class PrefabResolver
         // them here made catalog fallbacks differ from the preparation snapshot
         // and rejected usable ordinary one-way roads at e.g. 15.99 versus 16 m.
         var estimatedWidth=segment.MaximumNativeWidth;
-        segment=segment with{MaximumNativeWidth=float.PositiveInfinity,Lanes=Numeric.Clamp(segment.Lanes,1,IsHighway(segment)&&segment.OneWay?5:6)};
+        var sourceLanes=segment.Lanes;
+        segment=segment with{MaximumNativeWidth=float.PositiveInfinity,Lanes=NetworkSelection.MatchedLanes(segment.Lanes,IsHighway(segment),segment.OneWay)};
+        if(sourceLanes!=segment.Lanes)_log.Diagnostic($"ROAD PALETTE approximation classification={segment.Classification}; requestedLanes={sourceLanes}; targetLanes={segment.Lanes}; oneWay={segment.OneWay}; tiesRoundUp=true; familyLocked=true");
         var highway = segment.Classification.StartsWith("motorway", StringComparison.OrdinalIgnoreCase) ||
                       segment.Classification.StartsWith("trunk", StringComparison.OrdinalIgnoreCase);
         var candidates = new List<string>();
@@ -276,7 +280,7 @@ public sealed class PrefabResolver
         }
         else if (segment.OneWay)
         {
-            var size=segment.Lanes<=2?"Small":segment.Lanes<=4?"Medium":"Large";
+            var size="Small";
             candidates.Add($"{size} Road Oneway - {segment.Lanes} lane{(segment.Lanes == 1 ? "" : "s")}");
         }
         else
@@ -318,10 +322,40 @@ public sealed class PrefabResolver
             }
         }
         foreach(var prefab in _roadCatalog
-            .Where(p=>p.m_HighwayRules==highway&&NetworkSelection.IsBasicVanillaRoad(p.name)&&(!segment.ConsolidatedAvenue||p.name==NetworkSelection.BasicRoadName(segment.Lanes)))
+            .Where(p=>p.m_HighwayRules==highway&&AllowedPalette(p.name,highway,segment.OneWay))
             .OrderBy(p=>NamedLaneCount(p.name)==0?100:Math.Abs(NamedLaneCount(p.name)-segment.Lanes)).ThenByDescending(p=>NamedLaneCount(p.name)).ThenBy(p=>Math.Abs(ReadWidth(_prefabSystem.GetEntity(p))-segment.Lanes*3.5f)).ThenBy(p=>p.name,StringComparer.Ordinal))
         {var entity=_prefabSystem.GetEntity(prefab);if(Suitable(entity,segment)){_log.Diagnostic($"ROAD PREFAB lane-count-fallback requestedLanes={segment.Lanes}; selected={prefab.name}; nativeNamedLanes={NamedLaneCount(prefab.name)}; directionPreserved=true");return entity;}}
         return Entity.Null;
+    }
+
+    private void CaptureRoundaboutPalette()
+    {
+        var manager=_prefabSystem.EntityManager;var radii=new List<float>();
+        var ringRoad=ResolveRoad(new PreparedSegment(0,1,2,default,default,NetworkKind.Road,"primary",2,true,false,false,0));
+        var laneHalfWidth=ringRoad==Entity.Null?0:ReadWidth(ringRoad)/2;
+        foreach(var prefab in NativePrefabCatalog.Read<ObjectPrefab>(manager,_prefabSystem))
+        {
+            var entity=_prefabSystem.GetEntity(prefab);
+            if(!prefab.name.Contains("Roundabout")||!manager.HasComponent<NetObjectData>(entity)||!manager.HasComponent<ObjectGeometryData>(entity)||!manager.HasComponent<ObjectData>(entity))continue;
+            var data=manager.GetComponentData<NetObjectData>(entity);
+            if((data.m_CompositionFlags.m_General&CompositionFlags.General.Roundabout)==0)continue;
+            using var components=manager.GetComponentData<ObjectData>(entity).m_Archetype.GetComponentTypes(Allocator.Temp);
+            var types=new HashSet<ComponentType>();foreach(var type in components)types.Add(type);
+            if(!types.Contains(ComponentType.ReadWrite<Game.Objects.Attached>())||!types.Contains(ComponentType.ReadWrite<Game.Objects.Transform>())||!types.Contains(ComponentType.ReadWrite<PrefabRef>()))continue;
+            var size=manager.GetComponentData<ObjectGeometryData>(entity).m_Size;
+            var islandRadius=Math.Max(size.x,size.z)/2;
+            if(!float.IsNaN(islandRadius)&&!float.IsInfinity(islandRadius)&&islandRadius>0&&laneHalfWidth>0)
+            {radii.Add(islandRadius+laneHalfWidth);_log.Diagnostic($"ROUNDABOUT PALETTE prefab={prefab.name}; islandRadiusMeters={islandRadius}; measuredLaneHalfWidth={laneHalfWidth}; centerlineRadiusMeters={islandRadius+laneHalfWidth}; nativeObjectContract=true");}
+        }
+        ImportEarthLocation.Processing.RoundaboutPlanner.ConfigureStockRadii(radii);
+    }
+
+    private static bool AllowedPalette(string name,bool highway,bool oneWay)
+    {
+        if(!highway&&!oneWay)return name is "Small Road" or "Medium Road" or "Large Road";
+        var prefix=highway?(oneWay?"Highway Oneway - ":"Highway Twoway - "):"Small Road Oneway - ";
+        var counts=highway?(oneWay?new[]{1,2,3,4,5}:new[]{2,3,4,8}):new[]{1,2,3};
+        return counts.Any(n=>name==prefix+n+" lane"+(n==1?"":"s"));
     }
 
     public float ReadWidth(Entity entity, bool elevated = false)

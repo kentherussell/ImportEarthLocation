@@ -105,13 +105,16 @@ public static class VegetationPlanner
         foreach(var h in habitats.Where(h=>Tag(h.Polygon.Tags,"natural","scrub")||Tag(h.Polygon.Tags,"natural","heath")))
         for(var z=(int)Math.Floor(Math.Max(-half,h.Min.y)/8);z<=(int)Math.Floor(Math.Min(half,h.Max.y)/8);z++)
         for(var x=(int)Math.Floor(Math.Max(-half,h.Min.x)/8);x<=(int)Math.Floor(Math.Min(half,h.Max.x)/8);x++)
-        {token.ThrowIfCancellationRequested();var seed=math.hash(new int3(x,z,(int)h.Polygon.Id));if(seed%3!=0)continue;var p=new float3((x+.25f+(seed&255)/512f)*8,0,(z+.25f+((seed>>8)&255)/512f)*8);if(h.Polygon.Contains(p))Add(p,true,h.Polygon.Id,h.Polygon.Tags);}
+        {token.ThrowIfCancellationRequested();var seed=math.hash(new int3(x,z,(int)h.Polygon.Id));if(seed%12!=0)continue;var p=new float3((x+.25f+(seed&255)/512f)*8,0,(z+.25f+((seed>>8)&255)/512f)*8);if(h.Polygon.Contains(p))Add(p,true,h.Polygon.Id,h.Polygon.Tags);}
         foreach(var node in data.NodeTags.Where(p=>Tag(p.Value,"natural","shrub")))if(data.Nodes.ContainsKey(node.Key))Add(Local(node.Key),true,node.Key,node.Value);
-        output=output.OrderBy(p=>math.lengthsq(p.Position.xz)).ThenBy(p=>p.Seed).ToList();
+        // Distributed canopy first, then infill, then bushes. Stopping early
+        // leaves useful woodland across the whole map, not a completed centre.
+        output=output.OrderBy(p=>p.Form==VegetationForm.Shrub?2:p.Seed%4==0?0:1).ThenBy(p=>p.Seed).ToList();
+        log.Diagnostic("VEGETATION WORKLOAD canopyDensityRetained=true; inferredShrubFractionOfPrevious=0.25; explicitShrubsRetained=true; order=distributed-canopy-infill-shrubs");
         foreach(var group in output.GroupBy(p=>p.Form))log.Count("Vegetation planned "+group.Key,group.Count());
         foreach(var group in output.GroupBy(p=>(p.Form,p.Evidence)))log.Diagnostic($"VEGETATION DECISION form={group.Key.Form}; evidence={group.Key.Evidence}; count={group.Count()}; exampleSourceIds={string.Join(",",group.Take(3).Select(p=>p.SourceId))}; plannedNotNativeAcceptance=true");
         foreach(var reason in exclusions.OrderBy(p=>p.Key))log.Diagnostic($"VEGETATION EXCLUSION reason={reason.Key}; count={reason.Value}; generationPolicyUnchanged=true");
-        log.Diagnostic($"VEGETATION POLICY version=5; candidates={output.Count}; rejectedFinalMasks={rejected}; habitats={habitats.Length}; vanillaOnly=true; climateAvailable={climate!=null}; annualPrecipitationMm={annualRain:R}; warmAridPrior={warmArid}; uncapped=true; order=center-out; seedExcludesHeight=true; newDesertTreeSitesInvented=false; explicitTaxonOverridesClimate=true; speciesNotGuaranteed=true");
+        log.Diagnostic($"VEGETATION POLICY version=6; candidates={output.Count}; rejectedFinalMasks={rejected}; habitats={habitats.Length}; vanillaOnly=true; climateAvailable={climate!=null}; annualPrecipitationMm={annualRain:R}; warmAridPrior={warmArid}; uncapped=true; order=distributed-canopy-infill-shrubs; seedExcludesHeight=true; newDesertTreeSitesInvented=false; explicitTaxonOverridesClimate=true; speciesNotGuaranteed=true");
         return output;
     }
 }

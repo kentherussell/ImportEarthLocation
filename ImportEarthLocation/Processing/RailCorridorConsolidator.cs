@@ -11,7 +11,7 @@ namespace ImportEarthLocation.Processing;
 /// <summary>Fold parallel raw track spans onto a retained rail axis, splitting it at every transferred junction.</summary>
 public static class RailCorridorConsolidator
 {
-    public const float CorridorDistance = 7.5f;
+    public const float CorridorDistance = 40f;
     private sealed class Axis
     {
         public PreparedSegment[] Edges = Array.Empty<PreparedSegment>();
@@ -34,6 +34,7 @@ public static class RailCorridorConsolidator
         // Transferring switches can expose a short redundant triangle: the
         // direct axis and an identical two-edge approach. Re-consolidate the
         // canonical raw geometry before fitting curves, preserving all tails.
+        source=source.Select(s=>s.Kind==NetworkKind.Rail?s with{Lanes=1,PhysicalTracks=1,OneWay=false,ExplicitWallSides=NetworkSides.None,RetainingWallSides=NetworkSides.None}:s).ToArray();
         var result=ExactPhysicalDemands(source,log,token);
         for(var pass=0;pass<3;pass++)
         {
@@ -135,8 +136,8 @@ public static class RailCorridorConsolidator
                 var axis=axes[index];var retainedSource=axis.Edges[0];var candidateSource=group[0];
                 if(retainedSource.Bridge!=candidateSource.Bridge||retainedSource.Tunnel!=candidateSource.Tunnel||retainedSource.Layer!=candidateSource.Layer)continue;
                 // Yard ladders, sidings, and separately mapped double corridors are not duplicates.
-                if(retainedSource.Lanes>1||candidateSource.Lanes>1||retainedSource.RailService.Length>0||candidateSource.RailService.Length>0)continue;
-                if(retainedSource.Reference.Length>0&&candidateSource.Reference.Length>0&&retainedSource.Reference!=candidateSource.Reference)continue;
+                // Import policy deliberately folds yard ladders and multiple
+                // parallel routes onto one usable bidirectional rail corridor.
                 var spans=new List<(PreparedSegment,Projection,Projection)>();var length=0f;var distance=0f;
                 foreach(var edge in group)
                 {
@@ -158,7 +159,6 @@ public static class RailCorridorConsolidator
                     // not an arbitrary number of parallel routes. Allow disjoint
                     // continuation partners, but never fold a third overlapping track.
                     var intervalLo=Math.Min(aDistance,bDistance);var intervalHi=Math.Max(aDistance,bDistance);
-                    if(axis.PairedIntervals.Any(p=>Math.Min(p.hi,intervalHi)-Math.Max(p.lo,intervalLo)>2))continue;
                     if(map.TryGetValue((edge.Layer,edge.StartNodeId),out var oldA)&&math.distance(oldA.point.xz,a.Point.xz)>.5f ||
                        map.TryGetValue((edge.Layer,edge.EndNodeId),out var oldB)&&math.distance(oldB.point.xz,b.Point.xz)>.5f)continue;
                     spans.Add((edge,a,b));length+=originalLength;distance+=(a.Distance+b.Distance)*.5f*originalLength;
@@ -215,7 +215,7 @@ public static class RailCorridorConsolidator
             foreach(var original in replacements.TryGetValue(edge,out var pieces)?(IEnumerable<PreparedSegment>)pieces:new[]{edge})
             {
                 var paired=original.Kind==NetworkKind.Rail&&axisFor(original);
-                var s=original.Kind==NetworkKind.Rail?original with{Lanes=paired?2:original.Lanes,PhysicalTracks=paired?2:original.PhysicalTracks,OneWay=false}:original;
+                var s=original.Kind==NetworkKind.Rail?original with{Lanes=1,PhysicalTracks=1,OneWay=false,ExplicitWallSides=NetworkSides.None,RetainingWallSides=NetworkSides.None}:original;
                 if(paired&&pairedAxes.TryGetValue(original.WayId,out var owners))
                 {
                     var absorbed=owners.SelectMany(axis=>axis.PairedSources.Where(p=>NetworkNormalizer.DistanceToSegment((s.Start+s.End)*.5f,p.source.Start,p.source.End)<=CorridorDistance+1).Select(p=>p.source)).ToArray();

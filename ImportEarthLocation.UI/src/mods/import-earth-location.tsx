@@ -1,9 +1,11 @@
 import React, { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { bindValue, trigger, useValue } from "cs2/api";
 import * as UI from "cs2/ui";
 import { Button, Dropdown, DropdownToggle, Panel, Portal, Scrollable, Tooltip, DropdownItemProps } from "cs2/ui";
 import styles from "./import-earth-location.module.scss";
 import { Location, LocationPicker } from "./location-picker";
+import importIcon from "../import-earth-icon-generated.png";
 
 const group = "ImportEarthLocation";
 // The stock declarations also use DropdownItem as a data-interface name.
@@ -13,6 +15,69 @@ const isEditor$ = bindValue<boolean>(group, "isEditor", false);
 const mapExt$ = bindValue<boolean>(group, "mapExtDetected", false);
 const mapSize$ = bindValue<string>(group, "mapSize", "vanilla");
 const panelOpen$ = bindValue<boolean>(group, "panelOpen", false);
+export const ImportLauncher = ({ theme, className }: { theme?: any; className?: string }) => {
+  const editor = useValue(isEditor$);
+  const open = useValue(panelOpen$);
+  if (!editor) return null;
+  return <Tooltip tooltip="Import Earth" direction="up"><Button variant="icon"
+    focusKey="import-earth-location-launcher" className={className} theme={theme}
+    style={{ width: "44rem", height: "44rem", minWidth: "44rem", maxWidth: "44rem", minHeight: "44rem", maxHeight: "44rem", overflow: "hidden", flexShrink: 0 }}
+    selected={open}
+    onSelect={() => trigger(group, "setPanelOpen", !open)} aria-label="Import Earth"><img className={styles.launcherIcon} src={importIcon} alt="" width={32} height={32} style={{ width: "32rem", height: "32rem", maxWidth: "32rem", maxHeight: "32rem", flexShrink: 0, objectFit: "contain" }} /></Button></Tooltip>;
+};
+const AnchoredLauncher = () => {
+  const editor = useValue(isEditor$);
+  const [host, setHost] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!editor) return;
+    const container = document.createElement("div");
+    container.id = "import-earth-location-launcher-host";
+    let scheduled: number | null = null;
+    let stopped = false;
+    let lastMode = "";
+    const place = () => {
+      scheduled = null;
+      if (stopped) return;
+      const found = document.querySelector<HTMLElement>('[class*="editor-toolbar_"]');
+      const rectangle = found?.getBoundingClientRect();
+      const toolbar = found && rectangle && rectangle.width > 0 && rectangle.height > 0 ? found : null;
+      const buttons = toolbar ? Array.from(toolbar.querySelectorAll<HTMLElement>("button"))
+        .filter(button => !container.contains(button)) : [];
+      let row = buttons.length > 1 ? buttons[0].parentElement : toolbar;
+      const last = buttons[buttons.length - 1];
+      // Gameface cannot resolve CSS var() fallbacks reliably. Keep both the
+      // button and image explicitly bounded instead of inheriting auto sizes.
+      while (row && toolbar && last && !row.contains(last)) row = row.parentElement;
+      if (row && toolbar && !toolbar.contains(row)) row = toolbar;
+      const target = row || toolbar || document.body;
+      const mode = toolbar ? "toolbar" : "fallback";
+      container.className = toolbar ? styles.launcherHostInline : styles.launcherHostFallback;
+      if (container.parentElement !== target) target.appendChild(container);
+      if (mode !== lastMode) {
+        console.info("ImportEarthLocation launcher placement", { mode, toolbarFound: !!toolbar, nativeButtons: buttons.length });
+        trigger(group, "frontendState", JSON.stringify({ event: "launcher-placement", mode, nativeButtons: buttons.length }));
+        lastMode = mode;
+      }
+    };
+    const schedule = () => {
+      if (!stopped && scheduled === null) scheduled = window.requestAnimationFrame(place);
+    };
+    place(); setHost(container);
+    // Polling is also retained: some Gameface versions/mods replace UI trees
+    // without reliable DOM observation. Only our own host is moved/removed.
+    const observer = typeof MutationObserver !== "undefined" ? new MutationObserver(schedule) : null;
+    observer?.observe(document.body, { childList: true, subtree: true });
+    const interval = window.setInterval(schedule, 1000);
+    window.addEventListener("resize", schedule);
+    return () => {
+      stopped = true; observer?.disconnect(); window.clearInterval(interval);
+      window.removeEventListener("resize", schedule);
+      if (scheduled !== null) window.cancelAnimationFrame(scheduled);
+      container.remove();
+    };
+  }, [editor]);
+  return editor && host ? createPortal(<ImportLauncher className={styles.launcherButton} />, host) : null;
+};
 const busy$ = bindValue<boolean>(group, "busy", false);
 const ready$ = bindValue<boolean>(group, "ready", false);
 const stage$ = bindValue<number>(group, "stage", 0);
@@ -21,11 +86,13 @@ const error$ = bindValue<string>(group, "error", "");
 const summary$ = bindValue<string>(group, "summary", "");
 const log$ = bindValue<string>(group, "log", "");
 const location$ = bindValue<string>(group, "location", "{}");
-const roads$ = bindValue<string>(group, "roadLevel", "primary");
+const roads$ = bindValue<string>(group, "roadLevel", "none");
 const rail$ = bindValue<boolean>(group, "importRail", true);
 const forests$ = bindValue<boolean>(group, "importForests", true);
 const airConnections$ = bindValue<boolean>(group, "createAirConnections", false);
 const seaConnections$ = bindValue<boolean>(group, "createSeaConnections", false);
+const diagnostics$ = bindValue<boolean>(group, "diagnosticsEnabled", false);
+const surfaces$ = bindValue<boolean>(group,"applyGroundSurfaces",true);
 const session$ = bindValue<string>(group, "mapSession", "");
 const actionRevision$ = bindValue<string>(group, "actionRevision", "0");
 const serviceUrl$ = bindValue<string>(group, "serviceUrl", "");
@@ -38,7 +105,7 @@ class ImportPanelBoundary extends React.Component<React.PropsWithChildren<{}>, {
   static getDerivedStateFromError() { return { failed: true }; }
 
   componentDidCatch(error: Error) {
-    console.error("Import Earth Location panel failed:", error.message);
+    console.error("Import Earth panel failed:", error.message);
     trigger(group, "frontendState", JSON.stringify({ event: "render-error", error: error.message }));
   }
 
@@ -68,16 +135,20 @@ export const ImportEarthLocationContent = () => {
   const [longitude, setLongitude] = useState("");
   const mapSize = useValue(mapSize$);
   const rawRoadLevel = useValue(roads$);
-  const roadLevel = ["none", "highways", "primary", "secondary"].includes(rawRoadLevel) ? rawRoadLevel : "primary";
+  const roadGroups = rawRoadLevel.split("|").filter(id => ["highways", "routes", "streets"].includes(id));
+  // Toggle atomically in the backend; rapid clicks on different checkboxes
+  // must not overwrite a previous selection before its binding update arrives.
+  const toggleRoadGroup = (id: string) => trigger(group, "toggleRoadGroup", id);
   const rail = useValue(rail$);
   const forests = useValue(forests$);
   const mapSession = useValue(session$);
   const actionRevision = useValue(actionRevision$);
   const actionGate = useRef<string | null>(null);
   const [starting, setStarting] = useState(false);
-  const [surfaces, setSurfaces] = useState(false);
+  const surfaces = useValue(surfaces$);
   const airConnections = useValue(airConnections$);
   const seaConnections = useValue(seaConnections$);
+  const diagnostics = useValue(diagnostics$);
   const [confirming, setConfirming] = useState(false);
   const [showLog, setShowLog] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -132,21 +203,10 @@ export const ImportEarthLocationContent = () => {
   return (
     <Portal>
       <div className={styles.host}>
-        <Tooltip tooltip="Import Earth Location" direction="up">
-          <Button
-            variant="icon"
-            focusKey="import-earth-location-launcher"
-            className={styles.launcher}
-            src="Media/Editor/AssetImport.svg"
-            tinted
-            selected={panelOpen}
-            onSelect={() => trigger(group, "setPanelOpen", !panelOpen)}
-            aria-label="Import Earth Location"
-          />
-        </Tooltip>
+        <AnchoredLauncher />
 
         {panelOpen && (
-          <Panel header="Import Earth Location" className={styles.panel} onClose={closePanel}>
+          <Panel header="Import Earth" className={styles.panel} onClose={closePanel}>
             <Scrollable vertical className={styles.panelBody}>
             <div className={styles.section}>
               <div className={styles.notice}>Editor-only full-map import. Roads and rail are independently selectable.</div>
@@ -163,21 +223,22 @@ export const ImportEarthLocationContent = () => {
               </label>
               <div className={styles.field}>
                 <span>Map size</span>
+                <Tooltip tooltip="Other map sizes are not available in the alpha version." direction="up"><div>
                 <Dropdown theme={{ dropdownToggle: styles.sizeToggle, label: styles.sizeLabel, dropdownPopup: styles.sizePopup, dropdownMenu: styles.sizeMenu, dropdownItem: styles.sizeItem }} content={<>
-                  <DropdownItem value="vanilla" disabled={busy} selected={mapSize === "vanilla"} onChange={updateMapSize}>14.336 km (Vanilla)</DropdownItem>
-                  {mapExt && <DropdownItem value="mapext28" disabled={busy} selected={mapSize === "mapext28"} onChange={updateMapSize}>28.672 km (MapExt)</DropdownItem>}
-                  {mapExt && <DropdownItem value="mapext57" disabled={busy} selected={mapSize === "mapext57"} onChange={updateMapSize}>57.344 km (MapExt)</DropdownItem>}
+                  <DropdownItem value="vanilla" disabled selected={mapSize === "vanilla"} onChange={updateMapSize}>14.336 km (Vanilla)</DropdownItem>
+                  {mapExt && <DropdownItem value="mapext28" disabled selected={mapSize === "mapext28"} onChange={updateMapSize}>28.672 km (MapExt)</DropdownItem>}
+                  {mapExt && <DropdownItem value="mapext57" disabled selected={mapSize === "mapext57"} onChange={updateMapSize}>57.344 km (MapExt)</DropdownItem>}
                 </>}>
-                  <DropdownToggle disabled={busy}>{mapSize === "mapext57" ? "57.344 km (MapExt)" : mapSize === "mapext28" ? "28.672 km (MapExt)" : "14.336 km (Vanilla)"}</DropdownToggle>
+                  <DropdownToggle disabled>{mapSize === "mapext57" ? "57.344 km (MapExt)" : mapSize === "mapext28" ? "28.672 km (MapExt)" : "14.336 km (Vanilla)"}</DropdownToggle>
                 </Dropdown>
+                </div></Tooltip>
               </div>
-              <div className={styles.field} role="radiogroup" aria-label="Road import level">
-                <span>Road import level</span>
-                {[["none", "None"], ["highways", "Highways only"], ["primary", "Primary roads & above"], ["secondary", "Secondary roads & above"]].map(([id,label]) =>
-                  <Button key={id} variant="flat" className={styles.configChoice} focusKey={`iel-roads-${id}`} role="radio" aria-checked={roadLevel === id} selected={roadLevel === id} disabled={busy || starting} onSelect={() => trigger(group, "setRoadLevel", id)}>
-                    <span aria-hidden="true" className={`${styles.radioIndicator} ${roadLevel === id ? styles.radioSelected : ""}`} /><span>{label}</span>
+              <div className={styles.field} role="group" aria-label="Road groups">
+                <span>Road groups</span>
+                {[["highways", "Highways"], ["routes", "Main Roads"], ["streets", "Streets — experimental"]].map(([id,label]) =>
+                  <Button key={id} variant="flat" className={styles.check} focusKey={`iel-roads-${id}`} role="checkbox" aria-checked={roadGroups.includes(id)} selected={roadGroups.includes(id)} disabled={busy || starting} onSelect={() => toggleRoadGroup(id)}>
+                    <span className={styles.checkbox}>{roadGroups.includes(id) ? "✓" : ""}</span><span>{label}</span>
                   </Button>)}
-                <span className={styles.helper}>Primary includes highways. Secondary includes primary and highways.</span>
               </div>
               <Button variant="flat" className={styles.check} focusKey="iel-rail" role="checkbox" aria-checked={rail} selected={rail} disabled={busy || starting} onSelect={() => trigger(group, "setImportRail", !rail)}>
                 <span className={styles.checkbox}>{rail ? "✓" : ""}</span><span>Import rail</span>
@@ -186,14 +247,18 @@ export const ImportEarthLocationContent = () => {
                 <span className={styles.checkbox}>{forests ? "✓" : ""}</span><span>Import forests</span>
               </Button>
               <Button variant="flat" className={styles.check} role="checkbox" aria-checked={surfaces} selected={surfaces} disabled={busy} onSelect={() => {
-                setSurfaces(!surfaces); trigger(group, "setGroundSurfaces", !surfaces);
+                trigger(group, "setGroundSurfaces", !surfaces);
               }}><span className={styles.checkbox}>{surfaces ? "✓" : ""}</span><span>Apply real-world ground surfaces</span></Button>
               <Button variant="flat" className={styles.check} role="checkbox" aria-checked={airConnections} selected={airConnections} disabled={busy} onSelect={() => {
                 trigger(group, "setAirConnections", !airConnections);
-              }}><span className={styles.checkbox}>{airConnections ? "✓" : ""}</span><span>Create air connections to the nearest bundled cities</span></Button>
+              }}><span className={styles.checkbox}>{airConnections ? "✓" : ""}</span><span>Create air connections</span></Button>
               <Button variant="flat" className={styles.check} role="checkbox" aria-checked={seaConnections} selected={seaConnections} disabled={busy} onSelect={() => trigger(group, "setSeaConnections", !seaConnections)}>
-                <span className={styles.checkbox}>{seaConnections ? "✓" : ""}</span><span>Assess sea connections (native support verification pending)</span>
+                <span className={styles.checkbox}>{seaConnections ? "✓" : ""}</span><span>Create water connections</span>
               </Button>
+              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={diagnostics} selected={diagnostics} disabled={busy || starting} onSelect={() => trigger(group,"setDiagnostics",!diagnostics)}>
+                <span className={styles.checkbox}>{diagnostics ? "✓" : ""}</span><span>Enable diagnostics</span>
+              </Button>
+              <div className={styles.helper}>Detailed generation logs and diagnostic files. Off by default; status updates and important messages remain available.</div>
             </div>
 
             <div className={styles.section}>
@@ -208,6 +273,9 @@ export const ImportEarthLocationContent = () => {
                 )}
                 {busy && !applying && (
                   <Button variant="flat" className={`${styles.actionButton} ${styles.utility}`} focusKey="iel-cancel" onSelect={() => trigger(group, "cancel")}>Cancel preparation</Button>
+                )}
+                {busy && applying && (
+                  <Button variant="flat" className={`${styles.actionButton} ${styles.danger}`} focusKey="iel-stop" onSelect={() => trigger(group, "stopGeneration")}>Stop generation</Button>
                 )}
                 {ready && (
                   <Button variant="flat" focusKey="iel-replace" className={`${styles.actionButton} ${styles.danger}`} disabled={busy || starting} onSelect={() => setConfirming(true)}>
@@ -250,7 +318,7 @@ export const ImportEarthLocationContent = () => {
             <h3 id="iel-confirm-title">Replace current map contents?</h3>
             <Scrollable vertical horizontal={false} className={styles.confirmBody}>
               <p>This replaces terrain and removes existing roads, rail, other networks, and water sources from the open map—even when new roads or rail are disabled. Optional forest trees are added where supported. The map file and name are not deleted.</p>
-              <p><strong>Save a backup first.</strong> Once application starts it cannot be cancelled.</p>
+              <p><strong>Save a backup first.</strong></p>
               <p>The game may appear to freeze for up to 5 minutes while replacing the map, depending on its complexity. Please wait for it to finish.</p>
             </Scrollable>
             <div className={`${styles.actions} ${styles.confirmFooter}`}>

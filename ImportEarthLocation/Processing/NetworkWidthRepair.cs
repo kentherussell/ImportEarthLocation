@@ -43,6 +43,11 @@ public static class NetworkWidthRepair
         var grid=new Dictionary<(int,int),HashSet<int>>();var active=new HashSet<int>();var candidates=new HashSet<int>();var changed=new HashSet<int>();
         var pairs=new HashSet<(int,int)>();
         var blocked=new bool[original.Count];var shifts=new float2[original.Count];var sums=new float2[original.Count];var counts=new int[original.Count];
+        // An interchange repair must fit its connectors around the through route,
+        // not bend the through route to separate ramp footprints.
+        for(var i=0;i<sections.Length;i++)if(sections[i].Kind==NetworkKind.Road&&!sections[i].ProtectedLink&&sections[i].Classification is "motorway" or "trunk")
+            blocked[from[i]]=blocked[to[i]]=true;
+        log.Diagnostic($"WIDTH MAINLINE anchoredNodes={blocked.Count(v=>v)}; connectorsAbsorbSpacing=true; mainlineHorizontalShiftMeters=0");
         var previous=new float2[original.Count];var totals=new float2[original.Count];var scores=new double[sections.Length];
         long pairChecks=0;var refreshes=0;
         void Refresh(int index)

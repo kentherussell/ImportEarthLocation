@@ -8,6 +8,7 @@ using Game.Objects;
 using Game.Prefabs;
 using Game.Routes;
 using Game.UI;
+using Game.Simulation;
 using ImportEarthLocation.Core;
 using ImportEarthLocation.Processing;
 using Unity.Collections;
@@ -18,7 +19,7 @@ namespace ImportEarthLocation.Integration;
 
 public static class NativeAirBridge
 {
-    public static string Apply(PreparedImport prepared, EntityManager manager, PrefabSystem prefabs, AirwaySystem airways, NameSystem names, ImportLog log)
+    public static string Apply(PreparedImport prepared, EntityManager manager, PrefabSystem prefabs, AirwaySystem airways, NameSystem names, TerrainSystem terrain, ImportLog log)
     {
         // Read the actual native grid; do not assume MapExt's playable perimeter also changes airways.
         log.Diagnostic($"AIR BEGIN requested={prepared.AirDestinations.Count}; stage=airway-grid");
@@ -30,11 +31,17 @@ public static class NativeAirBridge
         var a = grid.GetNodePosition(new int2(0)); var b = grid.GetNodePosition(gridSize);
         if (!math.all(math.isfinite(a)) || !math.all(math.isfinite(b)) || math.abs(a.x + b.x) > 2 || math.abs(a.z + b.z) > 2 || math.abs(a.x - a.z) > 2)
             return "Air connections skipped: native airway bounds are not a verified centered square.";
-        var half = Math.Abs(a.x);
-        if (half <= 0 || half > prepared.Request.MapSize.WidthMeters / 2 + 10)
-            return "Air connections skipped: native airway grid does not fit the selected map.";
+        var gridHalf = Math.Abs(a.x);
+        var heights=terrain.GetHeightData(false);var bounds=TerrainUtils.GetBounds(ref heights);
+        if(gridHalf<=0 || !NativeMapBoundary.TryGetHalf(terrain,prepared.Request.MapSize.WidthMeters,prepared.Heightmap.Length,log,out var half))
+            return "Air connections skipped: actual native terrain boundary does not match the prepared centered map.";
+        // Native airway cells are inset even on a vanilla map. Outside objects
+        // are not grid nodes: native GetCellIndex(position) clamps to the valid
+        // grid and FindClosestLane connects their takeoff position to that lane.
+        // Keep native grid/altitude intact, place the object at the terrain edge.
+        log.Diagnostic($"AIR BOUNDS gridMin={a}; gridMax={b}; terrainMin={bounds.min}; terrainMax={bounds.max}; preparedWidth={prepared.Request.MapSize.WidthMeters}; airwayInsetMeters={half-gridHalf:0.###}; outsideObjectUsesTerrainBoundary=true; airwayGridModified=false; flightsVerified=false");
         Entity prefabEntity = Entity.Null; ObjectData objectData = default; var selectedPrefabName="";
-        log.Diagnostic($"AIR stage=prefab-catalog; nativeGrid={gridSize}; perimeterHalfMeters={half:0.###}");
+        log.Diagnostic($"AIR stage=prefab-catalog; nativeGrid={gridSize}; airwayHalfMeters={gridHalf:0.###}; objectPerimeterHalfMeters={half:0.###}");
         foreach (var prefab in NativePrefabCatalog.Read<ObjectPrefab>(manager, prefabs))
         {
             if (!prefab.TryGet<Game.Prefabs.OutsideConnection>(out var connection) || connection.m_TransferType != OutsideConnectionTransferType.Air ||
@@ -72,11 +79,14 @@ public static class NativeAirBridge
                 manager.SetComponentData(entity, new Transform(destination.Position, quaternion.identity));
                 if (!manager.HasComponent<Created>(entity)) manager.AddComponentData(entity, default(Created));
                 if (!manager.HasComponent<Updated>(entity)) manager.AddComponentData(entity, default(Updated));
-                names.SetCustomName(entity, destination.Name);
+                // Naming is optional and NameSystem requires a command-buffer
+                // context that this import phase does not provide. Preserve the
+                // functional connection with stock localization instead.
+                log.Diagnostic($"AIR NAME deferred name={destination.Name}; entity={entity}; stockLocalizationRetained=true; prohibitedNameCommandBufferNotInvoked=true");
                 try
                 {
                     var actual=manager.GetComponentData<Transform>(entity).m_Position;
-                    log.Diagnostic($"AIR READBACK name={destination.Name}; requestedPosition={destination.Position}; actualPosition={actual}; positionMatch={math.distance(actual,destination.Position)<.01f}; prefabMatch={manager.GetComponentData<PrefabRef>(entity).m_Prefab==prefabEntity}; airplaneStop={manager.HasComponent<AirplaneStop>(entity)}; outsideConnection={manager.HasComponent<Game.Objects.OutsideConnection>(entity)}; takeoffLocation={manager.HasComponent<Game.Routes.TakeoffLocation>(entity)}; initializationStillPending=true");
+                    log.Diagnostic($"AIR READBACK name={destination.Name}; requestedPosition={destination.Position}; actualPosition={actual}; terrainEdgeDistanceMeters={half-math.cmax(math.abs(actual.xz)):0.###}; nativeGridCell={grid.GetCellIndex(actual)}; positionMatch={math.distance(actual,destination.Position)<.01f}; prefabMatch={manager.GetComponentData<PrefabRef>(entity).m_Prefab==prefabEntity}; airplaneStop={manager.HasComponent<AirplaneStop>(entity)}; outsideConnection={manager.HasComponent<Game.Objects.OutsideConnection>(entity)}; takeoffLocation={manager.HasComponent<Game.Routes.TakeoffLocation>(entity)}; initializationStillPending=true");
                 }
                 catch(Exception diagnosticException){log.Diagnostic($"AIR READBACK unavailable name={destination.Name}: {diagnosticException}");}
                 positions.Add(destination.Position); created++;

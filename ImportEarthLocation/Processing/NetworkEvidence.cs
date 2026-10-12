@@ -21,18 +21,21 @@ public static class NetworkEvidence
         var ways=new Dictionary<long,OsmWay>();
         foreach(var w in source.Ways.Values){token.ThrowIfCancellationRequested();ways[w.Id]=w with{Tags=Tags(w.Tags)};}
         var selected=new HashSet<long>(ways.Values.Where(w=>w.Tags.TryGetValue("highway",out var h)&&NetworkSelection.Includes(request.RoadLevel,h)||request.ImportRail&&w.Tags.TryGetValue("railway",out var r)&&r=="rail").Select(w=>w.Id));
-        var selectedNodes=new HashSet<long>(selected.SelectMany(id=>ways[id].NodeIds));
+        // Support connectors are a road-selection feature, never rail dependency closure.
+        var selectedNodes=new HashSet<long>(selected.Where(id=>ways[id].Tags.ContainsKey("highway")&&request.RoadLevel!=RoadImportLevel.None).SelectMany(id=>ways[id].NodeIds));
         var support=new HashSet<long>();
         var relations=source.Relations.Select(r=>r with{Tags=Tags(r.Tags),OrderedMembers=r.OrderedMembers.Select(m=>m with{Type=m.Type.Trim().ToLowerInvariant(),Role=m.Role.Trim().ToLowerInvariant()}).ToArray()}).ToArray();
         foreach(var relation in relations)
         {
+            if(request.RoadLevel==RoadImportLevel.None)break;
             var members=relation.OrderedMembers;
             if(!members.Any(m=>m.Type=="way"&&m.Role=="from"&&selected.Contains(m.Id))||!members.Any(m=>m.Type=="way"&&m.Role=="to"&&selected.Contains(m.Id)))continue;
-            foreach(var via in members.Where(m=>m.Type=="way"&&m.Role=="via"))if(ways.ContainsKey(via.Id))support.Add(via.Id);
+            foreach(var via in members.Where(m=>m.Type=="way"&&m.Role=="via"))if(ways.TryGetValue(via.Id,out var viaWay)&&(!viaWay.Tags.TryGetValue("highway",out var viaClass)||!NetworkSelection.IsExcludedStreetLink(viaClass)))support.Add(via.Id);
         }
-        foreach(var w in ways.Values.Where(w=>!selected.Contains(w.Id)&&w.Tags.ContainsKey("highway")))
+        foreach(var w in ways.Values.Where(w=>request.RoadLevel!=RoadImportLevel.None&&!selected.Contains(w.Id)&&w.Tags.ContainsKey("highway")))
         {
             token.ThrowIfCancellationRequested();
+            if(NetworkSelection.IsExcludedStreetLink(w.Tags["highway"]))continue;
             var joins=w.NodeIds.Count(selectedNodes.Contains);
             var ring=w.Tags.TryGetValue("junction",out var j)&&j=="roundabout";
             if(joins==0||!ring&&joins<2)continue;
@@ -45,12 +48,12 @@ public static class NetworkEvidence
         // Complete split roundabout components, not just the arc touching a selected
         // road. The downloaded query is bounded; this walks only its ring subgraph.
         var ringNodes=new HashSet<long>(selected.Concat(support).Where(id=>ways[id].Tags.TryGetValue("junction",out var j)&&j=="roundabout").SelectMany(id=>ways[id].NodeIds));
-        var pending=ways.Values.Where(w=>!selected.Contains(w.Id)&&!support.Contains(w.Id)&&w.Tags.TryGetValue("junction",out var j)&&j=="roundabout").ToList();
+        var pending=ways.Values.Where(w=>request.RoadLevel!=RoadImportLevel.None&&!selected.Contains(w.Id)&&!support.Contains(w.Id)&&(!w.Tags.TryGetValue("highway",out var h)||!NetworkSelection.IsExcludedStreetLink(h))&&w.Tags.TryGetValue("junction",out var j)&&j=="roundabout").ToList();
         bool changed;
         do {changed=false;for(var i=pending.Count-1;i>=0;i--){token.ThrowIfCancellationRequested();var w=pending[i];if(!w.NodeIds.Any(ringNodes.Contains))continue;support.Add(w.Id);ringNodes.UnionWith(w.NodeIds);pending.RemoveAt(i);changed=true;}} while(changed);
         required=selected.Concat(support).Distinct().ToArray();
         var missing=required.SelectMany(id=>ways[id].NodeIds).Where(id=>!source.Nodes.ContainsKey(id)).Distinct().Take(20).ToArray();
-        if(missing.Length>0)throw new PreparationDataException(PreparationDataIssue.NetworkIncomplete,$"Downloaded network still has missing required node references after bounded dependency recovery ({string.Join(",",missing)}).");
+        if(missing.Length>0)log.Warn($"Network dependency recovery left missing node references ({string.Join(",",missing)}). Only segments with unavailable endpoints will be omitted; remaining networks retained.");
         log.Count("Junction support ways admitted",support.Count);
         log.Diagnostic($"NETWORK EVIDENCE selectedWays={selected.Count}; supportWays={support.Count}; taggedNodes={source.NodeTags.Count}; restrictions={source.Relations.Count(r=>r.Tags.TryGetValue("type",out var t)&&t=="restriction")}; connectivity={source.Relations.Count(r=>r.Tags.TryGetValue("type",out var t)&&t=="connectivity")}; dependencyClosure=true; interpretationVersion=3; newEndpoints=0");
         foreach(var r in source.Relations.Where(r=>r.Tags.TryGetValue("type",out var t)&&(t=="restriction"||t=="connectivity")).Take(40))

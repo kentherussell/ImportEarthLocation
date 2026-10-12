@@ -59,33 +59,48 @@ public static class LocationServices
         query = query.Trim();
         if (query.Length < 2 || query.Length > 160) return "{\"results\":[],\"message\":\"Enter a place name (2–160 characters).\"}";
         var encoded = Uri.EscapeDataString(query);
-        var endpoints = new[] { "https://photon.komoot.io/api/?limit=6&q=" + encoded,
-            "https://geocoding-api.open-meteo.com/v1/search?count=6&language=en&name=" + encoded };
-        for (var provider = 0; provider < endpoints.Length; provider++)
+        var endpoints = new[] { "https://photon.komoot.io/api/?limit=20&lang=en&q=" + encoded,
+            "https://geocoding-api.open-meteo.com/v1/search?count=20&language=en&name=" + encoded };
+        async Task<List<JObject>> Fetch(int provider)
         {
+            var results=new List<JObject>();
             try
             {
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
                 timeout.CancelAfter(TimeSpan.FromSeconds(10));
                 using var response = await PublicHttpClient.Instance.GetAsync(endpoints[provider], timeout.Token).ConfigureAwait(false);
-                if (!response.IsSuccessStatusCode) continue; // No hammering a rate-limited provider.
+                if (!response.IsSuccessStatusCode) return results;
                 var root = JObject.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
-                var results = new JArray();
-                foreach (var item in (root[provider == 0 ? "features" : "results"] as JArray ?? new JArray()).Take(6))
+                foreach (var item in (root[provider == 0 ? "features" : "results"] as JArray ?? new JArray()).Take(20))
                 {
                     var p = provider == 0 ? item["properties"]! : item;
                     var latitude = provider == 0 ? (double?)item["geometry"]?["coordinates"]?[1] : (double?)item["latitude"];
                     var longitude = provider == 0 ? (double?)item["geometry"]?["coordinates"]?[0] : (double?)item["longitude"];
                     if (!latitude.HasValue || !longitude.HasValue || !Valid(latitude.Value, longitude.Value)) continue;
-                    var label = string.Join(", ", new[] { (string?)p["name"], (string?)p[provider == 0 ? "state" : "admin1"], (string?)p["country"] }.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct());
+                    var name=(string?)p["name:en"]??(string?)p["name"]??"";
+                    var label = string.Join(", ", new[] { name, (string?)p[provider == 0 ? "state" : "admin1"], (string?)p["country"] }.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct());
                     if (label.Length == 0) continue;
-                    results.Add(new JObject { ["label"] = label, ["latitude"] = latitude, ["longitude"] = longitude });
+                    results.Add(new JObject { ["label"] = label, ["latitude"] = latitude, ["longitude"] = longitude,
+                        ["exactName"]=string.Equals(name,query,StringComparison.OrdinalIgnoreCase),["population"]=(long?)p["population"]??0,
+                        ["city"]=(string?)p["osm_value"]=="city"||(string?)p["feature_code"]=="PPLC"||(string?)p["feature_code"]=="PPLA",
+                        ["providerRank"]=results.Count,["source"]=provider==0?"Photon / OpenStreetMap":"Open-Meteo / GeoNames" });
                 }
-                if (results.Count > 0) return new JObject { ["results"] = results, ["message"] = "Select a result.", ["source"] = provider == 0 ? "Photon / OpenStreetMap" : "Open-Meteo / GeoNames" }.ToString(Newtonsoft.Json.Formatting.None);
             }
             catch (Exception) when (!token.IsCancellationRequested) { /* Try the independent fallback once. */ }
             token.ThrowIfCancellationRequested();
+            return results;
         }
+        var providers=await Task.WhenAll(Fetch(0),Fetch(1)).ConfigureAwait(false);
+        var merged=providers.SelectMany(p=>p).OrderByDescending(p=>(bool?)p["exactName"]??false)
+            .ThenByDescending(p=>(long?)p["population"]??0).ThenByDescending(p=>(bool?)p["city"]??false)
+            .ThenBy(p=>(int?)p["providerRank"]??0).ToArray();
+        var selected=new List<JObject>();
+        foreach(var item in merged)
+        {
+            if(selected.Any(p=>Math.Abs((double)p["latitude"]!-(double)item["latitude"]!)<.025&&Math.Abs((double)p["longitude"]!-(double)item["longitude"]!)<.025))continue;
+            selected.Add(item);if(selected.Count>=12)break;
+        }
+        if(selected.Count>0)return new JObject{["results"]=new JArray(selected),["message"]="Select a result.",["source"]="English names; exact match, population and city relevance"}.ToString(Newtonsoft.Json.Formatting.None);
         return "{\"results\":[],\"message\":\"Place search unavailable. Pan the map or enter coordinates manually.\"}";
     }
 }

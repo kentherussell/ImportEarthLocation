@@ -45,7 +45,7 @@ public static class NetworkLaneAlignment
             if(inputs.Length!=1||outputs.Length!=1)continue;
             var incoming=inputs[0];var outgoing=outputs[0];
             var a=result[incoming.index];var b=result[outgoing.index];var heading=Heading(a,false);
-            if(math.dot(heading,Heading(b,true))<.97f||a.Tunnel!=b.Tunnel)continue;
+            if(math.dot(heading,Heading(b,true))<.9f||a.Tunnel!=b.Tunnel)continue;
             var normal=new float3(heading.y,0,-heading.x);var anchor=a.End;
             var attached=entries.Where(e=>result[e.index].ProtectedLink&&result[e.index].OneWay&&result[e.index].Tunnel==a.Tunnel).ToArray();
             var side=1f;
@@ -58,10 +58,12 @@ public static class NetworkLaneAlignment
             // Keep the opposite through-lane edge fixed when a lane is added or
             // removed on the ramp side. Never centre a wider road on a narrower one.
             var aAnchor=side>0?al[0]:al[al.Length-1];var bAnchor=side>0?bl[0]:bl[bl.Length-1];
-            joins.Add((incoming,outgoing,normal,attached,aAnchor-bAnchor));
+            // Keep the surveyed through centerline stable. Ramp alignment below
+            // still uses the actual lane palette; width changes cannot displace it.
+            joins.Add((incoming,outgoing,normal,attached,0));
         }
         var continuation=joins.ToDictionary(j=>j.incoming.index,j=>j);
-        const float taperLength=140;
+        const float taperLength=220;
         foreach(var join in joins)
         {
             token.ThrowIfCancellationRequested();if(Math.Abs(join.delta)<.01f)continue;
@@ -102,9 +104,13 @@ public static class NetworkLaneAlignment
                 var target=entry.start?a:b;var targetOffsets=Lanes(target);var lane=rampSide>0?targetOffsets[targetOffsets.Length-1]:targetOffsets[0];
                 var targetOffset=entry.start?a.EndCurveOffset:result[outgoing.index].StartCurveOffset;
                 var rampOffsets=Lanes(ramp);var rampLane=rampSide>0?rampOffsets[0]:rampOffsets[rampOffsets.Length-1];
-                var offset=targetOffset+normal*(lane-rampLane);if(math.length(offset)>12)continue;
+                // Ramp local lane coordinates rotate with its own approach.
+                // Subtracting both offsets in the mainline frame picks the wrong
+                // receiving lane when the ramp enters at a substantial angle.
+                var rampHeading=Heading(ramp,entry.start);var rampNormal=new float3(rampHeading.y,0,-rampHeading.x);
+                var offset=targetOffset+normal*lane-rampNormal*rampLane;if(math.length(offset)>12)continue;
                 var control=entry.start?ramp.Control1??math.lerp(ramp.Start,ramp.End,1f/3):ramp.Control2??math.lerp(ramp.Start,ramp.End,2f/3);
-                var reach=Math.Min(60,math.distance(control.xz,anchor.xz));var aligned=anchor+new float3(heading.x,0,heading.y)*reach*(entry.start?1:-1);aligned.y=control.y;
+                var reach=Math.Min(math.distance(ramp.Start.xz,ramp.End.xz)*.45f,Math.Min(90,Math.Max(12,math.distance(control.xz,anchor.xz))));var aligned=anchor+new float3(heading.x,0,heading.y)*reach*(entry.start?1:-1);aligned.y=control.y;
                 result[entry.index]=entry.start?ramp with{Control1=aligned,StartCurveOffset=offset}:ramp with{Control2=aligned,EndCurveOffset=offset};ramps++;
             }
         }

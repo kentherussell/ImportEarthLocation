@@ -40,7 +40,11 @@ public static class NativeEndpointPolicy
         {
             var key=Identity(s,start?s.StartNodeId:s.EndNodeId);
             if(!values.TryGetValue(key,out var list))values[key]=list=new List<float>();
-            list.Add(NetworkStructure.IsStructure(s)?(start?s.StartElevation:s.EndElevation)??NetworkStructure.Offset(s):0);
+            var elevation=NetworkStructure.IsStructure(s)?(start?s.StartElevation:s.EndElevation)??NetworkStructure.Offset(s):0;
+            // A rail bridge abutment can be ground-supported, never a negative
+            // cutting composition. Tunnel elevations remain genuinely negative.
+            if(s.Kind==NetworkKind.Rail&&s.Bridge&&!s.Tunnel)elevation=Math.Max(0,elevation);
+            list.Add(elevation);
         }
         // Mixed ground/structure portals use one node composition on both courses;
         // edge structure flags remain per-edge. Native collection otherwise keeps

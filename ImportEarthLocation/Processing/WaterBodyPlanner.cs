@@ -129,6 +129,7 @@ public static class WaterBodyPlanner
         var width=(float)request.MapSize.WidthMeters;var half=width*.5f;var n=(int)Math.Sqrt(terrain.Heightmap.Length);
         var spacing=width/(n-1);var conditioned=(ushort[])terrain.Heightmap.Clone();var editMask=new byte[conditioned.Length];var editCount=0;var sources=new List<RiverSourcePlan>();
         var areaStages=new List<WaterAreaStage>();var reachStages=new List<WaterReachStage>();
+        var riverSurface=new float[conditioned.Length];
         var unresolved=0;var riverCount=0;var lakeCount=0;
         var clock=Stopwatch.StartNew();var lastPulse=-5d;var phase="indexing mapped water";long activeBody=0;long bedVisits=0;long reachSamples=0;var totalWays=0;
         void Pulse(bool force=false)
@@ -143,6 +144,7 @@ public static class WaterBodyPlanner
         bool Inside(float3 p)=>Math.Abs(p.x)<=half-cell*2&&Math.Abs(p.z)<=half-cell*2;
         int Pixel(float3 p)=>(int)Math.Round(math.clamp(p.z/width+.5f,0,1)*(n-1))*n+(int)Math.Round(math.clamp(p.x/width+.5f,0,1)*(n-1));
         float Height(float3 p)=>NetworkProcessor.Sample(p.x,p.z,conditioned,terrain.HeightScaleMeters,width);
+        float BankHeight(float3 p)=>NetworkProcessor.Sample(p.x,p.z,terrain.Heightmap,terrain.HeightScaleMeters,width);
         float3 Local(long id){var p=data.Nodes[id];return GeoMath.ToLocalMeters(p.Latitude,p.Longitude,request.Latitude,request.Longitude);}
         var areas=polygons.Where(p=>Tag(p.Tags,"natural","water")||Tag(p.Tags,"waterway","riverbank")||Tag(p.Tags,"landuse","reservoir"))
             .Where(p=>p.Outer.Any(r=>r.Length>0)).Select((p,i)=>{Pulse();return new Area(p,i,token,()=>Pulse());}).ToArray();
@@ -152,6 +154,19 @@ public static class WaterBodyPlanner
         bool Dry(Area a)=>Tag(a.Polygon.Tags,"intermittent","yes")||a.Polygon.Tags.TryGetValue("seasonal",out var season)&&season!="no"&&season!="false"&&season!="0";
         bool Lake(Area a)=>!Flowing(a)&&!Coastal(a)&&!Dry(a);
         bool MappedDry(float3 p)=>holeIndex.Nearby(p).Any(a=>a.InHole(p));
+        bool DryFootprint(float3 q,Func<float3,bool> wet)
+        {
+            if(!Inside(q)||wet(q))return false;
+            var margin=Math.Max(cell,spacing)*1.5f;
+            return !wet(q+new float3(margin,0,margin))&&!wet(q+new float3(-margin,0,margin))&&
+                !wet(q+new float3(margin,0,-margin))&&!wet(q+new float3(-margin,0,-margin));
+        }
+        float3? DryProbe(float3 p,float3 direction,Func<float3,bool> wet,float start)
+        {
+            for(var distance=Math.Max(start,Math.Max(cell,spacing)*2);distance<=1024;distance+=Math.Max(cell,spacing))
+            {var q=p+direction*distance;if(DryFootprint(q,wet))return q;}
+            return null;
+        }
         void Cut(float3 center,float radius,float target,Func<float3,bool> mask,float budget)
         {
             var pixel=Pixel(center);var x0=pixel%n;var z0=pixel/n;var reach=(int)Math.Ceiling(radius/spacing);
@@ -178,26 +193,31 @@ public static class WaterBodyPlanner
             for(var z=loZ;z<=hiZ;z++)for(var x=loX;x<=hiX;x++)
             {
                 if((bedVisits++&4095)==0)Pulse();var p=new float3(x*spacing-half,0,z*spacing-half);
-                if(!area.Contains(p))continue;var stage=level(p);if(!stage.HasValue||!math.isfinite(stage.Value))continue;
+                if(!area.Contains(p)||MappedDry(p))continue;var stage=level(p);if(!stage.HasValue||!math.isfinite(stage.Value))continue;
                 var interior=0;foreach(var direction in boundaryOffsets)if(area.Contains(p+direction))interior++;
                 var depth=interior==4?2:Math.Max(.25f,interior*.25f);
                 var index=z*n+x;var original=terrain.Heightmap[index]/65535f*terrain.HeightScaleMeters;
-                var height=Math.Max(0,Math.Max(original-(Lake(area)?8:12),Math.Min(original,stage.Value-depth)));
+                var height=Math.Max(0,Lake(area)?Math.Max(original-8,Math.Min(original,stage.Value-depth)):Math.Min(original,stage.Value-depth));
                 var encoded=(ushort)Math.Ceiling(math.clamp(height/terrain.HeightScaleMeters*65535,0,65535));
                 accepted++;if(height>=stage.Value-.1f)blockedByBudget++;
+                // The accepted wet interior owns its bed even if it was already
+                // below target. Later earthworks must not introduce a new dam.
+                if(!Lake(area)&&editMask[index]==0){editMask[index]=1;editCount++;}
                 if(encoded>=conditioned[index])continue;conditioned[index]=encoded;if(editMask[index]==0){editMask[index]=1;editCount++;}
             }
-            log.Diagnostic($"WATER AREA BED body={area.Polygon.Identity}; cellsVisitedInside={accepted}; bedAboveStageAfterBudget={blockedByBudget}; continuousMask=true; holesPreserved=true; budgetMeters={(Lake(area)?8:12)}");
+            log.Diagnostic($"WATER AREA BED body={area.Polygon.Identity}; cellsVisitedInside={accepted}; bedAboveStageAfterBudget={blockedByBudget}; continuousMask=true; holesPreserved=true; lakeBudgetMeters=8; mappedRiverCutsConfinedToWetMask=true");
             log.Count("Water area bed cells above stage",blockedByBudget);
         }
         bool Add(long way,long body,string kind,string name,float3 p,float radius,float stage,float bank,IReadOnlyList<float3> banks,IReadOnlyList<float3> probes,Func<float3,bool> mask)
         {
-            if(!Inside(p)||radius<cell||stage<=WaterLevels.Effective(terrain.SeaLevelMeters))return false;
+            if(!Inside(p)||radius<Math.Max(2,cell*.25f)||!math.isfinite(stage))return false;
             // No circle spilling onto banks or islands, even for boundary-driven rivers.
-            bool Fits(float r)=>Enumerable.Range(0,16).All(i=>mask(p+new float3(math.cos(i*math.PI/8),0,math.sin(i*math.PI/8))*r));
-            while(radius>cell&&!Fits(radius))radius-=cell*.5f;
+            bool Fits(float r)=>Enumerable.Range(1,3).All(ring=>Enumerable.Range(0,16).All(i=>mask(p+new float3(math.cos(i*math.PI/8),0,math.sin(i*math.PI/8))*(r*ring/3))));
+            while(radius>Math.Max(2,cell*.25f)&&!Fits(radius))radius=Math.Max(Math.Max(2,cell*.25f),radius-cell*.25f);
             if(!Fits(radius)||stage>bank-.35f){unresolved++;log.Count(stage>bank-.35f?"Water stage bank conflicts":"Water source footprint policy rejected");return false;}
-            Cut(p,radius+spacing*2,stage-1.5f,mask,kind=="lake"?8:12);
+            // Give every footprint ring a fully submerged core, including the
+            // neighbouring terrain samples used by native bilinear interpolation.
+            Cut(p,(radius+spacing*2)/.7f,stage-2.5f,mask,kind=="lake"?8:float.PositiveInfinity);
             p.y=Height(p);var depth=stage-p.y;
             if(depth<.4f){unresolved++;log.Diagnostic($"WATER BODY UNRESOLVED body={body}; reason=bed-above-bank-limited-stage; bed={p.y:R}; stage={stage:R}; noFloodBypass=true");return false;}
             var repairCells=new List<int>();var pixel=Pixel(p);var reach=(int)Math.Ceiling((radius+spacing*1.5f)/spacing);
@@ -212,7 +232,9 @@ public static class WaterBodyPlanner
         foreach(var area in areas.Where(Lake))
         {
             token.ThrowIfCancellationRequested();lakeCount++;var polygon=area.Polygon;activeBody=polygon.Id;Pulse();
-            var banks=polygon.Outer.SelectMany(r=>r.Where((p,i)=>i%Math.Max(1,r.Length/64)==0)).Where(Inside).ToArray();
+            var banks=polygon.Outer.SelectMany(r=>r.Where((p,i)=>i%Math.Max(1,r.Length/64)==0)).Where(Inside)
+                .Select(p=>Enumerable.Range(0,8).Select(i=>DryProbe(p,new float3(math.cos(i*math.PI/4),0,math.sin(i*math.PI/4)),area.Contains,cell*2)).FirstOrDefault(q=>q.HasValue))
+                .Where(p=>p.HasValue).Select(p=>p!.Value).ToArray();
             if(banks.Length<3){unresolved++;continue;}
             var sorted=banks.Select(Height).OrderBy(h=>h).ToArray();var stage=sorted[0]-.5f;
             areaStages.Add(new WaterAreaStage(polygon.Identity,"lake",stage));
@@ -250,7 +272,8 @@ public static class WaterBodyPlanner
         }
         var ends=new Dictionary<long,long>();foreach(var w in lines)foreach(var id in w.NodeIds){Pulse();if(ends.TryGetValue(id,out var other))Connect(w.Id,other);else ends[id]=w.Id;}
         var positions=new Dictionary<long,float3>();var nodeStage=new Dictionary<long,float>();
-        foreach(var w in lines)foreach(var id in w.NodeIds)if(!positions.ContainsKey(id)){Pulse();var p=Local(id);positions[id]=p;nodeStage[id]=Height(p)+1.8f;}
+        foreach(var w in lines)foreach(var id in w.NodeIds)if(!positions.ContainsKey(id)){Pulse();var p=Local(id);positions[id]=p;nodeStage[id]=BankHeight(p)+2.8f;}
+        var bankTargets=new Dictionary<long,float>();
         var bankLimitedNodes=0;
         foreach(var w in lines)for(var i=0;i<w.NodeIds.Length;i++)
         {
@@ -264,11 +287,19 @@ public static class WaterBodyPlanner
             {
                 var distance=Math.Max(cell,halfWidth);
                 while(distance<512&&area!=null&&area.Contains(p+normal*(distance*side)))distance+=Math.Max(cell,halfWidth*.5f);
-                var q=p+normal*(distance*side);if(Math.Abs(q.x)<=half&&Math.Abs(q.z)<=half)bank=Math.Min(bank,Height(q));
+                var q=DryProbe(p,normal*side,area!=null?area.Contains:r=>NetworkNormalizer.DistanceToSegment(r,p,neighbor)<=halfWidth,distance);
+                if(q.HasValue)bank=Math.Min(bank,BankHeight(q.Value));
             }
-            if(math.isfinite(bank)&&nodeStage[id]>bank-.35f)
-            {nodeStage[id]=bank-.35f;bankLimitedNodes++;}
+            if(math.isfinite(bank))
+            {
+                var target=bank-.35f;
+                if(bankTargets.TryGetValue(id,out var prior))target=Math.Min(prior,target);
+                bankTargets[id]=target;
+                if(nodeStage[id]>bank-.35f)bankLimitedNodes++;
+            }
         }
+        foreach(var p in bankTargets)nodeStage[p.Key]=p.Value;
+        var desiredStage=new Dictionary<long,float>(nodeStage);
         log.Diagnostic($"WATER OFFSET CONTAINMENT requestedOffsetMeters=1; bankLimitedNodeUpdates={bankLimitedNodes}; effectiveStageCappedAtBank=true; fullOffsetNotGuaranteed=true; reason=offset-and-containment-can-conflict");
         log.Count("Water offset bank limited nodes",bankLimitedNodes);
         var baseBed=positions.ToDictionary(p=>p.Key,p=>Height(p.Value));
@@ -276,7 +307,7 @@ public static class WaterBodyPlanner
         var lowerStage=positions.ToDictionary(p=>p.Key,p=>
         {
             var polygon=areaIndex.Nearby(p.Value).FirstOrDefault(a=>Flowing(a)&&!Coastal(a)&&!Dry(a)&&a.Contains(p.Value));
-            return baseBed[p.Key]-(polygon!=null?12:4)+.4f;
+            return polygon!=null?.4f:Math.Max(.4f,baseBed[p.Key]-8+.4f);
         });
         phase="sampling contained river stage bounds";Pulse(true);
         // Constrain the shared endpoint solve BEFORE carving or creating any
@@ -298,8 +329,8 @@ public static class WaterBodyPlanner
                 {
                     var distance=Math.Max(cell,halfWidth);
                     while(distance<512&&polygon!=null&&polygon.Contains(p+normal*(distance*side)))distance+=Math.Max(cell,halfWidth*.5f);
-                    var q=p+normal*(distance*side);
-                    if(Math.Abs(q.x)<=half&&Math.Abs(q.z)<=half){bank=Math.Min(bank,Height(q));banks++;}
+                    var q=DryProbe(p,normal*side,polygon!=null?polygon.Contains:r=>NetworkNormalizer.DistanceToSegment(r,a,b)<=halfWidth,distance);
+                    if(q.HasValue){bank=Math.Min(bank,BankHeight(q.Value));banks++;}
                 }
                 if(banks<2||!math.isfinite(bank)){missingBankSamples++;continue;}
                 var proposed=math.lerp(nodeStage[aid],nodeStage[bid],t);var excess=proposed-(bank-.35f);
@@ -308,12 +339,21 @@ public static class WaterBodyPlanner
                     // Lower both endpoints by the same excess. This preserves
                     // the reach gradient and satisfies its sampled linear bound;
                     // all later adjustments are downward, so prior bounds hold.
-                    nodeStage[aid]-=excess;nodeStage[bid]-=excess;sampledBankUpdates++;
+                    // Weighted projection cannot cumulatively lower a whole river
+                    // below its recoverable bed floor. Unsatisfied local constraints
+                    // remain local diagnostics, not whole-body isolation.
+                    // Absolute bounds reference the immutable desired profile.
+                    // Dense repeated samples cannot cumulatively subtract the
+                    // same bank constraint until a whole river becomes puddles.
+                    var slope=desiredStage[bid]-desiredStage[aid];var limit=bank-.35f;
+                    nodeStage[aid]=Math.Min(nodeStage[aid],Math.Max(lowerStage[aid],limit-slope*t));
+                    nodeStage[bid]=Math.Min(nodeStage[bid],Math.Max(lowerStage[bid],limit+slope*(1-t)));sampledBankUpdates++;
                 }
                 var minimum=Height(p)-(polygon!=null?12:4)+.4f;
                 if(math.lerp(nodeStage[aid],nodeStage[bid],t)<minimum-.005f)unsupportedBodies.Add(bodyIds[Root(way.Id)]);
             }
         }
+        foreach(var id in positions.Keys)nodeStage[id]=Math.Max(nodeStage[id],lowerStage[id]);
         foreach(var way in lines)
             if(way.NodeIds.Any(id=>nodeStage[id]<lowerStage[id]-.005f))unsupportedBodies.Add(bodyIds[Root(way.Id)]);
         log.Count("Water sampled bank bound updates",sampledBankUpdates);
@@ -356,12 +396,7 @@ public static class WaterBodyPlanner
         foreach(var way in lines)
         {
             token.ThrowIfCancellationRequested();riverCount++;var body=bodyIds[Root(way.Id)];activeBody=body;Pulse();var previousStage=nodeStage[way.NodeIds[0]];
-            if(unsupportedBodies.Contains(body))
-            {
-                unresolved++;log.Count("Water infeasible body ways isolated");
-                if(log.Metric("Water infeasible body ways isolated")<=32)log.Diagnostic($"WATER BODY ISOLATED body={body}; way={way.Id}; reason=no-feasible-contained-continuous-stage; canonicalStagePublished=false; riverBedCarved=false; regulatorCreated=false; overallImportContinues=true");
-                continue;
-            }
+            if(unsupportedBodies.Contains(body))log.Count("Water bodies using local feasible reaches");
             for(var i=1;i<way.NodeIds.Length;i++)
             {
                 var a=positions[way.NodeIds[i-1]];var b=positions[way.NodeIds[i]];if(!WaterPlanner.Clip(a,b,half-cell*2,out var lo,out var hi))continue;
@@ -377,18 +412,21 @@ public static class WaterBodyPlanner
                     reachSamples++;Pulse();var p=math.lerp(a,b,j/(float)steps);if(MappedDry(p))continue;var area=areaIndex.Nearby(p).FirstOrDefault(r=>Flowing(r)&&!Coastal(r)&&!Dry(r)&&r.Contains(p));
                     // Do not silently inflate a known 4m canal to the native
                     // 56m source diameter, or reinterpret an island as unmapped water.
-                    Func<float3,bool> mask=area!=null?area.Contains:q=>!MappedDry(q)&&NetworkNormalizer.DistanceToSegment(q,a,b)<=reach;
+                    Func<float3,bool> mask=area!=null?q=>area.Contains(q)&&!MappedDry(q):q=>!MappedDry(q)&&NetworkNormalizer.DistanceToSegment(q,a,b)<=reach;
                     var banks=new List<float3>();
                     foreach(var side in new[]{-1,1})
                     {
                         var distance=Math.Max(cell,reach);
                         while(distance<512&&mask(p+normal*(distance*side)))distance+=Math.Max(cell,reach*.5f);
-                        var bankPoint=p+normal*(distance*side);if(Math.Abs(bankPoint.x)<=half&&Math.Abs(bankPoint.z)<=half)banks.Add(bankPoint);
+                        var bankPoint=DryProbe(p,normal*side,mask,distance);if(bankPoint.HasValue)banks.Add(bankPoint.Value);
                     }
                     if(banks.Count<2){unresolved++;continue;}
-                    var bank=banks.Min(Height);var stage=Math.Min(previousStage,math.lerp(nodeStage[way.NodeIds[i-1]],nodeStage[way.NodeIds[i]],math.lerp(lo,hi,j/(float)steps)));
+                    var bank=banks.Min(BankHeight);var stage=Math.Min(bank-.35f,math.lerp(nodeStage[way.NodeIds[i-1]],nodeStage[way.NodeIds[i]],math.lerp(lo,hi,j/(float)steps)));
+                    var floor=area!=null?.4f:Math.Max(.4f,Height(p)-8+.4f);
+                    if(stage<floor){unresolved++;log.Count("Water locally infeasible reaches");continue;}
                     if(stage>bank-.25f)
                     {unresolved++;log.Count("Water sampled final bank bound violations");continue;}
+                    var stagePixel=Pixel(p);riverSurface[stagePixel]=riverSurface[stagePixel]>0?Math.Min(riverSurface[stagePixel],stage):stage;
                     // Publish stage evidence even when a native source is subgrid.
                     // Keep the shared-node solve authoritative rather than independently
                     // lowering each way at confluences. Bank conflicts reject controls.
@@ -411,15 +449,37 @@ public static class WaterBodyPlanner
                     // mapped wet cross-section instead of carving a 32m ribbon
                     // down the middle of a several-hundred-metre-wide river.
                     var wetRadius=area!=null?Math.Min(512,banks.Min(q=>math.distance(q.xz,p.xz)))*.95f:reach;
-                    previousStage=stage;Cut(p,wetRadius,stage-1.5f,mask,area!=null?12:4);
-                    if(area==null&&sourceWidth<cell*2){unresolved++;log.Count("Water mapped subgrid sites");continue;}
+                    previousStage=stage;Cut(p,wetRadius/.7f,stage-2.5f,mask,area!=null?float.PositiveInfinity:8);
+                    if(area==null&&sourceWidth<cell*2)log.Count("Water mapped subgrid sites using contained controls");
                     if(NearControl(body,p))continue;
-                    var radius=cell;if(Add(way.Id,body,"river",way.Tags.TryGetValue("name",out var name)?name:"waterway",p,radius,stage,bank,banks,new[]{p,math.lerp(p,b,.5f),b},mask))
+                    var radius=area!=null?Math.Max(cell,Math.Min(192,wetRadius*.55f)):Math.Max(2,Math.Min(cell,reach*.7f));if(Add(way.Id,body,"river",way.Tags.TryGetValue("name",out var name)?name:"waterway",p,radius,stage,bank,banks,new[]{p,math.lerp(p,b,.5f),b},mask))
                     {var key=((int)Math.Floor(p.x/192),(int)Math.Floor(p.z/192));if(!controlGrid.TryGetValue(key,out var list))controlGrid[key]=list=new();list.Add(sources[sources.Count-1]);}
                 }
             }
         }
         phase="publishing conditioned water terrain";Pulse(true);
+        // Multi-source propagation gives every mapped channel cell the nearby
+        // solved reach level in linear raster work, not a per-pixel scan of all
+        // river segments. Islands and disconnected polygons cannot be crossed.
+        var wet=new byte[conditioned.Length];
+        foreach(var area in areas.Where(a=>Flowing(a)&&!Coastal(a)&&!Dry(a)))
+        {
+            var loX=Math.Max(0,(int)Math.Ceiling((area.Min.x+half)/spacing));var hiX=Math.Min(n-1,(int)Math.Floor((area.Max.x+half)/spacing));
+            var loZ=Math.Max(0,(int)Math.Ceiling((area.Min.y+half)/spacing));var hiZ=Math.Min(n-1,(int)Math.Floor((area.Max.y+half)/spacing));
+            for(var z=loZ;z<=hiZ;z++)for(var x=loX;x<=hiX;x++)
+            {if((bedVisits++&4095)==0)Pulse();var p=new float3(x*spacing-half,0,z*spacing-half);if(area.Contains(p)&&!MappedDry(p))wet[z*n+x]=1;}
+        }
+        var riverQueue=new int[conditioned.Length];var head=0;var tail=0;
+        for(var i=0;i<wet.Length;i++){if((i&16383)==0)Pulse();if(wet[i]!=0&&riverSurface[i]>0)riverQueue[tail++]=i;else riverSurface[i]=0;}
+        while(head<tail)
+        {
+            if((head&4095)==0)Pulse();var i=riverQueue[head++];var x=i%n;var z=i/n;
+            void Visit(int next){if(next<0||wet[next]==0||riverSurface[next]>0)return;riverSurface[next]=riverSurface[i];riverQueue[tail++]=next;}
+            Visit(x>0?i-1:-1);Visit(x+1<n?i+1:-1);Visit(z>0?i-n:-1);Visit(z+1<n?i+n:-1);
+        }
+        foreach(var area in areas.Where(a=>Flowing(a)&&!Coastal(a)&&!Dry(a)))CarveArea(area,p=>riverSurface[Pixel(p)]>0?riverSurface[Pixel(p)]:(float?)null);
+        log.Diagnostic($"WATER CHANNEL CONTINUITY mappedWetCells={wet.Count(v=>v!=0)}; solvedWetCells={tail}; disconnectedUnseededCells={wet.Count(v=>v!=0)-tail}; islandsPreserved=true; sourceLevelPropagation=nearestConnectedRasterSeed; quadraticReachSearch=false");
+        log.Diagnostic($"WATER BANKFULL PROFILE targetBankFreeboardMeters=.35; immutableBankTerrain=true; nonCumulativeSampleBounds=true; initialCenterlineOffsetMeters=2.8; fullWidthDepthMeters=2.5; widthAwareSourceRadius=true; mappedRiverBedBudget=maskOwned; finalNodes={nodeStage.Count}; minimumFinalStage={nodeStage.Values.DefaultIfEmpty(0).Min():R}; maximumFinalStage={nodeStage.Values.DefaultIfEmpty(0).Max():R}");
         // River cross-sections were already stamped at <= half DEM spacing or
         // half mapped width. Do not perform a second polygon-wide nearest-reach
         // search per raster cell: it can turn dense hydrology into quadratic work.
@@ -427,7 +487,7 @@ public static class WaterBodyPlanner
         TerrainArtifactRepair.TraceEncoded(conditioned, terrain.HeightScaleMeters, terrain.SeaLevelMeters, "after-water-bed-planning", log.Diagnostic);
         var coastal=data.Ways.Values.Any(w=>Tag(w.Tags,"natural","coastline"));
         var report=$"Water: {sources.Count} bank-limited river/lake controls; {lakeCount} mapped lakes; {unresolved} unresolved narrow/height sites. No flooding bypass. Coverage requires simulation verification.";
-        log.Info(report);log.Diagnostic($"WATER BODY SUMMARY bodies={sources.Select(s=>s.BodyId).Distinct().Count()}; controls={sources.Count}; bedEdits={editCount}; cellMeters={cell:R}; mappedRiverBankWidthUsed=true; maximumPolygonBedCutMeters=12; fixedDepthFallback=false; floodingAccepted=false; unresolved={unresolved}; indexedPolygonPredicates=true; bedCellsVisited={bedVisits}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.###}; canonicalAreas={areaStages.Count}; canonicalReaches={reachStages.Count}; maskBytes={editMask.Length}; geometryVersion={WaterPlan.GeometryVersion}");
+        log.Info(report);log.Diagnostic($"WATER BODY SUMMARY bodies={sources.Select(s=>s.BodyId).Distinct().Count()}; controls={sources.Count}; bedEdits={editCount}; cellMeters={cell:R}; mappedRiverBankWidthUsed=true; polygonBedCutsMaskOwned=true; fixedDepthFallback=false; floodingAccepted=false; unresolved={unresolved}; indexedPolygonPredicates=true; bedCellsVisited={bedVisits}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.###}; canonicalAreas={areaStages.Count}; canonicalReaches={reachStages.Count}; maskBytes={editMask.Length}; geometryVersion={WaterPlan.GeometryVersion}");
         return new WaterPlan(coastal,riverCount,lakeCount,unresolved,report){Sources=sources,ConditionedHeightmap=editCount>0?conditioned:null,PlannedBedHeightmap=conditioned,WaterCellSize=cell,AreaStages=areaStages,ReachStages=reachStages,BedEdits=new TerrainEditSet("water-bed","pre-water-terrain",n,editMask)};
     }
 
@@ -478,7 +538,8 @@ public static class WaterBodyPlanner
                 if((index&4095)==0)Pulse();if(owned.Mask[index]==0||raster[index]<=plannedBed[index])continue;
                 if(protectedCells[index]!=0){supportBlocked++;continue;}
                 var cut=(raster[index]-plannedBed[index])/65535f*terrain.HeightScaleMeters;
-                if(cut>2){blocked++;continue;}
+                // This restores the exact previously accepted water-owned bed,
+                // not a new unbounded cut or a change to islands/infrastructure.
                 raster[index]=plannedBed[index];finalEdits[index]=1;repaired++;
             }
         foreach(var source in plan.Sources)
@@ -495,7 +556,7 @@ public static class WaterBodyPlanner
                 var q=new float3((index%n)*cell-half,0,(index/n)*cell-half);
                 if(source.BankProbes.Any(b=>math.distance(b.xz,q.xz)<cell*2))continue;
                 var old=raster[index]/65535f*terrain.HeightScaleMeters;var target=stage-.6f;if(old<=target)continue;
-                if(old-target>2){blocked++;continue;}
+                if(owned==null||owned.Mask.Length!=raster.Length||owned.Mask[index]==0){blocked++;continue;}
                 raster[index]=(ushort)Math.Ceiling(math.clamp(target/terrain.HeightScaleMeters*65535,0,65535));finalEdits[index]=1;repaired++;
             }
             p.y=Height(p);
@@ -503,7 +564,7 @@ public static class WaterBodyPlanner
             if(Math.Abs(stage-(source.TargetSurfaceLevel??stage))>.01f||Math.Abs(p.y-source.Position.y)>.01f)adjusted++;
             revised.Add(source with{Position=p,Depth=stage-p.y,TargetSurfaceLevel=stage,BankLevel=bank,ChannelProbes=source.ChannelProbes.Select(q=>new float3(q.x,Height(q),q.z)).ToArray()});
         }
-        log.Diagnostic($"WATER FINAL REVALIDATION controls={revised.Count}/{plan.Sources.Count}; adjusted={adjusted}; repairedBedSamples={repaired}; blockedLargeObstructions={blocked}; supportBlockedSamples={supportBlocked}; maximumNewCutMeters=2; infrastructureAndBanksProtected=true; lakesKeepOneStage=true; afterEarthworks=true; canonicalStagePreserved=true; recoveryUsesCompleteOwnedWetMask=true; protectionMaskBytes={protectedCells.Length}; producerMaskBytes={finalEdits.Length}");
+        log.Diagnostic($"WATER FINAL REVALIDATION controls={revised.Count}/{plan.Sources.Count}; adjusted={adjusted}; repairedBedSamples={repaired}; nonOwnedObstructionsBlocked={blocked}; supportBlockedSamples={supportBlocked}; restoresAcceptedOwnedBedWithoutTwoMeterCap=true; infrastructureAndBanksProtected=true; lakesKeepOneStage=true; afterEarthworks=true; canonicalStagePreserved=true; recoveryUsesCompleteOwnedWetMask=true; protectionMaskBytes={protectedCells.Length}; producerMaskBytes={finalEdits.Length}");
         TerrainArtifactRepair.TraceEncoded(raster, terrain.HeightScaleMeters, terrain.SeaLevelMeters, "after-water-final-revalidation", log.Diagnostic);
         return plan with{Sources=revised,ConditionedHeightmap=repaired>0?raster:null,FinalBedEdits=new TerrainEditSet("water-final-bed","post-roadbed-terrain",n,finalEdits),Skipped=plan.Skipped+plan.Sources.Count-revised.Count};
     }

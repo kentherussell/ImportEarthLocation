@@ -1,4 +1,5 @@
 using Newtonsoft.Json.Linq;
+using System.Collections.Generic;
 
 namespace ImportEarthLocation.Core;
 
@@ -7,11 +8,8 @@ public static class DiagnosticEvidence
     public static bool AllExpectedPresent(JArray expected,JArray? observed)
     {
         if(expected.Count==0||observed==null)return false;
-        foreach(var item in expected)
-        {
-            var found=false;foreach(var actual in observed)if(JToken.DeepEquals(item,actual)){found=true;break;}
-            if(!found)return false;
-        }
+        var native=new HashSet<JToken>(observed,new JTokenEqualityComparer());
+        foreach(var item in expected)if(!native.Contains(item))return false;
         return true;
     }
 

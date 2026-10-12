@@ -26,7 +26,7 @@ public static class RailVerticalProfiles
             // Bridge abutments may be ground-supported. A blanket +8 m at
             // every bridge endpoint produces unnecessary pillars and steps;
             // only observed independent crossings create clearance floors.
-            if(node.Value.All(s=>s.Tunnel))heights[node.Key]-=8;
+            if(node.Value.All(s=>s.Tunnel))heights[node.Key]-=15;
         }
         // Share heights through portals and branches; do not stack independently
         // sampled pieces. Propagate necessary bridge approaches along actual rails.
@@ -70,7 +70,7 @@ public static class RailVerticalProfiles
         float Clamp(long node,float value)
         {
             var ground=Ground(positions[node]);
-            var ceiling=joins[node].All(e=>e.Tunnel)?ground-8:ground+30;
+            var ceiling=joins[node].All(e=>e.Tunnel)?ground-15:ground+30;
             var floor=joins[node].Any(e=>e.Bridge)?bridgeFloors[node]:ground-20;
             return math.clamp(value,floor,ceiling);
         }
@@ -92,7 +92,7 @@ public static class RailVerticalProfiles
             {
                 var a=node.Value[0];var b=node.Value[1];
                 var left=a.StartNodeId==node.Key?a.EndNodeId:a.StartNodeId;var right=b.StartNodeId==node.Key?b.EndNodeId:b.StartNodeId;
-                if(a.Bridge!=b.Bridge||a.Tunnel!=b.Tunnel||a.Layer!=b.Layer)continue;
+                if(a.Tunnel!=b.Tunnel)continue;
                 var la=Math.Max(1,lengths[a]);var lb=Math.Max(1,lengths[b]);
                 var target=(snapshot[left]*lb+snapshot[right]*la)/(la+lb);
                 var value=Clamp(node.Key,math.lerp(snapshot[node.Key],target,.35f));
@@ -124,9 +124,9 @@ public static class RailVerticalProfiles
                 var ceiling=float.PositiveInfinity;
                 var length=NetworkVerticalProfiles.ArcLength(s);
                 var baseCurve=s with{Start=a,End=d,Control1=c1,Control2=c2};
-                float PortalCover(float distance){var t=math.clamp(distance/100,0,1);return 8*t*t*(3-2*t);}
+                float PortalCover(float distance){var t=math.clamp(distance/160,0,1);return 15*t*t*(3-2*t);}
                 for(var i=1;i<64;i++){var t=i/64f;var p=NetworkNormalizer.Evaluate(baseCurve,t);var line=p.y;
-                    var clearance=8f;
+                    var clearance=15f;
                     if(joins[s.StartNodeId].Any(e=>!e.Tunnel))clearance=Math.Min(clearance,PortalCover(length*t));
                     if(joins[s.EndNodeId].Any(e=>!e.Tunnel))clearance=Math.Min(clearance,PortalCover(length*(1-t)));
                     ceiling=Math.Min(ceiling,(Ground(p)-clearance-line)/(16*t*t*(1-t)*(1-t)));}

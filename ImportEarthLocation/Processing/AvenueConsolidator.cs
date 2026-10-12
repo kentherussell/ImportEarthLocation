@@ -49,18 +49,18 @@ public static class AvenueConsolidator
             return station/Length;
         }
     }
-    private static bool Eligible(PreparedSegment s) => s.Kind==NetworkKind.Road&&s.OneWay&&!s.Bridge&&!s.Tunnel&&
+    private static bool Eligible(PreparedSegment s) => s.Kind==NetworkKind.Road&&s.OneWay&&
         !s.Classification.EndsWith("_link",StringComparison.OrdinalIgnoreCase)&&
         (s.Classification=="primary"||s.Classification=="secondary"||s.Classification=="tertiary"||s.Classification=="residential"||s.Classification=="unclassified")&&
         !s.Roundabout&&s.Control1==null&&s.Control2==null;
     // Names often change at administrative/OSM splits. They do not delimit a
     // physical carriageway. Conflicting explicit references remain separate.
-    private static string Identity(PreparedSegment s) => s.Classification+":"+s.Layer+":"+s.Reference.Trim().ToUpperInvariant();
+    private static string Identity(PreparedSegment s) => "street:"+s.Layer+":"+s.Bridge+":"+s.Tunnel+":"+s.Reference.Trim().ToUpperInvariant();
 
     public static IReadOnlyList<PreparedSegment> Prepare(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
     {
         token.ThrowIfCancellationRequested(); var clock=Stopwatch.StartNew();
-        var structureNodes=new HashSet<long>(source.Where(s=>s.Bridge||s.Tunnel||s.Kind==NetworkKind.Rail).SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));
+        var structureNodes=new HashSet<long>(source.Where(s=>s.Kind==NetworkKind.Rail).SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));
         // Keep the actual structural tie-in edge, not an entire avenue just because
         // a distant end meets a bridge. The retained edge becomes the transition.
         var eligible=source.Where(s=>Eligible(s)&&!structureNodes.Contains(s.StartNodeId)&&!structureNodes.Contains(s.EndNodeId)).OrderBy(Identity,StringComparer.Ordinal).ThenBy(s=>s.WayId).ThenBy(s=>s.StartNodeId).ToArray();
@@ -79,13 +79,22 @@ public static class AvenueConsolidator
                 while(visited.Add(current))
                 {
                     token.ThrowIfCancellationRequested(); list.Add(current);
-                    if(!outgoing.TryGetValue(current.EndNodeId,out var next)||next.Length!=1||incoming[current.EndNodeId].Length!=1)break;
-                    current=next[0];
+                    if(!outgoing.TryGetValue(current.EndNodeId,out var next))break;
+                    if(next.Length==1&&incoming[current.EndNodeId].Length==1){current=next[0];continue;}
+                    // Keep a clearly aligned carriageway as one matching
+                    // corridor across side-street junctions. Junction stations
+                    // remain in SourcesBetween/Stations and are remapped later.
+                    var direction=math.normalizesafe(current.End.xz-current.Start.xz);
+                    var ranked=next.Where(e=>!visited.Contains(e)&&e.Bridge==current.Bridge&&e.Tunnel==current.Tunnel)
+                        .Select(e=>(edge:e,dot:math.dot(direction,math.normalizesafe(e.End.xz-e.Start.xz))))
+                        .OrderByDescending(e=>e.dot).ToArray();
+                    if(ranked.Length==0||ranked[0].dot<.95f||ranked.Length>1&&ranked[0].dot-ranked[1].dot<.05f)break;
+                    current=ranked[0].edge;
                 }
                 if(list.Count==0||list[0].StartNodeId==list[list.Count-1].EndNodeId)continue;
                 var distances=new float[list.Count+1];
                 for(var i=0;i<list.Count;i++)distances[i+1]=distances[i]+math.distance(list[i].Start.xz,list[i].End.xz);
-                if(distances[distances.Length-1]>=60&&distances.All(math.isfinite))chains.Add(new Chain{Edges=list.ToArray(),Distances=distances});
+                if(distances[distances.Length-1]>=20&&distances.All(math.isfinite))chains.Add(new Chain{Edges=list.ToArray(),Distances=distances});
             }
         }
         // Search near the opposite chain's end, not all pairs or only their midpoints.
@@ -114,13 +123,15 @@ public static class AvenueConsolidator
                     var sameIdentity=Identity(a.Edges[0])==Identity(b.Edges[0])&&
                         (a.Edges[0].Name.Equals(b.Edges[0].Name,StringComparison.OrdinalIgnoreCase)||
                          a.Edges[0].Reference.Length>0);
+                    if(a.Edges[0].Bridge!=b.Edges[0].Bridge||a.Edges[0].Tunnel!=b.Edges[0].Tunnel)continue;
                     if(!sameIdentity&&(a.Edges[0].Classification!=b.Edges[0].Classification||a.Edges[0].Layer!=b.Edges[0].Layer||
                         a.Edges[0].Reference.Length>0&&b.Edges[0].Reference.Length>0&&a.Edges[0].Reference!=b.Edges[0].Reference))continue;
                     var direction=math.normalizesafe(a.End.xz-a.Start.xz);
                     if(math.dot(direction,math.normalizesafe(b.End.xz-b.Start.xz))>-.95f)continue;
                     var a0=a.Project(b.End);var a1=a.Project(b.Start);var b0=b.Project(a.End);var b1=b.Project(a.Start);
                     var overlap=(a1-a0)*a.Length;var reverseOverlap=(b1-b0)*b.Length;
-                    if(overlap<60||reverseOverlap<60||overlap/reverseOverlap<.8f||overlap/reverseOverlap>1.25f)continue;
+                    var minimumOverlap=sameIdentity?20:60;
+                    if(overlap<minimumOverlap||reverseOverlap<minimumOverlap||overlap/reverseOverlap<.8f||overlap/reverseOverlap>1.25f)continue;
                     var valid=true;var separation=0f;var sign=0f;
                     var samples=Math.Max(32,(int)Math.Ceiling(Math.Max(overlap,reverseOverlap)/24));
                     for(var sample=0;sample<=samples;sample++)
@@ -137,7 +148,10 @@ public static class AvenueConsolidator
                     var unnamed=a.Edges[0].Name.Length==0&&a.Edges[0].Reference.Length==0;
                     // Different source names are not proof of different corridors.
                     // Require long, narrow, reciprocal geometry when name evidence differs.
-                    if(valid&&separation>=2&&(!unnamed||overlap>=120&&separation<=18)&&(sameIdentity||overlap>=160&&separation<=18))matches[i].Add((j,separation,a0,a1,b0,b1));
+                    // Rank coverage as well as separation. A nearby tiny fragment
+                    // must not displace a slightly farther full corridor match.
+                    var coverage=Math.Min(overlap/a.Length,reverseOverlap/b.Length);
+                    if(valid&&separation>=2&&(!unnamed||overlap>=120&&separation<=18)&&(sameIdentity||overlap>=160&&separation<=18))matches[i].Add((j,separation+12*(1-coverage),a0,a1,b0,b1));
                 }
             matches[i]=matches[i].OrderBy(m=>m.score).ThenBy(m=>m.other).ToList();
         }
@@ -224,7 +238,7 @@ public static class AvenueConsolidator
                 var sideA=a.SourcesBetween(fractions[k-1],fractions[k]);var sideB=b.SourcesBetween(1-fractions[k],1-fractions[k-1]);
                 var observations=sideA.Concat(sideB).ToArray();
                 var forward=a.Lanes(middle);var backward=b.Lanes(1-middle);var requested=forward+backward;
-                var lanes=requested<=4?4:6;
+                var lanes=NetworkSelection.MatchedLanes(requested,false,false);
                 var speeds=observations.Where(s=>s.SourceSpeedKph.HasValue).Select(s=>s.SourceSpeedKph!.Value).ToArray();
                 // Each output interval owns only overlapping evidence. Assigning
                 // every corridor way to every piece creates false native turns.
@@ -262,6 +276,8 @@ public static class AvenueConsolidator
         }
         result.AddRange(created);
         log.Count("Opposing road pairs consolidated into avenues",pairs);log.Count("Avenue attachment endpoints reconnected",reconnected);
+        foreach(var i in Enumerable.Range(0,chains.Count).Where(i=>!used.Contains(i)&&matches[i].Count>0).Take(40))
+            log.Diagnostic($"AVENUE UNRESOLVED opposingCandidate=true; sourceWay={chains[i].Edges[0].WayId}; candidateWay={chains[matches[i][0].other].Edges[0].WayId}; separationMeters={matches[i][0].score:0.###}; lengthMeters={chains[i].Length:0.###}; reason={(ClearBest(i)?"non-reciprocal-or-attachment-transition":"multiple-near-equal-candidates")}; noBlindDirectionConversion=true");
         log.Diagnostic($"AVENUE TOTAL eligibleSections={eligible.Length}; chains={chains.Count}; comparisons={comparisons}; pairsMerged={pairs}; sourceSectionsReplaced={removed.Count}; outputAvenueSections={created.Count}; attachmentEndpointsReconnected={reconnected}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.###}; ambiguousOrUnmatchedChainsPreserved={chains.Count-used.Count}; structuresPreserved=true");
         return AvenueJunctionRepair.Prepare(result,log,token);
     }

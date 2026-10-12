@@ -40,7 +40,7 @@ public sealed record ImportRequest(
     bool IncludeSecondaryRoads)
 {
     // Legacy constructor flag migrates to the new tier; rail remains independently enabled.
-    public RoadImportLevel RoadLevel { get; init; } = IncludeSecondaryRoads ? RoadImportLevel.Secondary : RoadImportLevel.Primary;
+    public RoadImportLevel RoadLevel { get; init; } = RoadImportLevel.None;
     public bool ImportRail { get; init; } = true;
     public bool ImportForests { get; init; } = true;
     public long MapSessionId { get; init; }
@@ -48,6 +48,7 @@ public sealed record ImportRequest(
     public bool ApplyGroundSurfaces { get; init; }
     public bool CreateAirConnections { get; init; }
     public bool CreateSeaConnections { get; init; }
+    public bool DiagnosticsEnabled { get; init; }
 }
 
 public sealed record MapSizeProfile(string Id, string Label, double WidthMeters, bool RequiresMapExt)
@@ -131,6 +132,7 @@ public sealed record PreparedSegment(
     public NetworkSides ExplicitCutSides { get; init; }
     public NetworkSides ExplicitWallSides { get; init; }
     public NetworkSides RetainingWallSides { get; init; }
+    public NetworkSides QuaySides { get; init; }
     public float? ExplicitIncline { get; init; }
     public long CorridorId { get; init; }
     public bool ConsolidatedAvenue { get; init; }

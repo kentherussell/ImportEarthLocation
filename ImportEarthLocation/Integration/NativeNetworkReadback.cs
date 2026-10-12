@@ -22,7 +22,7 @@ namespace ImportEarthLocation.Integration;
 public static class NativeNetworkReadback
 {
     private sealed record Live(Entity Entity,Entity A,Entity B,float3 Start,float3 End,NetworkKind Kind,Colossal.Mathematics.Bezier4x3 Curve);
-    public static void Check(EntityManager manager,IReadOnlyList<PreparedSegment> sections,OsmDataset? evidence,ImportLog log)
+    public static void Check(EntityManager manager,IReadOnlyList<PreparedSegment> sections,OsmDataset? evidence,ImportLog log,bool includeMovements=true)
     {
         manager.CompleteAllTrackedJobs();
         using var query=manager.CreateEntityQuery(new EntityQueryDesc{All=new[]{ComponentType.ReadOnly<Edge>(),ComponentType.ReadOnly<Curve>(),ComponentType.ReadOnly<PrefabRef>()},None=new[]{ComponentType.ReadOnly<Temp>(),ComponentType.ReadOnly<Deleted>()}});
@@ -101,7 +101,7 @@ public static class NativeNetworkReadback
             {
                 outcome="matched",s.WayId,s.SourceWayIds,s.StartNodeId,s.EndNodeId,kind=s.Kind.ToString(),entity=live.Entity.ToString(),
                 startNode=live.A.ToString(),endNode=live.B.ToString(),requestedLanesOrTracks=requested,actualCarLanes=cars,actualTrackLanes=tracks,
-                nativeWidth=width,plannedWidth=s.NativeWidth,tunnelRequested=s.Tunnel,nativeGeneralFlags=flags.m_General.ToString(),recordedLineage=bound,sourceChainEdges=chain.Count,
+                nativeWidth=width,plannedWidth=s.NativeWidth,tunnelRequested=s.Tunnel,nativeGeneralFlags=flags.m_General.ToString(),nativeLeftFlags=flags.m_Left.ToString(),nativeRightFlags=flags.m_Right.ToString(),railAutomaticSidesObserved=s.Kind==NetworkKind.Rail&&(flags.m_Left!=0||flags.m_Right!=0),recordedLineage=bound,sourceChainEdges=chain.Count,
                 a=DiagnosticArtifacts.Point(live.Curve.a),b=DiagnosticArtifacts.Point(live.Curve.b),c=DiagnosticArtifacts.Point(live.Curve.c),d=DiagnosticArtifacts.Point(live.Curve.d),
                 renderedAcceptanceUnverified=true
             });
@@ -112,6 +112,11 @@ public static class NativeNetworkReadback
         log.Diagnostic($"NATIVE READBACK ARTIFACT records={readbackRecords.Count}; recordLimit=8192; matchesSampled=true; unresolvedTotal={missing}; lineageQualifiedSections={lineageSections}; laneMismatchTotal={laneMismatch}; fileNotFullCoverageProof=true");
         // Junction lanes expose ordered source/target edge owners. This proves
         // movement existence, separately from two edges sharing a node anchor.
+        if(!includeMovements)
+        {
+            log.Diagnostic($"NATIVE ACCEPTANCE SAMPLE matchedSections={matched}/{sections.Count}; unresolvedSections={missing}; uniqueEdgesInspected={inspected.Count}; unavailableCompositions={compositionMissing}; tunnelFlagMismatches={exposed}; fullLaneGraphScanDeferred=true; completeConnectivityNotClaimed=true");
+            return;
+        }
         var movements=new HashSet<(NetworkKind Kind,long From,long To,Entity Via)>();var nodeLaneCount=0;var unlocatedLanes=0;
         using var lanesQuery=manager.CreateEntityQuery(new EntityQueryDesc{All=new[]{ComponentType.ReadOnly<Lane>()},Any=new[]{ComponentType.ReadOnly<CarLane>(),ComponentType.ReadOnly<TrackLane>()},None=new[]{ComponentType.ReadOnly<Deleted>(),ComponentType.ReadOnly<Temp>()}});
         using var lanes=lanesQuery.ToEntityArray(Allocator.Temp);

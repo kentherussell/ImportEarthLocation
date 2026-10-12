@@ -20,6 +20,7 @@ public static class CoastalTerrain
         var seedDistance = new double[heights.Length];
         for (var i = 0; i < seedDistance.Length; i++) seedDistance[i] = double.PositiveInfinity;
         var coastEdges = 0;
+        var oriented=new System.Collections.Generic.List<(double ax,double ay,double bx,double by)>();
         foreach (var way in geography.Ways.Values.Where(w => w.Tags.TryGetValue("natural", out var value) && value == "coastline"))
         {
             for (var k = 1; k < way.NodeIds.Length; k++)
@@ -31,6 +32,8 @@ public static class CoastalTerrain
                 var bx = GeoMath.LongitudeToTileX(b.Longitude, zoom) * 256 - originX;
                 var by = GeoMath.LatitudeToTileY(b.Latitude, zoom) * 256 - originY;
                 var dx = bx - ax; var dy = by - ay; var length = Math.Sqrt(dx * dx + dy * dy);
+                if(TerrainConditioner.Finite((float)length)&&length>.001&&length<=100000)
+                    oriented.Add((ax,ay,bx,by));
                 if (!TerrainConditioner.Finite((float)length) || length < .001 || Math.Max(ax, bx) < -5 || Math.Min(ax, bx) > width + 5 || Math.Max(ay, by) < -5 || Math.Min(ay, by) > height + 5) continue;
                 if (length > 100000) continue; // Malformed geography cannot create an unbounded loop.
                 coastEdges++;
@@ -142,9 +145,72 @@ public static class CoastalTerrain
             if (labels != 1) continue;
             accepted++; for (var k = 0; k < count; k++) if(!excluded[queue[k]]) {ocean[queue[k]] = true;oceanCells++;}
         }
+        // Classify scanlines directly from oriented coastline crossings. A single
+        // missing raster barrier or wrong-side seed must not poison an entire sea
+        // component. Crossings outside the crop still determine the interior side;
+        // no DEM sign or nearest-coast heuristic is used to declare land ocean.
+        var scanlineRepairs=0L;var classifiedRows=0;
+        var classified=new bool[heights.Length];var provenLand=new bool[heights.Length];
+        var bands=new System.Collections.Generic.Dictionary<int,System.Collections.Generic.List<(double ax,double ay,double bx,double by)>>();
+        foreach(var e in oriented)
+            for(var y=Math.Max(0,(int)Math.Ceiling(Math.Min(e.ay,e.by)));y<Math.Min(height,Math.Ceiling(Math.Max(e.ay,e.by)));y++)
+            {if(!bands.TryGetValue(y,out var band))bands[y]=band=new();band.Add(e);}
+        for(var y=0;y<height;y++)
+        {
+            token.ThrowIfCancellationRequested();if(!bands.TryGetValue(y,out var band))continue;
+            var crossings=band.Select(e=>(x:e.ax+(y-e.ay)*(e.bx-e.ax)/(e.by-e.ay),rightSea:e.by<e.ay)).OrderBy(e=>e.x).ToArray();
+            if(crossings.Length==0)continue;classifiedRows++;
+            var next=0;var sea=!crossings[0].rightSea;
+            for(var x=0;x<width;x++)
+            {
+                while(next<crossings.Length&&crossings[next].x<=x){sea=crossings[next].rightSea;next++;}
+                var i=y*width+x;if(barrier[i]||excluded[i])continue;
+                if(ocean[i]!=sea)scanlineRepairs++;ocean[i]=sea;classified[i]=true;provenLand[i]=!sea;
+            }
+        }
+        // The orthogonal sweep supplies evidence beyond the latitude extent of
+        // a cropped coastline. A row with no crossings is not an artificial shore.
+        var columns=new System.Collections.Generic.Dictionary<int,System.Collections.Generic.List<(double ax,double ay,double bx,double by)>>();
+        foreach(var e in oriented)if(e.ax!=e.bx)
+            for(var x=Math.Max(0,(int)Math.Ceiling(Math.Min(e.ax,e.bx)));x<Math.Min(width,Math.Ceiling(Math.Max(e.ax,e.bx)));x++)
+            {if(!columns.TryGetValue(x,out var band))columns[x]=band=new();band.Add(e);}
+        var verticalRepairs=0;
+        for(var x=0;x<width;x++)
+        {
+            token.ThrowIfCancellationRequested();if(!columns.TryGetValue(x,out var band))continue;
+            var crossings=band.Select(e=>(y:e.ay+(x-e.ax)*(e.by-e.ay)/(e.bx-e.ax),belowSea:e.bx>e.ax)).OrderBy(e=>e.y).ToArray();
+            var next=0;var sea=!crossings[0].belowSea;
+            for(var y=0;y<height;y++)
+            {
+                while(next<crossings.Length&&crossings[next].y<=y){sea=crossings[next].belowSea;next++;}
+                var i=y*width+x;if(barrier[i]||excluded[i]||classified[i])continue;
+                ocean[i]=sea;classified[i]=true;provenLand[i]=!sea;verticalRepairs++;
+            }
+        }
+        // Resolve remaining connected regions only from unanimous directed
+        // coastline witnesses. No DEM sign or nearest-coast flood heuristic.
+        Array.Clear(visited,0,visited.Length);var propagated=0;
+        for(var seed=0;seed<heights.Length;seed++)
+        {
+            if((seed&16383)==0)token.ThrowIfCancellationRequested();
+            if(visited[seed]||barrier[seed]||excluded[seed])continue;
+            var head=0;var count=1;byte votes=0;queue[0]=seed;visited[seed]=true;
+            while(head<count)
+            {
+                if((head&4095)==0)token.ThrowIfCancellationRequested();var i=queue[head++];var x=i%width;var y=i/width;
+                if(classified[i])votes|=(byte)(ocean[i]?1:2);
+                void Add(int k){if(k<0||visited[k]||barrier[k]||excluded[k])return;visited[k]=true;queue[count++]=k;}
+                Add(x>0?i-1:-1);Add(x+1<width?i+1:-1);Add(y>0?i-width:-1);Add(y+1<height?i+width:-1);
+            }
+            if(votes!=1&&votes!=2)continue;
+            for(var k=0;k<count;k++){var i=queue[k];if(classified[i])continue;ocean[i]=votes==1;provenLand[i]=votes==2;classified[i]=true;propagated++;}
+        }
+        if(capture!=null)for(var i=0;i<heights.Length;i++)if(classified[i])ambiguousMask[i]=unseededMask[i]=false;
+        oceanCells=ocean.LongCount(v=>v);
+        report?.Invoke($"DEM COAST RECONCILIATION classifiedRows={classifiedRows}/{height}; orthogonalCells={verticalRepairs}; propagatedWitnessCells={propagated}; orientedEdges={oriented.Count}; changedClassificationCells={scanlineRepairs}; acceptedOceanCells={oceanCells}; negativeHeightFloodFill=false; syntheticOffshoreDepth=true");
         // Two-pass shoreline distance. No artificial slope toward the map's crop edge.
         var distance = new float[heights.Length];
-        for (var i = 0; i < distance.Length; i++) distance[i] = !ocean[i] ? 0 : float.PositiveInfinity;
+        for (var i = 0; i < distance.Length; i++) distance[i] = barrier[i]||provenLand[i] ? 0 : float.PositiveInfinity;
         var diagonal = spacing * 1.41421356f;
         for (var y = 0; y < height; y++)
         {

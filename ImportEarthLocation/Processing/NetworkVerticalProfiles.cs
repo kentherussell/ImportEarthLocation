@@ -110,14 +110,14 @@ public static class NetworkVerticalProfiles
                         // Solve every branch on the actual graph. Ground/tunnel
                         // tie-ins remain portals, interior nodes remain underground.
                         foreach(var node in positions.Keys)
-                        {var surface=surfaceNodeIds.Contains(node);structureHeights[node]=Ground(positions[node])-(surface?0:8);}
+                        {var surface=surfaceNodeIds.Contains(node);structureHeights[node]=Ground(positions[node])-(surface?0:15);}
                         for(var pass=0;pass<64;pass++)foreach(var edge in group)
                         {
                             var a=edge.StartNodeId;var b=edge.EndNodeId;var allowed=lengths[edge]*GradeLimit(edge);
                             var excess=Math.Abs(structureHeights[a]-structureHeights[b])-allowed;if(excess<=.001f)continue;
                             var sign=structureHeights[a]>structureHeights[b]?1f:-1f;
-                            if(!surfaceNodeIds.Contains(a))structureHeights[a]=Math.Min(Ground(positions[a])-8,structureHeights[a]-sign*excess*.5f);
-                            if(!surfaceNodeIds.Contains(b))structureHeights[b]=Math.Min(Ground(positions[b])-8,structureHeights[b]+sign*excess*.5f);
+                            if(!surfaceNodeIds.Contains(a))structureHeights[a]=Math.Min(Ground(positions[a])-15,structureHeights[a]-sign*excess*.5f);
+                            if(!surfaceNodeIds.Contains(b))structureHeights[b]=Math.Min(Ground(positions[b])-15,structureHeights[b]+sign*excess*.5f);
                         }
                         log.Count("Branched tunnel groups fitted jointly");continue;
                     }

@@ -89,7 +89,14 @@ public sealed class TerrainBridge
             linear: true)
         { name = $"{Mod.Id}_Heightmap" };
 
-        var nativeSamples = Resample(prepared.Heightmap, backup.width, backup.height);
+        var data=_terrainSystem.GetHeightData(false);var nativeBounds=TerrainUtils.GetBounds(ref data);
+        var half=(float)prepared.Request.MapSize.WidthMeters*.5f;var registrationTolerance=prepared.Request.MapSize.WidthMeters/Math.Max(1,backup.width-1)*2;
+        var registered=Math.Abs(nativeBounds.min.x+half)<=registrationTolerance&&Math.Abs(nativeBounds.max.x-half)<=registrationTolerance&&Math.Abs(nativeBounds.min.z+half)<=registrationTolerance&&Math.Abs(nativeBounds.max.z-half)<=registrationTolerance;
+        var nativeSamples=registered?new ushort[backup.width*backup.height]:Resample(prepared.Heightmap,backup.width,backup.height);
+        if(registered)for(var z=0;z<backup.height;z++)for(var x=0;x<backup.width;x++)
+        {var wx=math.lerp(nativeBounds.min.x,nativeBounds.max.x,x/(float)(backup.width-1));var wz=math.lerp(nativeBounds.min.z,nativeBounds.max.z,z/(float)(backup.height-1));
+            nativeSamples[z*backup.width+x]=(ushort)Math.Round(Processing.TerrainSampling.Encoded(prepared.Heightmap,Processing.TerrainBuilder.Resolution,wx/(2*half)+.5,wz/(2*half)+.5));}
+        log?.Diagnostic($"TERRAIN REGISTRATION nativeSampleBoundsMin={nativeBounds.min}; nativeSampleBoundsMax={nativeBounds.max}; worldSampleResamplingApplied={registered}; toleranceMeters={registrationTolerance:R}; sameResolutionDoesNotImplySameTransform=true");
         log?.Diagnostic($"TERRAIN GRID interpolation=corner-aligned-bilinear-v1; preparedResolution={Processing.TerrainBuilder.Resolution}; nativeWidth={backup.width}; nativeHeight={backup.height}; requestedWidthMeters={prepared.Request.MapSize.WidthMeters:R}; nativeAreaX={mapSize.x:R}; nativeAreaZ={mapSize.y:R}; nativeOffsetX={mapCorner.x:R}; nativeOffsetZ={mapCorner.y:R}; encodedQuantizationMeters={prepared.HeightScaleMeters / ushort.MaxValue:R}; nativeResamplingRequired={backup.width != Processing.TerrainBuilder.Resolution || backup.height != Processing.TerrainBuilder.Resolution}; gridEquivalenceVerified=false");
         var bytes = new byte[nativeSamples.Length * sizeof(ushort)];
         Buffer.BlockCopy(nativeSamples, 0, bytes, 0, bytes.Length);

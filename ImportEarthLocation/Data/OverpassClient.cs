@@ -314,7 +314,7 @@ public sealed class OverpassClient
         // support candidates are filtered locally; only roundabout dependencies
         // receive a second expansion, never an unbounded city-wide network walk.
         return $"[out:xml][timeout:60];({roads}{tracks})->.network;node(w.network)->.junctions;"+
-            "way(bn.junctions)[\"highway\"~\"^(tertiary|tertiary_link|unclassified|residential|service)$\"]->.support;"+
+            "way(bn.junctions)[\"highway\"~\"^(unclassified|residential|service)$\"]->.support;"+
             "(.network;.support;)->.arms;node(w.arms)->.armnodes;way(bn.armnodes)[\"junction\"=\"roundabout\"]->.rings;"+
             "node(w.rings)->.ringnodes;way(bn.ringnodes)[\"junction\"=\"roundabout\"]->.rings;node(w.rings)->.ringnodes;way(bn.ringnodes)[\"junction\"=\"roundabout\"]->.rings;"+
             "(.network;.support;.rings;)->.routes;rel(bw.routes)[\"type\"~\"^(restriction|connectivity)$\"]->.movements;"+

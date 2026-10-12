@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <PublishConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-  <ModName>Import Earth Location</ModName>
-  <DisplayName>Import Earth Location</DisplayName>
+  <ModName>Import Earth</ModName>
+  <DisplayName>Import Earth</DisplayName>
   <ShortDescription>Import public terrain plus major roads and rail into the current map editor map.</ShortDescription>
   <LongDescription>Editor-only real-world terrain and network skeleton importer using public Terrarium and OpenStreetMap data.</LongDescription>
   <Version>0.1.0</Version>

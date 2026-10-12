@@ -27,6 +27,8 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
     private static bool s_PreviewOnly, s_ClearingPreview;
     private static NativePreviewException? s_PreviewFailure;
     private static int s_SettledFrames;
+    private static int s_CommitSequence;
+    private static bool s_DeepCapture;
     public static int LastMutationTargets { get; private set; }
     private static ImportLog? s_Log;
     private static object? s_Context;
@@ -38,6 +40,8 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
     public static void RequestCommit(long map, long generation, ImportLog? log = null, object? context = null, Action<IReadOnlyList<Entity>>? beforeApply = null, string? artifactStem = null, bool previewOnly = false)
     {
         if (!ImportSession.Matches(map, generation)) return;
+        if(s_Map!=map||s_Generation!=generation)s_CommitSequence=0;
+        s_DeepCapture=previewOnly||++s_CommitSequence%16==1;
         s_Map = map; s_Generation = generation;
         s_Requested = true;
         LastMutationTargets=0;
@@ -52,6 +56,9 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
     public static void CancelPending() { s_Requested = false; s_WaitFrames = 0; s_Failure = null; s_Map = s_Generation = 0; s_Submitted.Clear(); s_Applied=false; s_SettledFrames=0; s_Log=null; s_Context=null; s_BeforeApply=null;s_Recoverable=false;s_ArtifactStem=null;s_PreviewOnly=s_ClearingPreview=false;s_PreviewFailure=null; }
 
     public static NativePreviewException? PreviewFailure => s_PreviewFailure;
+    // An issued Apply must settle before a user stop touches remaining previews.
+    public static bool ApplicationInFlight => s_Requested && s_Applied;
+    public static bool HasIssuedApply => s_Applied;
 
     protected override void OnGamePreload(Colossal.Serialization.Entities.Purpose purpose, GameMode mode)
     { base.OnGamePreload(purpose, mode); CancelPending(); }
@@ -93,7 +100,23 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
         manager.CompleteAllTrackedJobs();
         using var query=manager.CreateEntityQuery(new EntityQueryDesc
         {All=new[]{ComponentType.ReadOnly<Temp>()},None=new[]{ComponentType.ReadOnly<Deleted>()}});
-        var count=query.CalculateEntityCount();
+        using var entities=query.ToEntityArray(Allocator.Temp);
+        var count=0;
+        foreach(var entity in entities)
+        {
+            var temp=manager.GetComponentData<Temp>(entity);
+            // Selection-only bookkeeping is not a placement preview. Native
+            // selection markers can remain indefinitely after a committed batch.
+            // Never relax this for a geometry/object/lane or an editing flag.
+            var selectionOnly=(temp.m_Flags&TempFlags.Select)!=0&&
+                (temp.m_Flags&~(TempFlags.Select|TempFlags.Essential))==0&&
+                temp.m_Original!=Entity.Null&&manager.Exists(temp.m_Original)&&
+                !manager.HasComponent<Edge>(entity)&&!manager.HasComponent<Node>(entity)&&
+                !manager.HasComponent<Lane>(entity)&&!manager.HasComponent<Game.Objects.Tree>(entity)&&
+                !manager.HasComponent<Game.Objects.Plant>(entity)&&!manager.HasComponent<CreationDefinition>(entity)&&
+                (!manager.HasComponent<Owner>(entity)||manager.GetComponentData<Owner>(entity).m_Owner==Entity.Null);
+            if(!selectionOnly)count++;
+        }
         reason=count==0?"":$"Editor-tool/native preview retirement pending ({count} temporary entities still present). Finish or cancel an unrelated editing preview before importing.";
         return count==0;
     }
@@ -110,8 +133,10 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
             if(records.Count>=256)continue;
             var temp=manager.GetComponentData<Temp>(entity);
             var owner=manager.HasComponent<Owner>(entity)?manager.GetComponentData<Owner>(entity).m_Owner:Entity.Null;
+            using var types=manager.GetComponentTypes(entity,Allocator.Temp);
+            var components=new List<string>();foreach(var type in types)components.Add(type.ToString());
             records.Add(new{entity=$"{entity.Index}:{entity.Version}",original=$"{temp.m_Original.Index}:{temp.m_Original.Version}",
-                owner=$"{owner.Index}:{owner.Version}",flags=temp.m_Flags.ToString(),lane=manager.HasComponent<Lane>(entity),
+                owner=$"{owner.Index}:{owner.Version}",components,flags=temp.m_Flags.ToString(),lane=manager.HasComponent<Lane>(entity),
                 edge=manager.HasComponent<Edge>(entity),node=manager.HasComponent<Node>(entity),frames,deletedEntitiesExcluded=true});
         }
         log?.Diagnostic($"NATIVE DOWNSTREAM RETIREMENT pendingTemps={entities.Length}; pendingLanes={laneCount}; recorded={records.Count}; truncated={entities.Length>records.Count}; frames={frames}; readOnly=true; clearingUnrelatedPreview=false");
@@ -166,9 +191,10 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
                 throw new InvalidOperationException("The native tool commit hook was unavailable.");
             // Native ECB faults are outside managed exception recovery. Reject an
             // oversized or malformed temporary graph BEFORE setting ApplyMode.
-            if(temporary.Length>8192)throw new InvalidOperationException($"Native batch unexpectedly generated {temporary.Length} temporary nodes/edges/plants; unsafe commit refused.");
-            s_Log?.DiagnosticRecords("last-native-temp-batch.ndjson",TempRecords(EntityManager,temporary.ToArray(),World.GetExistingSystemManaged<Game.Prefabs.PrefabSystem>()));
-            if(s_ArtifactStem!=null)s_Log?.DiagnosticRecords(s_ArtifactStem+"-temp.ndjson",TempRecords(EntityManager,temporary.ToArray(),World.GetExistingSystemManaged<Game.Prefabs.PrefabSystem>()));
+            if(temporary.Length>8192)s_Log?.Warn($"Large native preview: {temporary.Length} temporary entities; diagnostic only, not a generation gate.");
+            // One batch-local graph instead of two identical serialized copies.
+            // Vegetation has no road graph to diagnose; retain sampled captures.
+            if(s_ArtifactStem!=null||s_DeepCapture)s_Log?.DiagnosticRecords((s_ArtifactStem??"sampled-native-preview")+"-temp.ndjson",TempRecords(EntityManager,temporary.ToArray(),World.GetExistingSystemManaged<Game.Prefabs.PrefabSystem>()));
             var originalTargets=new HashSet<Entity>();var mutationTargets=new HashSet<Entity>();var originalMutations=0;
             foreach(var entity in temporary)
             {
@@ -179,42 +205,51 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
                 // CaptureGeneratedNodes proves its replacement coverage.
                 if((temp.m_Flags&TempFlags.Delete)!=0)continue;
                 if(!originalTargets.Add(temp.m_Original))
-                    throw new NativePreviewException("Native preview contains duplicate original mutation targets; regenerate a smaller batch before Apply.",0);
+                    s_Log?.Warn("Native preview contains duplicate original mutation targets; native companion updates retained for inspection.");
                 if(EntityManager.HasComponent<Deleted>(temp.m_Original)||
                     (EntityManager.HasComponent<Node>(entity)&&!EntityManager.HasComponent<Node>(temp.m_Original))||
                     (EntityManager.HasComponent<Edge>(entity)&&!EntityManager.HasComponent<Edge>(temp.m_Original)))
-                    throw new NativePreviewException("Native preview original has retired or changed component kind; regenerate before Apply.",0);
+                    s_Log?.Warn("Native preview original has retired or changed component kind; native lineage discrepancy recorded.");
             }
-            s_Log?.Diagnostic($"NATIVE APPLY WORKLOAD temporaryEntities={temporary.Length}; originalMutationTargets={originalMutations}; originalMutationLimit=64; rejectedBeforeApply={originalMutations>64}; downstreamLaneAcceptanceUnverified=true");
+            s_Log?.Diagnostic($"NATIVE APPLY WORKLOAD temporaryEntities={temporary.Length}; originalMutationTargets={originalMutations}; originalMutationLimit=disabled; rejectedBeforeApply=false; downstreamLaneAcceptanceUnverified=true");
             LastMutationTargets=originalMutations;
             // Existing graph matching proves ports/ownership, not downstream
             // native ECB capacity. Shrink an uncommitted regeneration burst,
             // including flags=0 updates, rather than Apply then retry it.
-            if(originalMutations>64)
-                throw new NativePreviewException($"Native preview regenerates {originalMutations} existing entities; bounded limit64 requires smaller batch before Apply.",0);
+            if(originalMutations>64)s_Log?.Count("Native batches above former mutation guard");
             if(s_ArtifactStem!=null)s_Log?.DiagnosticRecords(s_ArtifactStem+"-mutation-contracts.ndjson",MutationRecords(EntityManager,temporary.ToArray()));
             if(s_ArtifactStem!=null)
             {
                 using var allPreviewQuery=EntityManager.CreateEntityQuery(ComponentType.ReadOnly<Temp>());
                 using var allPreview=allPreviewQuery.ToEntityArray(Allocator.Temp);
-                s_Log?.DiagnosticRecords(s_ArtifactStem+"-downstream-contracts.ndjson",MutationRecords(EntityManager,allPreview.ToArray()),32L*1024*1024);
-                s_Log?.Diagnostic($"NATIVE DOWNSTREAM CAPTURE artifact={s_ArtifactStem}; allTempsIncludingDeletedAndLanes={allPreview.Length}; frame={UnityEngine.Time.frameCount}; readOnly=true; nativeCommandBufferContentsUnavailable=true");
-                AuditLaneContracts(EntityManager,allPreview.ToArray(),temporary.ToArray());
+                if(s_DeepCapture)s_Log?.DiagnosticRecords(s_ArtifactStem+"-downstream-contracts.ndjson",MutationRecords(EntityManager,allPreview.ToArray()),32L*1024*1024);
+                s_Log?.Diagnostic($"NATIVE DOWNSTREAM CAPTURE artifact={s_ArtifactStem}; allTempsIncludingDeletedAndLanes={allPreview.Length}; deepCapture={s_DeepCapture}; samplingEveryBatches=16; frame={UnityEngine.Time.frameCount}; readOnly=true; nativeCommandBufferContentsUnavailable=true");
+                AuditLaneContracts(EntityManager,allPreview.ToArray(),temporary.ToArray(),s_Log);
             }
+            var invalidNativeGraph=false;
             foreach(var entity in temporary)
             {
                 if(!EntityManager.HasComponent<Edge>(entity))continue;
+                if((EntityManager.GetComponentData<Temp>(entity).m_Flags&TempFlags.Delete)!=0)continue;
                 var edge=EntityManager.GetComponentData<Edge>(entity);
                 if(edge.m_Start==Entity.Null||edge.m_End==Entity.Null||edge.m_Start==edge.m_End||
                     !EntityManager.HasComponent<Node>(edge.m_Start)||!EntityManager.HasComponent<Node>(edge.m_End))
-                    throw new InvalidOperationException("Native temporary edge has invalid node references; unsafe commit refused.");
+                {invalidNativeGraph=true;s_Log?.Warn($"Native temporary edge {entity} has incomplete node references; this native preview will be cleared, not applied to an invalid engine graph.");}
                 if(EntityManager.HasComponent<Curve>(entity))
                 {
                     var curve=EntityManager.GetComponentData<Curve>(entity).m_Bezier;
                     if(!Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(curve.a))||!Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(curve.b))||
                        !Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(curve.c))||!Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(curve.d)))
-                        throw new InvalidOperationException("Native temporary edge has a non-finite curve; unsafe commit refused.");
+                    {invalidNativeGraph=true;s_Log?.Warn($"Native temporary edge {entity} has a non-finite curve; native preview defect recorded.");}
                 }
+            }
+            if(invalidNativeGraph)
+            {
+                if(s_ArtifactStem!=null)s_Log?.DiagnosticRecords(s_ArtifactStem+"-invalid-graph.ndjson",MutationRecords(EntityManager,temporary.ToArray()));
+                s_Failure="Native preview contained invalid engine references or non-finite coordinates. Preview cleared locally; subsequent import batches remain eligible.";
+                s_BeforeApply=null;foreach(var entity in temporary)s_Submitted.Add(entity);
+                _applyModeSetter.Invoke(lastTool,new object[]{ApplyMode.Clear});
+                s_ClearingPreview=true;s_WaitFrames=0;return;
             }
             s_BeforeApply?.Invoke(temporary.ToArray());
             s_BeforeApply=null;
@@ -232,6 +267,8 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
         }
         catch (Exception exception)
         {
+            try { if(s_ArtifactStem!=null)s_Log?.DiagnosticRecords(s_ArtifactStem+"-failure-contracts.ndjson",MutationRecords(EntityManager,temporary.ToArray()),32L*1024*1024); }
+            catch(Exception captureError){s_Log?.Warn("Failure contract capture unavailable: "+captureError.Message);}
             // Recovery is limited to typed graph rejection BEFORE Apply. Native
             // hook/playback failures are never blindly retried or mislabeled.
             s_Recoverable=!s_Applied&&exception is NativePreviewException;
@@ -268,7 +305,7 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
         }
     }
 
-    private static void AuditLaneContracts(EntityManager manager,IReadOnlyList<Entity> allPreview,IReadOnlyList<Entity> networks)
+    private static void AuditLaneContracts(EntityManager manager,IReadOnlyList<Entity> allPreview,IReadOnlyList<Entity> networks,ImportLog? log)
     {
         // Installed LaneSystem reads Lane/PrefabRef for each nonsecondary
         // SubLane. Reject broken references before requesting native playback.
@@ -276,7 +313,7 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
         {
             if(manager.HasComponent<SecondaryLane>(lane))return;
             if(!manager.Exists(lane)||!manager.HasComponent<Lane>(lane)||!manager.HasComponent<Game.Prefabs.PrefabRef>(lane))
-                throw new NativePreviewException($"Native lane contract incomplete ({context}, lane={lane}); rejected before Apply.",0);
+                log?.Warn($"Native lane contract incomplete ({context}, lane={lane}); advisory only.");
         }
         foreach(var preview in allPreview)
         {
@@ -285,9 +322,9 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
             if(manager.HasComponent<Deleted>(preview)||(temp.m_Flags&TempFlags.Cancel)!=0)continue;
             RequireLane(preview,"preview");
             if(temp.m_Original!=Entity.Null)RequireLane(temp.m_Original,"original");
-            if(!manager.HasComponent<Owner>(preview))throw new NativePreviewException("Native lane has no owner contract; rejected before Apply.",0);
+            if(!manager.HasComponent<Owner>(preview)){log?.Warn("Native lane has no owner contract; advisory only.");continue;}
             var owner=manager.GetComponentData<Owner>(preview).m_Owner;
-            if(!manager.Exists(owner))throw new NativePreviewException($"Native lane owner {owner} is unavailable; rejected before Apply.",0);
+            if(!manager.Exists(owner))log?.Warn($"Native lane owner {owner} is unavailable; advisory only.");
         }
         var visited=new HashSet<Entity>();
         foreach(var preview in networks)

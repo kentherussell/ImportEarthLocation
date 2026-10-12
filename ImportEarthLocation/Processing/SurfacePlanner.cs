@@ -107,7 +107,7 @@ public static class SurfacePlanner
                     // rather than giving trusted polygons a narrow hard outline.
                     strength = evidence == Cover.Sand ? .96f : edge * (evidence == Cover.Rock ? .88f : .92f); certainty = priority[i];
                 }
-                else if (!submerged && evidence != Cover.NonSand)
+                else if (evidence != Cover.NonSand)
                 {
                     var moisture = p.Wet * (1 - .72f * p.Steep) * (1 + .2f * p.Valley);
                     var exposure = .5f * p.Ridge + .38f * p.Steep + .08f * p.Exposure;
@@ -154,7 +154,7 @@ public static class SurfacePlanner
                 // vegetation/rock/dirt painting, but never water or paved/urban
                 // exclusions. Regional gating prevents unrelated grassy maps
                 // from becoming deserts merely because they contain a beach.
-                if (desert && !submerged && evidence != Cover.NonSand && evidence != Cover.Wetland)
+                if (desert && evidence != Cover.NonSand && evidence != Cover.Wetland)
                 {
                     strength = winner == GroundMaterial.Sand ? Math.Max(strength, .88f) : .88f;
                     winner = GroundMaterial.Sand;
@@ -219,7 +219,9 @@ public static class SurfacePlanner
         if (tags.ContainsKey("highway") || tags.ContainsKey("railway") || tags.ContainsKey("building")) return default;
         var natural = Tag(tags, "natural"); var landuse = Tag(tags, "landuse"); var surface = Tag(tags, "surface");
         if (natural.Length == 0 && landuse.Length == 0 && Tag(tags, "landcover").Length == 0 && surface.Length == 0 && Tag(tags, "area") != "yes" && !tags.ContainsKey("water") && !tags.ContainsKey("wetland") && Tag(tags, "waterway") != "riverbank") return default;
-        if (natural == "water" || natural == "bay" || tags.ContainsKey("water") || Tag(tags, "waterway") == "riverbank" || landuse == "reservoir") return new(Cover.NonSand, 255);
+        // A water mask describes simulation, not the underlying ground material.
+        // Keep substrate rules active in case the player later raises the bed.
+        if (natural == "water" || natural == "bay" || tags.ContainsKey("water") || Tag(tags, "waterway") == "riverbank" || landuse == "reservoir") return default;
         // Water/wetland and actual paving remain hard exclusions. District land
         // use cannot suppress observed physical cover within that district.
         if (natural == "wetland" || tags.ContainsKey("wetland")) return new(Cover.Wetland, 255);
