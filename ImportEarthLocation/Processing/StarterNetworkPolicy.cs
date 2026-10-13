@@ -78,7 +78,7 @@ public static class StarterNetworkPolicy
         var removed=new HashSet<int>();var cycles=0;
         foreach(var i in Enumerable.Range(0,result.Length).Where(i=>result[i].Kind==NetworkKind.Rail).OrderBy(i=>result[i].RailService.Length==0?0:1).ThenByDescending(i=>math.distance(result[i].Start,result[i].End)))
         {token.ThrowIfCancellationRequested();var s=result[i];var a=Root(s.StartNodeId);var b=Root(s.EndNodeId);if(a==b&&s.RailService is "yard" or "siding" or "spur"){removed.Add(i);cycles++;}else parent[a]=b;}
-        log.Diagnostic($"RAIL STARTER gapEndpointsJoined={joined}; redundantYardCycleEdgesRemoved={cycles}; corridorPhysicalTracks=1; bidirectional=true; bufferStopsPreserved=true; sameLevelOnly=true");
+        log.Diagnostic($"RAIL STARTER gapEndpointsJoined={joined}; redundantYardCycleEdgesRemoved={cycles}; corridorSegmentsPerAxis=1; tracksWithinSegment=2; bidirectional=true; bufferStopsPreserved=true; sameLevelOnly=true");
         return result.Where((s,i)=>!removed.Contains(i)).ToArray();
     }
 
@@ -99,7 +99,7 @@ public static class StarterNetworkPolicy
         {
             token.ThrowIfCancellationRequested();var nearby=new List<long>();
             for(var x=-1;x<=1;x++)for(var z=-1;z<=1;z++)if(cells.TryGetValue((pair.Key.Item1+x,pair.Key.Item2+z),out var list))nearby.AddRange(list);
-            if(nearby.Count>=6)dense.UnionWith(nearby);
+            if(nearby.Count>=3)dense.UnionWith(nearby);
         }
         var removed=new HashSet<int>();var tails=0;
         foreach(var end in nodes.Where(p=>p.Value.Count==1).OrderBy(p=>p.Key))
@@ -107,7 +107,7 @@ public static class StarterNetworkPolicy
             var node=end.Key;var index=end.Value[0];var route=new List<int>();var distance=0f;var touched=false;var seen=new HashSet<int>();
             while(seen.Add(index))
             {
-                token.ThrowIfCancellationRequested();var e=edges[index];if(e.Bridge||e.Tunnel)break;
+                token.ThrowIfCancellationRequested();var e=edges[index];
                 distance+=math.distance(e.Start.xz,e.End.xz);if(distance>300)break;route.Add(index);
                 node=e.StartNodeId==node?e.EndNodeId:e.StartNodeId;touched|=dense.Contains(node);
                 if(nodes[node].Count!=2){if(touched&&nodes[node].Count>=3){removed.UnionWith(route);tails++;}break;}
@@ -119,9 +119,9 @@ public static class StarterNetworkPolicy
         foreach(var i in Enumerable.Range(0,edges.Length).Where(i=>edges[i].Kind==NetworkKind.Rail&&!removed.Contains(i)).OrderBy(i=>dense.Contains(edges[i].StartNodeId)&&dense.Contains(edges[i].EndNodeId)?1:0).ThenByDescending(i=>math.distance(edges[i].Start.xz,edges[i].End.xz)))
         {
             var e=edges[i];var a=Root(e.StartNodeId);var b=Root(e.EndNodeId);
-            if(a==b&&dense.Contains(e.StartNodeId)&&dense.Contains(e.EndNodeId)&&!e.Bridge&&!e.Tunnel){removed.Add(i);cycles++;}else parent[a]=b;
+            if(a==b&&dense.Contains(e.StartNodeId)&&dense.Contains(e.EndNodeId)){removed.Add(i);cycles++;}else parent[a]=b;
         }
-        log.Diagnostic($"RAIL BACKBONE denseSwitchNodes={dense.Count}; shortYardTailsRemoved={tails}; redundantDenseSwitchEdgesRemoved={cycles}; sectionsRemoved={removed.Count}; throughRoutesPrioritized=true; structuresPreserved=true; denseSwitchThreshold=6; maximumYardTailMeters=300");
+        log.Diagnostic($"RAIL BACKBONE denseSwitchNodes={dense.Count}; shortYardTailsRemoved={tails}; redundantDenseSwitchEdgesRemoved={cycles}; sectionsRemoved={removed.Count}; throughRoutesPrioritized=true; denseSwitchThreshold=3; maximumYardTailMeters=300; yardsRendered=false");
         return edges.Where((s,i)=>!removed.Contains(i)).ToArray();
     }
 

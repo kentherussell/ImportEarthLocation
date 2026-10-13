@@ -78,11 +78,15 @@ public static class NativeVegetationPlacement
             try
             {
                 var candidate=points[i];var point=candidate.Position;var seed=candidate.Seed;
+                if(!math.all(math.isfinite(point)))
+                {manager.DestroyEntity(entity);Count("Vegetation invalid coordinates omitted");continue;}
                 var palette=palettes[candidate.Form];
                 // Unknown exact species may use a same-form stock asset, but a
                 // missing palm/conifer palette must not become unrelated foliage.
                 if(palette.Length==0){manager.DestroyEntity(entity);Count("Vegetation unavailable stock palette "+candidate.Form);continue;}
                 var selected=palette[seed%(uint)palette.Length];
+                if(!manager.Exists(selected.Entity)||!manager.HasComponent<PlantData>(selected.Entity)||!manager.HasComponent<PrefabData>(selected.Entity))
+                {manager.DestroyEntity(entity);Count("Vegetation retired prefabs omitted");continue;}
                 // Allocate the final definition archetype once, avoiding three
                 // structural migrations per candidate. Native initialization is
                 // unchanged: these remain tool definitions, not raw Tree entities.

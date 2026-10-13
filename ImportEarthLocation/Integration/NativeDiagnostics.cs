@@ -53,6 +53,18 @@ public static class NativeDiagnostics
     private static bool _enabled;
     private static string Root => Path.Combine(Application.persistentDataPath,"ModsData",Mod.Id,"diagnostics");
 
+    public static void ResetMap()
+    {
+        _work?.Dispose();_work=null;_workLog=null;_phase=null;_log=null;_waterLog=null;
+        _expectedAir=new JArray();_expectedWater=new JArray();
+        WaterProbes.Clear();WaterSourcePositions.Clear();WaterPlans.Clear();PlannedWater.Clear();WaterObservations.Clear();
+        _expectedClimate=_expectedLocalSurface=_expectedWorldSurface=null;
+        _run="";_enabled=false;_airPendingInitialization=0;_waterChecks=0;
+        _map=_generation=_waterMap=_waterGeneration=_workMap=_workGeneration=0;
+        SurfaceApplied=AirApplied=ClimateApplied=WaterApplied=false;
+        NativeNetworkDiagnostics.Clear();NativeSeaBridge.Clear();
+    }
+
     public static void Begin(PreparedImport prepared, ImportLog log)
     {
         _work?.Dispose();_work=null;_workLog=null;_phase=null;

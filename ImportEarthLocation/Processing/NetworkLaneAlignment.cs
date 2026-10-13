@@ -58,9 +58,9 @@ public static class NetworkLaneAlignment
             // Keep the opposite through-lane edge fixed when a lane is added or
             // removed on the ramp side. Never centre a wider road on a narrower one.
             var aAnchor=side>0?al[0]:al[al.Length-1];var bAnchor=side>0?bl[0]:bl[bl.Length-1];
-            // Keep the surveyed through centerline stable. Ramp alignment below
-            // still uses the actual lane palette; width changes cannot displace it.
-            joins.Add((incoming,outgoing,normal,attached,0));
+            // Fix the continuing lane edge, not the centers of different-width
+            // roads. Propagate this deck offset over the approach, never node IDs.
+            joins.Add((incoming,outgoing,normal,attached,aAnchor-bAnchor));
         }
         var continuation=joins.ToDictionary(j=>j.incoming.index,j=>j);
         const float taperLength=220;
@@ -108,12 +108,55 @@ public static class NetworkLaneAlignment
                 // Subtracting both offsets in the mainline frame picks the wrong
                 // receiving lane when the ramp enters at a substantial angle.
                 var rampHeading=Heading(ramp,entry.start);var rampNormal=new float3(rampHeading.y,0,-rampHeading.x);
-                var offset=targetOffset+normal*lane-rampNormal*rampLane;if(math.length(offset)>12)continue;
+                var addedLane=entry.start?a.Lanes>b.Lanes:b.Lanes>a.Lanes;
+                // Without an added receiving lane, use a real merging junction,
+                // not almost coincident decks with crossing lane markings.
+                var offset=addedLane?targetOffset+normal*lane-rampNormal*rampLane:targetOffset;
+                if(math.length(offset)>12)offset=math.normalizesafe(offset)*12;
                 var control=entry.start?ramp.Control1??math.lerp(ramp.Start,ramp.End,1f/3):ramp.Control2??math.lerp(ramp.Start,ramp.End,2f/3);
-                var reach=Math.Min(math.distance(ramp.Start.xz,ramp.End.xz)*.45f,Math.Min(90,Math.Max(12,math.distance(control.xz,anchor.xz))));var aligned=anchor+new float3(heading.x,0,heading.y)*reach*(entry.start?1:-1);aligned.y=control.y;
-                result[entry.index]=entry.start?ramp with{Control1=aligned,StartCurveOffset=offset}:ramp with{Control2=aligned,EndCurveOffset=offset};ramps++;
+                var approach=heading;
+                if(!addedLane)
+                {
+                    const float angle=.34906585f; // 20-degree terminal, curved upstream.
+                    var sign=entry.start?rampSide:-rampSide;
+                    approach=heading*(float)Math.Cos(angle)+new float2(normal.x,normal.z)*sign*(float)Math.Sin(angle);
+                }
+                var reach=Math.Min(math.distance(ramp.Start.xz,ramp.End.xz)*.4f,120);
+                var aligned=anchor+new float3(approach.x,0,approach.y)*reach*(entry.start?1:-1);
+                var mainGrade=(target.End.y-target.Start.y)/Math.Max(1,math.distance(target.Start.xz,target.End.xz));
+                aligned.y=anchor.y+mainGrade*reach*(entry.start?1:-1);
+                var farHeading=math.normalizesafe((ramp.End-ramp.Start).xz*.75f+approach*.25f);var farReach=math.distance(ramp.Start.xz,ramp.End.xz)/3;
+                var farControl=(entry.start?ramp.End:ramp.Start)+new float3(farHeading.x,0,farHeading.y)*farReach*(entry.start?-1:1);
+                farControl.y=math.lerp(ramp.Start.y,ramp.End.y,entry.start?2f/3:1f/3);
+                result[entry.index]=entry.start?ramp with{Control1=aligned,Control2=farControl,StartCurveOffset=offset}:ramp with{Control1=farControl,Control2=aligned,EndCurveOffset=offset};ramps++;
             }
         }
+        var bundles=0;
+        foreach(var node in nodes)
+        {
+            token.ThrowIfCancellationRequested();
+            var main=node.Value.Where(e=>!result[e.index].ProtectedLink&&result[e.index].Classification is "motorway" or "trunk").ToArray();
+            var inputs=main.Where(e=>!e.start).ToArray();var outputs=main.Where(e=>e.start).ToArray();
+            var merging=inputs.Length>=2&&outputs.Length==1;var splitting=outputs.Length>=2&&inputs.Length==1;
+            if(!merging&&!splitting)continue;
+            var receiver=merging?outputs[0]:inputs[0];var target=result[receiver.index];
+            var heading=Heading(target,merging);var normal=new float3(heading.y,0,-heading.x);
+            var branches=(merging?inputs:outputs).OrderBy(e=>math.dot((e.start?result[e.index].End:result[e.index].Start)-target.Start,normal)).ToArray();
+            var slots=Lanes(target);var total=branches.Sum(e=>Math.Max(1,result[e.index].Lanes));var cursor=0;
+            if(total!=slots.Length){log.Count("Lane bundles requiring native lane merge");continue;}
+            foreach(var branch in branches)
+            {
+                var s=result[branch.index];var count=Math.Max(1,s.Lanes);var laneCenter=slots.Skip(cursor).Take(count).Average();cursor+=count;
+                var branchCenter=Lanes(s).Average();var offset=normal*(laneCenter-branchCenter)+(merging?target.StartCurveOffset:target.EndCurveOffset);
+                Offset(branch,offset);var p=branch.start?s.Start:s.End;var reach=Math.Min(180,math.distance(s.Start.xz,s.End.xz)*.4f);
+                var control=p+new float3(heading.x,0,heading.y)*reach*(branch.start?1:-1);
+                var grade=(target.End.y-target.Start.y)/Math.Max(1,math.distance(target.Start.xz,target.End.xz));control.y=p.y+grade*reach*(branch.start?1:-1);
+                var revised=result[branch.index];result[branch.index]=branch.start?revised with{Control1=control}:revised with{Control2=control};
+            }
+            bundles++;
+        }
+        log.Count("Highway lane bundles aligned",bundles);
+        log.Diagnostic($"LANE BUNDLES junctions={bundles}; laneOrder=travel-frame-left-to-right; separateNodeIdentitiesCreated=false; noAddedLaneMergeAngleDegrees=20");
         // Offset handles and ramp tangents cannot extend past a clipped map end.
         // Roll back the whole affected join, not one incident curve endpoint:
         // otherwise the guard itself could introduce another misaligned join.

@@ -933,7 +933,10 @@ public sealed class NativeNetworkPlacement
         var endStation=endAnchor==null?Station(segment.EndNodeId):null;
         a=startStation!=null?startStation.Position-segment.StartCurveOffset:a;
         b=endStation!=null?endStation.Position-segment.EndCurveOffset:b;
-        segment=segment with{Start=a,End=b,Control1=segment.CourseControl1-segment.StartCurveOffset+(a-segment.Start),Control2=segment.CourseControl2-segment.EndCurveOffset+(b-segment.End)};
+        // Endpoint displacement blends along the entire curve. Moving just its
+        // nearest handle by the full displacement creates a local crest/kink.
+        var da=a-segment.Start;var db=b-segment.End;
+        segment=segment with{Start=a,End=b,Control1=segment.CourseControl1-segment.StartCurveOffset+math.lerp(da,db,1f/3),Control2=segment.CourseControl2-segment.EndCurveOffset+math.lerp(da,db,2f/3)};
         var curve = new Bezier4x3(segment.CourseStart,segment.CourseControl1,segment.CourseControl2,segment.CourseEnd);
         var direction = math.normalizesafe(segment.CourseControl1 - segment.CourseStart, new float3(0f, 0f, 1f));
         var rotation = quaternion.LookRotationSafe(direction, new float3(0f, 1f, 0f));

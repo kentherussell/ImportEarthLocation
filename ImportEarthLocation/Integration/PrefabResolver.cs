@@ -61,7 +61,9 @@ public sealed class PrefabResolver
 
     private Entity ResolveRail(int tracks)
     {
-        tracks=Numeric.Clamp(tracks,1,2);
+        // Rail import always means ONE double-track, two-way native asset.
+        // This is an asset choice, never two separately placed rail courses.
+        tracks=2;
         if (_railPrefabs.TryGetValue(tracks,out var cachedRail)) return cachedRail;
         try
         {

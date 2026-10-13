@@ -476,7 +476,36 @@ public static class WaterBodyPlanner
             if((head&4095)==0)Pulse();var i=riverQueue[head++];var x=i%n;var z=i/n;
             void Visit(int next){if(next<0||wet[next]==0||riverSurface[next]>0)return;riverSurface[next]=riverSurface[i];riverQueue[tail++]=next;}
             Visit(x>0?i-1:-1);Visit(x+1<n?i+1:-1);Visit(z>0?i-n:-1);Visit(z+1<n?i+n:-1);
+            // A diagonal raster contact is still a mapped channel contact.
+            if(x>0&&z>0)Visit(i-n-1);if(x+1<n&&z>0)Visit(i-n+1);
+            if(x>0&&z+1<n)Visit(i+n-1);if(x+1<n&&z+1<n)Visit(i+n+1);
         }
+        // Seed disconnected raster fragments from their SAME geographic river
+        // polygon's solved reach. Do not jump across islands or use another river.
+        var reachesByPolygon=reachStages.Where(r=>r.PolygonId.HasValue).GroupBy(r=>r.PolygonId!.Value).ToDictionary(g=>g.Key,g=>g.ToArray());
+        var additionalSeeds=0;
+        for(var i=0;i<wet.Length;i++)
+        {
+            if((i&16383)==0)Pulse();if(wet[i]==0||riverSurface[i]>0)continue;
+            var p=new float3(i%n*spacing-half,0,i/n*spacing-half);
+            var area=areaIndex.Nearby(p).FirstOrDefault(a=>Flowing(a)&&!Coastal(a)&&!Dry(a)&&a.Contains(p));
+            if(area==null||!reachesByPolygon.TryGetValue(area.Polygon.Identity,out var reaches))continue;
+            var best=float.PositiveInfinity;var level=0f;
+            foreach(var reach in reaches)
+            {
+                var d=reach.End.xz-reach.Start.xz;var t=math.clamp(math.dot(p.xz-reach.Start.xz,d)/Math.Max(1,math.lengthsq(d)),0,1);
+                var distance=math.distancesq(p.xz,math.lerp(reach.Start.xz,reach.End.xz,t));if(distance>=best)continue;
+                best=distance;level=math.lerp(reach.StartLevel,reach.EndLevel,t);
+            }
+            if(level<=0)continue;riverSurface[i]=level;riverQueue[tail++]=i;additionalSeeds++;
+            while(head<tail)
+            {
+                var current=riverQueue[head++];var x=current%n;var z=current/n;
+                void Visit(int next){if(next<0||wet[next]==0||riverSurface[next]>0)return;riverSurface[next]=riverSurface[current];riverQueue[tail++]=next;}
+                Visit(x>0?current-1:-1);Visit(x+1<n?current+1:-1);Visit(z>0?current-n:-1);Visit(z+1<n?current+n:-1);
+            }
+        }
+        log.Count("River raster components reseeded",additionalSeeds);
         foreach(var area in areas.Where(a=>Flowing(a)&&!Coastal(a)&&!Dry(a)))CarveArea(area,p=>riverSurface[Pixel(p)]>0?riverSurface[Pixel(p)]:(float?)null);
         log.Diagnostic($"WATER CHANNEL CONTINUITY mappedWetCells={wet.Count(v=>v!=0)}; solvedWetCells={tail}; disconnectedUnseededCells={wet.Count(v=>v!=0)-tail}; islandsPreserved=true; sourceLevelPropagation=nearestConnectedRasterSeed; quadraticReachSearch=false");
         log.Diagnostic($"WATER BANKFULL PROFILE targetBankFreeboardMeters=.35; immutableBankTerrain=true; nonCumulativeSampleBounds=true; initialCenterlineOffsetMeters=2.8; fullWidthDepthMeters=2.5; widthAwareSourceRadius=true; mappedRiverBedBudget=maskOwned; finalNodes={nodeStage.Count}; minimumFinalStage={nodeStage.Values.DefaultIfEmpty(0).Min():R}; maximumFinalStage={nodeStage.Values.DefaultIfEmpty(0).Max():R}");
@@ -516,7 +545,7 @@ public static class WaterBodyPlanner
         // Recovery is confined to previously accepted control footprints. Never
         // carve through a road bed, a bridge support envelope or a tunnel roof.
         var protectedCells=new byte[raster.Length];var finalEdits=new byte[raster.Length];
-        foreach(var s in networks??Array.Empty<PreparedSegment>())
+        foreach(var s in (networks??Array.Empty<PreparedSegment>()).Where(s=>!s.Bridge&&!s.Tunnel))
         {
             networkCount++;Pulse();
             var count=Math.Max(1,(int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(s)/Math.Max(1,cell*.5f)));var radius=Math.Max(4,s.NativeWidth*.5f)+cell*2;var reach=(int)Math.Ceiling(radius/cell);

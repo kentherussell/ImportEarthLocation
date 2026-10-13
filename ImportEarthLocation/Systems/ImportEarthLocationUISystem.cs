@@ -77,6 +77,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
     private CancellationTokenSource? _cancellation;
     private Task<DownloadBundle>? _downloadTask;
     private Task<ProcessedBundle>? _processTask;
+    private Task _retiredWorkers=Task.CompletedTask;
     private PreparedImport? _prepared;
     private bool _downloadConsumed;
     private bool _processConsumed;
@@ -180,6 +181,11 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         _cancellation?.Cancel();
         _searchCancellation?.Cancel();
         _tilesCancellation?.Cancel();
+        NativeDiagnostics.ResetMap();_prepared=null;
+        var cancellation=_cancellation;var searchCancellation=_searchCancellation;var tilesCancellation=_tilesCancellation;
+        var tasks=new List<Task>{_retiredWorkers};foreach(var task in new Task?[]{_downloadTask,_processTask,_searchTask,_tilesTask})if(task!=null)tasks.Add(task);
+        _=Task.WhenAll(tasks).ContinueWith(t=>{_=t.Exception;cancellation?.Dispose();searchCancellation?.Dispose();tilesCancellation?.Dispose();},TaskScheduler.Default);
+        _downloadTask=null;_processTask=null;_searchTask=null;_tilesTask=null;
         ImportApplySystem.Progress -= OnApplyProgress;
         ImportApplySystem.Stopped -= OnApplyStopped;
         ImportApplySystem.Completed -= OnApplyCompleted;
@@ -188,7 +194,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
     }
 
     protected override void OnGamePreload(Colossal.Serialization.Entities.Purpose purpose, GameMode mode)
-    { base.OnGamePreload(purpose, mode); _isEditor.Update(false); ImportSession.ChangeMap(false); ResetMapState(); }
+    { base.OnGamePreload(purpose, mode); _isEditor.Update(false); World.GetOrCreateSystemManaged<ImportApplySystem>().AbortMapWork(); ImportSession.ChangeMap(false); ResetMapState(); }
 
     protected override void OnGameLoadingComplete(Colossal.Serialization.Entities.Purpose purpose, GameMode mode)
     { base.OnGameLoadingComplete(purpose, mode); ImportSession.ChangeMap(mode == GameMode.Editor); ResetMapState(); _isEditor.Update(mode==GameMode.Editor); NativeUiBootstrap.Ensure(); Mod.Log.Info($"UI map loaded; mode={mode}; editor={_isEditor.value}; session={_mapSession}"); if(mode==GameMode.Editor)NativeDiagnostics.Queue("after-load",_log); }
@@ -199,10 +205,20 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
 
     private void ResetMapState()
     {
-        _log.CloseArchive(_busy.value ? "interrupted-by-map-change" : null);
+        var oldLog=_log;var wasBusy=_busy.value;
         _mapSession = ImportSession.Map; // Invalidate first, even if subsystem cleanup fails.
         try { _cancellation?.Cancel(); CancelLocationServices(); World.GetOrCreateSystemManaged<ImportApplySystem>().AbortMapWork(); }
         catch (Exception exception) { _log.Warn("Map-session cleanup failed; stale work remains fenced: " + exception.GetBaseException().Message); }
+        NativeDiagnostics.ResetMap();
+        var oldCancellation=_cancellation;var oldSearch=_searchCancellation;var oldTiles=_tilesCancellation;
+        _cancellation=_searchCancellation=_tilesCancellation=null;
+        var workers=new List<Task>{_retiredWorkers};
+        foreach(var task in new Task?[]{_downloadTask,_processTask,_searchTask,_tilesTask})if(task!=null)workers.Add(task);
+        _retiredWorkers=Task.WhenAll(workers).ContinueWith(t=>
+        {
+            _=t.Exception;oldCancellation?.Dispose();oldSearch?.Dispose();oldTiles?.Dispose();
+            oldLog.CloseArchive(wasBusy?"interrupted-by-map-change":null);
+        },CancellationToken.None,TaskContinuationOptions.None,TaskScheduler.Default);
         Observe(_downloadTask); Observe(_processTask); Observe(_searchTask); Observe(_tilesTask);
         _downloadTask = null; _processTask = null; _searchTask = null; _tilesTask = null; _prepared = null;
         _downloadConsumed = _processConsumed = true; _lastMapWidth = 0;
@@ -389,6 +405,9 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
     {
         var log = _log; // Capture the current session log; old tasks must not write into a new map's panel.
         var progress = _progress;
+        // Wait asynchronously; never stall the UI or overlap two maps' large
+        // cancelled preparations. Disk caches remain available to this request.
+        await _retiredWorkers.ConfigureAwait(false);token.ThrowIfCancellationRequested();
 
         var bounds = GeoMath.BoundsFromCenter(request.Latitude, request.Longitude, request.MapSize.WidthMeters);
         var cache = new CacheStore(log);
@@ -555,6 +574,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         // Core network construction cannot fall back to an empty import: retain
         // useful stage context, but never turn a processing fault into missing roads.
         var rawSegments = NetworkProcessor.BuildSegments(dataset, bundle.Request, log, token);
+        rawSegments=NetworkOverlapConsolidator.Prepare(rawSegments,log,token);
         rawSegments = OsmRecovery.Run("avenue-consolidation",()=>AvenueConsolidator.Prepare(rawSegments, log, token),rawSegments,log,token);
         rawSegments = OsmRecovery.Run("roundabouts",()=>RoundaboutPlanner.Prepare(rawSegments,log,token),rawSegments,log,token);
         if(bundle.Request.ImportRail) { progress.Begin("Combining nearby railway tracks"); rawSegments = OsmRecovery.Run("rail-consolidation",()=>RailCorridorConsolidator.Prepare(rawSegments, log, token),rawSegments,log,token); }
@@ -573,6 +593,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         hardened=NativeChainCompactor.Prepare(hardened,log,token);
         log.Diagnostic($"PROCESS terrain-alignment begin; sections={hardened.Count}");
         progress.Begin("Smoothing road and railway slopes");
+        hardened=CoordinatedNetworkDesign.TunnelIntervals(hardened,log,token);
         var initialAlignment = NetworkProcessor.AlignToTerrain(hardened, terrain.Heightmap, terrain.HeightScaleMeters, bundle.Request.MapSize.WidthMeters, token);
         var aligned = OsmRecovery.Run("rail-grading",()=>RailVerticalProfiles.Prepare(initialAlignment,terrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,log,token),initialAlignment,log,token);
         aligned=OsmRecovery.Run("road-grading",()=>NetworkVerticalProfiles.Prepare(aligned, terrain.Heightmap, terrain.HeightScaleMeters, bundle.Request.MapSize.WidthMeters, log, token),aligned,log,token);
@@ -602,7 +623,8 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
             .Select(w=>w.NodeIds.Where(dataset.Nodes.ContainsKey).Select(id=>{var node=dataset.Nodes[id];return GeoMath.ToLocalMeters(node.Latitude,node.Longitude,bundle.Request.Latitude,bundle.Request.Longitude);}).ToArray()).ToArray();
         aligned=NetworkCutPlanner.Prepare(aligned,terrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,protectedAreas,protectedLines,wallLines,log,token);
         var roadbedProfiles=aligned;
-        aligned=StarterNetworkPolicy.Coordinate(aligned,networkTerrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,log,token,WaterBodyPlanner.SurfaceSampler(water,polygons));
+        aligned=CoordinatedNetworkDesign.Prepare(aligned,networkTerrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,log,token,WaterBodyPlanner.SurfaceSampler(water,polygons));
+        aligned=NetworkLaneAlignment.Prepare(aligned,log,token,bundle.Request.MapSize.WidthMeters);
         aligned=StarterNetworkPolicy.Quays(aligned,networkTerrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,log,token);
         roadbedProfiles=aligned;
         var roadbedRaster=NetworkRoadbed.Prepare(terrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,aligned,protectedAreas,protectedLines,log,token);
@@ -615,7 +637,10 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         // Recover against the actual final raster, then grade all incident approaches.
         aligned=NetworkGeometrySafety.RepairFinalTunnelCover(aligned,terrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,log,token);
         aligned=CorridorProfiles.Prepare(aligned,log,token,WaterBodyPlanner.SurfaceSampler(water,polygons),finishOnly:true);
-        aligned=StarterNetworkPolicy.Coordinate(aligned,networkTerrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,log,token,WaterBodyPlanner.SurfaceSampler(water,polygons));
+        aligned=CoordinatedNetworkDesign.Prepare(aligned,networkTerrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,log,token,WaterBodyPlanner.SurfaceSampler(water,polygons));
+        aligned=NetworkLaneAlignment.Prepare(aligned,log,token,bundle.Request.MapSize.WidthMeters);
+        aligned=NetworkGeometrySafety.RepairFinalTunnelCover(aligned,terrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,log,token);
+        aligned=CarriagewaySeparation.Repair(aligned,log,token);
         aligned=NetworkGeometrySafety.RepairFinalTunnelCover(aligned,terrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,log,token);
         terrain=terrain with{Heightmap=NetworkRoadbed.Refresh(networkTerrain.Heightmap,roadbedRaster,terrain.Heightmap,terrain.HeightScaleMeters,bundle.Request.MapSize.WidthMeters,roadbedProfiles,aligned,protectedAreas,protectedLines,log,token,water.FinalBedEdits)};
         NetworkGeometrySafety.ValidateEnvelope(aligned,bundle.Request.MapSize.WidthMeters,terrain.HeightScaleMeters,token,log);
@@ -674,7 +699,8 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
             sections=NetworkGeometrySafety.Repair(sections,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token,allowQualityWarnings:true,waterLevel:WaterBodyPlanner.SurfaceSampler(result.Water,result.HabitatPolygons));
             sections=NetworkCutPlanner.Prepare(sections,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,result.ProtectedAreas,result.ProtectedLines,result.ExplicitWallLines,log,token);
             var roadbedBaseline=terrain.Heightmap;
-            sections=StarterNetworkPolicy.Coordinate(sections,roadbedBaseline,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token,WaterBodyPlanner.SurfaceSampler(result.Water,result.HabitatPolygons));
+            sections=CoordinatedNetworkDesign.Prepare(sections,roadbedBaseline,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token,WaterBodyPlanner.SurfaceSampler(result.Water,result.HabitatPolygons));
+            sections=NetworkLaneAlignment.Prepare(sections,log,token,request.MapSize.WidthMeters);
             sections=StarterNetworkPolicy.Quays(sections,roadbedBaseline,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token);
             var roadbedProfiles=sections;
             var roadbedRaster=NetworkRoadbed.Prepare(terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,sections,result.ProtectedAreas,result.ProtectedLines,log,token);
@@ -685,7 +711,10 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
             if(water.ConditionedHeightmap!=null)terrain=terrain with{Heightmap=water.ConditionedHeightmap};
             sections=NetworkGeometrySafety.RepairFinalTunnelCover(sections,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token);
             sections=CorridorProfiles.Prepare(sections,log,token,WaterBodyPlanner.SurfaceSampler(water,result.HabitatPolygons),finishOnly:true);
-            sections=StarterNetworkPolicy.Coordinate(sections,roadbedBaseline,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token,WaterBodyPlanner.SurfaceSampler(water,result.HabitatPolygons));
+            sections=CoordinatedNetworkDesign.Prepare(sections,roadbedBaseline,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token,WaterBodyPlanner.SurfaceSampler(water,result.HabitatPolygons));
+            sections=NetworkLaneAlignment.Prepare(sections,log,token,request.MapSize.WidthMeters);
+            sections=NetworkGeometrySafety.RepairFinalTunnelCover(sections,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token);
+            sections=CarriagewaySeparation.Repair(sections,log,token);
             sections=NetworkGeometrySafety.RepairFinalTunnelCover(sections,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token);
             terrain=terrain with{Heightmap=NetworkRoadbed.Refresh(roadbedBaseline,roadbedRaster,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,roadbedProfiles,sections,result.ProtectedAreas,result.ProtectedLines,log,token,water.FinalBedEdits)};
             NetworkGeometrySafety.ValidateEnvelope(sections,request.MapSize.WidthMeters,terrain.HeightScaleMeters,token,log);

@@ -52,6 +52,7 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
     private readonly Stopwatch _vegetationClock = new();
     private readonly Stopwatch _vegetationBatchClock=new();
     private int _vegetationBatchSize=2048;
+    private int _vegetationCooldown;
     private bool _seaAttempted;
     private string _seaReport="Sea connections were not submitted.";
     private int _seaDefinitions;
@@ -331,6 +332,7 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
             }
             if (_phase == 3)
             {
+                if(_vegetationCooldown>0){_vegetationCooldown--;return;}
                 if(prepared.Request.CreateSeaConnections&&!_seaAttempted)
                 {
                     if(!NetworkCommitSystem.CanStartExclusive(EntityManager,out var seaWait))
@@ -355,7 +357,9 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                     if (_treePrefabs.Length == 0) { s_Log?.Warn("Optional vegetation skipped: no verified stock trees or bushes are available."); s_Log?.Count("Vegetation skipped", vegetation.Count); Finish(); return; }
                 }
                 Progress?.Invoke($"Planting trees and bushes… {100L * _treeIndex / Math.Max(1, vegetation.Count)}% of locations processed.");
-                var count = Math.Min(_vegetationBatchSize, vegetation.Count - _treeIndex);
+                var managedBytes=GC.GetTotalMemory(false);
+                var batchBudget=managedBytes>=3L*1024*1024*1024?512:_vegetationBatchSize;
+                var count = Math.Min(batchBudget, vegetation.Count - _treeIndex);
                 var failuresBefore=s_Log!.Metric("Vegetation definition failures");
                 if(!NetworkCommitSystem.CanStartExclusive(EntityManager,out var vegetationPreviewReason))
                 {
@@ -366,7 +370,7 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                 }
                 _vegetationRetirementFrames=0;
                 _vegetationBatchClock.Restart();
-                s_Log.Checkpoint("vegetation/definitions",new { startIndex=_treeIndex, count, total=vegetation.Count, mapChanged=_mapChanged });
+                s_Log.Checkpoint("vegetation/definitions",new { startIndex=_treeIndex, count, total=vegetation.Count, mapChanged=_mapChanged, managedBytes, batchBudget });
                 _definitions = NativeVegetationPlacement.CreateBatch(EntityManager, vegetation, _treeIndex, count, _treePrefabs, s_Log!);
                 _treeIndex += count;
                 if (count >= 32 && s_Log.Metric("Vegetation definition failures")-failuresBefore > count / 2)
@@ -410,7 +414,11 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                 s_Log?.Diagnostic($"VEGETATION BATCH definitions={_definitions!.Count}; lifecycleMilliseconds={elapsed:0.###}; batchLimit={_vegetationBatchSize}; candidatesProcessed={_treeIndex}; total={prepared.Vegetation.Count}; masksRetained=true");
                 // Include native fixed frame/barrier cost in throughput, not a
                 // one-second threshold that repeatedly halves healthy batches.
-                _vegetationBatchSize=elapsed>8000?Math.Max(2048,_vegetationBatchSize/2):Math.Min(8192,_vegetationBatchSize+1024);
+                _vegetationBatchSize=elapsed>2000?Math.Max(256,_vegetationBatchSize/2):Math.Min(2048,_vegetationBatchSize+256);
+                // Temp retirement is not proof that all downstream object work
+                // has finished. Leave update opportunities before another burst.
+                _vegetationCooldown=GC.GetTotalMemory(false)>=3L*1024*1024*1024?4:2;
+                s_Log?.Diagnostic($"VEGETATION PRESSURE managedBytes={GC.GetTotalMemory(false)}; nextBatchLimit={_vegetationBatchSize}; cooldownUpdates={_vegetationCooldown}; aggregateCandidatesNotTruncated=true; nativeFaultCauseUnproven=true");
                 _definitions=null;
                 _phase = 3;
             }
@@ -631,7 +639,7 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
         _created = 0;
         _skipped = 0;
         _treeIndex = 0; _vegetationRetirementFrames=0; _treePrefabs = Array.Empty<NativeVegetationPlacement.StockPrefab>(); _vegetationClock.Reset();
-        _vegetationBatchSize=2048;_vegetationBatchClock.Reset();
+        _vegetationBatchSize=2048;_vegetationCooldown=0;_vegetationBatchClock.Reset();
         _seaAttempted=false;_seaReport="Sea connections were not submitted.";_seaDefinitions=0;
         _networkDefinitionsQueued=0;
         _roadSections = _railSections = 0;
@@ -702,9 +710,13 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
         // Clear static ownership FIRST. Only touch our recorded helper definitions; never
         // query/delete trees or networks belonging to a newly loaded map.
         var definitions = _definitions; var log = s_Log;
+        var ownedMap=s_Pending?.Request.MapSessionId;
         if(s_Pending!=null)CleanupOwnedPreview(s_Pending);
+        // Complete dependencies before dropping ownership of issued native work.
+        try{if(definitions!=null&&ownedMap==ImportSession.Map)EntityManager.CompleteAllTrackedJobs();}
+        catch(Exception exception){log?.Warn("Old-map native dependency completion unavailable: "+exception.GetBaseException().Message);}
         Reset(); NetworkCommitSystem.CancelPending();
-        if (definitions == null) return;
+        if (definitions == null||ownedMap!=ImportSession.Map) return;
         try
         {
             EntityManager.CompleteAllTrackedJobs();

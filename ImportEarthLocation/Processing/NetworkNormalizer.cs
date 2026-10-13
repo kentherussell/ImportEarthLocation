@@ -247,7 +247,7 @@ public static class NetworkNormalizer
         for(var i=0;i<input.Count;i++)
         {
             token.ThrowIfCancellationRequested();var s=input[i];
-            if(s.Kind!=NetworkKind.Road||s.ExplicitLanes||s.ProtectedLink||!s.OneWay||!(s.Classification=="motorway"||s.Classification=="trunk")||math.distance(s.Start.xz,s.End.xz)>180)continue;
+            if(s.Kind!=NetworkKind.Road||s.ProtectedLink||!s.OneWay||!(s.Classification=="motorway"||s.Classification=="trunk")||math.distance(s.Start.xz,s.End.xz)>180)continue;
             int Neighbor(long id)
             {
                 if(nodes[id].Count!=2)return -1;return nodes[id][0]==i?nodes[id][1]:nodes[id][0];
@@ -267,14 +267,13 @@ public static class NetworkNormalizer
             (a.WayId==b.WayId||a.CorridorId!=0&&a.CorridorId==b.CorridorId||a.Reference.Length>0&&a.Reference==b.Reference||a.Name.Length>0&&a.Name==b.Name);
         int Continuation(int index,long node)
         {
-            if(nodes[node].Any(i=>result[i].ProtectedLink))return -1;
             var candidates=nodes[node].Where(i=>i!=index&&SameRoute(result[index],result[i])).ToArray();
             return candidates.Length==1?candidates[0]:-1;
         }
         for(var seed=0;seed<result.Length;seed++)
         {
             token.ThrowIfCancellationRequested();var s=result[seed];
-            if(s.Kind!=NetworkKind.Road||s.ExplicitLanes||s.ProtectedLink||seenRuns.Contains(seed))continue;
+            if(s.Kind!=NetworkKind.Road||s.ProtectedLink||!(s.Classification is "motorway" or "trunk")||seenRuns.Contains(seed))continue;
             var run=new HashSet<int>{seed};var ends=new List<int>();var length=math.distance(s.Start.xz,s.End.xz);
             foreach(var startNode in new[]{s.StartNodeId,s.EndNodeId})
             {
@@ -287,7 +286,7 @@ public static class NetworkNormalizer
                 }
             }
             foreach(var index in run)seenRuns.Add(index);
-            if(length>350||ends.Count!=2||run.Any(index=>result[index].ExplicitLanes)||result[ends[0]].Lanes!=result[ends[1]].Lanes)continue;
+            if(length>350||ends.Count!=2||result[ends[0]].Lanes!=result[ends[1]].Lanes)continue;
             foreach(var index in run){result[index]=result[index] with{Lanes=result[ends[0]].Lanes};runChanged++;}
         }
         log.Count("Corridor lane fluctuation sections normalized",runChanged);

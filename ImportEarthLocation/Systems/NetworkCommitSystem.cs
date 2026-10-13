@@ -194,7 +194,10 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
             if(temporary.Length>8192)s_Log?.Warn($"Large native preview: {temporary.Length} temporary entities; diagnostic only, not a generation gate.");
             // One batch-local graph instead of two identical serialized copies.
             // Vegetation has no road graph to diagnose; retain sampled captures.
-            if(s_ArtifactStem!=null||s_DeepCapture)s_Log?.DiagnosticRecords((s_ArtifactStem??"sampled-native-preview")+"-temp.ndjson",TempRecords(EntityManager,temporary.ToArray(),World.GetExistingSystemManaged<Game.Prefabs.PrefabSystem>()));
+            // Retain the actual last object batch too, not just every sixteenth
+            // batch: native faults cannot be reconstructed after process exit.
+            var batchArtifact=(s_ArtifactStem??"last-native-temp-batch")+(s_ArtifactStem==null?".ndjson":"-temp.ndjson");
+            if(s_Log?.DiagnosticsEnabled==true)s_Log.DiagnosticRecords(batchArtifact,TempRecords(EntityManager,temporary.ToArray(),World.GetExistingSystemManaged<Game.Prefabs.PrefabSystem>()));
             var originalTargets=new HashSet<Entity>();var mutationTargets=new HashSet<Entity>();var originalMutations=0;
             foreach(var entity in temporary)
             {
@@ -260,7 +263,7 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
                 _applyModeSetter.Invoke(lastTool,new object[]{ApplyMode.Clear});
                 s_ClearingPreview=true;s_WaitFrames=0;return;
             }
-            s_Log?.Checkpoint("native-commit/before-apply",new { context=s_Context, mapSession=s_Map, generation=s_Generation, temporaryEntities=s_Submitted.Count, frame=UnityEngine.Time.frameCount, lastTool=lastTool.GetType().FullName, managedMemoryBytes=GC.GetTotalMemory(false), graph="last-native-temp-batch.ndjson" });
+            s_Log?.Checkpoint("native-commit/before-apply",new { context=s_Context, mapSession=s_Map, generation=s_Generation, temporaryEntities=s_Submitted.Count, frame=UnityEngine.Time.frameCount, lastTool=lastTool.GetType().FullName, managedMemoryBytes=GC.GetTotalMemory(false), graph=batchArtifact });
             _applyModeSetter.Invoke(lastTool, new object[] { ApplyMode.Apply });
             s_Applied=true;s_WaitFrames=0;
             s_Log?.Diagnostic($"NATIVE COMMIT requested temporaryEntities={s_Submitted.Count}; waitingForRetirement=true; includesBushPlants=true");

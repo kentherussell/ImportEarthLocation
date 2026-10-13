@@ -34,9 +34,10 @@ public static class RailCorridorConsolidator
         // Transferring switches can expose a short redundant triangle: the
         // direct axis and an identical two-edge approach. Re-consolidate the
         // canonical raw geometry before fitting curves, preserving all tails.
-        source=source.Select(s=>s.Kind==NetworkKind.Rail?s with{Lanes=1,PhysicalTracks=1,OneWay=false,ExplicitWallSides=NetworkSides.None,RetainingWallSides=NetworkSides.None}:s).ToArray();
+        // Two tracks inside ONE native corridor segment, never two generated axes.
+        source=source.Select(s=>s.Kind==NetworkKind.Rail?s with{Lanes=2,PhysicalTracks=2,OneWay=false,ExplicitWallSides=NetworkSides.None,RetainingWallSides=NetworkSides.None}:s).ToArray();
         var result=ExactPhysicalDemands(source,log,token);
-        for(var pass=0;pass<3;pass++)
+        for(var pass=0;pass<8;pass++)
         {
             var next=PreparePass(result,log,token);
             if(next.SequenceEqual(result))return next;
@@ -170,7 +171,7 @@ public static class RailCorridorConsolidator
             var ranked=options.OrderByDescending(o=>o.length).ThenBy(o=>o.distance).ThenBy(o=>o.axis).ToArray();
             var best=ranked.FirstOrDefault();
             if(ranked.Length>1&&ranked[1].length>=best.length*.9f&&Math.Abs(ranked[1].distance-best.distance)<1f)
-            {log.Count("Ambiguous parallel rail corridors preserved");AddAxis(group);continue;}
+                log.Count("Rail ambiguous axes resolved by retained corridor priority");
             if(best.spans==null){AddAxis(group);continue;}
             var retained=axes[best.axis];
             (long node,float3 point) Junction(Projection p)
@@ -215,7 +216,7 @@ public static class RailCorridorConsolidator
             foreach(var original in replacements.TryGetValue(edge,out var pieces)?(IEnumerable<PreparedSegment>)pieces:new[]{edge})
             {
                 var paired=original.Kind==NetworkKind.Rail&&axisFor(original);
-                var s=original.Kind==NetworkKind.Rail?original with{Lanes=1,PhysicalTracks=1,OneWay=false,ExplicitWallSides=NetworkSides.None,RetainingWallSides=NetworkSides.None}:original;
+                var s=original.Kind==NetworkKind.Rail?original with{Lanes=2,PhysicalTracks=2,OneWay=false,ExplicitWallSides=NetworkSides.None,RetainingWallSides=NetworkSides.None}:original;
                 if(paired&&pairedAxes.TryGetValue(original.WayId,out var owners))
                 {
                     var absorbed=owners.SelectMany(axis=>axis.PairedSources.Where(p=>NetworkNormalizer.DistanceToSegment((s.Start+s.End)*.5f,p.source.Start,p.source.End)<=CorridorDistance+1).Select(p=>p.source)).ToArray();
@@ -233,7 +234,7 @@ public static class RailCorridorConsolidator
             }
         }
         log.Count("Rail parallel spans consolidated",removed.Count);
-        log.Diagnostic($"RAIL TOTAL waysConsolidated={merged}; spansConsolidated={removed.Count}; endpointsReconnected={reconnected}; corridorDistanceMeters={CorridorDistance}; outputRailSpans={output.Count(s=>s.Kind==NetworkKind.Rail)}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.###}; bridgeTunnelSeparationPreserved=true; differentLayersPreserved=true; pairedTracksLimitedToTwo=true; yardsAndSidingsPreserved=true");
+        log.Diagnostic($"RAIL TOTAL waysConsolidated={merged}; spansConsolidated={removed.Count}; endpointsReconnected={reconnected}; corridorDistanceMeters={CorridorDistance}; outputRailSpans={output.Count(s=>s.Kind==NetworkKind.Rail)}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.###}; bridgeTunnelSeparationPreserved=true; differentLayersPreserved=true; oneSegmentPerAxis=true; yardBranchesPrunedByBackbone=true");
         return RailJunctionRepair.Prepare(output,log,token);
 
         bool axisFor(PreparedSegment section)

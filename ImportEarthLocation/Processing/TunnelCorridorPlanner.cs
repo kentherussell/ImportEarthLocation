@@ -58,14 +58,14 @@ public static class TunnelCorridorPlanner
         {
             token.ThrowIfCancellationRequested();var s=sections[i];
             var far=new Key(s.Kind,s.StartNodeId==queue[cursor].Id?s.EndNodeId:s.StartNodeId);var d=distance[queue[cursor]]+lengths[i];
-            if(d>1000||distance.TryGetValue(far,out var old)&&old<=d)continue;distance[far]=d;active.Add(far);queue.Add(far);
+            if(d>4000||distance.TryGetValue(far,out var old)&&old<=d)continue;distance[far]=d;active.Add(far);queue.Add(far);
         }
         // Include frontier edges with a fixed far anchor, and actual bridge
         // approaches. Otherwise one changed endpoint can leave an unbounded kink.
         foreach(var key in joins.Keys.Where(k=>!active.Contains(k)))floors[key]=ceilings[key]=heights[key];
         var affected=Enumerable.Range(0,sections.Count).Where(i=>active.Contains(new(sections[i].Kind,sections[i].StartNodeId))||active.Contains(new(sections[i].Kind,sections[i].EndNodeId))).ToArray();
         var passes=0;var residual=0f;
-        for(;passes<128;passes++)
+        for(;passes<512;passes++)
         {
             token.ThrowIfCancellationRequested();var movement=0f;residual=0;
             foreach(var i in affected)
@@ -94,7 +94,7 @@ public static class TunnelCorridorPlanner
             sections[i]=s with{Start=a,End=d,Control1=c1,Control2=c2,StartElevation=a.y-Ground(a),EndElevation=d.y-Ground(d)};changed++;
         }
         residual=affected.Select(i=>Math.Max(0,Math.Abs(heights[new(sections[i].Kind,sections[i].StartNodeId)]-heights[new(sections[i].Kind,sections[i].EndNodeId)])-lengths[i]*NetworkVerticalProfiles.DesiredGrade(sections[i]))).DefaultIfEmpty(0).Max();
-        log.Diagnostic($"TUNNEL CORRIDOR sections={sections.Count(s=>s.Tunnel)}; approachNodes={active.Count}; revisedSections={changed}; passes={Math.Min(passes+1,128)}; endpointGradeResidualMeters={residual:R}; portalCutMeters=2; interiorCoverMeters=15; approachEnvelopeMeters=1000; frontierAnchorsFixed=true; bridgeApproachesIncluded=true; proximityJoins=false; sourceSectionsDeleted=0; nativeUndergroundCompositionRequiresReadback=true");
+        log.Diagnostic($"TUNNEL CORRIDOR sections={sections.Count(s=>s.Tunnel)}; approachNodes={active.Count}; revisedSections={changed}; passes={Math.Min(passes+1,512)}; endpointGradeResidualMeters={residual:R}; portalCutMeters=2; interiorCoverMeters=15; approachEnvelopeMeters=4000; frontierAnchorsFixed=true; bridgeApproachesIncluded=true; proximityJoins=false; sourceSectionsDeleted=0; nativeUndergroundCompositionRequiresReadback=true");
         return sections;
     }
 }
