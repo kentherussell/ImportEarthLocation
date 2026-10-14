@@ -118,7 +118,7 @@ static class Program
 }
 namespace ImportEarthLocation.Core
 {
-    public sealed class ImportLog { public Dictionary<string,int> Counts=new(); public List<string> Diagnostics=new(); public void Info(string x){} public void Warn(string x){} public void Diagnostic(string x){Diagnostics.Add(x);} public void Count(string x,int count=1){Counts.TryGetValue(x,out var old);Counts[x]=old+count;} public void Time(string x,double seconds){} }
+    public sealed class ImportLog { public Dictionary<string,int> Counts=new(); public List<string> Diagnostics=new(); public double Metric(string x)=>Counts.TryGetValue(x,out var count)?count:0; public void Info(string x){} public void Warn(string x){} public void Diagnostic(string x){Diagnostics.Add(x);} public void Count(string x,int count=1){Counts.TryGetValue(x,out var old);Counts[x]=old+count;} public void Time(string x,double seconds){} }
 }
 namespace ImportEarthLocation.Processing
 {

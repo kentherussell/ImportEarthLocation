@@ -17,6 +17,8 @@ public static class InputValidator
             errors.Add("The selected size requires MapExt, but MapExt was not detected.");
 
         var bounds = GeoMath.BoundsFromCenter(request.Latitude, request.Longitude, request.MapSize.WidthMeters);
+        if(bounds.South < -85.05112878d || bounds.North > 85.05112878d)
+            errors.Add("The complete map must remain within the terrain provider's latitude bounds (±85.05112878 degrees).");
         if (bounds.CrossesDateline)
             errors.Add("Locations whose map bounds cross the international date line are not supported in the MVP.");
         return errors;

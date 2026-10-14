@@ -47,10 +47,27 @@ public static class CoordinatedNetworkDesign
             foreach(var index in run){result[index]=result[index] with{Tunnel=true,Bridge=false,Layer=Math.Min(result[boundary[0]].Layer,result[boundary[1]].Layer)};filled++;}
         }
         var underground=new HashSet<long>(result.Where(s=>s.Kind==NetworkKind.Road&&s.Tunnel).SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));
-        var excluded=new HashSet<long>(result.Where(s=>s.ProtectedLink&&(underground.Contains(s.StartNodeId)||underground.Contains(s.EndNodeId))).Select(s=>s.WayId));
+        var excluded=new HashSet<int>();var pending=new List<int>();
+        // Walk only the degree-two link corridor touched by a tunnel. A source
+        // WayId is not a corridor boundary: the same way may branch above ground.
+        for(var i=0;i<result.Length;i++)
+            if(result[i].ProtectedLink&&(underground.Contains(result[i].StartNodeId)||underground.Contains(result[i].EndNodeId)))
+                if(excluded.Add(i))pending.Add(i);
+        for(var k=0;k<pending.Count;k++)
+        {
+            token.ThrowIfCancellationRequested();var current=result[pending[k]];
+            foreach(var id in new[]{current.StartNodeId,current.EndNodeId})
+            {
+                var incident=nodes[(NetworkKind.Road,id)];
+                if(incident.Count!=2)continue;
+                foreach(var next in incident)
+                    if(result[next].ProtectedLink&&excluded.Add(next))pending.Add(next);
+            }
+        }
         log.Count("Short tunnel surface interruptions absorbed",filled);
-        log.Diagnostic($"TUNNEL INTERVALS surfaceSectionsAbsorbed={filled}; maximumInterruptionMeters=220; undergroundLinkWaysExcluded={excluded.Count}; geographicOverrides=false");
-        return result.Where(s=>!s.ProtectedLink||!excluded.Contains(s.WayId)).ToArray();
+        log.Count("Underground degree-two link sections intentionally omitted",excluded.Count);
+        if(log.DiagnosticsEnabled)log.Diagnostic($"TUNNEL INTERVALS surfaceSectionsAbsorbed={filled}; maximumInterruptionMeters=220; undergroundLinkSectionsExcluded={excluded.Count}; branchesStopOmission=true; geographicOverrides=false");
+        return result.Where((s,i)=>!excluded.Contains(i)).ToArray();
     }
 
     public static IReadOnlyList<PreparedSegment> Prepare(IReadOnlyList<PreparedSegment> source,ushort[] raster,float scale,double width,

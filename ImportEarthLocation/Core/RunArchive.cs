@@ -14,6 +14,10 @@ public sealed class RunArchive
     private readonly DateTime _started = DateTime.UtcNow;
     private string _state = "preparing";
     private long _checkpointSequence;
+    private long _recordBytes;
+    public sealed record NativeOperationIntent(long MapSession, long Generation, ulong WorldSequenceNumber,
+        string State, int Definitions, int Submitted, int ApplyInvocations,
+        int SourceStartIndex = -1, int SourceSections = -1);
 
     public sealed record ArtifactResult(string File, int Records, long Bytes, bool Truncated);
 
@@ -63,23 +67,19 @@ public sealed class RunArchive
     // periodic event buffer surviving an abrupt process exit. Not a crash diagnosis.
     public void Checkpoint(string phase, object details)
     {
-        var journal = ArtifactPath("checkpoints.ndjson");
-        var journalBytes = File.Exists(journal) ? new FileInfo(journal).Length : 0;
         var sequence = ++_checkpointSequence;
-        object Record(bool truncated) => new
+        // Legacy anonymous payloads can contain entire native graphs. Only the
+        // primitive intent contract belongs in the durable last-operation record.
+        var record = new
         {
             schemaVersion = 1, sequence, recordedUtc = DateTime.UtcNow,
-            phase, state = _state, details,
-            checkpointJournalTruncated = truncated,
-            evidence = "Last recorded operation, not proof it crashed or completed. Native faults can occur asynchronously."
+            phase = phase.Length<=160?phase:phase.Substring(0,160), state = _state,
+            details = details as NativeOperationIntent,
+            evidence = "Intent only; asynchronous native completion/fault is not proven."
         };
-        var bytes = new UTF8Encoding(false).GetBytes(JsonConvert.SerializeObject(Record(false)) + "\n");
-        var canAppend = journalBytes + bytes.Length <= 8L * 1024 * 1024;
-        WriteJson("last-operation.json", Record(!canAppend), durable: true);
-        if (canAppend)
-        {
-            using var stream = new FileStream(journal, FileMode.Append, FileAccess.Write, FileShare.Read); stream.Write(bytes, 0, bytes.Length);
-        }
+        if (Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(record))>4096)
+            throw new InvalidOperationException("Native intent exceeded the 4 KiB diagnostic budget.");
+        WriteJson("last-operation.json", record, durable: true);
     }
 
     public void WriteJson(string name, object value, bool durable = false)
@@ -100,6 +100,8 @@ public sealed class RunArchive
     public ArtifactResult WriteRecords(string name, IEnumerable<object> records, long maximumBytes = 64L * 1024 * 1024, int maximumRecords = 250000)
     {
         if (maximumBytes < 1 || maximumRecords < 1) throw new ArgumentOutOfRangeException(nameof(maximumBytes));
+        maximumBytes = Math.Min(maximumBytes, Math.Min(8L*1024*1024, Math.Max(0,32L*1024*1024-_recordBytes)));
+        maximumRecords = Math.Min(maximumRecords,64);
         var path = ArtifactPath(name); var temporary = path + ".tmp";
         var count = 0; long bytes = 0; var truncated = false; var encoding = new UTF8Encoding(false);
         using (var stream = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.Read))
@@ -114,6 +116,7 @@ public sealed class RunArchive
             }
         }
         Publish(temporary, path);
+        _recordBytes += bytes;
         var result = new ArtifactResult(name, count, bytes, truncated);
         WriteJson(name + ".meta.json", result);
         return result;

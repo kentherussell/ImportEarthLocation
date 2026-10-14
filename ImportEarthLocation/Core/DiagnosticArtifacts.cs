@@ -25,6 +25,10 @@ public static class DiagnosticArtifacts
             {
                 Index = index, s.WayId, s.StartNodeId, s.EndNodeId, Start = Point(s.Start), End = Point(s.End),
                 Control1 = Point(s.Control1), Control2 = Point(s.Control2), Kind = s.Kind.ToString(), s.Classification,
+                DeckStart = Point(s.CourseStart), DeckControl1 = Point(s.CourseControl1),
+                DeckControl2 = Point(s.CourseControl2), DeckEnd = Point(s.CourseEnd),
+                ExactFinalDeckStored = s.FinalDeckCurve.HasValue,
+                GeometryEvidence = "prepared-course-not-native-readback",
                 s.Lanes, s.OneWay, s.Bridge, s.Tunnel, s.Layer, s.Name, s.Reference, s.RailService, s.SourceWayIds,
                 s.StartTerminal, s.EndTerminal, s.PhysicalTracks, s.BothWaysLanes, s.ForwardLanes, s.BackwardLanes,
                 s.ExplicitLanes, s.SourceWidthMeters, s.SourceSpeedKph, s.ExplicitIncline, s.CorridorId, s.ConsolidatedAvenue,
@@ -73,12 +77,13 @@ public static class DiagnosticArtifacts
             DownstreamProbe = Point(s.DownstreamProbe), bedRepairCellCount = s.BedRepairCells.Count
         }), maximumBytes: 8L * 1024 * 1024);
         archive.WriteRecords("vegetation-plan.ndjson", prepared.Vegetation.Select((v, i) => (object)new
-        { index = i, position = Point(v.Position), form = v.Form.ToString(), v.Seed, v.SourceId, v.Evidence, v.Taxon }), maximumBytes: 8L * 1024 * 1024);
+        { index = i, position = Point(v.Position), form = v.Form.ToString(), v.Seed, sourceId=v.SourceId.ToString(System.Globalization.CultureInfo.InvariantCulture), v.MetadataIndex,
+            metadata=v.MetadataIndex>=0&&v.MetadataIndex<prepared.VegetationMetadata.Count?prepared.VegetationMetadata[v.MetadataIndex]:default }), maximumBytes: 8L * 1024 * 1024);
         archive.WriteJson("environment-plan.json", new
         {
             schemaVersion = 1, prepared.Request, prepared.Climate, prepared.SeaLevelMeters,
             vegetationCandidates = prepared.Vegetation.Count,
-            vegetationDecisions = prepared.Vegetation.GroupBy(v => (v.Form, v.Evidence)).Select(g => new { form = g.Key.Form.ToString(), evidence = g.Key.Evidence, count = g.Count() }).ToArray(),
+            vegetationMetadataEntries = prepared.VegetationMetadata.Count,
             waterControls = prepared.Water?.Sources.Count ?? 0, waterCellSize = prepared.Water?.WaterCellSize,
             surfaceRequested = prepared.Request.ApplyGroundSurfaces, surfaceAvailable = prepared.SurfaceMask != null,
             surfaceResolution = prepared.SurfaceMask?.Resolution, surfaceReport = prepared.SurfaceMask?.Report,

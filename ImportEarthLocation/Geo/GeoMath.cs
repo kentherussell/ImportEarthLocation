@@ -34,11 +34,14 @@ public static class GeoMath
     }
 
     public static float3 ToLocalMeters(double latitude, double longitude, double centerLatitude, double centerLongitude)
+        => (float3)ToLocalMetersDouble(latitude, longitude, centerLatitude, centerLongitude);
+
+    public static double3 ToLocalMetersDouble(double latitude, double longitude, double centerLatitude, double centerLongitude)
     {
         var lat0 = DegreesToRadians(centerLatitude);
         var x = EarthRadius * DegreesToRadians(longitude - centerLongitude) * Math.Cos(lat0);
         var z = EarthRadius * DegreesToRadians(latitude - centerLatitude);
-        return new float3((float)x, 0f, (float)z);
+        return new double3(x, 0d, z);
     }
 
     public static double LongitudeToTileX(double longitude, int zoom) =>

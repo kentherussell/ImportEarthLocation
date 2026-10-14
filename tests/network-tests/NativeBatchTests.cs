@@ -287,7 +287,9 @@ internal static class NativeBatchTests
             var graph=File.ReadLines(graphPath).Select(line=>{var row=JObject.Parse(line);return new NativeBatchBindings.Edge<string>((string)row["entity"]!,(string)row["startNode"]!,(string)row["endNode"]!,Point(row["start"]!),Point(row["end"]!),Enum.Parse<NetworkKind>((string)row["mode"]!),(string)row["prefab"]!)
                 {CurveStart=row["curveStart"] is JObject a?Point(a):null,CurveEnd=row["curveEnd"] is JObject b?Point(b):null};}).ToArray();
             var owners=File.ReadLines(ownersPath).Select(JObject.Parse).ToDictionary(row=>(string)row["source"]!,row=>(string)row["entity"]!,StringComparer.Ordinal);
-            var wasRejected=File.ReadLines(Path.Combine(folder,"checkpoints.ndjson")).Select(JObject.Parse).Any(row=>(string?)row["phase"]=="native-batch/preview-rejected"&&(string?)row["details"]?["artifactStem"]==stem);
+            var journal=Path.Combine(folder,"checkpoints.ndjson");
+            var wasRejected=File.Exists(Path.Combine(folder,stem+"-matcher-rejection.ndjson"))||
+                File.Exists(journal)&&File.ReadLines(journal).Select(JObject.Parse).Any(row=>(string?)row["phase"]=="native-batch/preview-rejected"&&(string?)row["details"]?["artifactStem"]==stem);
             try
             {
                 var result=NativeBatchBindings.Match(expected,graph,owners);
@@ -313,7 +315,7 @@ internal static class NativeBatchTests
                 archive.WriteRecords(stem+"-owners.ndjson",new object[]{new{source="Road:1",entity="committed"}});
                 archive.WriteRecords(stem+"-graph.ndjson",valid?new object[]{new{entity="edge",startNode="committed",endNode="new-end",start=DiagnosticArtifacts.Point(s.Start+new float3(2,-.5f,0)),end=DiagnosticArtifacts.Point(s.End),
                     mode="Road",prefab="stock",curveStart=DiagnosticArtifacts.Point(s.CourseStart),curveEnd=DiagnosticArtifacts.Point(s.CourseEnd)}}:Array.Empty<object>());
-                if(!valid)archive.Checkpoint("native-batch/preview-rejected",new{artifactStem=stem,applied=false});
+                if(!valid)archive.WriteRecords(stem+"-matcher-rejection.ndjson",new object[]{new{artifactStem=stem,applied=false,reason="fixture-preview-rejected"}});
             }
             Write("native-batch-000128-128-attempt-00",false);
             Write("native-batch-000128-032-attempt-01",true);

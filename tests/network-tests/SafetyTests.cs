@@ -76,8 +76,15 @@ static class SafetyTests
         Check(shortRecovered.All(s=>NetworkVerticalProfiles.MaximumGrade(s)<=.081f),"Final roof repair recovered cover but left a steep short portal handle/approach");
         NetworkGeometrySafety.ValidateTunnelCover(shortRecovered,raster,200,1000,default);
         var impossiblePortal=new[]{S(321,30,31,new(-200,100,0),new(-10,100,0),true,1),S(322,31,32,new(-10,100,0),new(10,100,0)) with{Tunnel=true}};
-        try{NetworkGeometrySafety.RepairFinalTunnelCover(impossiblePortal,raster,200,1000,new ImportLog(),default);throw new Exception("Irrecoverable fixed deck/roof conflict was accepted");}
-        catch(PreparationDataException error){Check(error.Issue==PreparationDataIssue.GeometryUnavailable&&error.UserMessage.Contains("unchanged"),"Exhausted geometric recovery was not a graceful typed data outcome");}
+        // A source bridge flag is not a verified committed native boundary.
+        // Keep the same incompatible100m deck/90m roof fixture, but supply the
+        // actual fixed poses explicitly and require a measured failure outcome.
+        var fixedLog=new ImportLog();
+        var fixedResult=NetworkGeometrySafety.RepairFinalTunnelCover(impossiblePortal,raster,200,1000,fixedLog,default,
+            new Dictionary<SourceNodeKey,double>{{new(NetworkKind.Road,30),100},{new(NetworkKind.Road,31),100}});
+        Check(fixedResult[0].Start.y==100&&fixedResult[0].End.y==100,"Verified fixed bridge boundary moved to disguise a cover conflict");
+        Check(fixedLog.Metric("Joint profile exposed cover samples")>0&&fixedLog.Metric("Network repair quality observations")>0,"Irrecoverable fixed deck/roof conflict was silently certified");
+        Check(fixedResult.All(s=>math.all(math.isfinite(s.CourseStart))&&math.all(math.isfinite(s.CourseEnd))),"Physical review outcome lost finite inspectable geometry");
         using var stop=new CancellationTokenSource();stop.Cancel();
         try{CorridorProfiles.Prepare(waves,new ImportLog(),stop.Token);throw new Exception("Corridor cancellation ignored");}catch(OperationCanceledException){}
         Console.WriteLine("PASS: macro corridor waves, immutable shared topology, water deck floors/graded approaches, final tunnel-cover recovery with connected mixed portals, cancellation.");

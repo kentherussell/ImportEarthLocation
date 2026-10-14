@@ -56,8 +56,8 @@ try {
         if(!$flag -or [int]$flag.Constant -ne $networkFlag[2]) { throw "Native wall/roundabout flag changed: $($networkFlag[0]).$($networkFlag[1])" }
     }
     $placementSource=Get-Content -Raw (Join-Path $PSScriptRoot '..\ImportEarthLocation\Systems\NativeNetworkPlacement.cs')
-    if($placementSource -notmatch 'm_Flags = structure \? CreationFlags.SubElevation : 0' -or $placementSource -notmatch 'CoursePosFlags.FreeHeight'){
-        throw 'Ground courses must not use elevation-edit SubElevation; FreeHeight must remain supported'
+    if($placementSource -notmatch 'm_Flags = structure \? CreationFlags.SubElevation : 0' -or $placementSource -match 'CoursePosFlags.FreeHeight'){
+        throw 'Absolute solved courses must not enable FreeHeight or ground elevation-edit SubElevation'
     }
     $bootstrap=Get-Content -Raw (Join-Path $PSScriptRoot '..\ImportEarthLocation\Integration\NativeUiBootstrap.cs')
     foreach($guard in @('Core.UiPackageDiscovery.Find','RemoveActiveUIModLocation(new[]{s_RegisteredModule})','RemoveHostLocation("ui-mods",s_RegisteredDirectory)','ReferenceEquals(s_RegisteredHost,host)')){
@@ -185,12 +185,12 @@ try {
     }
     $sourceRoot=Join-Path $PSScriptRoot '..\ImportEarthLocation'
     $terrainSource=Get-Content -Raw (Join-Path $sourceRoot 'Integration\TerrainBridge.cs')
-    if($terrainSource -match '_replaceHeightmap\.Invoke' -or $terrainSource -notmatch 'var backup=Capture' -or $terrainSource -notmatch 'Finalize\(backup,oldScale\)' -or $terrainSource -notmatch 'worldBackup,true' -or $terrainSource -notmatch 'Resample\(prepared.Heightmap, backup.width, backup.height\)'){throw 'Terrain replacement lacks transform-preserving snapshot/owned rollback'}
+    if($terrainSource -match '_replaceHeightmap\.Invoke' -or $terrainSource -notmatch 'var backup=Capture' -or $terrainSource -notmatch 'Finalize\(backup,oldScale\)' -or $terrainSource -notmatch 'worldBackup,true' -or $terrainSource -notmatch 'Resample\(prepared.Heightmap,\s*backup.width,\s*backup.height\)'){throw 'Terrain replacement lacks transform-preserving snapshot/owned rollback'}
     $commitSource=Get-Content -Raw (Join-Path $sourceRoot 'Systems\NetworkCommitSystem.cs')
-    if($commitSource -notmatch 'ReadOnly<Game.Objects.Plant>' -or $commitSource -notmatch 's_Submitted.Contains\(entity\)' -or $commitSource -notmatch 's_SettledFrames>=2' -or $commitSource -notmatch 'CanStartExclusive'){throw 'Native commit again completes on request, ignores bush-only batches or lacks unrelated-preview preflight'}
+    if($commitSource -notmatch 'ReadOnly<Temp>' -or $commitSource -notmatch 's_Submitted.Contains\(entity\)' -or $commitSource -notmatch 's_SettledFrames>=2' -or $commitSource -notmatch 'CanStartExclusive'){throw 'Native commit again completes on request, omits complete Temp census or lacks unrelated-preview preflight'}
     if($commitSource.IndexOf('native-commit/before-apply') -lt 0 -or $commitSource.IndexOf('native-commit/before-apply') -gt $commitSource.IndexOf('_applyModeSetter.Invoke(lastTool, new object[] { ApplyMode.Apply })')){throw 'Native diagnostic checkpoint is not recorded before requesting Apply'}
-    if($commitSource -notmatch 'ReadOnly<Node>' -or $commitSource.IndexOf('s_BeforeApply?.Invoke') -lt 0 -or $commitSource.IndexOf('s_BeforeApply?.Invoke') -gt $commitSource.IndexOf('_applyModeSetter.Invoke(lastTool, new object[] { ApplyMode.Apply })')){throw 'Native graph lineage is not captured before Apply or node retirement is omitted'}
-    foreach($guard in @('NativeBatchBindings.Match','TempFlags.Replace','TempFlags.Combine','HasBuffer<ConnectedEdge>','m_Entity=existingStart','NativeBatchBindings.Rebase','live.m_Start!=e.StartNode')) {
+    if($commitSource -notmatch 'ReadOnly<Temp>' -or $commitSource.IndexOf('s_BeforeApply?.Invoke') -lt 0 -or $commitSource.IndexOf('s_BeforeApply?.Invoke') -gt $commitSource.IndexOf('_applyModeSetter.Invoke(lastTool, new object[] { ApplyMode.Apply })')){throw 'Native graph lineage is not captured before Apply or complete Temp retirement is omitted'}
+    foreach($guard in @('NativeBatchBindings.Match','TempFlags.Replace','TempFlags.Combine','HasBuffer<ConnectedEdge>','startPosition.m_Entity=startAnchor.Entity','NativeBatchBindings.Rebase','live.m_Start!=e.StartNode')) {
         if($placementSource -notmatch [regex]::Escape($guard)){throw "Native batch lineage/continuation guard missing: $guard"}
     }
     foreach($guard in @('NativeBatchBindings.RebaseBound','CurveStart=curve.a','_submittedCourses','ArtifactStem+"-owners.ndjson"','_verifiedPaths','BindVerified')) {

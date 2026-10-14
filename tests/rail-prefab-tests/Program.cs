@@ -95,14 +95,17 @@ static class Program
         }
         var ordinaryResolver=new PrefabResolver(ordinary,new ImportLog());var widths=ordinaryResolver.CaptureMinimumWidths();
         var chainBridge=highway with{WayId=227895247,Classification="primary",Lanes=6,NativeWidth=16,MaximumNativeWidth=15.775f};
-        Check(PrefabResolver.SizedPaletteKey(chainBridge).EndsWith(":6"),"Six-lane ordinary one-way road still uses the highway five-lane cap");
-        Check(widths[PrefabResolver.SizedPaletteKey(chainBridge)]==24,"Preparation snapshot has wrong native footprint for six-lane ordinary one-way road");
+        // The final specification deliberately caps regular one-way representation
+        // at three lanes. Preserve source six-lane evidence, but verify snapshot,
+        // actual asset, widths and direction against that explicit stock policy.
+        Check(PrefabResolver.SizedPaletteKey(chainBridge).EndsWith(":3"),"Regular one-way stock representation does not follow the specified three-lane cap");
+        Check(widths[PrefabResolver.SizedPaletteKey(chainBridge)]==16,"Preparation snapshot has wrong native footprint for the specified capped regular one-way representation");
         var prepared=PrefabResolver.ApplyMetadata(chainBridge,widths,ordinaryResolver.LaneOffsets);
-        Check(prepared.NativeWidth==24&&prepared.Lanes==6,"Metadata refresh changes lanes or audits stale 16 m footprint");
-        Check(ordinaryResolver.Resolve(chainBridge)==new Entity(24),"Narrow corridor prevented valid native one-way fallback");
-        Check(ordinaryResolver.Resolve(chainBridge with{MaximumNativeWidth=float.PositiveInfinity})==new Entity(24),"Spacing estimate changes catalog asset selection");
-        Check(ordinaryResolver.ResolveMetadata(chainBridge).NativeWidth==24,"Actual metadata readback cannot reconcile stale prepared width");
-        Check(ordinaryResolver.ResolveMetadata(chainBridge with{Bridge=true}).NativeWidth==25,"Elevated width omitted from the audited footprint");
+        Check(prepared.NativeWidth==16&&prepared.Lanes==6,"Metadata refresh changes source lane evidence or audits the wrong selected footprint");
+        Check(ordinaryResolver.Resolve(chainBridge)==new Entity(16),"Narrow corridor prevented specified regular one-way representation");
+        Check(ordinaryResolver.Resolve(chainBridge with{MaximumNativeWidth=float.PositiveInfinity})==new Entity(16),"Spacing estimate changes catalog asset selection");
+        Check(ordinaryResolver.ResolveMetadata(chainBridge).NativeWidth==16,"Actual metadata readback does not match preparation snapshot");
+        Check(ordinaryResolver.ResolveMetadata(chainBridge with{Bridge=true}).NativeWidth==17,"Elevated width omitted from the audited footprint");
         Check(ordinaryResolver.Resolve(chainBridge with{OneWay=false})==Entity.Null,"Estimated-width relaxation changed required road direction");
         Check(ordinaryResolver.Resolve(chainBridge with{Classification="PRIMARY",Lanes=2})==new Entity(16),"Case or absent two-lane exact name prevented ordinary one-way catalog fallback");
         Check(ordinaryResolver.ResolveMetadata(chainBridge with{Classification="primary",Lanes=2}).NativeWidth==16,"Small spacing deficit still rejects a usable native road");

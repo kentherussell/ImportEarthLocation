@@ -15,6 +15,8 @@ static class Program
     }
     static void Run(string[] args)
     {
+        if(args.Length==1&&args[0]=="--design-math-only"){DesignMathTests.Run();return;}
+        if(args.Length==1&&args[0]=="--profile-math-only"){ProfileMathTests.Run();return;}
         if(args.Length==2&&args[0]=="--audit-local-compaction")
         {NativeImportRegressionTests.ReplayLocalCompaction(args[1]);return;}
         if(args.Length>=2&&args[0]=="--audit-compaction")
@@ -49,13 +51,15 @@ static class Program
         if(args.Length==2&&args[0]=="--repair-snapshot"){CorridorTests.AuditSnapshot(args[1],true);return;}
         var log=new ImportLog();var request=new ImportRequest(0,0,MapSizeProfile.Vanilla,false);
         var nodes=new Dictionary<long,OsmNode>();var ways=new Dictionary<long,OsmWay>();
-        var classes=NetworkSelection.Classes(RoadImportLevel.Secondary).Split('|');
-        for(var i=0;i<9;i++){var id=i*2L+1;nodes[id]=new(id,0,i*.001);nodes[id+1]=new(id+1,.0001,i*.001);ways[i+1]=new(i+1,new[]{id,id+1},new Dictionary<string,string>{{i==8?"railway":"highway",i==8?"rail":classes[i]}});}
+        // Explicit fixture includes excluded street links as negative cases.
+        // Road levels are now independent flags, not the old cumulative enum.
+        var classes=new[]{"motorway","motorway_link","trunk","trunk_link","primary","primary_link","secondary","secondary_link","tertiary"};
+        for(var i=0;i<=classes.Length;i++){var id=i*2L+1;nodes[id]=new(id,0,i*.001);nodes[id+1]=new(id+1,.0001,i*.001);ways[i+1]=new(i+1,new[]{id,id+1},new Dictionary<string,string>{{i==classes.Length?"railway":"highway",i==classes.Length?"rail":classes[i]}});}
         var data=new OsmDataset{Nodes=nodes,Ways=ways};
         foreach(var level in Enum.GetValues<RoadImportLevel>())foreach(var rail in new[]{false,true})
         {
             var selected=request with{RoadLevel=level,ImportRail=rail};var result=NetworkProcessor.BuildSegments(data,selected,log);
-            var expected=level switch{RoadImportLevel.None=>0,RoadImportLevel.Highways=>4,RoadImportLevel.Primary=>6,_=>8};
+            var expected=((level&RoadImportLevel.Highways)!=0?2:0)+((level&RoadImportLevel.Routes)!=0?((level&RoadImportLevel.Streets)!=0?2:1):0)+((level&RoadImportLevel.Streets)!=0?3:0);
             Check(result.Count(s=>s.Kind==NetworkKind.Road)==expected&&result.Count(s=>s.Kind==NetworkKind.Rail)==(rail?1:0),"Road/rail independence failed");
             var query=OverpassClient.BuildNetworkQuery(new(-1,-1,1,1),level,rail);
             Check(query.Contains("way[\"highway\"~\"^("+NetworkSelection.Classes(level))== (level!=RoadImportLevel.None)&&query.Contains("way[\"railway\"=\"rail\"]")==rail,"Disabled selected network type fetched");
@@ -63,9 +67,9 @@ static class Program
             var forestQuery=OverpassClient.BuildForestQuery(new(-1,-1,1,1));
             Check(forestQuery.Contains("forest")&&forestQuery.Contains("wood")&&!forestQuery.Contains("highway")&&!forestQuery.Contains("railway"),"Forest query includes networks or loses cover");
         }
-        Check(new ImportRequest(0,0,MapSizeProfile.Vanilla,true).RoadLevel==RoadImportLevel.Secondary,"Legacy constructor migration failed");
+        Check(new ImportRequest(0,0,MapSizeProfile.Vanilla,true).RoadLevel==RoadImportLevel.None,"Legacy constructor enabled independent groups without an explicit selection");
         Check(NetworkPreferences.Parse("{}")==NetworkPreferences.Defaults&&NetworkPreferences.Parse("broken")==NetworkPreferences.Defaults,"Corrupt/missing preferences unsafe");
-        Check(NetworkPreferences.Parse("{\"includeSecondaryRoads\":true}").Roads==RoadImportLevel.Secondary,"Legacy persisted secondary not migrated");
+        Check(NetworkPreferences.Parse("{\"includeSecondaryRoads\":true}").Roads==RoadImportLevel.None,"Legacy persisted secondary enabled independent groups without an explicit selection");
         Check(NetworkPreferences.Parse("{\"roadLevel\":\"none\",\"importRail\":false}")==new NetworkPreferences(RoadImportLevel.None,false),"Explicit none/off not persisted");
         Check(!NetworkPreferences.Parse("{\"importForests\":false}").Forests,"Independent forestry preference not preserved");
         Check(NetworkPreferences.Parse("{\"roadLevel\":123,\"importRail\":\"false\"}")==NetworkPreferences.Defaults,"Corrupt typed preference did not default");
@@ -98,13 +102,15 @@ static class Program
         var raster=Enumerable.Repeat((ushort)32768,128*128).ToArray();
         var flat=NetworkVerticalProfiles.Prepare(new[]{S(50,50,51,-100,0,100,0)},raster,100,1000,log,default);
         Check(flat.Count==1&&NetworkVerticalProfiles.MaximumGrade(flat[0])<.0001,"Flat road gained microrelief");
-        Check(NetworkVerticalProfiles.GradeLimit(S(1,1,2,0,0,100,0) with{Classification="motorway"})==.08f,"Motorway practical limit missing");
-        Check(NetworkVerticalProfiles.GradeLimit(S(1,1,2,0,0,100,0) with{Classification="motorway_link"})==.12f,"Ramp practical limit missing");
+        // Match the existing physical policies explicitly retained in ROAD-005:
+        // motorway exceptional9%, protected-link13%, not the older8%/12% draft.
+        Check(NetworkVerticalProfiles.GradeLimit(S(1,1,2,0,0,100,0) with{Classification="motorway"})==.09f,"Motorway specified exceptional limit missing");
+        Check(NetworkVerticalProfiles.GradeLimit(S(1,1,2,0,0,100,0) with{Classification="motorway_link"})==.13f,"Ramp specified exceptional limit missing");
         var rolling=new ushort[128*128];
         for(var z=0;z<128;z++)for(var x=0;x<128;x++)rolling[z*128+x]=(ushort)Math.Round((100+((x/127f-.5f)*1000)*.12f)/200*65535);
         var gradingSource=new[]{S(70,70,71,-100,0,0,0) with{Classification="motorway"},S(70,71,72,0,0,100,0) with{Classification="motorway"},S(71,71,73,0,0,0,100)};
         var grading=NetworkVerticalProfiles.Prepare(gradingSource,rolling,200,1000,log,default);
-        Check(grading.Count>=3&&grading.Where(s=>s.Classification=="motorway").All(s=>NetworkVerticalProfiles.WithinGradeCeiling(s,.08f)),"Repairable highway grades not reduced to practical limit");
+        Check(grading.Count>=3&&grading.Where(s=>s.Classification=="motorway").All(s=>NetworkVerticalProfiles.WithinGradeCeiling(s,.09f)),"Repairable highway grades not reduced to specified exceptional limit");
         var junctionHeights=grading.SelectMany(s=>new[]{(id:s.StartNodeId,y:s.Start.y),(id:s.EndNodeId,y:s.End.y)}).Where(p=>p.id==71).ToArray();
         Check(junctionHeights.Length==3&&junctionHeights.All(p=>Math.Abs(p.y-junctionHeights[0].y)<.001f),"Grade smoothing disconnected a shared junction");
         Check(gradingSource.SelectMany(s=>new[]{s.Start,s.End}).All(p=>p.y==0),"Grading mutated source geometry");
@@ -139,7 +145,7 @@ static class Program
     }
 }
 namespace ImportEarthLocation { public static class Mod { public const string Id="ImportEarthLocation"; } }
-namespace ImportEarthLocation.Core { public sealed class ImportLog { public readonly List<string> Lines=new();public void Info(string s)=>Lines.Add(s);public void Warn(string s)=>Lines.Add(s);public void Diagnostic(string s)=>Lines.Add(s);public void Count(string s,int count=1){}public void Time(string s,double seconds){} } }
+namespace ImportEarthLocation.Core { public sealed class ImportLog { public readonly List<string> Lines=new();private readonly Dictionary<string,double> _metrics=new();public bool DiagnosticsEnabled=>false;public void Info(string s)=>Lines.Add(s);public void Warn(string s)=>Lines.Add(s);public void Diagnostic(string s)=>Lines.Add(s);public void Count(string s,int count=1){_metrics.TryGetValue(s,out var old);_metrics[s]=old+count;}public void AddCounter(string s,long count){_metrics.TryGetValue(s,out var old);_metrics[s]=old+count;}public void AddDuration(string s,double seconds){_metrics.TryGetValue(s+" time (s)",out var old);_metrics[s+" time (s)"]=old+seconds;}public void DiagnosticRecords(string s,IEnumerable<object> records){} public void Time(string s,double seconds){_metrics[s+" time (s)"]=seconds;}public double Metric(string s)=>_metrics.TryGetValue(s,out var value)?value:0; } }
 namespace ImportEarthLocation.Processing { public static class TerrainBuilder { public const int Resolution=128; } }
 namespace ImportEarthLocation.Data
 {

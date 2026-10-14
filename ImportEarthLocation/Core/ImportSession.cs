@@ -2,6 +2,8 @@ using System.Threading;
 
 namespace ImportEarthLocation.Core;
 
+public readonly record struct ImportEpoch(long MapSession, long Generation, ulong WorldSequenceNumber);
+
 /// <summary>Process-wide epoch fences static queues across editor maps and mod/world reloads.</summary>
 public static class ImportSession
 {
@@ -15,4 +17,6 @@ public static class ImportSession
     public static void ChangeMap(bool ready)
     { Volatile.Write(ref s_Ready, 0); Interlocked.Increment(ref s_Map); InvalidateOperation(); Volatile.Write(ref s_Ready, ready ? 1 : 0); }
     public static bool Matches(long map, long generation) => Ready && map == Map && generation == Generation;
+    public static bool Matches(ImportEpoch epoch, ulong currentWorldSequenceNumber)
+        => Matches(epoch.MapSession, epoch.Generation) && epoch.WorldSequenceNumber == currentWorldSequenceNumber;
 }

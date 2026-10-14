@@ -24,6 +24,8 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
     private static long s_Map, s_Generation;
     private static readonly HashSet<Entity> s_Submitted = new();
     private static bool s_Applied;
+    private static int s_ApplyInvocations;
+    private static bool s_OverdueReported;
     private static bool s_PreviewOnly, s_ClearingPreview;
     private static NativePreviewException? s_PreviewFailure;
     private static int s_SettledFrames;
@@ -40,6 +42,10 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
     public static void RequestCommit(long map, long generation, ImportLog? log = null, object? context = null, Action<IReadOnlyList<Entity>>? beforeApply = null, string? artifactStem = null, bool previewOnly = false)
     {
         if (!ImportSession.Matches(map, generation)) return;
+        if(s_Instance==null||!s_Instance._hasLease||s_Instance._retirementId!=0)
+            throw new InvalidOperationException("Native commit requires the definition batch's original exclusive lease.");
+        if (s_Requested)
+            throw new InvalidOperationException("A native transaction still owns its Apply/retirement lease.");
         if(s_Map!=map||s_Generation!=generation)s_CommitSequence=0;
         s_DeepCapture=previewOnly||++s_CommitSequence%16==1;
         s_Map = map; s_Generation = generation;
@@ -49,11 +55,18 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
         s_Failure = null;
         s_Recoverable=false;s_ArtifactStem=artifactStem;
         s_Submitted.Clear(); s_Applied=false; s_SettledFrames=0; s_Log=log; s_Context=context;
+        s_ApplyInvocations=0;s_OverdueReported=false;
         s_PreviewOnly=previewOnly;s_ClearingPreview=false;s_PreviewFailure=null;
         s_BeforeApply=beforeApply;
     }
 
-    public static void CancelPending() { s_Requested = false; s_WaitFrames = 0; s_Failure = null; s_Map = s_Generation = 0; s_Submitted.Clear(); s_Applied=false; s_SettledFrames=0; s_Log=null; s_Context=null; s_BeforeApply=null;s_Recoverable=false;s_ArtifactStem=null;s_PreviewOnly=s_ClearingPreview=false;s_PreviewFailure=null; }
+    public static void CancelPending()
+    {
+        // A UI reset or diagnostic deadline is not native retirement. The
+        // explicit map/world retirement owner must release issued work later.
+        if (s_Requested && (s_Applied || s_ClearingPreview)) return;
+        s_Requested = false; s_WaitFrames = 0; s_Failure = null; s_Map = s_Generation = 0; s_Submitted.Clear(); s_Applied=false; s_SettledFrames=0; s_Log=null; s_Context=null; s_BeforeApply=null;s_Recoverable=false;s_ArtifactStem=null;s_PreviewOnly=s_ClearingPreview=false;s_PreviewFailure=null;
+    }
 
     public static NativePreviewException? PreviewFailure => s_PreviewFailure;
     // An issued Apply must settle before a user stop touches remaining previews.
@@ -61,8 +74,11 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
     public static bool HasIssuedApply => s_Applied;
 
     protected override void OnGamePreload(Colossal.Serialization.Entities.Purpose purpose, GameMode mode)
-    { base.OnGamePreload(purpose, mode); CancelPending(); }
-    protected override void OnDestroy() { CancelPending(); base.OnDestroy(); }
+    { base.OnGamePreload(purpose, mode); BeginMapRetirement(); }
+    protected override void OnGameLoadingComplete(Colossal.Serialization.Entities.Purpose purpose, GameMode mode)
+    { base.OnGameLoadingComplete(purpose,mode); FinishMapRetirement(); }
+    protected override void OnDestroy()
+    { BeginMapRetirement(); _toolSystem.EventToolChanged-=ToolChanged; DetachOwner(); base.OnDestroy(); }
 
     public static bool TryConsumeResult(out bool complete, out string? failure)
         => TryConsumeResult(out complete,out failure,out _);
@@ -95,6 +111,8 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
 
     public static bool CanStartExclusive(EntityManager manager,out string reason)
     {
+        if(s_Instance!=null&&(s_Instance._hasLease||s_Instance._retirementId!=0))
+        {reason="An importer-owned native transaction or map-retirement ticket is still unresolved.";return false;}
         // ApplyMode is global to the native tool output pipeline. Never submit
         // an import while unrelated editing previews could be committed with it.
         manager.CompleteAllTrackedJobs();
@@ -149,17 +167,19 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
         _toolSystem = World.GetOrCreateSystemManaged<ToolSystem>();
         _lastToolField = typeof(ToolSystem).GetField("m_LastTool", BindingFlags.Instance | BindingFlags.NonPublic);
         _applyModeSetter = typeof(ToolBaseSystem).GetProperty("applyMode", BindingFlags.Instance | BindingFlags.Public)?.GetSetMethod(nonPublic: true);
+        AttachOwner();_toolSystem.EventToolChanged+=ToolChanged;
     }
 
     protected override void OnUpdate()
     {
+        if(_retirementId!=0)return;
+        if(_hasLease&&!s_Applied&&!s_ClearingPreview&&!ObserveExclusiveWindow(false))return;
         if (!s_Requested) return;
         if (!ImportSession.Matches(s_Map, s_Generation) || Game.SceneFlow.GameManager.instance.isGameLoading) { CancelPending(); return; }
         EntityManager.CompleteAllTrackedJobs();
         using var query = EntityManager.CreateEntityQuery(new EntityQueryDesc
         {
             All = new[] { ComponentType.ReadOnly<Temp>() },
-            Any = new[] { ComponentType.ReadOnly<Edge>(), ComponentType.ReadOnly<Node>(), ComponentType.ReadOnly<Game.Objects.Tree>(), ComponentType.ReadOnly<Game.Objects.Plant>() },
             None = new[] { ComponentType.ReadOnly<Deleted>() }
         });
         using var temporary=query.ToEntityArray(Allocator.Temp);
@@ -171,10 +191,13 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
             foreach(var entity in temporary)if(s_Submitted.Contains(entity))remaining++;
             s_SettledFrames=remaining==0?s_SettledFrames+1:0;
             if(s_SettledFrames>=2)
-            {s_Log?.Diagnostic($"NATIVE {(s_ClearingPreview?"PREFLIGHT":"COMMIT")} settled submitted={s_Submitted.Count}; pendingTemps=0; frames={s_WaitFrames}; definitionCountNotAcceptance=true");s_Log?.Checkpoint(s_ClearingPreview?"native-preflight/cleared":"native-commit/settled",new { context=s_Context, submitted=s_Submitted.Count, frames=s_WaitFrames, applied=s_Applied, liveRenderingNotVerified=true });s_Requested=false;s_WaitFrames=-1;return;}
+            {RecordSettlement();s_Log?.Diagnostic($"NATIVE {(s_ClearingPreview?"PREFLIGHT":"COMMIT")} settled submitted={s_Submitted.Count}; pendingTemps=0; frames={s_WaitFrames}; definitionCountNotAcceptance=true");s_Log?.Checkpoint(s_ClearingPreview?"native-preflight/cleared":"native-commit/settled",new { context=s_Context, submitted=s_Submitted.Count, frames=s_WaitFrames, applied=s_Applied, liveRenderingNotVerified=true });s_Requested=false;s_WaitFrames=-1;return;}
             if(++s_WaitFrames<180)return;
+            TransactionState=NativeTransactionState.SettlementOverdue;
             s_Failure=$"Native {(s_ClearingPreview?"preview clearing":"application")} did not settle: {remaining} of {s_Submitted.Count} submitted temporary entities remain. No duplicate retry was attempted.";
-            s_Log?.Diagnostic("NATIVE COMMIT timeout "+s_Failure);s_Requested=false;return;
+            if(!s_OverdueReported)
+            {s_OverdueReported=true;s_Log?.Event(TelemetryEvent.Failure,TelemetryReason.WaitOverdue,s_Failure);}
+            return; // Keep the lease and poll; never continue placement at timeout.
         }
         if (temporary.Length == 0)
         {
@@ -186,6 +209,7 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
 
         try
         {
+            if(!ObserveExclusiveWindow(true))return;
             var lastTool = _lastToolField?.GetValue(_toolSystem) as ToolBaseSystem;
             if (lastTool == null || _applyModeSetter == null)
                 throw new InvalidOperationException("The native tool commit hook was unavailable.");
@@ -220,12 +244,12 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
             // native ECB capacity. Shrink an uncommitted regeneration burst,
             // including flags=0 updates, rather than Apply then retry it.
             if(originalMutations>64)s_Log?.Count("Native batches above former mutation guard");
-            if(s_ArtifactStem!=null)s_Log?.DiagnosticRecords(s_ArtifactStem+"-mutation-contracts.ndjson",MutationRecords(EntityManager,temporary.ToArray()));
+            if(s_ArtifactStem!=null&&s_Log?.DiagnosticsEnabled==true)s_Log.DiagnosticRecords(s_ArtifactStem+"-mutation-contracts.ndjson",MutationRecords(EntityManager,temporary.ToArray()));
             if(s_ArtifactStem!=null)
             {
                 using var allPreviewQuery=EntityManager.CreateEntityQuery(ComponentType.ReadOnly<Temp>());
                 using var allPreview=allPreviewQuery.ToEntityArray(Allocator.Temp);
-                if(s_DeepCapture)s_Log?.DiagnosticRecords(s_ArtifactStem+"-downstream-contracts.ndjson",MutationRecords(EntityManager,allPreview.ToArray()),32L*1024*1024);
+                if(s_DeepCapture&&s_Log?.DiagnosticsEnabled==true)s_Log.DiagnosticRecords(s_ArtifactStem+"-downstream-contracts.ndjson",MutationRecords(EntityManager,allPreview.ToArray()),32L*1024*1024);
                 s_Log?.Diagnostic($"NATIVE DOWNSTREAM CAPTURE artifact={s_ArtifactStem}; allTempsIncludingDeletedAndLanes={allPreview.Length}; deepCapture={s_DeepCapture}; samplingEveryBatches=16; frame={UnityEngine.Time.frameCount}; readOnly=true; nativeCommandBufferContentsUnavailable=true");
                 AuditLaneContracts(EntityManager,allPreview.ToArray(),temporary.ToArray(),s_Log);
             }
@@ -251,21 +275,28 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
                 if(s_ArtifactStem!=null)s_Log?.DiagnosticRecords(s_ArtifactStem+"-invalid-graph.ndjson",MutationRecords(EntityManager,temporary.ToArray()));
                 s_Failure="Native preview contained invalid engine references or non-finite coordinates. Preview cleared locally; subsequent import batches remain eligible.";
                 s_BeforeApply=null;foreach(var entity in temporary)s_Submitted.Add(entity);
-                _applyModeSetter.Invoke(lastTool,new object[]{ApplyMode.Clear});
+                IssueOwnedClear(lastTool);
                 s_ClearingPreview=true;s_WaitFrames=0;return;
             }
             s_BeforeApply?.Invoke(temporary.ToArray());
             s_BeforeApply=null;
-            foreach(var entity in temporary)s_Submitted.Add(entity);
+            foreach(var entity in _claimedTemps)s_Submitted.Add(entity);
             if(s_PreviewOnly)
             {
                 s_Log?.Checkpoint("native-preflight/validated",new { context=s_Context, temporaryEntities=s_Submitted.Count, applied=false, wholeMapVerified=false });
-                _applyModeSetter.Invoke(lastTool,new object[]{ApplyMode.Clear});
+                IssueOwnedClear(lastTool);
                 s_ClearingPreview=true;s_WaitFrames=0;return;
             }
-            s_Log?.Checkpoint("native-commit/before-apply",new { context=s_Context, mapSession=s_Map, generation=s_Generation, temporaryEntities=s_Submitted.Count, frame=UnityEngine.Time.frameCount, lastTool=lastTool.GetType().FullName, managedMemoryBytes=GC.GetTotalMemory(false), graph=batchArtifact });
+            if(s_Log?.DiagnosticsEnabled==true)s_Log.Checkpoint("native-commit/before-apply",
+                new RunArchive.NativeOperationIntent(s_Map,s_Generation,World.SequenceNumber,"PreviewGenerated",0,s_Submitted.Count,s_ApplyInvocations));
+            if(!ObserveExclusiveWindow(true))return;
+            // Reflective invocation can throw after setting the native backing
+            // field. Mark issued BEFORE entering it, with no logging in between.
+            CaptureFoliageCandidates();
+            s_Applied=true;s_ApplyInvocations++;s_WaitFrames=0;
+            TransactionState=NativeTransactionState.ApplyIssued;
             _applyModeSetter.Invoke(lastTool, new object[] { ApplyMode.Apply });
-            s_Applied=true;s_WaitFrames=0;
+            TransactionState=NativeTransactionState.AwaitingRetirement;
             s_Log?.Diagnostic($"NATIVE COMMIT requested temporaryEntities={s_Submitted.Count}; waitingForRetirement=true; includesBushPlants=true");
         }
         catch (Exception exception)
@@ -276,11 +307,16 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
             // hook/playback failures are never blindly retried or mislabeled.
             s_Recoverable=!s_Applied&&exception is NativePreviewException;
             s_PreviewFailure=exception as NativePreviewException;
-            s_Log?.Diagnostic($"NATIVE COMMIT FAILURE context={Newtonsoft.Json.JsonConvert.SerializeObject(s_Context)}; exception={exception}");
+            if(s_Log?.DiagnosticsEnabled==true)s_Log.Diagnostic($"NATIVE COMMIT FAILURE context={Newtonsoft.Json.JsonConvert.SerializeObject(s_Context)}; exception={exception}");
             s_Log?.Checkpoint("native-commit/managed-failure",new { context=s_Context, exception=exception.ToString(), submitted=s_Submitted.Count, recoverable=s_Recoverable, applied=s_Applied,artifactStem=s_ArtifactStem });
-            CancelOwnedPreview(s_Log);
             s_Failure = $"Native network commit failed: {exception.GetBaseException().Message}";
-            s_Requested = false;
+            if(s_Applied||s_ClearingPreview)
+            {
+                s_Log?.Event(TelemetryEvent.Failure,TelemetryReason.OwnerUncertain,s_Failure+" A native notification was issued; retaining ownership without Clear or retry.");
+                return;
+            }
+            CancelOwnedPreview(s_Log);
+            if(!s_ClearingPreview)s_Requested = false;
         }
     }
 
@@ -371,6 +407,8 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
 
     public void CancelOwnedPreview(ImportLog? log)
     {
+        if(s_Applied&&s_Requested)return;
+        if(!_hasLease||!ObserveExclusiveWindow(true))return;
         if(Game.SceneFlow.GameManager.instance.isGameLoading)return;
         try
         {
@@ -378,7 +416,8 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
             var lastTool=_lastToolField?.GetValue(_toolSystem) as ToolBaseSystem;
             if(lastTool!=null && _applyModeSetter!=null)
             {
-                _applyModeSetter.Invoke(lastTool,new object[]{ApplyMode.Clear});
+                foreach(var id in _claimedTemps)s_Submitted.Add(id);
+                IssueOwnedClear(lastTool);
                 log?.Diagnostic("NATIVE PREVIEW cancelled through native Clear; no failed batch was re-applied");
             }
         }

@@ -1,6 +1,19 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
   <ItemGroup>
+    <Compile Include="../../ImportEarthLocation/Core/VegetationPlan.cs" Link="VegetationPlan.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/NativeAssetContracts.cs" Link="NativeAssetContracts.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/NetworkDesignModels.cs" Link="NetworkDesignModels.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkDesignChecks.cs" Link="NetworkDesignChecks.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkFootprintMath.cs" Link="NetworkFootprintMath.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkFootprintIndex.cs" Link="NetworkFootprintIndex.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkTerrainPolynomial.cs" Link="NetworkTerrainPolynomial.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkProfileGraph.cs" Link="NetworkProfileGraph.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkTunnelProfile.cs" Link="NetworkTunnelProfile.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkProfileSolve.cs" Link="NetworkProfileSolve.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/ProfileHardProjector.cs" Link="ProfileHardProjector.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/TerrainSampling.cs" Link="TerrainSampling.cs" />
+    <Compile Include="../../ImportEarthLocation/Data/ServicePreferences.cs" Link="ServicePreferences.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkEvidence.cs" Link="NetworkEvidence.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/TerrainConditioner.cs" Link="TerrainConditioner.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkContactPolicy.cs" Link="NetworkContactPolicy.cs" />

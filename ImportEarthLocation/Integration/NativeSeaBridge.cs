@@ -10,6 +10,7 @@ using Unity.Mathematics;
 using ImportEarthLocation.Core;
 using Unity.Collections;
 using Unity.Entities;
+using ImportEarthLocation.Systems;
 
 namespace ImportEarthLocation.Integration;
 
@@ -72,12 +73,14 @@ public static class NativeSeaBridge
             for(var i=0;i<=12;i++)if(!Wet(math.lerp(a-outward*.5f,b,i/12f))){fits=false;break;}
             if(fits){eligible++;candidates.Add((a,b));}
         }
+        if(candidates.Count>0)NetworkCommitSystem.BeginDefinitionBatch(manager,log);
         for(var i=0;i<candidates.Count;i++)
         {
             // At most eight connections, stratified across eligible wet edge slots.
             if(i%Math.Max(1,(int)Math.Ceiling(candidates.Count/8d))!=0)continue;
             var (a,b)=candidates[i];var direction=math.normalizesafe(b-a);var rotation=quaternion.LookRotationSafe(direction,new float3(0,1,0));
             var curve=new Bezier4x3(a,math.lerp(a,b,1/3f),math.lerp(a,b,2/3f),b);var definition=manager.CreateEntity();
+            NetworkCommitSystem.RegisterDefinition(definition);
             try
             {
                 CoursePos Position(float3 p,bool first)=>new(){m_Position=p,m_Rotation=rotation,m_CourseDelta=first?0:1,m_ParentMesh=-1,
@@ -89,6 +92,7 @@ public static class NativeSeaBridge
             }
             catch(Exception error){manager.DestroyEntity(definition);log.Warn("Sea course omitted locally: "+error.Message);}
         }
+        if(result.Count==0)NetworkCommitSystem.ReleaseEmptyDefinitions(manager);
         log.Count("Sea courses submitted",result.Count);log.Diagnostic($"SEA PLAN eligibleWetPerimeterSlots={eligible}/32; definitions={result.Count}; rejectedCoverage={rejectedCoverage}; rejectedDepth={rejectedDepth}; rejectedBounds={rejectedBounds}; nativeOutsideObjectsRequired=true; riverConnectionsExcluded=true");
         return result;
     }

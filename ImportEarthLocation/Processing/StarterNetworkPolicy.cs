@@ -52,77 +52,22 @@ public static class StarterNetworkPolicy
     }
     public static IReadOnlyList<PreparedSegment> Rail(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
     {
-        var result=PruneRailYards(source,log,token);var nodes=new Dictionary<long,List<(int i,bool start)>>();
-        for(var i=0;i<result.Length;i++)if(result[i].Kind==NetworkKind.Rail)
-            foreach(var start in new[]{true,false}){var id=start?result[i].StartNodeId:result[i].EndNodeId;if(!nodes.TryGetValue(id,out var list))nodes[id]=list=new();list.Add((i,start));}
-        var protectedNodes=new HashSet<long>(source.Where(s=>s.Kind==NetworkKind.Road).SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));
-        var grid=new Dictionary<(int,int),List<long>>();
-        foreach(var p in nodes.Where(p=>p.Value.Count==1&&!protectedNodes.Contains(p.Key)))
-        {var e=p.Value[0];var s=result[e.i];if(e.start?s.StartTerminal:s.EndTerminal)continue;var v=e.start?s.Start:s.End;var key=((int)Math.Floor(v.x/16),(int)Math.Floor(v.z/16));if(!grid.TryGetValue(key,out var list))grid[key]=list=new();list.Add(p.Key);}
-        var used=new HashSet<long>();var joined=0;
-        foreach(var entry in nodes.Where(p=>p.Value.Count==1).OrderBy(p=>p.Key))
+        var output=new List<PreparedSegment>(source.Count);var omitted=0;
+        foreach(var segment in source)
         {
-            token.ThrowIfCancellationRequested();if(used.Contains(entry.Key)||protectedNodes.Contains(entry.Key))continue;
-            var e=entry.Value[0];var s=result[e.i];if(e.start?s.StartTerminal:s.EndTerminal)continue;var p=e.start?s.Start:s.End;
-            var inward=math.normalizesafe((e.start?s.End-s.Start:s.Start-s.End).xz);var best=0L;var bestDistance=12f;
-            var gx=(int)Math.Floor(p.x/16);var gz=(int)Math.Floor(p.z/16);
-            for(var x=gx-1;x<=gx+1;x++)for(var z=gz-1;z<=gz+1;z++)if(grid.TryGetValue((x,z),out var list))foreach(var id in list)
-            {if(id==entry.Key||used.Contains(id))continue;var f=nodes[id][0];if(f.i==e.i)continue;var t=result[f.i];if(s.Layer!=t.Layer||s.Bridge!=t.Bridge||s.Tunnel!=t.Tunnel)continue;
-                var q=f.start?t.Start:t.End;var d=math.distance(p.xz,q.xz);if(d>=bestDistance||Math.Abs(p.y-q.y)>2)continue;
-                var other=math.normalizesafe((f.start?t.End-t.Start:t.Start-t.End).xz);if(math.dot(inward,other)>-.9f)continue;best=id;bestDistance=d;}
-            if(best==0)continue;var target=nodes[best][0];var t0=result[target.i];var point=(p+(target.start?t0.Start:t0.End))*.5f;
-            result[e.i]=e.start?s with{Start=point}:s with{End=point};
-            result[target.i]=target.start?t0 with{Start=point,StartNodeId=entry.Key}:t0 with{End=point,EndNodeId=entry.Key};used.Add(entry.Key);used.Add(best);joined++;
+            token.ThrowIfCancellationRequested();
+            if(segment.Kind!=NetworkKind.Rail){output.Add(segment);continue;}
+            // Density, short tails and cycles cannot prove yard membership.
+            // Legitimate loops and terminal obligations retain source identity.
+            var service=segment.RailService;
+            if(segment.RawSourceTags.TryGetValue("service",out var raw))service=raw;
+            else if(segment.SourceTags.TryGetValue("service",out var normalized))service=normalized;
+            if(service is "yard" or "siding" or "spur"){omitted++;continue;}
+            output.Add(segment with{PhysicalTracks=2,Lanes=2,OneWay=false});
         }
-        var parent=new Dictionary<long,long>();long Root(long n){if(!parent.ContainsKey(n))parent[n]=n;while(parent[n]!=n){parent[n]=parent[parent[n]];n=parent[n];}return n;}
-        var removed=new HashSet<int>();var cycles=0;
-        foreach(var i in Enumerable.Range(0,result.Length).Where(i=>result[i].Kind==NetworkKind.Rail).OrderBy(i=>result[i].RailService.Length==0?0:1).ThenByDescending(i=>math.distance(result[i].Start,result[i].End)))
-        {token.ThrowIfCancellationRequested();var s=result[i];var a=Root(s.StartNodeId);var b=Root(s.EndNodeId);if(a==b&&s.RailService is "yard" or "siding" or "spur"){removed.Add(i);cycles++;}else parent[a]=b;}
-        log.Diagnostic($"RAIL STARTER gapEndpointsJoined={joined}; redundantYardCycleEdgesRemoved={cycles}; corridorSegmentsPerAxis=1; tracksWithinSegment=2; bidirectional=true; bufferStopsPreserved=true; sameLevelOnly=true");
-        return result.Where((s,i)=>!removed.Contains(i)).ToArray();
-    }
-
-    private static PreparedSegment[] PruneRailYards(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
-    {
-        var edges=source.ToArray();var nodes=new Dictionary<long,List<int>>();
-        for(var i=0;i<edges.Length;i++)if(edges[i].Kind==NetworkKind.Rail)
-            foreach(var id in new[]{edges[i].StartNodeId,edges[i].EndNodeId})
-            {if(!nodes.TryGetValue(id,out var list))nodes[id]=list=new();list.Add(i);}
-        var cells=new Dictionary<(int,int),List<long>>();
-        foreach(var p in nodes.Where(p=>p.Value.Count>=3))
-        {
-            var e=edges[p.Value[0]];var point=e.StartNodeId==p.Key?e.Start:e.End;var key=((int)Math.Floor(point.x/128),(int)Math.Floor(point.z/128));
-            if(!cells.TryGetValue(key,out var list))cells[key]=list=new();list.Add(p.Key);
-        }
-        var dense=new HashSet<long>();
-        foreach(var pair in cells)
-        {
-            token.ThrowIfCancellationRequested();var nearby=new List<long>();
-            for(var x=-1;x<=1;x++)for(var z=-1;z<=1;z++)if(cells.TryGetValue((pair.Key.Item1+x,pair.Key.Item2+z),out var list))nearby.AddRange(list);
-            if(nearby.Count>=3)dense.UnionWith(nearby);
-        }
-        var removed=new HashSet<int>();var tails=0;
-        foreach(var end in nodes.Where(p=>p.Value.Count==1).OrderBy(p=>p.Key))
-        {
-            var node=end.Key;var index=end.Value[0];var route=new List<int>();var distance=0f;var touched=false;var seen=new HashSet<int>();
-            while(seen.Add(index))
-            {
-                token.ThrowIfCancellationRequested();var e=edges[index];
-                distance+=math.distance(e.Start.xz,e.End.xz);if(distance>300)break;route.Add(index);
-                node=e.StartNodeId==node?e.EndNodeId:e.StartNodeId;touched|=dense.Contains(node);
-                if(nodes[node].Count!=2){if(touched&&nodes[node].Count>=3){removed.UnionWith(route);tails++;}break;}
-                index=nodes[node][0]==index?nodes[node][1]:nodes[node][0];
-            }
-        }
-        var parent=new Dictionary<long,long>();long Root(long id){if(!parent.ContainsKey(id))parent[id]=id;while(parent[id]!=id){parent[id]=parent[parent[id]];id=parent[id];}return id;}
-        var cycles=0;
-        foreach(var i in Enumerable.Range(0,edges.Length).Where(i=>edges[i].Kind==NetworkKind.Rail&&!removed.Contains(i)).OrderBy(i=>dense.Contains(edges[i].StartNodeId)&&dense.Contains(edges[i].EndNodeId)?1:0).ThenByDescending(i=>math.distance(edges[i].Start.xz,edges[i].End.xz)))
-        {
-            var e=edges[i];var a=Root(e.StartNodeId);var b=Root(e.EndNodeId);
-            if(a==b&&dense.Contains(e.StartNodeId)&&dense.Contains(e.EndNodeId)){removed.Add(i);cycles++;}else parent[a]=b;
-        }
-        log.Diagnostic($"RAIL BACKBONE denseSwitchNodes={dense.Count}; shortYardTailsRemoved={tails}; redundantDenseSwitchEdgesRemoved={cycles}; sectionsRemoved={removed.Count}; throughRoutesPrioritized=true; denseSwitchThreshold=3; maximumYardTailMeters=300; yardsRendered=false");
-        return edges.Where((s,i)=>!removed.Contains(i)).ToArray();
+        log.Count("Source-evidenced yard sections intentionally omitted",omitted);
+        if(log.DiagnosticsEnabled)log.Diagnostic($"RAIL BACKBONE yardServiceOmissions={omitted}; densityPruning=false; proximityWelding=false; legitimateTerminalsAndLoopsRetained=true; oneDoubleTrackCourse=true");
+        return output;
     }
 
     public static IReadOnlyList<PreparedSegment> Coordinate(IReadOnlyList<PreparedSegment> source,ushort[] raster,float scale,double width,ImportLog log,CancellationToken token,Func<float3,float?>? waterLevel=null)

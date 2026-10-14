@@ -10,8 +10,8 @@ namespace ImportEarthLocation.Processing;
 // Final coupled solve, after horizontal fitting and the legacy profile passes.
 // Roads and rail share clearance constraints. Only explicit, same-level OSM
 // crossing anchors may also share elevation; proximity never joins networks.
-// Bounds, tunnel cover and shared anchors always block invalid output. The caller
-// may explicitly accept residual clearance/grade warnings for a test iteration.
+// Production callers retain finite native-safe geometry as RequiresReview when
+// quality constraints fail. Strict offline callers may reject a quality fixture.
 public static class NetworkGeometrySafety
 {
     public const float DeckGap = NetworkVerticalProfiles.MinimumBridgeClearance + 4f;
@@ -376,7 +376,26 @@ public static class NetworkGeometrySafety
             if(c.Kind!=NetworkContactKind.IndependentLevels||!math.isfinite(gap)||gap<MinimumSafeGap)collisions.Add(c);
         }
         log.Diagnostic($"NETWORK SAFETY FINAL sections={sections.Count}; widthAwareContacts={contacts.Count}; clearanceFailures={collisions.Count}; gradeFailures={steep.Length}; minimumClearSpaceMeters=5; deckAllowanceMeters=2; failClosed={!allowQualityWarnings}; iterationMode={allowQualityWarnings}; nativeRenderingStillRequiresVerification=true");
-        DescribeQuality(sections,log,token);
+        if(log.DiagnosticsEnabled)
+        {
+            DescribeQuality(sections,log,token);
+            log.DiagnosticRecords("network-clearance-observations.ndjson",contacts
+                .OrderBy(c=>Math.Abs(NetworkNormalizer.Evaluate(sections[c.A],c.T).y-NetworkNormalizer.Evaluate(sections[c.B],c.U).y))
+                .Take(64).Select(c=>(object)new
+                {
+                    constraint="independent-level-deck-gap",policyStatus="implementation-assumption-awaiting-game-validation",
+                    evidence="prepared-curve-observation-not-native-readback",nativeRenderingVerified=false,
+                    aWay=sections[c.A].WayId,aStart=sections[c.A].StartNodeId,aEnd=sections[c.A].EndNodeId,
+                    bWay=sections[c.B].WayId,bStart=sections[c.B].StartNodeId,bEnd=sections[c.B].EndNodeId,
+                    aT=c.T,bT=c.U,contactKind=c.Kind.ToString(),
+                    aPosition=DiagnosticArtifacts.Point(NetworkNormalizer.Evaluate(sections[c.A],c.T)),
+                    bPosition=DiagnosticArtifacts.Point(NetworkNormalizer.Evaluate(sections[c.B],c.U)),
+                    measuredDeckGapMeters=Math.Abs(NetworkNormalizer.Evaluate(sections[c.A],c.T).y-NetworkNormalizer.Evaluate(sections[c.B],c.U).y),
+                    requiredDeckGapMeters=MinimumSafeGap,
+                    applicability=c.Kind==NetworkContactKind.IndependentLevels?"vertical-clearance":"horizontal-conflict-needs-review-not-height-stacking",
+                    requestedContacts=contacts.Count,sampleSelection="smallest-gap-first-at-most-64-not-complete-coverage"
+                }));
+        }
         if(steep.Length>0||collisions.Count>0)
         {
             foreach(var s in steep.Take(10))log.Diagnostic($"NETWORK SAFETY GRADE way={s.WayId}; kind={s.Kind}; bridge={s.Bridge}; tunnel={s.Tunnel}; grade={NetworkVerticalProfiles.MaximumGrade(s):R}; length={NetworkVerticalProfiles.ArcLength(s):R}; start={s.Start}; end={s.End}");
@@ -384,7 +403,7 @@ public static class NetworkGeometrySafety
             var ways=steep.Select(s=>s.WayId).Concat(collisions.SelectMany(c=>new[]{sections[c.A].WayId,sections[c.B].WayId})).Distinct().Take(12);
             if(allowQualityWarnings)
             {log.Count("Network repair quality observations",collisions.Count+steep.Length);log.Warn($"Iteration quality warning: {collisions.Count} clearance observations and {steep.Length} excessive-grade sections remain after bounded repair. Complete network retained for testing; not production-accepted. Ways: {string.Join(",",ways)}.");return;}
-            log.Warn($"Network quality observations: {collisions.Count} clearance failures, {steep.Length} excessive grades. Generation retained for diagnosis. Ways: {string.Join(",",ways)}.");
+            throw new InvalidOperationException($"Strict offline network quality validation prevented application: {collisions.Count} clearance failures, {steep.Length} excessive grades. Ways: {string.Join(",",ways)}.");
         }
     }
 
@@ -407,6 +426,24 @@ public static class NetworkGeometrySafety
             foreach(var start in new[]{true,false})
             {var key=new Key(s.Kind,start?s.StartNodeId:s.EndNodeId);if(!joins.TryGetValue(key,out var list))joins[key]=list=new();list.Add((s,start));}
         }
+        log.DiagnosticRecords("network-constraint-observations.ndjson",metrics
+            .OrderByDescending(m=>m.Grade/Math.Max(.000001f,GradeLimit(m.Section))).Take(64)
+            .Select(m=>(object)new
+            {
+                constraint="longitudinal-grade-and-sampled-curvature",policyStatus="implementation-assumption-awaiting-game-validation",
+                evidence="prepared-curve-observation-not-native-readback",nativeRenderingVerified=false,
+                m.Section.WayId,m.Section.StartNodeId,m.Section.EndNodeId,m.Section.SourceWayIds,
+                kind=m.Section.Kind.ToString(),m.Section.Classification,m.Section.Bridge,m.Section.Tunnel,
+                m.Section.Lanes,m.Section.OneWay,m.Section.NativeWidth,
+                measuredMaximumGrade=m.Grade,desiredGrade=NetworkVerticalProfiles.DesiredGrade(m.Section),
+                exceptionalGrade=GradeLimit(m.Section),exceptionalResidual=m.Grade-GradeLimit(m.Section),
+                exceptionalContinuousCheckPassed=NetworkVerticalProfiles.WithinGradeCeiling(m.Section,GradeLimit(m.Section)),
+                sampledMinimumRadiusMeters=float.IsInfinity(m.Radius)?(float?)null:m.Radius,
+                curvatureEvidence="33-parameter-samples-not-continuous-certification",lengthMeters=m.Length,
+                deckStart=DiagnosticArtifacts.Point(m.Section.CourseStart),deckControl1=DiagnosticArtifacts.Point(m.Section.CourseControl1),
+                deckControl2=DiagnosticArtifacts.Point(m.Section.CourseControl2),deckEnd=DiagnosticArtifacts.Point(m.Section.CourseEnd),
+                requestedSections=sections.Count,sampleSelection="highest-grade-ratio-first-at-most-64-not-complete-coverage"
+            }));
         foreach(var group in metrics.GroupBy(m=>m.Section.Kind==NetworkKind.Rail?"rail":m.Section.ProtectedLink?"ramps":m.Section.Classification=="motorway"||m.Section.Classification=="trunk"?"mainline":"streets"))
         {
             var above=group.Count(m=>m.Grade>NetworkVerticalProfiles.DesiredGrade(m.Section)+.001f);
@@ -415,113 +452,54 @@ public static class NetworkGeometrySafety
                 log.Diagnostic($"NETWORK QUALITY OUTLIER way={m.Section.WayId}; sourceIds={string.Join(",",m.Section.SourceWayIds)}; nodes={m.Section.StartNodeId},{m.Section.EndNodeId}; class={group.Key}; length={m.Length:R}; grade={m.Grade:R}; target={NetworkVerticalProfiles.DesiredGrade(m.Section):R}; radius={m.Radius:R}; bridge={m.Section.Bridge}; tunnel={m.Section.Tunnel}");
         }
         var tangentBreaks=0;var gradeBreaks=0;var maximumAngle=0f;var maximumGradeJump=0f;
+        var joinObservations=new List<(object Record,float Severity)>();var joinCount=0;
         foreach(var pair in joins.Values.Where(p=>p.Count==2&&p[0].Section!=p[1].Section))
         {
             var left=pair[0];var right=pair[1];
             var a=left.Start?left.Section.CourseStart-left.Section.CourseControl1:left.Section.CourseEnd-left.Section.CourseControl2;
             var b=right.Start?right.Section.CourseControl1-right.Section.CourseStart:right.Section.CourseControl2-right.Section.CourseEnd;
             var angle=(float)Math.Acos(math.clamp(math.dot(math.normalizesafe(a.xz),math.normalizesafe(b.xz)),-1,1))*180/math.PI;
+            var leftPoint=left.Start?left.Section.CourseStart:left.Section.CourseEnd;
+            var rightPoint=right.Start?right.Section.CourseStart:right.Section.CourseEnd;
+            var leftReach=math.length(a.xz);var rightReach=math.length(b.xz);
+            double? measuredJump=leftReach>1e-8f&&rightReach>1e-8f
+                ?Math.Abs(a.y/leftReach-b.y/rightReach):null;
+            joinCount++;
+            var severity=Math.Max(angle/15,math.distance(leftPoint,rightPoint)/.05f);
+            if(measuredJump.HasValue&&angle<=30)severity=Math.Max(severity,(float)(measuredJump.Value/.01));
+            joinObservations.Add((new
+            {
+                constraint="degree-two-join-continuity",policyStatus="implementation-assumption-awaiting-game-validation",
+                evidence="prepared-port-pair-not-native-lanes",nativeLaneConnectivityVerified=false,
+                leftWay=left.Section.WayId,rightWay=right.Section.WayId,node=left.Start?left.Section.StartNodeId:left.Section.EndNodeId,
+                kind=left.Section.Kind.ToString(),angleDegrees=angle,gradeJump=measuredJump,
+                endpointDistanceMeters=math.distance(leftPoint,rightPoint),leftReachMeters=leftReach,rightReachMeters=rightReach,
+                tangentWarningDegrees=15,throughJoinAngleCeilingDegrees=30,gradeJumpWarning=.01,
+                gradeJumpApplicable=angle<=30&&measuredJump.HasValue,
+                interpretation="source-corner-may-be-intentional-inspect-before-changing-policy",
+                leftLanes=left.Section.Lanes,rightLanes=right.Section.Lanes,
+                leftOneWay=left.Section.OneWay,rightOneWay=right.Section.OneWay
+            },severity));
+            // Keep only the worst 64 observations, not a second whole-network dump.
+            if(joinObservations.Count>64)
+            {var least=0;for(var j=1;j<joinObservations.Count;j++)if(joinObservations[j].Severity<joinObservations[least].Severity)least=j;joinObservations.RemoveAt(least);}
             if(angle>15){tangentBreaks++;maximumAngle=Math.Max(maximumAngle,angle);}
             if(angle>30)continue; // An intentional corner is not a grade-continuity claim.
             var jump=Math.Abs(a.y/Math.Max(.001f,math.length(a.xz))-b.y/Math.Max(.001f,math.length(b.xz)));
             if(jump>.01f){gradeBreaks++;maximumGradeJump=Math.Max(maximumGradeJump,jump);}
         }
         log.Diagnostic($"NETWORK QUALITY JOINS degreeTwoTangentBreaks={tangentBreaks}; maximumAngleDegrees={maximumAngle:R}; continuousDirectionGradeJumps={gradeBreaks}; maximumGradeJump={maximumGradeJump:R}; multiArmJunctionsNotClassifiedAsThroughJoins=true; sourceCornersMayBeIntentional=true");
+        log.DiagnosticRecords("network-join-observations.ndjson",joinObservations.OrderByDescending(p=>p.Severity).Select(p=>p.Record));
+        log.Diagnostic($"NETWORK JOIN EVIDENCE eligibleJoins={joinCount}; records={joinObservations.Count}; sampleSelection=worst-64; completeCoverage={joinCount<=64}; zeroReachGradeNotInvented=true");
+        log.Diagnostic($"NETWORK CONSTRAINT EVIDENCE policyStatus=implementation-assumption-awaiting-game-validation; evidence=prepared-geometry; tangentWarningDegrees=15; throughJoinAngleCeilingDegrees=30; gradeJumpWarning=0.01; clearanceDeckGapMeters={MinimumSafeGap:R}; nativeRenderingVerified=false; sampledPassDoesNotValidatePhysicalPolicy=true; qualityFailureAction=RequiresReview-in-production");
     }
 
     private const float MinimumSafeGap=NetworkVerticalProfiles.MinimumBridgeClearance+2+.01f;
 
-    public static IReadOnlyList<PreparedSegment> RepairFinalTunnelCover(IReadOnlyList<PreparedSegment> source,ushort[] raster,float scale,double width,ImportLog log,CancellationToken token)
+    public static IReadOnlyList<PreparedSegment> RepairFinalTunnelCover(IReadOnlyList<PreparedSegment> source,ushort[] raster,float scale,double width,ImportLog log,CancellationToken token,IReadOnlyDictionary<SourceNodeKey,double>? verifiedBoundaryHeights=null)
     {
-        var samples=TunnelCoverSamples(source,raster,scale,width,token).ToArray();if(samples.Length==0)return source;
-        var nodes=new Dictionary<Key,int>();var heights=new List<float>();
-        int Node(Key key,float y){if(nodes.TryGetValue(key,out var id))return id;id=heights.Count;nodes[key]=id;heights.Add(y);return id;}
-        var from=new int[source.Count];var to=new int[source.Count];var first=new int[source.Count];var second=new int[source.Count];
-        for(var index=0;index<source.Count;index++)
-        {
-            var s=source[index];from[index]=Node(new(s.Kind,s.StartNodeId),s.Start.y);to[index]=Node(new(s.Kind,s.EndNodeId),s.End.y);
-            first[index]=heights.Count;heights.Add(s.CourseControl1.y);second[index]=heights.Count;heights.Add(s.CourseControl2.y);
-        }
-        var initial=heights.ToArray();var h=(float[])initial.Clone();var floor=initial.Select(y=>Math.Max(0,y-120)).ToArray();
-        // Cover and portal grades must be solved together. Lowering just one
-        // shared anchor can create a near-vertical short approach or handle.
-        var incident=new Dictionary<int,List<int>>();
-        for(var i=0;i<source.Count;i++)foreach(var id in new[]{from[i],to[i]})
-        {if(!incident.TryGetValue(id,out var list))incident[id]=list=new();list.Add(i);}
-        foreach(var s in source.Where(s=>s.Bridge&&!s.Tunnel))
-        {floor[nodes[new(s.Kind,s.StartNodeId)]]=initial[nodes[new(s.Kind,s.StartNodeId)]];floor[nodes[new(s.Kind,s.EndNodeId)]]=initial[nodes[new(s.Kind,s.EndNodeId)]];}
-        var gradeEdges=new HashSet<int>(Enumerable.Range(0,source.Count).Where(i=>source[i].Tunnel));
-        var frontier=gradeEdges.ToArray();
-        for(var ring=0;ring<4;ring++)
-        {
-            var next=new List<int>();
-            foreach(var i in frontier)foreach(var id in new[]{from[i],to[i]})foreach(var j in incident[id])if(gradeEdges.Add(j))next.Add(j);
-            frontier=next.ToArray();
-        }
-        var constraints=samples.Select(sample=>
-        {
-            var s=source[sample.index];var t=sample.t;var u=1-t;
-            return (sample.index,sample.t,sample.ceiling,originalY:NetworkNormalizer.Evaluate(s,t).y,
-                a:u*u*u,b:3*u*u*t,c:3*u*t*t,d:t*t*t);
-        }).ToArray();
-        var passes=0;
-        float CoverPass()
-        {
-            var largest=0f;
-            foreach(var c in constraints)
-            {
-                var a=from[c.index];var b=first[c.index];var d=to[c.index];var e=second[c.index];
-                var y=c.originalY+c.a*(h[a]-initial[a])+c.b*(h[b]-initial[b])+c.c*(h[e]-initial[e])+c.d*(h[d]-initial[d]);
-                var excess=y-c.ceiling;if(excess<=.01f)continue;
-                var denominator=c.a*c.a+c.b*c.b+c.c*c.c+c.d*c.d;if(denominator<.000001f)continue;
-                void Lower(int id,float weight){var before=h[id];h[id]=Math.Max(floor[id],before-excess*weight/denominator);largest=Math.Max(largest,before-h[id]);}
-                Lower(a,c.a);Lower(b,c.b);Lower(e,c.c);Lower(d,c.d);
-            }
-            return largest;
-        }
-        for(;passes<128;passes++)
-        {
-            token.ThrowIfCancellationRequested();var largest=CoverPass();
-            foreach(var i in gradeEdges)
-            {
-                var s=source[i];var a=from[i];var b=first[i];var c=second[i];var d=to[i];
-                for(var j=0;j<=16;j++)
-                {
-                    var t=j/16f;var u=1-t;
-                    var derivative=3*u*u*(s.CourseControl1-s.CourseStart)+6*u*t*(s.CourseControl2-s.CourseControl1)+3*t*t*(s.CourseEnd-s.CourseControl2);
-                    var wa=s.Tunnel?-3*u*u:-1;var wb=s.Tunnel?3*u*u-6*u*t:0;var wc=s.Tunnel?6*u*t-3*t*t:0;var wd=s.Tunnel?3*t*t:1;
-                    var dy=derivative.y+wa*(h[a]-initial[a])+wb*(h[b]-initial[b])+wc*(h[c]-initial[c])+wd*(h[d]-initial[d]);
-                    var allowed=GradeLimit(s)*math.length(derivative.xz);var residual=dy-math.clamp(dy,-allowed,allowed);
-                    if(Math.Abs(residual)<.001f)continue;
-                    var denominator=wa*wa+wb*wb+wc*wc+wd*wd;if(denominator<.000001f)continue;
-                    void Project(int id,float weight){var before=h[id];h[id]=math.clamp(before-residual*weight/denominator,floor[id],initial[id]);largest=Math.Max(largest,Math.Abs(before-h[id]));}
-                    Project(a,wa);Project(b,wb);Project(c,wc);Project(d,wd);
-                }
-            }
-            if(largest<.001f)break;
-        }
-        // Cover remains a hard gate when an exceptional grade is infeasible.
-        // Do not expose the tunnel merely to make a grade metric pass.
-        for(var repair=0;repair<16;repair++){token.ThrowIfCancellationRequested();if(CoverPass()<.001f)break;}
-        var result=source.ToArray();var changed=0;var maximum=0f;
-        for(var index=0;index<source.Count;index++)
-        {
-            var s=source[index];var a=from[index];var b=to[index];var c=first[index];var d=second[index];
-            var drop=Math.Max(Math.Max(initial[a]-h[a],initial[b]-h[b]),Math.Max(initial[c]-h[c],initial[d]-h[d]));if(drop<=0)continue;
-            var start=s.Start;var end=s.End;var control1=s.Control1??math.lerp(s.Start,s.End,1f/3);var control2=s.Control2??math.lerp(s.Start,s.End,2f/3);
-            start.y=h[a];end.y=h[b];
-            if(s.Tunnel){control1.y=h[c]-s.StartCurveOffset.y;control2.y=h[d]-s.EndCurveOffset.y;}
-            else{control1.y+=math.lerp(h[a]-initial[a],h[b]-initial[b],1f/3);control2.y+=math.lerp(h[a]-initial[a],h[b]-initial[b],2f/3);}
-            result[index]=s with{Start=start,End=end,Control1=control1,Control2=control2,StartElevation=(s.StartElevation??0)+h[a]-initial[a],EndElevation=(s.EndElevation??0)+h[b]-initial[b]};
-            changed++;maximum=Math.Max(maximum,drop);
-        }
-        log.Count("Final tunnel-cover sections repaired",changed);
-        log.Diagnostic($"PROCESS final-tunnel-cover sectionsRepaired={changed}; maximumLoweringMeters={maximum:0.###}; passes={Math.Min(passes+1,128)}; coupledGradeSections={gradeEdges.Count}; bridgeFloorsPreserved=true; sharedSurfacePortalsFixed=false; incidentApproachesMovedTogether=true; horizontalGeometryUnchanged=true; terrainUnchanged=true");
-        try{ValidateTunnelCover(result,raster,scale,width,token,log);}
-        catch(InvalidOperationException error)
-        {log.Warn($"Final tunnel recovery retained best bounded geometry: {error.Message}");}
-        if(changed>0){ValidateEnvelope(result,width,scale,token);Validate(result,log,token,allowQualityWarnings:true);}
-        return changed>0?result:source;
+        var samples=TunnelCoverSamples(source,raster,scale,width,token).ToArray();
+        return NetworkTunnelProfile.Solve(source,scale,samples,log,token,verifiedBoundaryHeights);
     }
 
     public static void ValidateTunnelCover(IReadOnlyList<PreparedSegment> sections,ushort[] raster,float scale,double width,CancellationToken token,ImportLog? log=null)
@@ -530,7 +508,15 @@ public static class NetworkGeometrySafety
         {
             var s=sections[sample.index];
             if(NetworkNormalizer.Evaluate(s,sample.t).y>sample.ceiling+.05f)
-            {log?.Count("Final exposed tunnel observations");if(log?.Metric("Final exposed tunnel observations")<=25)log.Warn($"Final terrain exposes {s.Kind} tunnel way {s.WayId} at {sample.t:0.###}; advisory only.");}
+            {
+                // No-log calls are the existing strict offline audit contract.
+                // Production supplies a log and retains safe inspectable output.
+                if(log==null)throw new InvalidOperationException($"Strict offline tunnel cover audit failed for way {s.WayId} at {sample.t:R}.");
+                log.Count("Final exposed tunnel observations");
+                if(log.Metric("Final exposed tunnel observations")==1)log.Warn("Final terrain exposes tunnel geometry; retained as RequiresReview. Enable diagnostics for measured cover residuals.");
+                if(log.DiagnosticsEnabled&&log.Metric("Final exposed tunnel observations")<=25)
+                    log.Diagnostic($"TUNNEL COVER OBSERVATION way={s.WayId}; nodes={s.StartNodeId},{s.EndNodeId}; t={sample.t:R}; deckY={NetworkNormalizer.Evaluate(s,sample.t).y:R}; ceilingY={sample.ceiling:R}; residualMeters={NetworkNormalizer.Evaluate(s,sample.t).y-sample.ceiling:R}; toleranceMeters=0.05; policyStatus=implementation-assumption-awaiting-game-validation; evidence=final-prepared-raster-not-native-readback; qualityFailureAction=RequiresReview");
+            }
         }
     }
 
@@ -590,7 +576,13 @@ public static class NetworkGeometrySafety
             // the actual native course, not only its shared node anchors.
             foreach(var p in new[]{s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd})
                 if(!math.all(math.isfinite(p))||Math.Abs(p.x)>half+.01f||Math.Abs(p.z)>half+.01f||p.y<0||p.y>scale)
-                    log?.Warn($"Network envelope observation: {s.Kind} way {s.WayId}; local finite-input repair required, not an import gate.");
+                {
+                    if(log==null)throw new InvalidOperationException($"Strict offline native envelope audit failed for way {s.WayId}.");
+                    log.Count("Network envelope observations");
+                    if(log.Metric("Network envelope observations")==1)log.Warn("Network envelope observations require local representability checks before native placement; see diagnostics.");
+                    if(log.DiagnosticsEnabled&&log.Metric("Network envelope observations")<=25)
+                        log.Diagnostic($"NETWORK ENVELOPE way={s.WayId}; nodes={s.StartNodeId},{s.EndNodeId}; point={p}; finite={math.all(math.isfinite(p))}; halfWidthMeters={half:R}; heightScaleMeters={scale:R}; boundsToleranceMeters=0.01; evidence=prepared-control-hull; nativeRepresentabilityVerified=false; localNativeSafetyCheckRequired=true");
+                }
         }
     }
 

@@ -100,6 +100,7 @@ public sealed class NativeNetworkPlacement
 
     public IReadOnlyList<Entity> CreateDefinitions(IReadOnlyList<PreparedSegment> segments, out int skipped,Processing.OsmDataset? evidence=null)
     {
+        NetworkCommitSystem.BeginDefinitionBatch(_entityManager,_log);
         _entityManager.CompleteAllTrackedJobs();
         if (_source == null) Initialize(segments,evidence);
         var definitions = new List<Entity>(segments.Count);
@@ -124,7 +125,7 @@ public sealed class NativeNetworkPlacement
                 {
                     skipped++;
                     _log.Warn($"Network definition unavailable: {segment.Kind} way {segment.WayId} {segment.StartNodeId}->{segment.EndNodeId}; continuing other sections. {error.GetBaseException().Message}");
-                    _log.Diagnostic($"NATIVE DEFINITION OMITTED artifact={ArtifactStem}; section={Newtonsoft.Json.JsonConvert.SerializeObject(segment)}; exception={error}");
+                    if(_log.DiagnosticsEnabled)_log.Diagnostic($"NATIVE DEFINITION OMITTED artifact={ArtifactStem}; section={Newtonsoft.Json.JsonConvert.SerializeObject(segment)}; exception={error}");
                 }
                 finally { if (segment.Kind == NetworkKind.Road) roadTime += roads.Elapsed.TotalSeconds; else railTime += roads.Elapsed.TotalSeconds; }
             }
@@ -135,16 +136,18 @@ public sealed class NativeNetworkPlacement
             if(error is OutOfMemoryException||error is OperationCanceledException)throw;
             throw new InvalidOperationException($"Native definition failed for {active?.Kind} way {active?.WayId}; pending batch rolled back. {error.Message}",error);
         }
-        if (roadTime > 0) _log.Time("Road apply", roadTime);
-        if (railTime > 0) _log.Time("Rail apply", railTime);
+        if (roadTime > 0) _log.AddDuration("Road apply", roadTime);
+        if (railTime > 0) _log.AddDuration("Rail apply", railTime);
         _log.DiagnosticRecords(ArtifactStem+"-expected.ndjson",ExpectedRecords());
         CapturePlacementEvidence(definitions,"submitted");
+        if(definitions.Count==0)NetworkCommitSystem.ReleaseEmptyDefinitions(_entityManager);
         return definitions;
     }
 
     // Read-only evidence: never use nearby nodes to choose an attachment.
     private void CapturePlacementEvidence(IReadOnlyList<Entity> definitions,string phase)
     {
+        if(!_log.DiagnosticsEnabled)return;
         try
         {
             var records=new List<object>();
@@ -817,6 +820,8 @@ public sealed class NativeNetworkPlacement
         _log.Count("Native chain edges verified",_generatedBatch.Edges.Count);
         _log.DiagnosticRecords("native-live-batch-bindings.ndjson",LiveBindingRecords(_generatedBatch));
         _log.DiagnosticRecords(ArtifactStem+"-live.ndjson",LiveBindingRecords(_generatedBatch));
+        if(_log.DiagnosticsEnabled)
+            _log.DiagnosticRecords(ArtifactStem+"-live-constraint-observations.ndjson",LiveConstraintRecords(_generatedBatch));
         _log.Diagnostic($"NATIVE BATCH artifact={ArtifactStem}; anchorsVerified={_generatedBatch.Anchors.Count}; sourceSectionsVerified={_generatedBatch.SectionCount}; nativeEdgesVerified={_generatedBatch.Edges.Count}; accumulatedSourceNodes={_committedNodes.Count}; numericPreviewCenterAndExactAsset=true; entityLineage=true; incidentBuffersReady=true");
         _generatedBatch=null;_stagedCommitted=null;_stagedEdges=null;_touchedEdges=Array.Empty<NativeBatchBindings.Edge<Entity>>();pending="";return true;
     }
@@ -898,6 +903,59 @@ public sealed class NativeNetworkPlacement
         }
     }
 
+    // Read only inside the existing qualified-batch audit, after its existing job
+    // synchronization. No extra synchronization or diagnostic background query.
+    private IEnumerable<object> LiveConstraintRecords(NativeBatchBindings.Batch<Entity> batch)
+    {
+        var count=0;
+        foreach(var binding in batch.Edges)
+        {
+            if(count++>=64)yield break;
+            var e=binding.Generated;
+            if(!_entityManager.Exists(e.Entity)||!_entityManager.HasComponent<Curve>(e.Entity))
+            {
+                yield return new{constraint="native-edge-geometry",entity=e.Entity.ToString(),binding.Section.WayId,
+                    evidence="native-edge-unavailable-at-audit",geometryVerified=false,requiresReview=true};
+                continue;
+            }
+            var live=_entityManager.GetComponentData<Curve>(e.Entity).m_Bezier;
+            var maximumGrade=0f;var minimumRadius=float.PositiveInfinity;var stationary=false;
+            for(var i=0;i<=32;i++)
+            {
+                var t=i/32f;var u=1-t;
+                var derivative=3*u*u*(live.b-live.a)+6*u*t*(live.c-live.b)+3*t*t*(live.d-live.c);
+                var second=6*u*(live.c-2*live.b+live.a)+6*t*(live.d-2*live.c+live.b);
+                var speed=math.length(derivative.xz);
+                if(speed<=1e-8f){stationary=true;if(Math.Abs(derivative.y)>1e-8f)maximumGrade=float.PositiveInfinity;continue;}
+                maximumGrade=Math.Max(maximumGrade,Math.Abs(derivative.y)/speed);
+                var cross=Math.Abs(derivative.x*second.z-derivative.z*second.x);
+                if(cross>1e-8f)minimumRadius=Math.Min(minimumRadius,speed*speed*speed/cross);
+            }
+            yield return new
+            {
+                constraint="native-edge-grade-and-curve-playback",policyStatus="implementation-assumption-awaiting-visual-validation",
+                evidence="live-native-Curve-component",geometryVerified=true,visualAppearanceVerified=false,
+                nativeGeometryFinite=math.all(math.isfinite(live.a))&&math.all(math.isfinite(live.b))&&math.all(math.isfinite(live.c))&&math.all(math.isfinite(live.d)),
+                continuousCertificate=false,sampledStations=33,stationaryHorizontalDerivativeObserved=stationary,
+                entity=e.Entity.ToString(),prefab=e.Prefab.ToString(),binding.Section.WayId,
+                binding.Section.StartNodeId,binding.Section.EndNodeId,kind=binding.Section.Kind.ToString(),
+                binding.Section.Lanes,binding.Section.OneWay,binding.Section.Bridge,binding.Section.Tunnel,
+                desiredGrade=Processing.NetworkVerticalProfiles.DesiredGrade(binding.Section),
+                exceptionalGrade=Processing.NetworkGeometrySafety.GradeLimit(binding.Section),sampledMaximumGrade=maximumGrade,
+                sampledGradeResidual=maximumGrade-Processing.NetworkGeometrySafety.GradeLimit(binding.Section),
+                sampledMinimumRadiusMeters=float.IsInfinity(minimumRadius)?(float?)null:minimumRadius,
+                liveCurve=CurveEvidence(live),
+                previewStart=e.CurveStart.HasValue?DiagnosticArtifacts.Point(e.CurveStart.Value):null,
+                previewControl1=e.CurveControl1.HasValue?DiagnosticArtifacts.Point(e.CurveControl1.Value):null,
+                previewControl2=e.CurveControl2.HasValue?DiagnosticArtifacts.Point(e.CurveControl2.Value):null,
+                previewEnd=e.CurveEnd.HasValue?DiagnosticArtifacts.Point(e.CurveEnd.Value):null,
+                control1MovementMeters=e.CurveControl1.HasValue?(float?)math.distance(live.b,e.CurveControl1.Value):null,
+                control2MovementMeters=e.CurveControl2.HasValue?(float?)math.distance(live.c,e.CurveControl2.Value):null,
+                requestedNativeEdges=batch.Edges.Count,sampleSelection="first-64-qualified-native-edges-not-complete-coverage"
+            };
+        }
+    }
+
     private Entity CreateDefinition(PreparedSegment segment, Entity prefab)
     {
         NativeBatchBindings.Anchor<Entity>? Committed(long id)
@@ -933,10 +991,11 @@ public sealed class NativeNetworkPlacement
         var endStation=endAnchor==null?Station(segment.EndNodeId):null;
         a=startStation!=null?startStation.Position-segment.StartCurveOffset:a;
         b=endStation!=null?endStation.Position-segment.EndCurveOffset:b;
-        // Endpoint displacement blends along the entire curve. Moving just its
-        // nearest handle by the full displacement creates a local crest/kink.
-        var da=a-segment.Start;var db=b-segment.End;
-        segment=segment with{Start=a,End=b,Control1=segment.CourseControl1-segment.StartCurveOffset+math.lerp(da,db,1f/3),Control2=segment.CourseControl2-segment.EndCurveOffset+math.lerp(da,db,2f/3)};
+        // Native node centres and deck ports are different contracts. Preserve
+        // the exact submitted deck; an owner movement must not silently apply
+        // an affine correction to its tangents or its vertical profile.
+        segment=NativeBatchBindings.RebaseBound(segment,startAnchor,endAnchor);
+        if(startStation!=null||endStation!=null)segment=segment with{Start=a,End=b};
         var curve = new Bezier4x3(segment.CourseStart,segment.CourseControl1,segment.CourseControl2,segment.CourseEnd);
         var direction = math.normalizesafe(segment.CourseControl1 - segment.CourseStart, new float3(0f, 0f, 1f));
         var rotation = quaternion.LookRotationSafe(direction, new float3(0f, 1f, 0f));
@@ -964,6 +1023,7 @@ public sealed class NativeNetworkPlacement
         startPosition.m_Flags|=CoursePosFlags.DisableMerge;
         endPosition.m_Flags|=CoursePosFlags.DisableMerge;
         var entity = _entityManager.CreateEntity();
+        NetworkCommitSystem.RegisterDefinition(entity);
         try
         {
         _entityManager.AddComponentData(entity, new CreationDefinition

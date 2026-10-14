@@ -247,7 +247,7 @@ public static class NetworkNormalizer
         for(var i=0;i<input.Count;i++)
         {
             token.ThrowIfCancellationRequested();var s=input[i];
-            if(s.Kind!=NetworkKind.Road||s.ProtectedLink||!s.OneWay||!(s.Classification=="motorway"||s.Classification=="trunk")||math.distance(s.Start.xz,s.End.xz)>180)continue;
+            if(s.Kind!=NetworkKind.Road||s.ExplicitLanes||s.ProtectedLink||!s.OneWay||!(s.Classification=="motorway"||s.Classification=="trunk")||math.distance(s.Start.xz,s.End.xz)>180)continue;
             int Neighbor(long id)
             {
                 if(nodes[id].Count!=2)return -1;return nodes[id][0]==i?nodes[id][1]:nodes[id][0];
@@ -273,7 +273,7 @@ public static class NetworkNormalizer
         for(var seed=0;seed<result.Length;seed++)
         {
             token.ThrowIfCancellationRequested();var s=result[seed];
-            if(s.Kind!=NetworkKind.Road||s.ProtectedLink||!(s.Classification is "motorway" or "trunk")||seenRuns.Contains(seed))continue;
+            if(s.Kind!=NetworkKind.Road||s.ExplicitLanes||s.ProtectedLink||!(s.Classification is "motorway" or "trunk")||seenRuns.Contains(seed))continue;
             var run=new HashSet<int>{seed};var ends=new List<int>();var length=math.distance(s.Start.xz,s.End.xz);
             foreach(var startNode in new[]{s.StartNodeId,s.EndNodeId})
             {
@@ -281,7 +281,7 @@ public static class NetworkNormalizer
                 while(run.Count<64&&length<=350)
                 {
                     var next=Continuation(current,node);if(next<0||run.Contains(next))break;
-                    var road=result[next];if(road.Lanes!=s.Lanes){ends.Add(next);break;}
+                    var road=result[next];if(road.ExplicitLanes||road.Lanes!=s.Lanes){ends.Add(next);break;}
                     run.Add(next);length+=math.distance(road.Start.xz,road.End.xz);current=next;node=road.StartNodeId==node?road.EndNodeId:road.StartNodeId;
                 }
             }

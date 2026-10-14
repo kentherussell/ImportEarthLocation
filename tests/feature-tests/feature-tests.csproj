@@ -10,6 +10,11 @@
     <DefineConstants>$(DefineConstants);WATER_SMOKE_ONLY</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="../../ImportEarthLocation/Processing/TerrainSampling.cs" Link="TerrainSampling.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/TerrainArtifactRepair.cs" Link="TerrainArtifactRepair.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/VegetationPlan.cs" Link="VegetationPlan.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/NativeAssetContracts.cs" Link="NativeAssetContracts.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/NetworkDesignModels.cs" Link="NetworkDesignModels.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkEvidence.cs" Link="NetworkEvidence.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/VegetationPlanner.cs" Link="VegetationPlanner.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/ForestProcessor.cs" Link="ForestProcessor.cs" />

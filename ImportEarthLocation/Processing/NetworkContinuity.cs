@@ -63,8 +63,13 @@ public static class NetworkContinuity
         }
         log.Count("Network continuity unresolved sections",lost);log.Count("Network junction position conflicts",conflicts);log.Count("Rail overlap observations",overlaps);
         log.Diagnostic($"PROCESS continuity checked; verified={conflicts+lost+overlaps==0}; sourceSections={before.Count}; finalSections={after.Count}; components={index}; sharedPortalConflicts={conflicts}; unresolvedSections={lost}; railOverlapObservations={overlaps}; failClosed={!allowQualityWarnings}; topologyFailClosed=true; nativeAcceptanceNotYetTested=true");
-        if(conflicts+lost>0)log.Warn($"Network continuity observations: {conflicts} conflicting junctions, {lost} unresolved sections. Generation continues for visual diagnosis.");
+        if(conflicts+lost>0){log.Count("Network repair quality observations",conflicts+lost);log.Warn($"Network continuity observations: {conflicts} conflicting junctions, {lost} unresolved sections. Generation continues for visual diagnosis.");}
         if(overlaps>0)
         {log.Count("Network repair quality observations",overlaps);log.Warn($"Iteration retains {overlaps} rail overlap observations for testing. Known endpoint connections remain intact.");}
+        // Explicit strict offline validation remains available. Production
+        // callers opt into inspectable RequiresReview geometry; they do not
+        // abort an otherwise native-safe import for geometric observations.
+        if(!allowQualityWarnings&&conflicts+lost+overlaps>0)
+            throw new InvalidOperationException("Strict continuity validation failed: geometric RequiresReview observations remain.");
     }
 }

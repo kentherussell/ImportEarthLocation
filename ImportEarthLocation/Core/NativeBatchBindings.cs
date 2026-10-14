@@ -283,9 +283,9 @@ public static class NativeBatchBindings
     private static float Budget(float value,PreparedSegment s)=>math.isfinite(value)&&value>0?Math.Min(32,value):CenterBudget(s);
 
     // Only a fully verified source/entity binding authorizes center rebasing.
-    // Translate the course and its adjacent handles to the verified live center.
-    // The native entity attachment regenerates the curve at that center too;
-    // cancelling this displacement in the offsets creates a stale expected port.
+    // Existing curve evidence may retain a deck port away from the node centre.
+    // Rebasing the NODE anchor is not evidence that the deck moved. Preserve its
+    // exact float bits until an explicit owned-unit refit replaces the design.
     public static PreparedSegment RebaseBound<T>(PreparedSegment s,Anchor<T>? start,Anchor<T>? end) where T:notnull
     {
         void Verify(Anchor<T>? anchor,float3 planned)
@@ -296,7 +296,8 @@ public static class NativeBatchBindings
         }
         Verify(start,s.Start);Verify(end,s.End);
         var a=start?.Generated??s.Start;var b=end?.Generated??s.End;
-        return TranslateCourse(s,a,b);
+        var deck=new Cubic3f(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd);
+        return s with{Start=a,End=b,FinalDeckCurve=deck};
     }
 
     // Preview movement is qualified against ORIGINAL source coordinates, not

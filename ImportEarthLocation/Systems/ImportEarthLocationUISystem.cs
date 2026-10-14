@@ -194,7 +194,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
     }
 
     protected override void OnGamePreload(Colossal.Serialization.Entities.Purpose purpose, GameMode mode)
-    { base.OnGamePreload(purpose, mode); _isEditor.Update(false); World.GetOrCreateSystemManaged<ImportApplySystem>().AbortMapWork(); ImportSession.ChangeMap(false); ResetMapState(); }
+    { base.OnGamePreload(purpose, mode); NetworkCommitSystem.BeginMapRetirement(); _isEditor.Update(false); World.GetOrCreateSystemManaged<ImportApplySystem>().AbortMapWork(); ImportSession.ChangeMap(false); ResetMapState(); }
 
     protected override void OnGameLoadingComplete(Colossal.Serialization.Entities.Purpose purpose, GameMode mode)
     { base.OnGameLoadingComplete(purpose, mode); ImportSession.ChangeMap(mode == GameMode.Editor); ResetMapState(); _isEditor.Update(mode==GameMode.Editor); NativeUiBootstrap.Ensure(); Mod.Log.Info($"UI map loaded; mode={mode}; editor={_isEditor.value}; session={_mapSession}"); if(mode==GameMode.Editor)NativeDiagnostics.Queue("after-load",_log); }
@@ -308,7 +308,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         { Fail("Enter valid numeric latitude and longitude values."); return; }
 
         var request = new ImportRequest(latitude, longitude, MapSizeProfile.FromId(_mapSizeId), false)
-        { RoadLevel = _roadLevel, ImportRail = _importRail, ImportForests = _importForests, MapSessionId = ImportSession.Map, Generation = ImportSession.Begin(), ApplyGroundSurfaces = _applyGroundSurfaces, CreateAirConnections = _createAirConnections,CreateSeaConnections=_createSeaConnections,DiagnosticsEnabled=_diagnosticsEnabled };
+        { RoadLevel = _roadLevel, ImportRail = _importRail, ImportForests = _importForests, MapSessionId = ImportSession.Map, Generation = ImportSession.Begin(), WorldSequenceNumber = World.SequenceNumber, ApplyGroundSurfaces = _applyGroundSurfaces, CreateAirConnections = _createAirConnections,CreateSeaConnections=_createSeaConnections,DiagnosticsEnabled=_diagnosticsEnabled };
         var errors = InputValidator.Validate(request, MapExtDetector.HasVerifiedSizeApi).ToList();
         if (!MapExtDetector.TryGetCurrentMapWidth(out var actualWidth))
             errors.Add("The active MapExt map size could not be read; import is disabled to prevent a scale mismatch.");
@@ -322,6 +322,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         if (!terrainBridge.CanApply(out var readinessReason)) { Fail(readinessReason); return; }
 
         _log.BeginArchive(request);
+        _log.BeginStage(TelemetryStage.Download);
 
         _cancellation?.Dispose();
         _cancellation = new CancellationTokenSource();
@@ -551,6 +552,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
             log.Warn("Network dependency recovery unavailable: "+error.Message+". Continuing available OSM ways; missing individual references will be diagnosed and omitted locally.");
             networkSource=await osmTask.ConfigureAwait(false);
         }
+        var sourceManifest = NetworkSourceManifest.Build(networkSource,bundle.Request,token);
         var dataset = NetworkEvidence.Normalize(networkSource,bundle.Request,log,token);
         var terrain = await terrainTask.ConfigureAwait(false);
         log.Diagnostic($"PROCESS terrain/parsing complete; networkWays={dataset.Ways.Count}; heightSamples={terrain.Heightmap.Length}; starting water classification");
@@ -569,6 +571,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         }
         token.ThrowIfCancellationRequested();
         log.Info("Building OSM topology and cleaning network geometry.");
+        log.BeginStage(TelemetryStage.Source);
         progress.Begin("Connecting roads and simplifying nearby routes");
         var clock = Stopwatch.StartNew();
         // Core network construction cannot fall back to an empty import: retain
@@ -582,6 +585,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         log.Diagnostic($"PROCESS source-topology complete; sections={rawSegments.Count}; starting normalization");
         log.Time("Network cleanup", clock.Elapsed.TotalSeconds);
         log.Info("Simplifying protected network chains and fitting bounded-error curves.");
+        log.BeginStage(TelemetryStage.Design);
         progress.Begin("Smoothing road and railway curves");
         var normalized = OsmRecovery.Run("normalization",()=>NetworkNormalizer.Normalize(rawSegments, log, token, bundle.Request.MapSize.WidthMeters),rawSegments,log,token);
         var hardened = OsmRecovery.Run("network-hardening",()=>NetworkHardener.Prepare(normalized, log, token, bundle.Request.ImportRail),normalized,log,token);
@@ -665,15 +669,15 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
                 var forestClock=Stopwatch.StartNew();
                 forestData=OsmRecovery.Parse(bundle.ForestDocuments,parsedCacheRoot,"forests",log,token);
                 log.Time("Forest OSM parse",forestClock.Elapsed.TotalSeconds);
-                trees=ForestProcessor.Prepare(forestData,bundle.Request,terrain,aligned,log,token);
+                // Candidate generation waits for actual native footprints and
+                // final terrain. Never generate a full intermediate tree list.
             }
             else log.Info(bundle.Request.ImportForests ? "Optional vegetation skipped: independent forest data unavailable; core terrain/networks remain valid." : "Optional vegetation skipped: forestry disabled by user.");
         }
         catch (Exception exception) when (exception is not OperationCanceledException) { log.Warn($"Vegetation preparation skipped: {exception.Message}"); }
         token.ThrowIfCancellationRequested();
-        var vegetation=VegetationPlanner.Prepare(forestData,trees,bundle.Request,terrain,aligned,polygons,water,bundle.Climate,log,token);
         return new ProcessedBundle(bundle, terrain, aligned, trees, dataset.Ways.Count, surfaces, destinations, water)
-            {Vegetation=vegetation,HabitatPolygons=polygons,NetworkData=dataset,NetworkTerrain=networkTerrain,ProtectedAreas=protectedAreas,ProtectedLines=protectedLines,ExplicitWallLines=wallLines,ForestData=forestData,SurfaceGeography=bundle.Request.ApplyGroundSurfaces?geography:null,SurfacePolygons=bundle.Request.ApplyGroundSurfaces?polygons:Array.Empty<GeographicPolygon>()};
+            {Source=sourceManifest,HabitatPolygons=polygons,NetworkData=dataset,NetworkTerrain=networkTerrain,ProtectedAreas=protectedAreas,ProtectedLines=protectedLines,ExplicitWallLines=wallLines,ForestData=forestData,SurfaceGeography=bundle.Request.ApplyGroundSurfaces?geography:null,SurfacePolygons=bundle.Request.ApplyGroundSurfaces?polygons:Array.Empty<GeographicPolygon>()};
     }
 
     private async Task<DownloadBundle> RecoverTerrainAsync(DownloadBundle bundle,IReadOnlyList<int> invalid,CancellationToken token)
@@ -722,8 +726,6 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
             NetworkGeometrySafety.ValidateTunnelCover(sections,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,token,log);
             NetworkContinuity.Validate(result.Segments,sections,log,token,allowQualityWarnings:true);
             if(sections.Count!=result.Segments.Count)log.Warn($"Native footprint recovery retained {sections.Count}/{result.Segments.Count} sections; remaining sections not fabricated.");
-            var trees=result.ForestData==null?result.Trees:ForestProcessor.Prepare(result.ForestData,request,terrain,sections,log,token);
-            var vegetation=VegetationPlanner.Prepare(result.ForestData,trees,request,terrain,sections,result.HabitatPolygons,water,result.Download.Climate,log,token);
             var surfaces=result.Surfaces;
             if(request.ApplyGroundSurfaces&&result.SurfaceGeography!=null)
             {
@@ -732,7 +734,30 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
             }
             log.Time("Native footprint reconciliation",clock.Elapsed.TotalSeconds);
             log.Diagnostic($"PREFLIGHT repaired actual native footprints; sections={sections.Count}; deletedSections=0; repeatLimit=1; bounds/continuity/tunnelCoverRechecked=true");
-            return result with{Terrain=terrain,Segments=sections,Trees=trees,Vegetation=vegetation,Surfaces=surfaces,Water=water,NativeFootprintsRepaired=true};
+            return result with{Terrain=terrain,Segments=sections,Surfaces=surfaces,Water=water,NativeFootprintsRepaired=true};
+        },token);
+    }
+
+    private Task<ProcessedBundle> FinalizeVegetationAsync(ProcessedBundle result,CancellationToken token)
+    {
+        var log=_log;var progress=_progress;
+        return Task.Run(()=>
+        {
+            token.ThrowIfCancellationRequested();log.BeginStage(TelemetryStage.Forest);progress.Begin("Choosing tree locations");
+            IReadOnlyList<Unity.Mathematics.float3> trees=Array.Empty<Unity.Mathematics.float3>();
+            var vegetation=VegetationPlan.Empty;
+            try
+            {
+                if(result.ForestData!=null)trees=ForestProcessor.Prepare(result.ForestData,result.Download.Request,result.Terrain,result.Segments,log,token);
+                vegetation=VegetationPlanner.Prepare(result.ForestData,trees,result.Download.Request,
+                    result.Terrain,result.Segments,result.HabitatPolygons,result.Water,result.Download.Climate,log,token);
+            }
+            catch(Exception error) when(error is not OperationCanceledException&&error is not OutOfMemoryException)
+            {log.Warn("Optional final vegetation preparation unavailable: "+error.GetBaseException().Message);trees=Array.Empty<Unity.Mathematics.float3>();}
+            // The compact final plan owns positions/seeds. Raw canopy points and
+            // forest masks must not survive into ReadyWait/application.
+            return result with{Vegetation=vegetation,TreeCandidateCount=trees.Count,VegetationFinalized=true,
+                Trees=Array.Empty<Unity.Mathematics.float3>(),ForestData=null};
         },token);
     }
 
@@ -768,7 +793,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
             if (result.Download.Request.RoadLevel != RoadImportLevel.None && !result.Segments.Any(segment => segment.Kind == NetworkKind.Road)) warnings.Add("No selected road sections remain inside these bounds; see the processing log.");
             var geometrySkips = _log.Metric("Unsafe carriageway sections omitted") + _log.Metric("Roads rejected for impossible grade/profile") + _log.Metric("OSM irrecoverable geometry sections omitted");
             if (geometrySkips > 0) warnings.Add($"Network preparation could not recover {geometrySkips:0} sections; remaining geometry retained for inspection.");
-            if (trees.Count > 0)
+            if (result.Vegetation.Count > 0)
             {
                 try
                 {
@@ -796,6 +821,16 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
                 return;
             }
 
+            if(!result.VegetationFinalized)
+            {
+                // Freeze verified composition metadata on the main thread;
+                // never pass live ECS lookups into final design workers.
+                result=result with{NativeAssets=CaptureNativeAssets(result.Segments)};
+                _processConsumed=false;
+                _processTask=FinalizeVegetationAsync(result,_cancellation!.Token);
+                return;
+            }
+
             validationPhase = "prepared-result/summary";
             _prepared = new PreparedImport
             {
@@ -805,8 +840,10 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
                 HeightScaleMeters = result.Terrain.HeightScaleMeters,
                 SeaLevelMeters = result.Terrain.SeaLevelMeters,
                 Segments = result.Segments,
+                NativeAssets=result.NativeAssets,
                 Trees = trees,
                 Vegetation=result.Vegetation,
+                VegetationMetadata=result.Vegetation.Metadata,
                 SurfaceMask = result.Surfaces,
                 AirDestinations = result.Destinations,
                 Climate = result.Download.Climate,
@@ -822,13 +859,18 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
             var rail = result.Segments.Count(segment => segment.Kind == NetworkKind.Rail);
             _log.Time("Runtime validation", validationClock.Elapsed.TotalSeconds);
             _summary.Update("");
-            _log.Info("Preparation summary: " + NetworkSelection.Summary(result.Download.Request.RoadLevel, result.Download.Request.ImportRail) + $"\nTerrain {result.Terrain.MinimumElevation:0}–{result.Terrain.MaximumElevation:0} m • {roads:N0} road sections" + (result.Download.Request.ImportRail ? $" • {rail:N0} rail sections" : "") + $" • {trees.Count:N0} optional trees • {warnings.Count} warnings\n" + result.Terrain.ConditioningSummary + "\n" + result.Water.Report);
+            _log.Info("Preparation summary: " + NetworkSelection.Summary(result.Download.Request.RoadLevel, result.Download.Request.ImportRail) + $"\nTerrain {result.Terrain.MinimumElevation:0}–{result.Terrain.MaximumElevation:0} m • {roads:N0} road sections" + (result.Download.Request.ImportRail ? $" • {rail:N0} rail sections" : "") + $" • {result.TreeCandidateCount:N0} optional trees • {warnings.Count} warnings\n" + result.Terrain.ConditioningSummary + "\n" + result.Water.Report);
             foreach (var warning in warnings) _log.Warn(warning);
             _ready.Update(true);
             _busy.Update(false);
             _stage.Update((int)ImportStage.ReadyForConfirmation);
             _status.Update("Preparation complete. Save a backup, then choose Replace current map." + (warnings.Count > 0 ? " Review warnings in View log." : ""));
             _log.Info("Preflight complete. No editor entities have been modified.");
+            _log.BeginStage(TelemetryStage.ReadyWait);
+            // Final products have been handed off; completed Tasks must not keep
+            // downloads, pixels, raw forest points or intermediate plans alive.
+            _downloadTask = null;
+            _processTask = null;
             if(_log.DiagnosticsEnabled)_log.Info("Preparation statistics: " + _log.Metrics());
             _log.FlushArchive("prepared");
         }
@@ -904,6 +946,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         if (_prepared != null) _log.Info(_prepared.FeatureReport);
         if(_log.DiagnosticsEnabled)_log.Info("Completion statistics: " + _log.Metrics());
         _log.ReportSuppressed();
+        _log.Event(TelemetryEvent.RunEnd,TelemetryReason.None,"Import workflow ended; native visual acceptance remains unverified.");
         _log.Diagnostic("IMPORT TOTALS (definition counts, not final live-entity proof): " + _log.Metrics());
         _log.FlushArchive("completed");
         _prepared = null;
@@ -995,8 +1038,10 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         WaterPlan Water)
     {
         public TerrainBuilder.Result? NetworkTerrain { get; init; }
+        public SourceManifest? Source { get; init; }
+        public IReadOnlyList<NativeAssetContract> NativeAssets { get; init; }=Array.Empty<NativeAssetContract>();
         public OsmDataset? NetworkData { get; init; }
-        public IReadOnlyList<VegetationCandidate> Vegetation { get; init; }=Array.Empty<VegetationCandidate>();
+        public VegetationPlan Vegetation { get; init; }=VegetationPlan.Empty;
         public IReadOnlyList<GeographicPolygon> HabitatPolygons { get; init; }=Array.Empty<GeographicPolygon>();
         public Unity.Mathematics.float3[][] ProtectedAreas { get; init; }=Array.Empty<Unity.Mathematics.float3[]>();
         public Unity.Mathematics.float3[][] ProtectedLines { get; init; }=Array.Empty<Unity.Mathematics.float3[]>();
@@ -1005,6 +1050,8 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         public OsmDataset? SurfaceGeography { get; init; }
         public IReadOnlyList<GeographicPolygon> SurfacePolygons { get; init; }=Array.Empty<GeographicPolygon>();
         public bool NativeFootprintsRepaired { get; init; }
+        public bool VegetationFinalized { get; init; }
+        public int TreeCandidateCount { get; init; }
     }
 }
 }

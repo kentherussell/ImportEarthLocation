@@ -110,6 +110,8 @@ public static class OsmRecovery
             result.Add(segment with{Start=a,End=d,Control1=c1,Control2=c2,StartElevation=startElevation,EndElevation=endElevation,StartCurveOffset=startOffset,EndCurveOffset=endOffset,SourceGeometry=anchorsRecovered?new[]{a,d}:segment.SourceGeometry,HorizontalParent=changed?null:segment.HorizontalParent});
         }
         log.Count("OSM geometry sections repaired",repaired);
+        if(source.Count>0&&result.Count==0)
+            throw new InvalidOperationException("No source section has representable finite anchors; replacement cannot safely proceed with an empty recovery result.");
         if(repaired>0)log.Warn($"OSM geometry recovery: {repaired} sections repaired using known anchors/bounded controls; all {result.Count} sections retained.");
         return result;
     }

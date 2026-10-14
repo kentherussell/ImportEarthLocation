@@ -145,8 +145,9 @@ public sealed class PrefabResolver
 
     private static bool IsHighway(PreparedSegment s) => s.Classification.StartsWith("motorway",StringComparison.OrdinalIgnoreCase)||s.Classification.StartsWith("trunk",StringComparison.OrdinalIgnoreCase);
     public static string PaletteKey(PreparedSegment s) => $"{(IsHighway(s)?"highway":"road")}:{s.OneWay}:{s.Bridge}:{s.ConsolidatedAvenue}";
-    // Ordinary one-way roads can contain six lanes (including turn lanes). Only
-    // the one-way highway palette is capped at five. Snapshot and lookup must agree.
+    // Source counts may exceed the supported representation. The specified stock
+    // palette caps regular one-way roads at three and highways at five; snapshot
+    // keys and lookup must agree without overwriting immutable source evidence.
     public static string SizedPaletteKey(PreparedSegment s) => s.Kind==NetworkKind.Rail ? $"rail:{s.Bridge}:{Numeric.Clamp(s.PhysicalTracks>0?s.PhysicalTracks:s.Lanes,1,2)}" : PaletteKey(s)+":"+Numeric.Clamp(s.Lanes,1,IsHighway(s)?(s.OneWay?5:8):(s.OneWay?3:6));
     public static PreparedSegment ApplyMetadata(PreparedSegment s,IReadOnlyDictionary<string,float> widths,IReadOnlyDictionary<string,float[]> offsets)
     {

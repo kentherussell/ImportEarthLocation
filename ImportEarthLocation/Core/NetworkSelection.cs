@@ -19,7 +19,16 @@ public static class NetworkSelection
     public static string Label(RoadImportLevel value) => Id(value).Replace("|",", ");
     public static string Classes(RoadImportLevel value) {var names=new List<string>();if((value&RoadImportLevel.Highways)!=0)names.Add("motorway|motorway_link");if((value&RoadImportLevel.Routes)!=0)names.Add((value&RoadImportLevel.Streets)!=0?"trunk|trunk_link":"trunk");if((value&RoadImportLevel.Streets)!=0)names.Add("primary|secondary|tertiary");return string.Join("|",names);}
     public static bool IsExcludedStreetLink(string classification) => classification is "primary_link" or "secondary_link" or "tertiary_link";
-    public static int MatchedLanes(int requested,bool highway,bool oneWay) {var choices=highway?(oneWay?new[]{1,2,3,4,5}:new[]{2,3,4,8}):(oneWay?new[]{1,2,3}:new[]{2,4,6});var best=choices[0];foreach(var lanes in choices)if(Math.Abs(lanes-requested)<=Math.Abs(best-requested))best=lanes;return best;}
+    public static int MatchedLanes(int requested,bool highway,bool oneWay)
+    {
+        var choices=highway?(oneWay?new[]{1,2,3,4,5}:new[]{2,3,4,8}):(oneWay?new[]{1,2,3}:new[]{2,4,6});
+        // Asset representation is a ceiling, not nearest-neighbour rounding:
+        // five through seven two-way highway lanes must not become four.
+        if(highway)
+        {foreach(var lanes in choices)if(lanes>=requested)return lanes;return choices[choices.Length-1];}
+        var best=choices[0];foreach(var lanes in choices)if(Math.Abs(lanes-requested)<=Math.Abs(best-requested))best=lanes;
+        return best;
+    }
     public static bool Includes(RoadImportLevel value, string classification)
     {
         foreach(var candidate in Classes(value).Split('|')) if(candidate.Length > 0 && candidate.Equals(classification,StringComparison.OrdinalIgnoreCase)) return true;

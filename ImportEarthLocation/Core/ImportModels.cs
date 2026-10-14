@@ -45,6 +45,7 @@ public sealed record ImportRequest(
     public bool ImportForests { get; init; } = true;
     public long MapSessionId { get; init; }
     public long Generation { get; init; }
+    public ulong WorldSequenceNumber { get; init; }
     public bool ApplyGroundSurfaces { get; init; }
     public bool CreateAirConnections { get; init; }
     public bool CreateSeaConnections { get; init; }
@@ -142,10 +143,11 @@ public sealed record PreparedSegment(
     // stays exact for topology; these offsets affect the deck, not connectivity.
     public float3 StartCurveOffset { get; init; }
     public float3 EndCurveOffset { get; init; }
-    public float3 CourseStart => Start + StartCurveOffset;
-    public float3 CourseEnd => End + EndCurveOffset;
-    public float3 CourseControl1 => (Control1 ?? Unity.Mathematics.math.lerp(Start,End,1f/3)) + StartCurveOffset;
-    public float3 CourseControl2 => (Control2 ?? Unity.Mathematics.math.lerp(Start,End,2f/3)) + EndCurveOffset;
+    public Cubic3f? FinalDeckCurve { get; init; }
+    public float3 CourseStart => FinalDeckCurve?.P0 ?? Start + StartCurveOffset;
+    public float3 CourseEnd => FinalDeckCurve?.P3 ?? End + EndCurveOffset;
+    public float3 CourseControl1 => FinalDeckCurve?.P1 ?? (Control1 ?? Unity.Mathematics.math.lerp(Start,End,1f/3)) + StartCurveOffset;
+    public float3 CourseControl2 => FinalDeckCurve?.P2 ?? (Control2 ?? Unity.Mathematics.math.lerp(Start,End,2f/3)) + EndCurveOffset;
     public IReadOnlyList<float> NativeLaneOffsets { get; init; } = Array.Empty<float>();
     public float? StartElevation { get; init; }
     public float? EndElevation { get; init; }
@@ -183,10 +185,12 @@ public sealed class PreparedImport
     public float HeightScaleMeters { get; init; }
     public float SeaLevelMeters { get; init; }
     public IReadOnlyList<PreparedSegment> Segments { get; init; } = Array.Empty<PreparedSegment>();
+    public IReadOnlyList<NativeAssetContract> NativeAssets { get; init; } = Array.Empty<NativeAssetContract>();
     public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
     public int SourceWayCount { get; init; }
     public IReadOnlyList<float3> Trees { get; init; } = Array.Empty<float3>();
     public IReadOnlyList<VegetationCandidate> Vegetation { get; init; } = Array.Empty<VegetationCandidate>();
+    public IReadOnlyList<VegetationMetadata> VegetationMetadata { get; init; } = Array.Empty<VegetationMetadata>();
     public SurfaceMask? SurfaceMask { get; init; }
     public IReadOnlyList<AirDestination> AirDestinations { get; init; } = Array.Empty<AirDestination>();
     public ClimateNormals? Climate { get; init; }
@@ -200,7 +204,6 @@ public sealed record ClimateNormals(float[] Temperatures, float[] Precipitation,
     float SourceElevation, string SourceVersion);
 
 public enum VegetationForm { Broadleaf, Conifer, Palm, Shrub }
-public sealed record VegetationCandidate(float3 Position,VegetationForm Form,uint Seed,long SourceId,string Evidence,string Taxon);
 
 public enum GroundMaterial : byte { Base, Sand, DryGrass, Grass, Dirt }
 public enum SurfaceTransition : byte { Hard, Medium, Soft }
