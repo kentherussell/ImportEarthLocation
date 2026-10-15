@@ -10,11 +10,94 @@ namespace ImportEarthLocation.Processing;
 /// <summary>Joint fixed-row cover/grade solve. Never performs a cover-only rewrite after grading.</summary>
 public static class NetworkTunnelProfile
 {
+    public sealed record TerrainReference(ushort[] Heights,double Width,Func<float3,float?>? Water=null);
+    private readonly record struct Crossing(int Upper,float T,int Lower,float U);
+    private readonly record struct Span(int Edge,float T,float U,float3 A,float3 B);
+
+    private static Crossing[] Crossings(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
+    {
+        var spans=new List<Span>();var grid=new Dictionary<(int,int),List<int>>();
+        var nodes=new Dictionary<SourceNodeKey,int>();var arcs=new List<List<ProfileGraphArc>>();
+        int Node(PreparedSegment s,long id){var key=new SourceNodeKey(s.Kind,id);if(nodes.TryGetValue(key,out var n))return n;n=nodes.Count;nodes[key]=n;arcs.Add(new());return n;}
+        foreach(var s in source)
+        {var a=Node(s,s.StartNodeId);var b=Node(s,s.EndNodeId);var cost=Math.Max(1,NetworkVerticalProfiles.ArcLength(s))*NetworkVerticalProfiles.DesiredGrade(s);arcs[a].Add(new(b,cost));arcs[b].Add(new(a,cost));}
+        var graph=new NetworkProfileGraph(arcs.Select(a=>a.ToArray()).ToArray());var distances=new Dictionary<int,double[]>();
+        double Distance(int a,int b)
+        {if(!distances.TryGetValue(a,out var row)){if(distances.Count>=64)distances.Clear();row=graph.Distances(new[]{a},8,token);distances[a]=row;}return row[b];}
+        double Blend(double a,double b,double t)=>t<=1e-8?a:t>=1-1e-8?b:(1-t)*a+t*b;
+        for(var i=0;i<source.Count;i++)
+        {
+            var s=source[i];if(s.Tunnel)continue;var count=Math.Max(8,Math.Min(256,(int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(s)/24)));
+            var previous=NetworkNormalizer.Evaluate(s,0);
+            for(var j=1;j<=count;j++)
+            {
+                token.ThrowIfCancellationRequested();var next=NetworkNormalizer.Evaluate(s,j/(float)count);var id=spans.Count;
+                spans.Add(new(i,(j-1)/(float)count,j/(float)count,previous,next));
+                var low=math.min(previous.xz,next.xz);var high=math.max(previous.xz,next.xz);
+                for(var x=(int)Math.Floor(low.x/64);x<=(int)Math.Floor(high.x/64);x++)for(var z=(int)Math.Floor(low.y/64);z<=(int)Math.Floor(high.y/64);z++)
+                {if(!grid.TryGetValue((x,z),out var list))grid[(x,z)]=list=new();list.Add(id);}
+                previous=next;
+            }
+        }
+        var pairs=new HashSet<(int,int)>();var result=new List<Crossing>();var contradictory=0;
+        foreach(var cell in grid.Values)for(var i=0;i<cell.Count;i++)for(var j=i+1;j<cell.Count;j++)
+        {
+            token.ThrowIfCancellationRequested();var a=spans[cell[i]];var b=spans[cell[j]];if(a.Edge==b.Edge)continue;
+            var s=source[a.Edge];var t=source[b.Edge];if(!s.Bridge&&!t.Bridge||s.Layer==t.Layer&&s.Bridge==t.Bridge)continue;
+            if(s.Kind==t.Kind&&(s.StartNodeId==t.StartNodeId||s.StartNodeId==t.EndNodeId||s.EndNodeId==t.StartNodeId||s.EndNodeId==t.EndNodeId))continue;
+            var u=a.B.xz-a.A.xz;var v=b.B.xz-b.A.xz;var determinant=u.x*v.y-u.y*v.x;
+            if(Math.Abs(determinant)<1e-6||Math.Abs(math.dot(math.normalizesafe(u),math.normalizesafe(v)))>.95f)continue;
+            var delta=b.A.xz-a.A.xz;var pa=(delta.x*v.y-delta.y*v.x)/determinant;var pb=(delta.x*u.y-delta.y*u.x)/determinant;
+            if(pa<0||pa>1||pb<0||pb>1)continue;
+            var ta=math.lerp(a.T,a.U,pa);var tb=math.lerp(b.T,b.U,pb);
+            var upper=s.Layer!=t.Layer?s.Layer>t.Layer:s.Bridge;
+            var crossing=upper?new Crossing(a.Edge,ta,b.Edge,tb):new Crossing(b.Edge,tb,a.Edge,ta);
+            var key=(Math.Min(a.Edge,b.Edge),Math.Max(a.Edge,b.Edge));if(pairs.Contains(key))continue;
+            var hi=source[crossing.Upper];var lo=source[crossing.Lower];
+            if(hi.Kind==lo.Kind)
+            {
+                var aa=nodes[new(hi.Kind,hi.StartNodeId)];var ab=nodes[new(hi.Kind,hi.EndNodeId)];var ba=nodes[new(lo.Kind,lo.StartNodeId)];var bb=nodes[new(lo.Kind,lo.EndNodeId)];
+                var allowance=Blend(Blend(Distance(aa,ba),Distance(aa,bb),crossing.U),Blend(Distance(ab,ba),Distance(ab,bb),crossing.U),crossing.T);
+                if(allowance<7-.01)
+                {pairs.Add(key);contradictory++;if(contradictory<=16)log.Diagnostic($"CROSSING INTERPRETATION REVIEW upperWay={hi.WayId}; lowerWay={lo.WayId}; requestedGapMeters=7; connectedGradeAllowanceMeters={allowance:R}; inferredObstacleOmitted=true; realConnectivityPreserved=true");continue;}
+            }
+            pairs.Add(key);result.Add(crossing);
+        }
+        log.Diagnostic($"PROFILE CROSSINGS curvePolylineStations=true; crossingConstraints={result.Count}; contradictoryInferredObstacles={contradictory}; endpointChordIntersections=false; ceilingExpansion=false; requiresReview={contradictory>0}");
+        return result.ToArray();
+    }
+
+    private static void AddParallelRows(IReadOnlyList<PreparedSegment> source,int[] from,int[] to,int[] c1,int[] c2,SparseProfileRows rows,CancellationToken token)
+    {
+        var grid=new Dictionary<(int,int),List<(int Edge,float T,float3 Point)>>();
+        bool Eligible(PreparedSegment s)=>s.Kind==NetworkKind.Road&&s.OneWay&&!s.ProtectedLink&&s.CorridorId!=0;
+        for(var i=0;i<source.Count;i++)if(Eligible(source[i]))
+        {
+            var count=Math.Max(8,(int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(source[i])/12));
+            for(var j=0;j<=count;j++){var t=j/(float)count;var p=NetworkNormalizer.Evaluate(source[i],t);var key=((int)Math.Floor(p.x/64),(int)Math.Floor(p.z/64));if(!grid.TryGetValue(key,out var list))grid[key]=list=new();list.Add((i,t,p));}
+        }
+        var indices=new int[8];var coefficients=new double[8];
+        void Basis(int slot,int edge,double t,double sign)
+        {var u=1-t;indices[slot]=from[edge];indices[slot+1]=c1[edge];indices[slot+2]=c2[edge];indices[slot+3]=to[edge];coefficients[slot]=sign*u*u*u;coefficients[slot+1]=sign*3*u*u*t;coefficients[slot+2]=sign*3*u*t*t;coefficients[slot+3]=sign*t*t*t;}
+        for(var i=0;i<source.Count;i++)if(Eligible(source[i]))for(var j=0;j<=2;j++)
+        {
+            token.ThrowIfCancellationRequested();var s=source[i];var t=j*.5f;var p=NetworkNormalizer.Evaluate(s,t);var gx=(int)Math.Floor(p.x/64);var gz=(int)Math.Floor(p.z/64);
+            var best=80f*80;var edge=-1;var parameter=0f;
+            var heading=math.normalizesafe((s.End-s.Start).xz);
+            for(var x=gx-1;x<=gx+1;x++)for(var z=gz-1;z<=gz+1;z++)if(grid.TryGetValue((x,z),out var list))foreach(var candidate in list)
+            {
+                var other=source[candidate.Edge];if(candidate.Edge<=i||other.CorridorId!=s.CorridorId||other.Layer!=s.Layer||other.Bridge!=s.Bridge||other.Tunnel!=s.Tunnel||math.dot(heading,math.normalizesafe((other.End-other.Start).xz))>-.9f)continue;
+                var d=math.lengthsq(p.xz-candidate.Point.xz);if(d>=best)continue;best=d;edge=candidate.Edge;parameter=candidate.T;
+            }
+            if(edge<0)continue;Basis(0,i,t,1);Basis(4,edge,parameter,-1);rows.Append(indices,coefficients,8,0,1000,ProfileRowKind.EqualityCost);
+        }
+    }
     public static IReadOnlyList<PreparedSegment> Solve(IReadOnlyList<PreparedSegment> source,float scale,
         IReadOnlyList<(int index,float t,float ceiling)> cover,ImportLog log,CancellationToken token,
-        IReadOnlyDictionary<SourceNodeKey,double>? verifiedBoundaryHeights=null)
+        IReadOnlyDictionary<SourceNodeKey,double>? verifiedBoundaryHeights=null,TerrainReference? design=null)
     {
-        if(cover.Count==0)return source;
+        if(source.Count==0||cover.Count==0&&design==null)return source;
+        float Ground(float3 point)=>NetworkProcessor.Sample(point.x,point.z,design!.Heights,scale,design.Width);
         var ordered=Enumerable.Range(0,source.Count).OrderBy(i=>source[i].Kind).ThenBy(i=>source[i].StartNodeId)
             .ThenBy(i=>source[i].EndNodeId).ThenBy(i=>source[i].WayId).ToArray();
         var ids=new Dictionary<SourceNodeKey,int>();var keys=new Dictionary<int,SourceNodeKey>();var prior=new List<double>();
@@ -81,6 +164,37 @@ public static class NetworkTunnelProfile
                 coefficients[2]=3*u*t*t/budget;coefficients[3]=t*t*t/budget;
                 var weight=support/8*(sample==0||sample==8?.5:1);
                 Row(4,NetworkNormalizer.Evaluate(s,(float)t).y/budget,weight,ProfileRowKind.EqualityCost);
+                if(design!=null)
+                {
+                    var p=NetworkNormalizer.Evaluate(s,(float)t);var ground=Ground(p);
+                    var lower=ground-(s.Tunnel?120:s.Bridge?0:budget);var upper=ground+(s.Bridge?(s.Kind==NetworkKind.Rail?30:60):budget);
+                    // Fixed terrain-relative observations: never increase these
+                    // limits in response to another road's current iteration.
+                    Row(4,upper/budget,weight*1000,ProfileRowKind.UpperHingeCost);
+                    for(var k=0;k<4;k++)coefficients[k]=-coefficients[k];
+                    Row(4,-lower/budget,weight*1000,ProfileRowKind.UpperHingeCost);
+                    var level=design.Water?.Invoke(p);
+                    if(s.Bridge&&!s.Tunnel&&level.HasValue&&math.isfinite(level.Value))
+                        Row(4,-(level.Value+7)/budget,weight*1000,ProfileRowKind.UpperHingeCost);
+                }
+            }
+            if(design!=null)
+            {
+                // Penalize change of longitudinal grade, not just maximum slope.
+                // z_ss = z_tt/|h_t|^2 - z_t dot(h_t,h_tt)/|h_t|^4.
+                var transition=s.Kind==NetworkKind.Rail?250d:s.ProtectedLink?60d:150d;
+                for(var sample=0;sample<3;sample++)
+                {
+                    var t=(sample+.5)/3;var u=1-t;
+                    var h1=3*u*u*(double2)(s.CourseControl1-s.CourseStart).xz+6*u*t*(double2)(s.CourseControl2-s.CourseControl1).xz+3*t*t*(double2)(s.CourseEnd-s.CourseControl2).xz;
+                    var h2=6*u*(double2)(s.CourseControl2-2*s.CourseControl1+s.CourseStart).xz+6*t*(double2)(s.CourseEnd-2*s.CourseControl2+s.CourseControl1).xz;
+                    var square=(double)math.lengthsq(h1);if(square<1e-8)continue;
+                    var correction=math.dot(h1,h2)/(square*square);var normalization=transition/NetworkVerticalProfiles.DesiredGrade(s);
+                    var first=new[]{-3*u*u,3*u*u-6*u*t,6*u*t-3*t*t,3*t*t};
+                    var second=new[]{6*u,-12*u+6*t,6*u-12*t,6*t};
+                    for(var k=0;k<4;k++)coefficients[k]=normalization*(second[k]/square-first[k]*correction);
+                    Row(4,0,support/3,ProfileRowKind.EqualityCost);
+                }
             }
             // Freeze derivative leaves first; the row parameter and horizontal
             // lower bound both refer to that leaf's own parameterization.
@@ -129,10 +243,29 @@ public static class NetworkTunnelProfile
                 Row(4,(sample.Ceiling-.25)/eps,10000d/samples.Count,ProfileRowKind.UpperHingeCost);
             }
         }
+        var crossings=design==null?Array.Empty<Crossing>():Crossings(source,log,token);
+        foreach(var crossing in crossings)
+        {
+            void Basis(int offset,int edge,double t,double sign)
+            {
+                var u=1-t;indices[offset]=from[edge];indices[offset+1]=c1[edge];indices[offset+2]=c2[edge];indices[offset+3]=to[edge];
+                coefficients[offset]=sign*u*u*u/eps;coefficients[offset+1]=sign*3*u*u*t/eps;
+                coefficients[offset+2]=sign*3*u*t*t/eps;coefficients[offset+3]=sign*t*t*t/eps;
+            }
+            Basis(0,crossing.Upper,crossing.T,-1);Basis(4,crossing.Lower,crossing.U,1);
+            Row(8,-7/eps,1000,ProfileRowKind.UpperHingeCost);
+        }
+        if(design!=null)AddParallelRows(source,from,to,c1,c2,rows,token);
         for(var i=0;i<prior.Count;i++)
         {indices[0]=i;coefficients[0]=1;Row(1,prior[i],1e-8,ProfileRowKind.EqualityCost);}
         rows.Freeze();var clock=System.Diagnostics.Stopwatch.StartNew();
-        var solution=NetworkProfileSolve.SolveComponent(rows,prior.ToArray(),new ProfileHardProjector(prior.Count,scale,stars.ToArray()),token);
+        var outcomes=new int[4];var componentFailures=0;
+        var solution=NetworkProfileSolve.SolveComponents(rows,prior.ToArray(),scale,stars.ToArray(),token,(id,count,report)=>
+        {
+            outcomes[(int)report.Outcome]++;
+            if(report.Outcome>=ProfileSolveOutcome.NumericFallback&&componentFailures++<16)
+                log.Diagnostic($"PROFILE COMPONENT root={id}; variables={count}; outcome={report.Outcome}; reason={report.FailureReason}; iterations={report.AcceptedIterations}; objective={report.Objective:R}; bestFiniteProfileRetained=true");
+        });
         var result=source.ToArray();var maximumGrade=0f;var exposed=0;var maxExcess=0d;var gradeFailures=0;
         foreach(var i in ordered)
         {
@@ -140,7 +273,7 @@ public static class NetworkTunnelProfile
             a.y=(float)solution.Heights[from[i]];b.y=(float)solution.Heights[c1[i]];c.y=(float)solution.Heights[c2[i]];d.y=(float)solution.Heights[to[i]];
             var start=s.Start;var end=s.End;start.y=a.y;end.y=d.y;
             result[i]=s with{Start=start,End=end,Control1=b-s.StartCurveOffset,Control2=c-s.EndCurveOffset,
-                FinalDeckCurve=null,HorizontalParent=null,StartElevation=(s.StartElevation??0)+a.y-s.CourseStart.y,EndElevation=(s.EndElevation??0)+d.y-s.CourseEnd.y};
+                FinalDeckCurve=null,HorizontalParent=null,StartElevation=design==null?(s.StartElevation??0)+a.y-s.CourseStart.y:a.y-Ground(a),EndElevation=design==null?(s.EndElevation??0)+d.y-s.CourseEnd.y:d.y-Ground(d)};
             maximumGrade=Math.Max(maximumGrade,NetworkVerticalProfiles.MaximumGrade(result[i]));
             if(!NetworkVerticalProfiles.WithinGradeCeiling(result[i],NetworkGeometrySafety.GradeLimit(s)))gradeFailures++;
         }
@@ -158,8 +291,9 @@ public static class NetworkTunnelProfile
         if(log.DiagnosticsEnabled)
         {
             log.Diagnostic($"V-PROFILE JOINT outcome={report.Outcome}; variables={prior.Count}; rows={rows.Count}; terms={rows.Terms}; packedCapacityBytes={rows.CapacityBytes}; vectorBytes={report.VectorCapacityBytes}; iterations={report.AcceptedIterations}; restarts={report.Restarts}; backtracks={report.Backtracks}; gap={report.OptimalityGap:R}; objective={report.Objective:R}; maximumGrade={maximumGrade:R}; coverResidual={maxExcess:R}; observedCoverOnly=true; continuousCoverCertificate=false; coverOnlyPostRewrite=false; fixedHeightBox=true; soleOptimizer=FISTA");
-            log.DiagnosticRecords("joint-tunnel-profile-input.ndjson",DiagnosticArtifacts.NetworkRecords(source));
-            log.DiagnosticRecords("joint-tunnel-profile.ndjson",DiagnosticArtifacts.NetworkRecords(result));
+            log.Diagnostic($"PROFILE DESIGN fixedTerrainReference={design!=null}; crossingStations={crossings.Length}; independentComponents={report.Components}; convergedComponents={outcomes[0]}; cappedComponents={outcomes[1]}; numericFallbackComponents={outcomes[2]}; unavailableComponents={outcomes[3]}; perComponentIterationCap=2000; longitudinalSmoothness={design!=null}; repeatedEndpointRaising=false; clearanceDatumMeters=7; nativeCompositionClearanceStillRequiresReadback=true");
+            log.DiagnosticRecords("joint-tunnel-profile-input.ndjson",DiagnosticArtifacts.NetworkRecords(source.Take(32).ToArray()));
+            log.DiagnosticRecords("joint-tunnel-profile.ndjson",DiagnosticArtifacts.NetworkRecords(result.Take(32).ToArray()));
             var failures=Enumerable.Range(0,result.Length).Where(i=>!NetworkVerticalProfiles.WithinGradeCeiling(result[i],NetworkGeometrySafety.GradeLimit(result[i])));
             var coverFailures=cover.Where(p=>NetworkNormalizer.Evaluate(result[p.index],p.t).y>p.ceiling+.05).Select(p=>p.index);
             log.DiagnosticRecords("joint-tunnel-profile-failures.ndjson",DiagnosticArtifacts.NetworkRecords(failures.Concat(coverFailures).Distinct().Take(32).Select(i=>result[i]).ToArray()));

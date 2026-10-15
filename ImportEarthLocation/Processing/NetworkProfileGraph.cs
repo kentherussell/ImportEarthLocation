@@ -4,15 +4,15 @@ using System.Threading;
 
 namespace ImportEarthLocation.Processing;
 
-public readonly record struct ProfileGraphArc(int To,double Cost);
+public readonly record struct ProfileGraphArc(int To, double Cost);
 
 /// <summary>Frozen weighted adjacency and reusable value heap for multi-source portal/witness distances.</summary>
 public sealed class NetworkProfileGraph
 {
     private readonly ProfileGraphArc[][] _adjacency;
-    private readonly List<(double Distance,int Node)> _heap=new();
+    private readonly List<(double Distance, int Node)> _heap = new();
     public long Relaxations { get; private set; }
-    public int Nodes=>_adjacency.Length;
+    public int Nodes => _adjacency.Length;
     public NetworkProfileGraph(IReadOnlyList<ProfileGraphArc[]> adjacency)
     {
         _adjacency=new ProfileGraphArc[adjacency.Count][];
@@ -24,8 +24,9 @@ public sealed class NetworkProfileGraph
             Array.Sort(copy,(a,b)=>{var c=a.To.CompareTo(b.To);return c!=0?c:a.Cost.CompareTo(b.Cost);});_adjacency[i]=copy;
         }
     }
-    private static bool Before((double Distance,int Node) a,(double Distance,int Node) b)
-        =>a.Distance<b.Distance||(a.Distance==b.Distance&&a.Node<b.Node);
+    // Node order breaks equal-distance ties deterministically.
+    private static bool Before((double Distance, int Node) a, (double Distance, int Node) b)
+        => a.Distance < b.Distance || (a.Distance == b.Distance && a.Node < b.Node);
     private void Push((double Distance,int Node) entry)
     {
         var i=_heap.Count;_heap.Add(entry);
@@ -43,7 +44,9 @@ public sealed class NetworkProfileGraph
         }
         _heap[i]=tail;return first;
     }
-    public double[] Distances(IReadOnlyList<int> sources,double maximum,CancellationToken token,int[]? predecessor=null)
+    // Costs and maximum share caller-defined units. The reused heap belongs to
+    // this instance, so searches on the same instance must not run concurrently.
+    public double[] Distances(IReadOnlyList<int> sources, double maximum, CancellationToken token, int[]? predecessor = null)
     {
         if(double.IsNaN(maximum)||maximum<0||predecessor!=null&&predecessor.Length!=Nodes)throw new ArgumentException("Invalid graph search bounds.");
         var distances=new double[Nodes];for(var i=0;i<Nodes;i++){distances[i]=double.PositiveInfinity;if(predecessor!=null)predecessor[i]=-1;}

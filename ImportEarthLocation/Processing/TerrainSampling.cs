@@ -14,6 +14,8 @@ public static class TerrainSampling
         return size;
     }
 
+    // u/v are normalized x/z coordinates; the result is in encoded ushort
+    // height units, not metres. Raster indexing is row-major z, then x.
     public static double Encoded(ushort[] raster, int size, double u, double v)
     {
         var x = Math.Max(0, Math.Min(1, u)) * (size - 1);

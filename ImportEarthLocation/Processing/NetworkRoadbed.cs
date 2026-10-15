@@ -20,8 +20,9 @@ public static class NetworkRoadbed
         for(var i=0;i<Math.Min(previousProfiles.Count,finalProfiles.Count);i++)
         {
             token.ThrowIfCancellationRequested();var a=previousProfiles[i];var b=finalProfiles[i];if(NetworkStructure.IsStructure(b))continue;
-            if(Math.Abs(a.CourseStart.y-b.CourseStart.y)>.01f||Math.Abs(a.CourseControl1.y-b.CourseControl1.y)>.01f||
-               Math.Abs(a.CourseControl2.y-b.CourseControl2.y)>.01f||Math.Abs(a.CourseEnd.y-b.CourseEnd.y)>.01f)changed++;
+            if(math.distance(a.CourseStart,b.CourseStart)>.01f||math.distance(a.CourseControl1,b.CourseControl1)>.01f||
+               math.distance(a.CourseControl2,b.CourseControl2)>.01f||math.distance(a.CourseEnd,b.CourseEnd)>.01f||
+               Math.Abs(a.NativeWidth-b.NativeWidth)>.01f||NetworkStructure.IsStructure(a)!=NetworkStructure.IsStructure(b))changed++;
         }
         if(changed==0)return finalRaster;
         // Recompute against the immutable pre-earthworks raster. A late profile

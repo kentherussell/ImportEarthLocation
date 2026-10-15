@@ -106,12 +106,55 @@ public sealed class SparseProfileRows
 }
 
 public enum ProfileSolveOutcome { Converged, IterationCap, NumericFallback, HardSetUnavailable }
-public sealed record ProfileSolveReport(ProfileSolveOutcome Outcome,int AcceptedIterations,int Trials,int Restarts,int GradientSweeps,int ObjectiveSweeps,int CheckSweeps,int Projections,double Objective,double ProjectedStep,long VectorCapacityBytes,double OptimalityGap,int OptimalityChecks,int CurvatureSweeps,int Backtracks);
+public sealed record ProfileSolveReport(ProfileSolveOutcome Outcome,int AcceptedIterations,int Trials,int Restarts,int GradientSweeps,int ObjectiveSweeps,int CheckSweeps,int Projections,double Objective,double ProjectedStep,long VectorCapacityBytes,double OptimalityGap,int OptimalityChecks,int CurvatureSweeps,int Backtracks)
+{ public int Components { get; init; } = 1; public string FailureReason { get; init; } = ""; }
 public sealed record ProfileSolveResult(double[] Heights,ProfileSolveReport Report);
 
 /// <summary>The single amendment-selected solver. Geometric acceptance is separate.</summary>
 public static class NetworkProfileSolve
 {
+    // Row/star connectivity is the exact separability criterion. Roads joined by
+    // a crossing or parallel-profile row stay in the same solve component.
+    public static ProfileSolveResult SolveComponents(SparseProfileRows rows,double[] prior,double scale,ProfileStar[] stars,CancellationToken token=default,Action<int,int,ProfileSolveReport>? componentReport=null)
+    {
+        var parent=new int[rows.Variables];for(var i=0;i<parent.Length;i++)parent[i]=i;
+        int Root(int i){while(parent[i]!=i){parent[i]=parent[parent[i]];i=parent[i];}return i;}
+        void Join(int a,int b){a=Root(a);b=Root(b);if(a!=b)parent[Math.Max(a,b)]=Math.Min(a,b);}
+        for(long i=0;i<rows.Count;i++)
+        {if((i&1023)==0)token.ThrowIfCancellationRequested();var row=rows.Row(i);for(var j=1;j<row.Count;j++)Join(rows.Index(row.Offset),rows.Index(row.Offset+j));}
+        foreach(var star in stars)foreach(var control in star.Controls)Join(star.Height,control);
+        var groups=new Dictionary<int,List<int>>();var local=new int[parent.Length];
+        for(var i=0;i<parent.Length;i++){var root=Root(i);if(!groups.TryGetValue(root,out var group))groups[root]=group=new();local[i]=group.Count;group.Add(i);}
+        if(groups.Count<=1){var single=SolveComponent(rows,prior,new ProfileHardProjector(rows.Variables,scale,stars),token);componentReport?.Invoke(0,prior.Length,single.Report);return single;}
+        var builders=new Dictionary<int,SparseProfileRows>();var blocks=new Dictionary<int,List<ProfileStar>>();
+        foreach(var group in groups){builders[group.Key]=new(group.Value.Count);blocks[group.Key]=new();}
+        var indices=new int[8];var coefficients=new double[8];var constantObjective=0d;
+        for(long i=0;i<rows.Count;i++)
+        {
+            if((i&1023)==0)token.ThrowIfCancellationRequested();var row=rows.Row(i);
+            if(row.Count==0){var residual=row.Kind==ProfileRowKind.UpperHingeCost?Math.Max(0,-row.Target):-row.Target;constantObjective+=.5*row.Weight*residual*residual;continue;}
+            for(var j=0;j<row.Count;j++){indices[j]=local[rows.Index(row.Offset+j)];coefficients[j]=rows.Coefficient(row.Offset+j);}
+            builders[Root(rows.Index(row.Offset))].Append(indices,coefficients,row.Count,row.Target,row.Weight,row.Kind);
+        }
+        foreach(var star in stars)
+        {var controls=new int[star.Controls.Length];for(var j=0;j<controls.Length;j++)controls[j]=local[star.Controls[j]];blocks[Root(star.Height)].Add(new(local[star.Height],controls,star.Alpha,star.Groups,star.FixedHeight,star.FixedSlopes));}
+        var output=new double[prior.Length];ProfileSolveReport? total=null;
+        foreach(var group in groups)
+        {
+            token.ThrowIfCancellationRequested();var seed=new double[group.Value.Count];for(var j=0;j<seed.Length;j++)seed[j]=prior[group.Value[j]];
+            var problem=builders[group.Key];problem.Freeze();var result=SolveComponent(problem,seed,new ProfileHardProjector(seed.Length,scale,blocks[group.Key].ToArray()),token);
+            componentReport?.Invoke(group.Key,seed.Length,result.Report);
+            for(var j=0;j<seed.Length;j++)output[group.Value[j]]=result.Heights[j];
+            var report=result.Report;
+            if(total==null)total=report;else total=new(
+                (ProfileSolveOutcome)Math.Max((int)total.Outcome,(int)report.Outcome),Math.Max(total.AcceptedIterations,report.AcceptedIterations),total.Trials+report.Trials,total.Restarts+report.Restarts,
+                total.GradientSweeps+report.GradientSweeps,total.ObjectiveSweeps+report.ObjectiveSweeps,total.CheckSweeps+report.CheckSweeps,total.Projections+report.Projections,
+                total.Objective+report.Objective,Math.Max(total.ProjectedStep,report.ProjectedStep),Math.Max(total.VectorCapacityBytes,report.VectorCapacityBytes),
+                total.OptimalityGap+report.OptimalityGap,total.OptimalityChecks+report.OptimalityChecks,total.CurvatureSweeps+report.CurvatureSweeps,total.Backtracks+report.Backtracks);
+        }
+        return new(output,total! with{Components=groups.Count,Objective=total.Objective+constantObjective});
+    }
+
     public static ProfileSolveResult SolveComponent(SparseProfileRows rows,double[] immutablePrior,ProfileHardProjector projector,CancellationToken token=default)
     {
         var n=rows.Variables;if(immutablePrior.Length!=n||projector.Variables!=n)throw new ArgumentException("Profile component dimension mismatch.");
@@ -121,8 +164,8 @@ public static class NetworkProfileSolve
         var fx=double.NaN;var bestF=double.NaN;
         var optimalityGap=double.PositiveInfinity;var optimalityChecks=0;
         var curvatureSweeps=0;var backtracks=0;var previousL=l;var acceptedL=l;var trialObjective=double.NaN;
-        ProfileSolveResult Finish(ProfileSolveOutcome outcome)
-            =>new(best,new(outcome,accepted,trials,restarts,gradients,objectives,checks,projections,bestF,projectedStep,checked((long)n*8*8),optimalityGap,optimalityChecks,curvatureSweeps,backtracks));
+        ProfileSolveResult Finish(ProfileSolveOutcome outcome,string reason="")
+            =>new(best,new ProfileSolveReport(outcome,accepted,trials,restarts,gradients,objectives,checks,projections,bestF,projectedStep,checked((long)n*8*8),optimalityGap,optimalityChecks,curvatureSweeps,backtracks){FailureReason=reason});
         // Even a numerical failure must return a finite bounded diagnostic profile.
         // This fallback is not convergence or proof of a satisfied hard set.
         for(var j=0;j<n;j++)best[j]=SparseProfileRows.Finite(x[j])?Math.Max(0,Math.Min(projector.HeightScale,x[j])):0;
@@ -163,16 +206,23 @@ public static class NetworkProfileSolve
         for(var iteration=1;iteration<=2000;iteration++)
         {
             token.ThrowIfCancellationRequested();
-            if(!AllFinite(y)||!Trial())return Finish(ProfileSolveOutcome.NumericFallback);
+            if(!AllFinite(y)||!Trial())
+            {
+                // A failed extrapolated probe is not evidence that a step from
+                // the last accepted point is unavailable. Restart acceleration
+                // and retry the same safeguarded FISTA trial before falling back.
+                restarts++;t=1;Array.Copy(x,y,n);
+                if(!Trial())return Finish(ProfileSolveOutcome.NumericFallback,"restarted_projected_majorization_trial_failed");
+            }
             var fc=trialObjective;
             if(!SparseProfileRows.Finite(fc))return Finish(ProfileSolveOutcome.NumericFallback);
             var tolerance=1e-12*Math.Max(1,Math.Abs(fx));
             if(fc>fx+tolerance)
             {
                 restarts++;t=1;Array.Copy(x,y,n);token.ThrowIfCancellationRequested();
-                if(!Trial())return Finish(ProfileSolveOutcome.NumericFallback);
+                if(!Trial())return Finish(ProfileSolveOutcome.NumericFallback,"restart_majorization_trial_failed");
                 fc=trialObjective;
-                if(!SparseProfileRows.Finite(fc)||fc>fx+tolerance)return Finish(ProfileSolveOutcome.NumericFallback);
+                if(!SparseProfileRows.Finite(fc)||fc>fx+tolerance)return Finish(ProfileSolveOutcome.NumericFallback,"restart_objective_increased");
             }
             // Equal rounded objectives can still have substantially different
             // first-order gaps near an optimum with a large constant residual.

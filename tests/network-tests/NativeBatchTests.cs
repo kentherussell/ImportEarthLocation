@@ -25,6 +25,8 @@ internal static class NativeBatchTests
 
     public static void Run()
     {
+        NativeOwnershipTests.Run();
+        NativeOwnerLineageTests.Run();
         Check(NativeBatchBindings.Target("preview","null",false,false)=="preview","New native entity should survive as itself");
         Check(NativeBatchBindings.Target("preview","original",true,false)=="original","Ordinary native update must bind Original");
         Check(NativeBatchBindings.Target("preview","original",true,true)=="preview","Native replacement must not bind the deleted Original");
@@ -308,6 +310,14 @@ internal static class NativeBatchTests
         try
         {
             var archive=new RunArchive(root,new{fixture=true},typeof(NativeBatchTests).Assembly.Location);
+            var records=Enumerable.Range(0,600).Select(i=>(object)new{index=i}).ToArray();
+            var full=archive.WriteRecords("over-64.ndjson",records);
+            Check(full.Records==600&&!full.Truncated,"Diagnostic writer still imposes the old 64-record cap");
+            var chunks=archive.WriteRecordChunks("chunked.ndjson",records);
+            Check(chunks.Records==600&&!chunks.Truncated&&chunks.Chunks.Length==3,"Chunked readback lost record coverage");
+            Check(chunks.Chunks.All(c=>c.Records<=256)&&chunks.Chunks.Sum(c=>c.Records)==600,"Diagnostic chunk limits or cumulative counts are incorrect");
+            var sequence=chunks.Chunks.SelectMany(c=>File.ReadLines(Path.Combine(archive.DirectoryPath,c.File))).Select(line=>(int)JObject.Parse(line)["index"]!).ToArray();
+            Check(sequence.SequenceEqual(Enumerable.Range(0,600)),"Chunked diagnostic readback reordered or duplicated records");
             var s=Section() with{NativeWidth=32};
             void Write(string stem,bool valid)
             {
@@ -322,8 +332,18 @@ internal static class NativeBatchTests
             Replay(archive.DirectoryPath);
             Check(Directory.GetFiles(archive.DirectoryPath,"*-graph.ndjson").Length==2,"Successful retry overwrote failed graph evidence");
             var path=Path.Combine(archive.DirectoryPath,"native-batch-000128-032-attempt-01-graph.ndjson");
-            archive.WriteRecords(Path.GetFileName(path),new object[]{new{oversized=true}},maximumBytes:1);
+            var preserved=archive.WriteRecords(Path.GetFileName(path),new object[]{new{oversized=true}},maximumBytes:1);
+            Check(preserved.PreservedPrevious&&new FileInfo(path).Length>0,"Budget exhaustion erased valid prior graph evidence");
+            Replay(archive.DirectoryPath);
+            archive.WriteRecords("native-batch-000256-032-attempt-00-expected.ndjson",new object[]{new{kind="expected-course",prefab="stock",StartCenterBudget=18,EndCenterBudget=18,section=DiagnosticArtifacts.NetworkRecords(new[]{s}).First()}});
+            archive.WriteRecords("native-batch-000256-032-attempt-00-owners.ndjson",new object[]{new{source="Road:1",entity="committed"}});
+            archive.WriteRecords("native-batch-000256-032-attempt-00-graph.ndjson",new object[]{new{oversized=true}},maximumBytes:1);
             Refuses(()=>Replay(archive.DirectoryPath),"Incomplete batch artifact","Truncated captured graph may not establish coverage");
+            var filler=new{payload=new string('x',32768)};
+            for(var i=0;i<6;i++)archive.WriteRecords($"budget-{i}.ndjson",Enumerable.Repeat((object)filler,300));
+            var finalRecord=new object[]{new{payload=new string('y',65536)}};
+            Check(archive.WriteRecords("ordinary-full.ndjson",finalRecord).Truncated,"Ordinary-budget exhaustion fixture did not fill its budget");
+            Check(archive.WriteRecords("reserved-final.ndjson",finalRecord,final:true).Records==1,"Early transcripts consumed final-readback reserve");
         }
         finally{if(Directory.Exists(root))Directory.Delete(root,true);}
         Console.WriteLine("PASS: synthetic diagnostic manifest/owner/graph roundtrip retains rejected and accepted attempts independently; truncated evidence cannot claim coverage.");

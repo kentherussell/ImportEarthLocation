@@ -520,7 +520,7 @@ public static class NetworkGeometrySafety
         }
     }
 
-    private static IEnumerable<(int index,float t,float ceiling)> TunnelCoverSamples(IReadOnlyList<PreparedSegment> sections,ushort[] raster,float scale,double width,CancellationToken token)
+    internal static IEnumerable<(int index,float t,float ceiling)> TunnelCoverSamples(IReadOnlyList<PreparedSegment> sections,ushort[] raster,float scale,double width,CancellationToken token)
     {
         var n=(int)Math.Sqrt(raster.Length);
         if(n*n!=raster.Length||n<2||scale<=0||width<=0)throw new InvalidOperationException("Invalid final terrain for tunnel cover audit.");

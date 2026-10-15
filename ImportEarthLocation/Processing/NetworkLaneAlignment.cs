@@ -30,7 +30,7 @@ public static class NetworkLaneAlignment
             // bounded vanilla lane-spacing estimate instead of a false centre lane.
             var spacing=4f;return laneCache[s]=Enumerable.Range(0,count).Select(i=>(i-(count-1)*.5f)*spacing).ToArray();
         }
-        float2 Heading(PreparedSegment s,bool start)=>math.normalizesafe((start?s.CourseControl1-s.CourseStart:s.CourseEnd-s.CourseControl2).xz);
+        float2 Heading(PreparedSegment s,bool start)=>math.normalizesafe((start?s.CourseControl1-s.CourseStart:s.CourseEnd-s.CourseControl2).xz,math.normalizesafe((s.End-s.Start).xz));
         void Offset((int index,bool start) entry,float3 value)
         {var s=result[entry.index];result[entry.index]=entry.start?s with{StartCurveOffset=value}:s with{EndCurveOffset=value};}
         // Build immutable joins before applying any correction. This removes
@@ -117,15 +117,21 @@ public static class NetworkLaneAlignment
                 var approach=heading;
                 if(!addedLane)
                 {
-                    const float angle=.34906585f; // 20-degree terminal, curved upstream.
+                    var chord=math.normalizesafe((ramp.End-ramp.Start).xz);
+                    // Use available approach geometry, bounded away from a nearly
+                    // parallel overlapping merge. No uniform forced 20-degree hook.
+                    var angle=math.clamp((float)Math.Acos(math.clamp(math.dot(chord,heading),-1,1))*.5f,.17453293f,.5235988f);
                     var sign=entry.start?rampSide:-rampSide;
                     approach=heading*(float)Math.Cos(angle)+new float2(normal.x,normal.z)*sign*(float)Math.Sin(angle);
                 }
-                var reach=Math.Min(math.distance(ramp.Start.xz,ramp.End.xz)*.4f,120);
+                var reach=Math.Min(math.distance(ramp.Start.xz,ramp.End.xz)/3,120);
                 var aligned=anchor+new float3(approach.x,0,approach.y)*reach*(entry.start?1:-1);
                 var mainGrade=(target.End.y-target.Start.y)/Math.Max(1,math.distance(target.Start.xz,target.End.xz));
                 aligned.y=anchor.y+mainGrade*reach*(entry.start?1:-1);
-                var farHeading=math.normalizesafe((ramp.End-ramp.Start).xz*.75f+approach*.25f);var farReach=math.distance(ramp.Start.xz,ramp.End.xz)/3;
+                var travel=math.normalizesafe((ramp.End-ramp.Start).xz);
+                var farHeading=Heading(ramp,!entry.start);
+                if(math.dot(farHeading,travel)<.35f)farHeading=travel;
+                var farReach=Math.Min(120,math.distance(ramp.Start.xz,ramp.End.xz)/3);
                 var farControl=(entry.start?ramp.End:ramp.Start)+new float3(farHeading.x,0,farHeading.y)*farReach*(entry.start?-1:1);
                 farControl.y=math.lerp(ramp.Start.y,ramp.End.y,entry.start?2f/3:1f/3);
                 result[entry.index]=entry.start?ramp with{Control1=aligned,Control2=farControl,StartCurveOffset=offset}:ramp with{Control1=farControl,Control2=aligned,EndCurveOffset=offset};ramps++;
@@ -156,7 +162,7 @@ public static class NetworkLaneAlignment
             bundles++;
         }
         log.Count("Highway lane bundles aligned",bundles);
-        log.Diagnostic($"LANE BUNDLES junctions={bundles}; laneOrder=travel-frame-left-to-right; separateNodeIdentitiesCreated=false; noAddedLaneMergeAngleDegrees=20");
+        log.Diagnostic($"LANE BUNDLES junctions={bundles}; laneOrder=travel-frame-left-to-right; separateNodeIdentitiesCreated=false; noAddedLaneMergeAngleDegrees=10-to-30-from-approach; appliedBeforeVerticalSolve=true");
         // Offset handles and ramp tangents cannot extend past a clipped map end.
         // Roll back the whole affected join, not one incident curve endpoint:
         // otherwise the guard itself could introduce another misaligned join.

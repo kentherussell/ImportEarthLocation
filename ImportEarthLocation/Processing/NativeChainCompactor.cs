@@ -73,7 +73,7 @@ public static class NativeChainCompactor
     }
 
     private static bool Compatible(PreparedSegment a,PreparedSegment b)=>
-        !a.Bridge&&!b.Bridge&&!a.Tunnel&&!b.Tunnel&&a.Kind==b.Kind&&a.Classification==b.Classification&&a.Roundabout==b.Roundabout&&
+        a.Bridge==b.Bridge&&a.Tunnel==b.Tunnel&&a.Kind==b.Kind&&a.Classification==b.Classification&&a.Roundabout==b.Roundabout&&
         a.OneWay==b.OneWay&&a.Lanes==b.Lanes&&a.Layer==b.Layer&&a.RailService==b.RailService&&a.PhysicalTracks==b.PhysicalTracks&&
         a.ForwardLanes==b.ForwardLanes&&a.BackwardLanes==b.BackwardLanes&&a.BothWaysLanes==b.BothWaysLanes&&
         a.ExplicitIncline==b.ExplicitIncline&&a.SourceSpeedKph==b.SourceSpeedKph&&a.SourceWidthMeters==b.SourceWidthMeters&&

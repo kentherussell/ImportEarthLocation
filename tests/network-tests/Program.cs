@@ -15,6 +15,8 @@ static class Program
     }
     static void Run(string[] args)
     {
+        if(args.Length==1&&args[0]=="--corridor-quality-only"){CorridorQualityTests.Run();return;}
+        if(args.Length==2&&args[0]=="--corridor-quality-replay"){CorridorQualityTests.Replay(args[1]);return;}
         if(args.Length==1&&args[0]=="--design-math-only"){DesignMathTests.Run();return;}
         if(args.Length==1&&args[0]=="--profile-math-only"){ProfileMathTests.Run();return;}
         if(args.Length==2&&args[0]=="--audit-local-compaction")

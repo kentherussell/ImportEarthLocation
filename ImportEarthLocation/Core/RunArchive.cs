@@ -15,11 +15,15 @@ public sealed class RunArchive
     private string _state = "preparing";
     private long _checkpointSequence;
     private long _recordBytes;
+    private long _criticalRecordBytes;
+    private long _finalRecordBytes;
     public sealed record NativeOperationIntent(long MapSession, long Generation, ulong WorldSequenceNumber,
         string State, int Definitions, int Submitted, int ApplyInvocations,
         int SourceStartIndex = -1, int SourceSections = -1);
 
-    public sealed record ArtifactResult(string File, int Records, long Bytes, bool Truncated);
+    public sealed record ArtifactResult(string File, int Records, long Bytes, bool Truncated)
+    { public bool PreservedPrevious { get; init; } }
+    public sealed record ChunkedArtifactResult(string Manifest, ArtifactResult[] Chunks, int Records, bool Truncated);
 
     public RunArchive(string root, object settings, string assemblyPath, object? environment = null)
     {
@@ -97,11 +101,14 @@ public sealed class RunArchive
         Publish(temporary, path);
     }
 
-    public ArtifactResult WriteRecords(string name, IEnumerable<object> records, long maximumBytes = 64L * 1024 * 1024, int maximumRecords = 250000)
+    public ArtifactResult WriteRecords(string name, IEnumerable<object> records, long maximumBytes = 64L * 1024 * 1024, int maximumRecords = 250000, bool critical = false,bool final = false)
     {
         if (maximumBytes < 1 || maximumRecords < 1) throw new ArgumentOutOfRangeException(nameof(maximumBytes));
-        maximumBytes = Math.Min(maximumBytes, Math.Min(8L*1024*1024, Math.Max(0,32L*1024*1024-_recordBytes)));
-        maximumRecords = Math.Min(maximumRecords,64);
+        // Keep a separate bounded reserve so ordinary preview captures cannot
+        // consume the evidence budget for a later ownership failure.
+        var remaining=critical?4L*1024*1024-_criticalRecordBytes:final?16L*1024*1024-_finalRecordBytes:32L*1024*1024-_recordBytes;
+        maximumBytes = Math.Min(maximumBytes, Math.Min(critical?1024L*1024:8L*1024*1024, Math.Max(0,remaining)));
+        maximumRecords = Math.Min(maximumRecords,250000);
         var path = ArtifactPath(name); var temporary = path + ".tmp";
         var count = 0; long bytes = 0; var truncated = false; var encoding = new UTF8Encoding(false);
         using (var stream = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.Read))
@@ -115,11 +122,38 @@ public sealed class RunArchive
                 count++; bytes += buffer.Length;
             }
         }
-        Publish(temporary, path);
-        _recordBytes += bytes;
-        var result = new ArtifactResult(name, count, bytes, truncated);
-        WriteJson(name + ".meta.json", result);
+        // A depleted budget must never erase earlier valid evidence. Keep its
+        // metadata intact and describe this unsuccessful attempt separately.
+        var preserve=count==0&&truncated&&File.Exists(path)&&new FileInfo(path).Length>0;
+        if(preserve)File.Delete(temporary);else Publish(temporary, path);
+        if(critical)_criticalRecordBytes+=bytes;else if(final)_finalRecordBytes+=bytes;else _recordBytes+=bytes;
+        var result = new ArtifactResult(name, count, bytes, truncated){PreservedPrevious=preserve};
+        WriteJson(name + (preserve?".skipped.meta.json":".meta.json"), result);
         return result;
+    }
+
+    public ChunkedArtifactResult WriteRecordChunks(string name,IEnumerable<object> records,int chunkRecords=256,bool final=false)
+    {
+        if(chunkRecords<1||chunkRecords>1024)throw new ArgumentOutOfRangeException(nameof(chunkRecords));
+        ArtifactPath(name); // Validate the caller's name before deriving part names.
+        var stem=Path.GetFileNameWithoutExtension(name);
+        var chunks=new List<ArtifactResult>();var batch=new List<object>(chunkRecords);
+        var total=0;var truncated=false;
+        using var enumerator=records.GetEnumerator();
+        var exhausted=false;
+        while(!exhausted)
+        {
+            batch.Clear();
+            while(batch.Count<chunkRecords)
+            {if(!enumerator.MoveNext()){exhausted=true;break;}batch.Add(enumerator.Current);}
+            if(batch.Count==0)break;
+            var result=WriteRecords($"{stem}-part-{chunks.Count:D4}.ndjson",batch,maximumRecords:chunkRecords,final:final);
+            chunks.Add(result);total+=result.Records;
+            if(result.Truncated){truncated=true;break;}
+        }
+        var manifest=stem+"-chunks.json";
+        var output=new ChunkedArtifactResult(manifest,chunks.ToArray(),total,truncated);
+        WriteJson(manifest,output);return output;
     }
 
     public void WriteBytes(string name, byte[] values, int maximumBytes = 32 * 1024 * 1024)

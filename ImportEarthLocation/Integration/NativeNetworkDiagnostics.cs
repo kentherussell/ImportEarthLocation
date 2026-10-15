@@ -92,7 +92,17 @@ public static class NativeNetworkDiagnostics
         log.Diagnostic($"NATIVE CONNECTIVITY SUMMARY liveEdges={entities.Length}; sharedJunctionsChecked={checkedJoins}; missingIncidentEdges={missing}; splitJunctions={split}; structurePortalsChecked={portals}; structurePortalsMismatched={badPortals}; boundSourceNodes={VerifiedNodes.Count}; readOnly=true; verifiedEntityMatchingWhenAvailable=true; geometricFallbackOnlyWhenUnbound=true; saveReloadVerificationRequired=true");
         if(missing+split>0)log.Warn($"Native network check found {missing} junctions with missing/moved edges and {split} with separate nodes, including {badPortals} structure portals. Definition counts are not proof of connectivity; generation is not blocked.");
         log.Diagnostic($"NATIVE READBACK BUDGET sectionLimit={sectionLimit}; totalPreparedSections={_sections.Count}; sampledReadback={_sections.Count>sectionLimit}; completeConnectivityNotClaimed={_sections.Count>sectionLimit}");
-        NativeNetworkReadback.Check(manager,_sections.Take(sectionLimit).ToArray(),_evidence,log,includeMovements:sectionLimit==int.MaxValue);
+        // Stratify the bounded sample: a road-first source array must not hide
+        // every railway and tunnel from final native inspection.
+        var selected=new List<PreparedSegment>();var strata=_sections.GroupBy(s=>(s.Kind,s.Tunnel,s.Bridge)).ToArray();
+        for(var group=0;group<strata.Length;group++)
+        {
+            var all=strata[group].OrderBy(s=>s.WayId).ThenBy(s=>s.StartNodeId).ToArray();
+            var quota=sectionLimit==int.MaxValue?all.Length:Math.Min(all.Length,sectionLimit/strata.Length+(group<sectionLimit%strata.Length?1:0));
+            for(var j=0;j<quota;j++)selected.Add(all[(int)((long)j*all.Length/quota)]);
+        }
+        log.Diagnostic($"NATIVE READBACK SAMPLE selected={selected.Count}; strata=kind-tunnel-bridge; sourceOrderBiasRemoved=true; fullMapReadback={selected.Count==_sections.Count}");
+        NativeNetworkReadback.Check(manager,selected,_evidence,log,includeMovements:sectionLimit==int.MaxValue);
         var islandRecords=new List<object>();var attachedIslands=0;
         foreach(var pair in RoundaboutIslands)
         {

@@ -139,11 +139,18 @@ public sealed class ImportLog
         Artifact("checkpoint", archive => archive.Checkpoint(phase, intent));
     }
 
-    public void DiagnosticRecords(string name, IEnumerable<object> records, long maximumBytes = 8L * 1024 * 1024)
+    public void DiagnosticRecords(string name, IEnumerable<object> records, long maximumBytes = 8L * 1024 * 1024, bool critical = false)
         => Artifact(name, archive =>
         {
-            var result = archive.WriteRecords(name, records, maximumBytes);
-            Diagnostic($"ARTIFACT file={result.File}; records={result.Records}; bytes={result.Bytes}; truncated={result.Truncated}; localOnly=true");
+            var result = archive.WriteRecords(name, records, maximumBytes,critical:critical);
+            Diagnostic($"ARTIFACT file={result.File}; records={result.Records}; bytes={result.Bytes}; truncated={result.Truncated}; preservedPrevious={result.PreservedPrevious}; criticalReserve={critical}; localOnly=true");
+        });
+
+    public void DiagnosticRecordChunks(string name,IEnumerable<object> records)
+        => Artifact(name,archive=>
+        {
+            var result=archive.WriteRecordChunks(name,records,final:true);
+            Diagnostic($"ARTIFACT CHUNKS manifest={result.Manifest}; chunks={result.Chunks.Length}; records={result.Records}; truncated={result.Truncated}; boundedRunByteBudget=true; localOnly=true");
         });
 
     public void CaptureGeometry(string stage, IReadOnlyList<PreparedSegment> sections, ushort[] heights, float scale, double width)
@@ -163,8 +170,14 @@ public sealed class ImportLog
         lock (_archiveGate) { if (_finalCapture) return; _finalCapture=true; }
         Artifact("prepared-plan", archive =>
         {
-            archive.WriteRecords("final-network-sample.ndjson", DiagnosticArtifacts.NetworkRecords(prepared.Segments).Take(64), 8L*1024*1024, 64);
-            Diagnostic("PREPARED ARTIFACT bounded network sample; not replay-complete; raster and per-site transcripts omitted.");
+            var records=prepared.Segments.Select(s=>(object)new
+            {
+                s.WayId,s.StartNodeId,s.EndNodeId,kind=s.Kind.ToString(),s.Classification,s.Reference,s.CorridorId,s.Lanes,s.OneWay,s.Bridge,s.Tunnel,s.Layer,s.NativeWidth,
+                a=DiagnosticArtifacts.Point(s.CourseStart),b=DiagnosticArtifacts.Point(s.CourseControl1),c=DiagnosticArtifacts.Point(s.CourseControl2),d=DiagnosticArtifacts.Point(s.CourseEnd),
+                nodeStart=DiagnosticArtifacts.Point(s.Start),nodeEnd=DiagnosticArtifacts.Point(s.End),s.StartElevation,s.EndElevation
+            });
+            var result=archive.WriteRecordChunks("final-prepared-network.ndjson",records,final:true);
+            Diagnostic($"PREPARED ARTIFACT manifest={result.Manifest}; records={result.Records}/{prepared.Segments.Count}; truncated={result.Truncated}; compactFinalCurves=true; reservedFinalBudget=true; nativeAppearanceNotCertified=true");
         });
     }
 

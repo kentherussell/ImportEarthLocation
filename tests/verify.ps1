@@ -193,6 +193,7 @@ try {
             $arguments=@($binary)
             if($suite -eq 'network' -and $Focus -eq 'NativeHandoff') { $arguments+=@('--native-bindings-only') }
             $checks.Add((New-VerificationJob $suite $dotnet $arguments))
+            if($suite -eq 'network') { $checks.Add((New-VerificationJob 'corridor-quality' $dotnet @($binary,'--corridor-quality-only'))) }
         }
         $gameBuild=$Focus -eq 'Full' -or $IncludeGameBuild
         # Keep stock deploy/UI targets disabled; all verification outputs remain

@@ -100,7 +100,7 @@ public sealed class NativeNetworkPlacement
 
     public IReadOnlyList<Entity> CreateDefinitions(IReadOnlyList<PreparedSegment> segments, out int skipped,Processing.OsmDataset? evidence=null)
     {
-        NetworkCommitSystem.BeginDefinitionBatch(_entityManager,_log);
+        NetworkCommitSystem.BeginDefinitionBatch(_entityManager,_log,ArtifactStem);
         _entityManager.CompleteAllTrackedJobs();
         if (_source == null) Initialize(segments,evidence);
         var definitions = new List<Entity>(segments.Count);

@@ -29,7 +29,9 @@ public sealed partial class NetworkCommitSystem
     private readonly HashSet<Entity> _ownedDefinitions = new();
     private readonly HashSet<Entity> _baselineTemps = new();
     private readonly HashSet<Entity> _claimedTemps = new();
-    private readonly HashSet<Entity> _ownedNetworks = new();
+    private readonly NativeEntityOwnership<Entity> _ownedEntities = new();
+    private readonly NativeOwnerLineage<Entity> _ownerLineage = new();
+    private readonly NativeOwnerLineage<Entity> _retiringLineage = new();
     private readonly Dictionary<Entity,(Entity Prefab,bool Tree)> _foliageCandidates=new();
     private ToolBaseSystem? _capturedActive, _capturedLast;
     private long _toolSerial, _capturedSerial;
@@ -41,7 +43,7 @@ public sealed partial class NetworkCommitSystem
     public NativeTransactionState TransactionState { get; private set; }
     public static bool MapRetirementInProgress => s_Instance?._retirementId != null && s_Instance._retirementId != 0;
 
-    private void ToolChanged(ToolBaseSystem tool) { _toolSerial++; }
+    private void ToolChanged(ToolBaseSystem tool) { _toolSerial++; RecordToolChange(tool); }
 
     private void AttachOwner()
     {
@@ -61,16 +63,17 @@ public sealed partial class NetworkCommitSystem
 
     public static void ReleaseEmptyDefinitions(EntityManager manager)
     {
-        var owner=s_Instance;if(owner==null||!owner._hasLease||owner._allocationUnknown)return;
+        var owner=s_Instance;if(owner==null||!owner._hasLease||owner._allocationUnknown||s_Applied||s_ClearingPreview)return;
         foreach(var id in owner._ownedDefinitions)if(manager.Exists(id))return;
         using var query=manager.CreateEntityQuery(ComponentType.ReadOnly<Temp>());
         using var ids=query.ToEntityArray(Allocator.Temp);
         foreach(var id in ids)if(!owner._baselineTemps.Contains(id))return;
         owner._hasLease=false;owner._ownedDefinitions.Clear();owner._baselineTemps.Clear();owner._leaseLog=null;
+        owner._ownedEntities.DiscardBatch();
         owner.TransactionState=NativeTransactionState.Cleared;
     }
 
-    public static void BeginDefinitionBatch(EntityManager manager, ImportLog log)
+    public static void BeginDefinitionBatch(EntityManager manager, ImportLog log, string? artifactStem = null)
     {
         var owner = s_Instance ?? manager.World.GetOrCreateSystemManaged<NetworkCommitSystem>();
         if (owner._hasLease || owner._retirementId != 0)
@@ -80,19 +83,28 @@ public sealed partial class NetworkCommitSystem
         { All=new[]{ComponentType.ReadOnly<CreationDefinition>(),ComponentType.ReadOnly<Updated>()},None=new[]{ComponentType.ReadOnly<Deleted>()} });
         if (!definitions.IsEmptyIgnoreFilter) throw new InvalidOperationException("An unrelated native definition producer is active.");
         var last = owner._lastToolField?.GetValue(owner._toolSystem) as ToolBaseSystem;
-        if (last == null || last.applyMode != ApplyMode.None)
-            throw new InvalidOperationException("The native tool has an unconsumed notification.");
+        if (last == null)
+            throw new InvalidOperationException("The engine's last tool is unavailable for native placement.");
+        // ToolOutput reads this mode; it does not acknowledge/reset it. The
+        // default tool may request Clear on an empty preview every frame.
+        // CanStartExclusive already excluded unrelated definitions/edit Temps.
+        // Do not clear foreign state or treat the mode as an unconsumed message.
+        log.Diagnostic($"NATIVE TOOL READINESS active={owner._toolSystem.activeTool?.GetType().FullName}; last={last.GetType().FullName}; mode={last.applyMode}; serial={owner._toolSerial}; exclusiveEntitiesChecked=true; modeAloneBlocks=false; frame={UnityEngine.Time.frameCount}");
+        if(last.applyMode!=ApplyMode.None)log.Count("Native idle tool modes accepted");
         if(owner._leaseEpoch.MapSession!=ImportSession.Map||owner._leaseEpoch.Generation!=ImportSession.Generation)
-            owner._ownedNetworks.Clear();
+            owner._ownedEntities.Clear();
         owner._leaseEpoch = new ImportEpoch(ImportSession.Map,ImportSession.Generation,manager.World.SequenceNumber);
         s_Applied=false;s_ClearingPreview=false;s_ApplyInvocations=0;s_Submitted.Clear();
         owner._capturedActive=owner._toolSystem.activeTool;owner._capturedLast=last;owner._capturedSerial=owner._toolSerial;
         owner._ownedDefinitions.Clear();owner._baselineTemps.Clear();owner._claimedTemps.Clear();
         owner._foliageCandidates.Clear();
+        owner._ownedEntities.DiscardBatch();
         using var temps = manager.CreateEntityQuery(ComponentType.ReadOnly<Temp>());
         using var ids = temps.ToEntityArray(Allocator.Temp);
         foreach(var id in ids) owner._baselineTemps.Add(id);
         owner._batchId++;owner._leaseLog=log;owner._hasLease=true;owner._generationExclusive=true;owner._allocationUnknown=false;
+        owner.ResetSuspensionDiagnostics(artifactStem);
+        owner._ownerLineage.BeginObservation();
         owner.TransactionState=NativeTransactionState.LeaseAcquired;
     }
 
@@ -113,21 +125,36 @@ public sealed partial class NetworkCommitSystem
 
     private bool ObserveExclusiveWindow(bool claimOutputs)
     {
-        if(!_hasLease||_retirementId!=0||_allocationUnknown||!World.IsCreated||
-           !ImportSession.Matches(_leaseEpoch,World.SequenceNumber)) return false;
-        if(_toolSerial!=_capturedSerial||!ReferenceEquals(_capturedActive,_toolSystem.activeTool)||
-           !ReferenceEquals(_capturedLast,_lastToolField?.GetValue(_toolSystem))) _generationExclusive=false;
+        if(!_hasLease)return false;
+        if(_retirementId!=0||_allocationUnknown||!World.IsCreated||!ImportSession.Matches(_leaseEpoch,World.SequenceNumber))
+        {ReportSuspension($"Lease unavailable: retirement={_retirementId!=0}, allocationUnknown={_allocationUnknown}, worldCreated={World.IsCreated}, epochMatches={World.IsCreated&&ImportSession.Matches(_leaseEpoch,World.SequenceNumber)}");return false;}
+        var serialChanged=_toolSerial!=_capturedSerial;
+        var activeChanged=!ReferenceEquals(_capturedActive,_toolSystem.activeTool);
+        var lastChanged=!ReferenceEquals(_capturedLast,_lastToolField?.GetValue(_toolSystem));
+        if(serialChanged||activeChanged||lastChanged) _generationExclusive=false;
         using var definitions=EntityManager.CreateEntityQuery(new EntityQueryDesc
         {All=new[]{ComponentType.ReadOnly<CreationDefinition>(),ComponentType.ReadOnly<Updated>()},None=new[]{ComponentType.ReadOnly<Deleted>()}});
         using var ids=definitions.ToEntityArray(Allocator.Temp);
-        foreach(var id in ids) if(!_ownedDefinitions.Contains(id)) _generationExclusive=false;
+        var unexpectedCount=0;
+        List<Entity>? unexpected=null;
+        foreach(var id in ids) if(!_ownedDefinitions.Contains(id))
+        {
+            _generationExclusive=false;unexpectedCount++;
+            if(_leaseLog?.DiagnosticsEnabled==true&&!_suspensionActive)
+            {unexpected??=new List<Entity>();if(unexpected.Count<32)unexpected.Add(id);}
+        }
         if(!_generationExclusive)
         {
             TransactionState=NativeTransactionState.AwaitingExclusiveSafety;
-            _leaseLog?.Event(TelemetryEvent.Failure,TelemetryReason.OwnerUncertain,"The native producer/tool changed during generation. Apply and Clear suspended; ownership is not inferred from source geometry.");
+            var reason=$"serialChanged={serialChanged}, activeToolChanged={activeChanged}, lastToolChanged={lastChanged}, unexpectedDefinitions={unexpectedCount}";
+            if(!serialChanged&&!activeChanged&&!lastChanged&&unexpectedCount==0)reason="Tool/definition checks unchanged; original/owner checks not rerun because prior suspension remains unresolved";
+            ReportSuspension(reason,unexpected:unexpected,unexpectedCount:unexpectedCount,
+                comparisons:_leaseLog?.DiagnosticsEnabled==true&&!_suspensionActive ? new{claimOutputs,serialChanged,activeChanged,lastChanged,unexpectedCount} : null);
             return false;
         }
         if(!claimOutputs) return true;
+        _ownerLineage.BeginObservation();
+        _retiringLineage.BeginObservation();
         using var tempQuery=EntityManager.CreateEntityQuery(ComponentType.ReadOnly<Temp>());
         using var temps=tempQuery.ToEntityArray(Allocator.Temp);
         foreach(var id in temps)
@@ -142,23 +169,50 @@ public sealed partial class NetworkCommitSystem
                 !EntityManager.HasComponent<Game.Objects.Tree>(id)&&!EntityManager.HasComponent<Game.Objects.Plant>(id)&&
                 !EntityManager.HasComponent<CreationDefinition>(id)&&
                 (!EntityManager.HasComponent<Owner>(id)||EntityManager.GetComponentData<Owner>(id).m_Owner==Entity.Null);
-            if(!selectionOnly)return SuspendUncertain();
+            if(!selectionOnly)return SuspendUncertain("Baseline preview is not selection-only",id,temp.m_Original);
         }
         foreach(var id in _claimedTemps)
         {
-            if(!EntityManager.HasComponent<Temp>(id))continue;
-            var original=EntityManager.GetComponentData<Temp>(id).m_Original;
-            if(original!=Entity.Null&&!_ownedNetworks.Contains(original)&&!_claimedTemps.Contains(original)) return SuspendUncertain();
+            if(!EntityManager.HasComponent<Temp>(id)||EntityManager.HasComponent<Deleted>(id))continue;
+            var temp=EntityManager.GetComponentData<Temp>(id);
+            if((temp.m_Flags&TempFlags.Cancel)!=0)continue;
+            var removing=(temp.m_Flags&TempFlags.Delete)!=0;
+            var original=temp.m_Original;
+            if(original!=Entity.Null&&!Known(original,removing)) return SuspendUncertain("Preview original has no valid imported owner lineage",id,original);
             if(EntityManager.HasComponent<Owner>(id))
-            {var parent=EntityManager.GetComponentData<Owner>(id).m_Owner;if(parent!=Entity.Null&&!_ownedNetworks.Contains(parent)&&!_claimedTemps.Contains(parent))return SuspendUncertain();}
-            if(EntityManager.HasComponent<Edge>(id))
-            {var edge=EntityManager.GetComponentData<Edge>(id);if(!Known(edge.m_Start)||!Known(edge.m_End))return SuspendUncertain();}
+            {var parent=EntityManager.GetComponentData<Owner>(id).m_Owner;if(parent!=Entity.Null&&!Known(parent,removing))return SuspendUncertain("Preview parent has no valid imported owner lineage",id,parent);}
+            if(!removing&&EntityManager.HasComponent<Edge>(id))
+            {var edge=EntityManager.GetComponentData<Edge>(id);if(!Known(edge.m_Start))return SuspendUncertain("Edge references an unknown start node",id,edge.m_Start);if(!Known(edge.m_End))return SuspendUncertain("Edge references an unknown end node",id,edge.m_End);}
+        }
+        ResumeOwnershipObservation();
+        return true;
+    }
+    private NativeOwnerLink<Entity> InspectOwnership(Entity entity) => InspectOwnership(entity,false);
+    private NativeOwnerLink<Entity> InspectRetiringOwnership(Entity entity) => InspectOwnership(entity,true);
+    private NativeOwnerLink<Entity> InspectOwnership(Entity entity,bool removing)
+    {
+        if(entity==Entity.Null||!EntityManager.Exists(entity)||(!removing&&EntityManager.HasComponent<Deleted>(entity))||
+            EntityManager.HasComponent<PrefabData>(entity)||EntityManager.HasComponent<NetCompositionData>(entity)||
+            EntityManager.HasComponent<CreationDefinition>(entity))return default;
+        var temporary=EntityManager.HasComponent<Temp>(entity);
+        var root=_claimedTemps.Contains(entity)||(!temporary&&_ownedEntities.Contains(entity));
+        var parent=EntityManager.HasComponent<Owner>(entity)?EntityManager.GetComponentData<Owner>(entity).m_Owner:Entity.Null;
+        return new NativeOwnerLink<Entity>(true,root,parent!=Entity.Null,parent);
+    }
+    private bool Known(Entity entity,bool removing=false)
+    {
+        var lineage=removing?_retiringLineage:_ownerLineage;
+        if(!lineage.Resolve(entity,removing?InspectRetiringOwnership:InspectOwnership,out var root,out var reason))return false;
+        if(!_ownedEntities.Contains(entity)&&!_claimedTemps.Contains(entity))
+        {
+            _leaseLog?.Count("Native downstream owner-lineage references accepted");
+            if(_leaseLog?.DiagnosticsEnabled==true&&_leaseLog.Metric("Native downstream owner-lineage references accepted")<=64)
+                _leaseLog.Diagnostic($"NATIVE OWNER LINEAGE entity={entity}; root={root}; proof={reason}; batch={_diagnosticBatchStem}; prefabOrProximityGuess=false; geometryCertificationRequired=false");
         }
         return true;
     }
-    private bool Known(Entity entity) => entity!=Entity.Null&&(_claimedTemps.Contains(entity)||_ownedNetworks.Contains(entity));
-    private bool SuspendUncertain()
-    { _generationExclusive=false;TransactionState=NativeTransactionState.AwaitingExclusiveSafety;return false; }
+    private bool SuspendUncertain(string reason,Entity culprit,Entity related)
+    { TransactionState=NativeTransactionState.AwaitingExclusiveSafety;ReportSuspension(reason,culprit,related);return false; }
 
     private void IssueOwnedClear(ToolBaseSystem tool)
     {
@@ -190,11 +244,15 @@ public sealed partial class NetworkCommitSystem
             _leaseLog?.Count("Vegetation native outcomes unverified",unverified);
         }
         _foliageCandidates.Clear();
-        foreach(var entity in _claimedTemps)
+        if(s_Applied)
         {
-            if(!EntityManager.Exists(entity)||EntityManager.HasComponent<Deleted>(entity))continue;
-            if(EntityManager.HasComponent<Node>(entity)||EntityManager.HasComponent<Edge>(entity)||EntityManager.HasComponent<Lane>(entity)) _ownedNetworks.Add(entity);
+            _ownedEntities.SettleApplied(entity => EntityManager.Exists(entity)&&
+                !EntityManager.HasComponent<Deleted>(entity)&&!EntityManager.HasComponent<Temp>(entity)&&
+                !EntityManager.HasComponent<CreationDefinition>(entity)&&!EntityManager.HasComponent<PrefabData>(entity)&&
+                !EntityManager.HasComponent<NetCompositionData>(entity));
+            _leaseLog?.Diagnostic($"NATIVE OWNERSHIP SETTLED batch={_diagnosticBatchStem}; retainedEntities={_ownedEntities.Count}; includesGeneratedObjects=true; candidatesFromExclusivePreviewOnly=true; worldScan=false; geometryCertificationRequired=false");
         }
+        else _ownedEntities.DiscardBatch();
         _hasLease=false;_ownedDefinitions.Clear();_baselineTemps.Clear();_claimedTemps.Clear();_leaseLog=null;
         TransactionState=s_Applied?NativeTransactionState.Settled:NativeTransactionState.Cleared;
     }
@@ -213,6 +271,21 @@ public sealed partial class NetworkCommitSystem
         }
     }
 
+    private void CaptureOwnershipCandidates()
+    {
+        // Called only after the complete original/owner checks and immediately
+        // before Apply. Clear/preflight never promotes candidates to ownership.
+        _ownedEntities.DiscardBatch();
+        foreach(var id in _claimedTemps)
+        {
+            if(!EntityManager.HasComponent<Temp>(id)||EntityManager.HasComponent<Deleted>(id))continue;
+            var temp=EntityManager.GetComponentData<Temp>(id);
+            _ownedEntities.Capture(id,temp.m_Original,temp.m_Original!=Entity.Null,
+                (temp.m_Flags&TempFlags.Delete)!=0,(temp.m_Flags&TempFlags.Cancel)!=0);
+        }
+        _leaseLog?.Diagnostic($"NATIVE OWNERSHIP CAPTURE batch={_diagnosticBatchStem}; claimedPreviewEntities={_claimedTemps.Count}; retainedBeforeApply={_ownedEntities.Count}; includesGeneratedObjects=true; applyIssued=false");
+    }
+
     public static long BeginMapRetirement()
     {
         var owner=s_Instance;if(owner==null)return 0;
@@ -220,7 +293,7 @@ public sealed partial class NetworkCommitSystem
         owner._retirementId=++owner._batchId;
         owner.TransactionState=NativeTransactionState.MapRetiring;
         owner._retirementCovered=!owner._allocationUnknown;
-        owner._retirementNotificationSafe=!owner._hasLease;
+        owner._retirementNotificationSafe=!owner._hasLease||(!s_Applied&&!s_ClearingPreview);
         if(!owner._hasLease)owner._leaseEpoch=new ImportEpoch(ImportSession.Map,ImportSession.Generation,owner.World.SequenceNumber);
         if(owner.World.IsCreated&&owner.World.SequenceNumber==owner._leaseEpoch.WorldSequenceNumber)
         {
@@ -259,7 +332,8 @@ public sealed partial class NetworkCommitSystem
         // Loading-complete is the verified engine clear boundary. NEVER inspect
         // or delete old IDs in the new map, even when the World is reused.
         owner._hasLease=false;owner._retirementId=0;owner._ownedDefinitions.Clear();owner._baselineTemps.Clear();
-        owner._claimedTemps.Clear();owner._ownedNetworks.Clear();owner._leaseLog=null;
+        owner._claimedTemps.Clear();owner._ownedEntities.Clear();owner._leaseLog=null;
+        owner._ownerLineage.BeginObservation();
         owner._foliageCandidates.Clear();
         owner.TransactionState=worldChanged?NativeTransactionState.WorldRetired:NativeTransactionState.MapRetired;
         s_Requested=false;s_Applied=false;s_ClearingPreview=false;s_Submitted.Clear();CancelPending();

@@ -66,6 +66,12 @@ namespace Game.Simulation
 {
     public struct HeightArray { public bool IsCreated; public int Length; }
     public struct TerrainHeightData { public HeightArray heights; public Unity.Mathematics.int3 resolution; }
+    public readonly record struct TerrainBounds(Unity.Mathematics.float3 min, Unity.Mathematics.float3 max);
+    public static class TerrainUtils
+    {
+        public static TerrainBounds GetBounds(ref TerrainHeightData data) =>
+            new(new(-28672, 0, -28672), new(28672, 1000, 28672));
+    }
     public class TerrainSystem
     {
         public Texture? heightmap = new Texture { width = 8, height = 8 };
@@ -86,7 +92,9 @@ namespace Game.Simulation
 }
 namespace ImportEarthLocation.Core
 {
-    public class PreparedImport { public ushort[] Heightmap = new ushort[16]; public float HeightScaleMeters, SeaLevelMeters; }
+    public class TestMapSize { public double WidthMeters = 57344; }
+    public class TestRequest { public TestMapSize MapSize = new(); }
+    public class PreparedImport { public ushort[] Heightmap = new ushort[16]; public float HeightScaleMeters, SeaLevelMeters; public TestRequest Request = new(); }
     public class ImportLog { public void Diagnostic(string s){} }
 }
 namespace ImportEarthLocation.Processing { public static class TerrainBuilder { public const int Resolution = 4; } }

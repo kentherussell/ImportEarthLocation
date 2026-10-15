@@ -108,7 +108,7 @@ public static class NativeNetworkReadback
             if(inspected.Count<=80||s.Tunnel||count!=requested)log.Diagnostic($"NATIVE NETWORK EDGE entity={live.Entity}; kind={s.Kind}; way={s.WayId}; requestedLanesOrTracks={requested}; actualCarLanes={cars}; actualTrackLanes={tracks}; invertedCarLanes={reverse}; requestedOneWay={s.OneWay}; compositionWidth={width:R}; plannedWidth={s.NativeWidth:R}; tunnelRequested={s.Tunnel}; nativeGeneralFlags={flags.m_General}; nativeLeftFlags={flags.m_Left}; nativeRightFlags={flags.m_Right}; nativeSpeeds={string.Join(",",speeds.Distinct())}; renderedAcceptanceUnverified=true");
             }
         }
-        log.DiagnosticRecords("native-network-readback.ndjson",readbackRecords);
+        log.DiagnosticRecordChunks("native-network-readback.ndjson",readbackRecords);
         log.Diagnostic($"NATIVE READBACK ARTIFACT records={readbackRecords.Count}; recordLimit=8192; matchesSampled=true; unresolvedTotal={missing}; lineageQualifiedSections={lineageSections}; laneMismatchTotal={laneMismatch}; fileNotFullCoverageProof=true");
         // Junction lanes expose ordered source/target edge owners. This proves
         // movement existence, separately from two edges sharing a node anchor.
