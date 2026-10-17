@@ -14,6 +14,7 @@ public sealed partial class ImportEarthLocationUISystem
 {
     private IReadOnlyList<NativeAssetContract> CaptureNativeAssets(IReadOnlyList<PreparedSegment> segments)
     {
+        if(segments.Count==0)return Array.Empty<NativeAssetContract>();
         _log.BeginStage(TelemetryStage.AssetCapture);
         // This method executes on the UI system's main thread. The verified
         // helper contract cannot be silently substituted after an engine update.
@@ -67,7 +68,13 @@ public sealed partial class ImportEarthLocationUISystem
                     composition.m_SurfaceHeight.min,composition.m_SurfaceHeight.max,
                     composition.m_HeightRange.min,composition.m_HeightRange.max,composition.m_NodeOffset,valid);
             }
-            var trainLimit=segment.Kind==NetworkKind.Rail?CaptureTrainCurvature(prefab):(float?)null;
+            float? trainLimit=null;
+            if(segment.Kind==NetworkKind.Rail)
+            {
+                try {trainLimit=CaptureTrainCurvature(prefab);}
+                catch(InvalidOperationException error)
+                {_log.Warn($"Native train curvature metadata unavailable for {key}: {error.Message} Rail curvature remains RequiresReview; available roads and rail are not discarded.");}
+            }
             output.Add(new NativeAssetContract(key,envelopes,segment.NativeLaneOffsets,trainLimit));
             if(_log.DiagnosticsEnabled)_log.Diagnostic($"NATIVE ASSET CONTRACT palette={key}; envelopes=48; unavailable={unavailable}; guessedOffsets=false");
         }

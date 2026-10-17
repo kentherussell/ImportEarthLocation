@@ -87,7 +87,7 @@ internal static class CorridorTests
         foreach(var line in log.Lines.Where(l=>l.StartsWith("RAIL TOTAL")||l.StartsWith("AVENUE TOTAL")||l.StartsWith("PROCESS normalization complete")))Console.WriteLine(line);
         Console.WriteLine($"PASS: cached location offline; latitude={latitude}; longitude={longitude}; rawRoadSpans={raw.Count(s=>s.Kind==NetworkKind.Road)}; rawRailSpans={raw.Count(s=>s.Kind==NetworkKind.Rail)}; consolidatedRailSpans={rails.Count(s=>s.Kind==NetworkKind.Rail)}; fittedRailBefore={baseline.Count(s=>s.Kind==NetworkKind.Rail)}; fittedRailAfter={normalized.Count(s=>s.Kind==NetworkKind.Rail)}; outputSections={normalized.Count}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.###}; flatDemFixture=true; noDownloadsOrGame=true; nativeRenderingNotTested=true");
     }
-    private static readonly System.Text.Json.JsonSerializerOptions SnapshotOptions=new(){IncludeFields=true,NumberHandling=System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals,Converters={new Float3Converter()}};
+    private static readonly System.Text.Json.JsonSerializerOptions SnapshotOptions=new(){IncludeFields=true,NumberHandling=System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals|System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString,Converters={new Float3Converter()}};
     private sealed class Float3Converter:System.Text.Json.Serialization.JsonConverter<float3>
     {
         public override float3 Read(ref System.Text.Json.Utf8JsonReader reader,Type type,System.Text.Json.JsonSerializerOptions options)
@@ -144,8 +144,10 @@ internal static class CorridorTests
             DiagnosticArtifacts.CaptureGeometry(archive,"native-plan",new[]{tunnel},heights,100,1000);
             AuditDiagnostic(archive.DirectoryPath,"native-plan");
             DiagnosticArtifacts.CaptureGeometry(archive,"before-cover",new[]{tunnel},new ushort[16*16],100,1000);
-            var rejected=false;try{AuditDiagnostic(archive.DirectoryPath,"before-cover");}catch(InvalidOperationException e){rejected=e.Message.Contains("terrain exposes");}
+            var rejected=false;try{AuditDiagnostic(archive.DirectoryPath,"before-cover");}catch(InvalidOperationException e){rejected=e.Message.Contains("Strict offline tunnel cover audit failed for way 77");}
             Check(rejected,"Diagnostic replay substituted flat terrain or missed an exposed roof in the original raster");
+            var advisory=new ImportLog();NetworkGeometrySafety.ValidateTunnelCover(new[]{tunnel},new ushort[16*16],100,1000,default,advisory);
+            Check(advisory.Metric("Final exposed tunnel observations")>0,"Production tunnel-quality path neither reported the exposure nor retained advisory inspectability");
             Console.WriteLine("PASS: diagnostic original-raster replay preserves controls/offsets and distinguishes covered from exposed tunnels without a download or game mutation.");
         }
         finally{if(Directory.Exists(root))Directory.Delete(root,true);}
@@ -203,11 +205,15 @@ internal static class CorridorTests
         var dividedAxis=new[]{S(1,1,2,0,0,100,0),S(1,2,7,100,0,200,0),S(1,7,6,200,0,300,0),S(2,3,5,300,6,0,6)};
         Check(RailCorridorConsolidator.Prepare(dividedAxis,log,default).Count==3,"Different raw vertex spacing prevented rail consolidation");
         var partial=RailCorridorConsolidator.Prepare(new[]{main,S(2,3,4,0,6,200,6) with{RailService="siding"},S(2,4,5,200,6,400,6) with{RailService="siding"}},log,default);
-        Check(partial.Count(s=>s.WayId==2)==2&&partial.Any(s=>s.WayId==2&&s.End.x==400),"Independent siding or its unique tail was deleted");
+        Check(partial.Any(s=>s.WayId==2&&s.End.x==400)&&partial.Any(s=>s.SourceWayIds.Contains(2))&&
+            partial.Where(s=>s.WayId==2).Any(tail=>partial.Any(axis=>axis.WayId==1&&(axis.StartNodeId==tail.StartNodeId||axis.EndNodeId==tail.StartNodeId))),
+            "Siding consolidation lost its unique tail, source provenance, or exact attachment to the retained axis");
         var dense=new List<PreparedSegment>{main};for(var i=0;i<8;i++)dense.Add(S(10+i,100+i*2,101+i*2,0,2+i*2,300,2+i*2) with{RailService="yard"});
-        Check(RailCorridorConsolidator.Prepare(dense,log,default).Count==dense.Count,"Independent yard tracks were destructively consolidated");
+        var denseResult=RailCorridorConsolidator.Prepare(dense,log,default);
+        Check(denseResult.Count==1&&denseResult[0].Lanes==2&&denseResult[0].PhysicalTracks==2&&!denseResult[0].OneWay&&
+            denseResult[0].SourceWayIds.OrderBy(id=>id).SequenceEqual(dense.Select(s=>s.WayId).OrderBy(id=>id)),"Starter rail corridor must fold the parallel yard ladder without losing source provenance or creating extra physical axes");
         Check(RailCorridorConsolidator.Prepare(new[]{main,S(2,3,4,0,6,300,6) with{Layer=1}},log,default).Count==2,"Different rail levels were destructively consolidated");
-        foreach(var guarded in new[]{S(2,3,4,0,30,300,30),S(2,3,4,0,6,300,6) with{Bridge=true},S(2,3,4,0,6,300,6) with{Tunnel=true},S(2,3,4,150,-100,150,100)})
+        foreach(var guarded in new[]{S(2,3,4,0,RailCorridorConsolidator.CorridorDistance+5,300,RailCorridorConsolidator.CorridorDistance+5),S(2,3,4,0,6,300,6) with{Bridge=true},S(2,3,4,0,6,300,6) with{Tunnel=true},S(2,3,4,150,-100,150,100)})
             Check(RailCorridorConsolidator.Prepare(new[]{main,guarded},log,default).Count==2,"Rail crossing/level/structure guard failed");
         var bridge=S(3,5,6,300,6,400,6) with{Bridge=true,Layer=1};
         var protectedResult=RailCorridorConsolidator.Prepare(new[]{main,parallel[0],parallel[1],bridge},log,default);
@@ -227,7 +233,13 @@ internal static class CorridorTests
         Check(NetworkNormalizer.Normalize(sharp,log,default,1000).Count==2,"Intentional corner rounded across topology");
         var divided=new[]{S(80,300,301,0,0,100,0,NetworkKind.Road) with{OneWay=true},S(80,301,302,100,0,200,0,NetworkKind.Road) with{OneWay=true},S(80,302,303,200,0,300,0,NetworkKind.Road) with{OneWay=true},S(81,304,305,300,10,200,10,NetworkKind.Road) with{OneWay=true},S(81,305,306,200,10,100,10,NetworkKind.Road) with{OneWay=true},S(81,306,307,100,10,0,10,NetworkKind.Road) with{OneWay=true},S(82,299,300,-100,0,0,0,NetworkKind.Road) with{Bridge=true},S(83,307,308,0,10,-100,10,NetworkKind.Road) with{Bridge=true}};
         var dividedResult=AvenueConsolidator.Prepare(divided,log,default);
-        Check(dividedResult.Any(s=>s.ConsolidatedAvenue)&&dividedResult.Single(s=>s.WayId==82).EndNodeId==300&&dividedResult.Single(s=>s.WayId==83).StartNodeId==307,"Structural approach preservation unnecessarily blocked the entire interior avenue");
+        var entryBridge=dividedResult.Single(s=>s.WayId==82);var exitBridge=dividedResult.Single(s=>s.WayId==83);
+        bool HasAvenuePort(long node,float3 point)=>dividedResult.Any(s=>s.ConsolidatedAvenue&&
+            (s.StartNodeId==node&&math.all(s.Start==point)||s.EndNodeId==node&&math.all(s.End==point)));
+        Check(dividedResult.Any(s=>s.ConsolidatedAvenue)&&entryBridge.Bridge&&exitBridge.Bridge&&
+            math.all(entryBridge.Start==divided[6].Start)&&math.all(exitBridge.End==divided[7].End)&&
+            HasAvenuePort(entryBridge.EndNodeId,entryBridge.End)&&HasAvenuePort(exitBridge.StartNodeId,exitBridge.Start),
+            "Interior avenue simplification lost a structural approach, its distant endpoint, or the exact shared portal connection");
         var terrain=new ushort[128*128];for(var z=0;z<128;z++)for(var x=0;x<128;x++){var wx=(x/127f-.5f)*1000;terrain[z*128+x]=(ushort)Math.Round((50+3*Math.Cos(wx/25))/100*65535);}
         var roads=new List<PreparedSegment>();for(var i=0;i<12;i++)roads.Add(S(70,200+i,201+i,-150+i*25,0,-125+i*25,0,NetworkKind.Road));
         var graded=NetworkVerticalProfiles.Prepare(roads,terrain,100,1000,log,default);
@@ -261,6 +273,10 @@ internal static class CorridorTests
         var laneRun=new[]{Road(701,1,2,-300,0,-50,0),Road(702,2,3,-50,0,50,0,2),Road(703,3,4,50,0,300,0)};
         var normalized=NetworkNormalizer.Normalize(laneRun,log,default,1000);
         Check(normalized.All(s=>s.Lanes==3)&&normalized.First().StartNodeId==1&&normalized.Last().EndNodeId==4,"Short 3-2-3 mainline lane blip not removed or unique terminal topology changed");
+        var explicitLanes=NetworkNormalizer.Normalize(laneRun.Select(s=>s.WayId==702?s with{ExplicitLanes=true}:s).ToArray(),log,default,1000);
+        Check(explicitLanes.Single(s=>s.WayId==702).Lanes==2,"Inferred lane smoothing overwrote explicit source lane evidence");
+        var narrowBridge=NetworkNormalizer.Normalize(laneRun.Select(s=>s.WayId==702?s with{Bridge=true,Layer=1}:s).ToArray(),log,default,1000);
+        Check(narrowBridge.Single(s=>s.WayId==702).Lanes==2,"Lane smoothing erased a real bridge cross-section boundary");
         var junction=Road(704,2,5,-50,0,-50,100,1) with{Classification="motorway_link"};
         Check(NetworkNormalizer.Normalize(laneRun.Concat(new[]{junction}).ToArray(),log,default,1000).Single(s=>s.WayId==702).Lanes==2,"Meaningful merge lane change was erased");
         var merge=new[]{Road(720,30,31,-300,0,0,0),Road(721,31,32,0,0,250,0),Road(722,32,33,250,0,450,0),Road(723,34,31,-120,-80,0,0,1) with{Classification="motorway_link"}};
@@ -293,9 +309,15 @@ internal static class CorridorTests
             var mainOut=Road(951,401,402,0,0,300,0) with{NativeLaneOffsets=new[]{-3.5f,0,3.5f}};
             var ramp=Road(952,403,401,-200,side*80,0,0,1) with{Classification="motorway_link",Control1=new float3(-150,0,side*60),Control2=new float3(-40,0,side*8),NativeLaneOffsets=new[]{0f}};
             var aligned=NetworkLaneAlignment.Prepare(new[]{mainIn,mainOut,ramp},new ImportLog(),default,1000);
-            var refined=NetworkNormalizer.RefineFinalRoadJoins(aligned,new ImportLog(),default,1000).Single(s=>s.WayId==952);
+            // Production has one lane/tangent owner before the joint vertical
+            // solve; do not run the retired late join writer over its result.
+            var refined=aligned.Single(s=>s.WayId==952&&s.EndNodeId==ramp.EndNodeId);
+            Check(aligned.Any(s=>s.WayId==952&&s.StartNodeId==ramp.StartNodeId),"Whole-approach subdivision lost the ramp's far source port");
             Check(math.all(refined.End==ramp.End)&&refined.EndNodeId==ramp.EndNodeId,"Lane alignment detached the shared junction");
-            Check(Math.Sign(refined.EndCurveOffset.z)==side&&Math.Abs(Math.Abs(refined.EndCurveOffset.z)-3.5f)<.001&&Math.Abs(refined.CourseControl2.z)<3.6f,"Ramp course did not select the closest outside lane exactly once");
+            var heading=math.normalizesafe((refined.CourseEnd-refined.CourseControl2).xz);
+            var angle=Math.Acos(math.clamp(heading.x,-1,1))*180/Math.PI;
+            Check(math.lengthsq(refined.EndCurveOffset)<1e-8&&angle>=9.99&&angle<=30.01&&Math.Sign(heading.y)==-side,
+                "No-added-lane ramp must enter the shared junction on the correct side at a genuine merge angle, not a parallel outside-lane offset");
         }
         Console.WriteLine($"ROAD DESIGN FIXTURE clearanceDeckSeparationMeters={separation:0.###}; inputSections={crossing.Length}; outputSections={solved.Count}; shortLaneBlipsNormalized=true; mergeLaneChangesPreserved=true; offlineSynthetic=true");
     }

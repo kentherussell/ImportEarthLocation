@@ -502,9 +502,29 @@ public static class NetworkGeometrySafety
         return NetworkTunnelProfile.Solve(source,scale,samples,log,token,verifiedBoundaryHeights);
     }
 
-    public static void ValidateTunnelCover(IReadOnlyList<PreparedSegment> sections,ushort[] raster,float scale,double width,CancellationToken token,ImportLog? log=null)
+    public static void ValidateTunnelCover(IReadOnlyList<PreparedSegment> sections,ushort[] raster,float scale,double width,CancellationToken token,ImportLog? log=null,IReadOnlyDictionary<string,NativeAssetContract>? assets=null)
     {
-        foreach(var sample in TunnelCoverSamples(sections,raster,scale,width,token))
+        if(assets!=null)
+        {
+            var count=sections.Count;var a=new int[count];var b=new int[count];var c=new int[count];var d=new int[count];var heights=new double[count*4];
+            for(var i=0;i<count;i++)
+            {a[i]=4*i;b[i]=4*i+1;c[i]=4*i+2;d[i]=4*i+3;var s=sections[i];heights[a[i]]=s.CourseStart.y;heights[b[i]]=s.CourseControl1.y;heights[c[i]]=s.CourseControl2.y;heights[d[i]]=s.CourseEnd.y;}
+            var rows=new SparseProfileRows(heights.Length);var eps=Math.Max(.05,2*scale/65535d);
+            var report=NetworkTunnelContacts.Append(sections,raster,scale,width,assets,a,b,c,d,rows,eps,token);rows.Freeze();
+            long failed=0;var maximum=0d;
+            for(long i=0;i<rows.Count;i++)
+            {
+                if((i&1023)==0)token.ThrowIfCancellationRequested();var row=rows.Row(i);var residual=-row.Target;
+                for(var j=0;j<row.Count;j++)residual+=rows.Coefficient(row.Offset+j)*heights[rows.Index(row.Offset+j)];
+                residual*=eps;if(residual>eps){failed++;maximum=Math.Max(maximum,residual);}
+            }
+            if(log==null&&(failed>0||report.Uncertified>0||report.MissingAssets>0))throw new InvalidOperationException("Strict continuous tunnel cover audit requires review.");
+            log?.Count("Final continuous tunnel cover rows requiring review",(int)Math.Min(int.MaxValue,failed));
+            log?.Diagnostic($"FINAL CONTINUOUS COVER rows={rows.Count}; failedRows={failed}; maximumResidualMeters={maximum:R}; uncertified={report.Uncertified}; missingAssets={report.MissingAssets}; exactEncodedTerrain=true; floatDeckControls=true; nativeMeshStillRequiresReadback=true; qualityFailureBlocksPlacement=false");
+            if(failed>0||report.Uncertified>0||report.MissingAssets>0)log?.Warn("Final full-width tunnel cover needs review; native-safe geometry remains available for inspection.");
+            return;
+        }
+        foreach(var sample in TunnelCoverSamples(sections,raster,scale,width,token,assets))
         {
             var s=sections[sample.index];
             if(NetworkNormalizer.Evaluate(s,sample.t).y>sample.ceiling+.05f)
@@ -520,7 +540,7 @@ public static class NetworkGeometrySafety
         }
     }
 
-    internal static IEnumerable<(int index,float t,float ceiling)> TunnelCoverSamples(IReadOnlyList<PreparedSegment> sections,ushort[] raster,float scale,double width,CancellationToken token)
+    internal static IEnumerable<(int index,float t,float ceiling)> TunnelCoverSamples(IReadOnlyList<PreparedSegment> sections,ushort[] raster,float scale,double width,CancellationToken token,IReadOnlyDictionary<string,NativeAssetContract>? assets=null)
     {
         var n=(int)Math.Sqrt(raster.Length);
         if(n*n!=raster.Length||n<2||scale<=0||width<=0)throw new InvalidOperationException("Invalid final terrain for tunnel cover audit.");
@@ -546,6 +566,7 @@ public static class NetworkGeometrySafety
         for(var index=0;index<sections.Count;index++)
         {
             var s=sections[index];if(!s.Tunnel)continue;
+            var roofHeight=assets!=null&&assets.TryGetValue(s.NativeAssetKey,out var asset)&&asset.TryEnvelope(NativeStructureMode.Tunnel,out var envelope)?envelope.RangeMax:0;
             var length=NetworkVerticalProfiles.ArcLength(s);var count=Math.Max(16,(int)Math.Ceiling(length/4));
             var a=distance.TryGetValue(new(s.Kind,s.StartNodeId),out var da)?da:float.PositiveInfinity;
             var b=distance.TryGetValue(new(s.Kind,s.EndNodeId),out var db)?db:float.PositiveInfinity;
@@ -561,7 +582,9 @@ public static class NetworkGeometrySafety
                 // into full-width auditing over one physical road width, not
                 // an arbitrary 100m exemption. Interiors retain the full check.
                 var roof=math.lerp(Ground(p),fullRoof,math.clamp(portalDistance/Math.Max(8,2*Radius(s)),0,1));
-                yield return(index,t,roof-cover);
+                // Composition roof height never fades at a portal. Only the
+                // ground allowance and requested cover have transition ramps.
+                yield return(index,t,roof-cover-roofHeight);
             }
         }
     }

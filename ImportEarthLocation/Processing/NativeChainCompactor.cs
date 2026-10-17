@@ -20,6 +20,7 @@ public static class NativeChainCompactor
         void Add(int index,PreparedSegment s){foreach(var id in new[]{s.StartNodeId,s.EndNodeId}){var key=Key(s,id);if(!nodes.TryGetValue(key,out var set))nodes[key]=set=new HashSet<int>();set.Add(index);}}
         void Remove(int index,PreparedSegment s){nodes[Key(s,s.StartNodeId)].Remove(index);nodes[Key(s,s.EndNodeId)].Remove(index);}
         for(var i=0;i<work.Length;i++)Add(i,work[i]!);
+        var protectedAliases=new HashSet<SourceNodeKey>(source.SelectMany(s=>s.SourceNodeAliases.Where(a=>a.Mandatory).Select(a=>new SourceNodeKey(s.Kind,a.CanonicalNodeId))));
         // Process short joins first: insertion order can otherwise absorb a
         // short span into a long one and strand its other artificial junction
         // against the unchanged 400m fit bound.
@@ -53,8 +54,12 @@ public static class NativeChainCompactor
             if(Key(b,b.StartNodeId)!=key){if(b.OneWay)continue;b=NetworkNormalizer.Reverse(b);}
             if(!Compatible(a,b)){Reject("semantic-or-structure-boundary");continue;}
             if(a.StartNodeId==b.EndNodeId||!math.all(a.End==b.Start)||a.EndMiniRoundabout||b.StartMiniRoundabout||
-                a.EndTerminal||b.StartTerminal||a.EndRoundaboutRadius>0||b.StartRoundaboutRadius>0){Reject("loop-anchor-or-marker");continue;}
-            var candidate=Fit(a,b,out var reason);
+                a.EndTerminal||b.StartTerminal||a.EndRoundaboutRadius>0||b.StartRoundaboutRadius>0||protectedAliases.Contains(new(a.Kind,a.EndNodeId))){Reject("loop-anchor-or-marker");continue;}
+            var candidate=Fit(a,b,token,out var reason);
+            if(candidate!=null&&candidate.Kind==NetworkKind.Rail&&candidate.NativeCenterlineCurvatureLimit.HasValue&&
+                NetworkDesignChecks.Certify(new(candidate.CourseStart,candidate.CourseControl1,candidate.CourseControl2,candidate.CourseEnd),
+                    candidate.NativeCenterlineCurvatureLimit.Value,double.PositiveInfinity,token:token,maximumLeaves:4096).Quality!=DesignQuality.Certified)
+            {candidate=null;reason="native-train-curvature-contract";}
             if(candidate==null)
             {
                 Reject(reason);
@@ -68,7 +73,7 @@ public static class NativeChainCompactor
         }
         log.Count("Native artificial junctions compacted",merged);
         log.Diagnostic($"NATIVE CHAIN COMPACTION input={source.Count}; output={source.Count-merged}; artificialNodesRemoved={merged}; realBranchesPreserved=true; curveEvidenceRetained=true");
-        log.Diagnostic("NATIVE CHAIN REJECTIONS "+string.Join("; ",rejected.OrderBy(p=>p.Key).Select(p=>$"{p.Key}={p.Value}"))+"; countsAreCandidateVisits=true; boundedFitIterations=5; toleranceRelaxed=false");
+        log.Diagnostic("NATIVE CHAIN REJECTIONS "+string.Join("; ",rejected.OrderBy(p=>p.Key).Select(p=>$"{p.Key}={p.Value}"))+"; countsAreCandidateVisits=true; boundedTwoHandleFit=true; toleranceRelaxed=false");
         return work.Where(s=>s!=null).Select(s=>s!).ToArray();
     }
 
@@ -76,8 +81,8 @@ public static class NativeChainCompactor
         a.Bridge==b.Bridge&&a.Tunnel==b.Tunnel&&a.Kind==b.Kind&&a.Classification==b.Classification&&a.Roundabout==b.Roundabout&&
         a.OneWay==b.OneWay&&a.Lanes==b.Lanes&&a.Layer==b.Layer&&a.RailService==b.RailService&&a.PhysicalTracks==b.PhysicalTracks&&
         a.ForwardLanes==b.ForwardLanes&&a.BackwardLanes==b.BackwardLanes&&a.BothWaysLanes==b.BothWaysLanes&&
-        a.ExplicitIncline==b.ExplicitIncline&&a.SourceSpeedKph==b.SourceSpeedKph&&a.SourceWidthMeters==b.SourceWidthMeters&&
-        a.NativeWidth==b.NativeWidth&&a.NativeLaneOffsets.SequenceEqual(b.NativeLaneOffsets)&&
+        a.ExplicitIncline==b.ExplicitIncline&&a.SignedInclinePriorAccepted==b.SignedInclinePriorAccepted&&a.SourceSpeedKph==b.SourceSpeedKph&&a.SourceWidthMeters==b.SourceWidthMeters&&
+        a.NativeWidth==b.NativeWidth&&a.NativeAssetKey==b.NativeAssetKey&&a.NativeCenterlineCurvatureLimit==b.NativeCenterlineCurvatureLimit&&a.NativeLaneOffsets.SequenceEqual(b.NativeLaneOffsets)&&
         a.CorridorId==b.CorridorId&&a.ConsolidatedAvenue==b.ConsolidatedAvenue&&a.ExplicitCutSides==b.ExplicitCutSides&&
         a.ExplicitWallSides==b.ExplicitWallSides&&a.RetainingWallSides==b.RetainingWallSides&&a.Name==b.Name&&a.Reference==b.Reference&&
         math.all(a.StartCurveOffset==0)&&math.all(a.EndCurveOffset==0)&&math.all(b.StartCurveOffset==0)&&math.all(b.EndCurveOffset==0)&&
@@ -95,7 +100,7 @@ public static class NativeChainCompactor
         return true;
     }
 
-    private static PreparedSegment? Fit(PreparedSegment a,PreparedSegment b,out string reason)
+    private static PreparedSegment? Fit(PreparedSegment a,PreparedSegment b,CancellationToken token,out string reason)
     {
         reason="curve-span-bound";
         var points=new List<float3>();
@@ -113,55 +118,17 @@ public static class NativeChainCompactor
             MaximumNativeWidth=Math.Min(a.MaximumNativeWidth,b.MaximumNativeWidth),
             EndMiniRoundabout=b.EndMiniRoundabout,EndTerminal=b.EndTerminal,EndRoundaboutRadius=b.EndRoundaboutRadius,
             SourceWayIds=a.SourceWayIds.Concat(b.SourceWayIds).Concat(new[]{a.WayId,b.WayId}).Distinct().ToArray(),
-            SourceGeometry=reference,OriginalGeometry=original,HorizontalParent=null,ParentStartT=0,ParentEndT=1};
-        var parameters=lengths.Select(length=>length/total).ToArray();
-        // Arc length is only an initial parameter guess, not cubic time. Refine
-        // that guess rather than relax the geographic or old-curve tolerances.
-        // A fixed iteration count bounds work; outer tangent directions stay fixed.
-        for(var iteration=0;iteration<5;iteration++)
-        {
-            double aa=0,ab=0,bb=0,ar=0,br=0;
-            for(var i=1;i<points.Count-1;i++)
-            {
-                var t=parameters[i];var u=1-t;var x=3*u*u*t;var y=3*u*t*t;
-                var p=points[i].xz-((u*u*u+x)*a.Start.xz+(y+t*t*t)*b.End.xz);
-                var va=x*da;var vb=-y*db;aa+=math.dot(va,va);ab+=math.dot(va,vb);bb+=math.dot(vb,vb);ar+=math.dot(va,p);br+=math.dot(vb,p);
-            }
-            var determinant=aa*bb-ab*ab;reason="singular-handle-fit";
-            if(determinant<1e-9)
-            {
-                // Collinear tangents make the two-handle least-squares system
-                // singular, not the road invalid. Try the bounded chord fit.
-                var straight=template with{Control1=math.lerp(a.Start,b.End,1f/3),Control2=math.lerp(a.Start,b.End,2f/3)};
-                if(NetworkNormalizer.WithinTolerance(straight)&&NetworkNormalizer.WithinTolerance(straight with{SourceGeometry=points}))
-                { reason="accepted-collinear";return straight; }
-                return null;
-            }
-            var ha=(float)((ar*bb-br*ab)/determinant);var hb=(float)((br*aa-ar*ab)/determinant);
-            reason="handle-length-bound";
-            if(!math.isfinite(ha)||!math.isfinite(hb)||ha<0||hb<0||ha>total||hb>total)return null;
-            var c1=new float3(a.Start.x+da.x*ha,math.lerp(a.Start.y,b.End.y,1f/3),a.Start.z+da.y*ha);
-            var c2=new float3(b.End.x-db.x*hb,math.lerp(a.Start.y,b.End.y,2f/3),b.End.z-db.y*hb);
-            var candidate=template with{Control1=c1,Control2=c2};
-            // Accumulated reference prevents progressive fitting drift.
-            var rawValid=NetworkNormalizer.WithinTolerance(candidate);
-            var pairValid=NetworkNormalizer.WithinTolerance(candidate with{SourceGeometry=points});
-            if(rawValid&&pairValid){reason="accepted";return candidate;}
-            reason=!rawValid&&!pairValid?"raw-reference-and-pair-tolerance":!rawValid?"raw-reference-tolerance":"current-pair-tolerance";
-            for(var i=1;i<points.Count-1;i++)
-            {
-                var t=parameters[i];var u=1-t;var delta=(NetworkNormalizer.Evaluate(candidate,t)-points[i]).xz;
-                var derivative=(3*u*u*(c1-a.Start)+6*u*t*(c2-c1)+3*t*t*(b.End-c2)).xz;
-                var second=(6*u*(c2-2*c1+a.Start)+6*t*(b.End-2*c2+c1)).xz;
-                var denominator=math.dot(derivative,derivative)+math.dot(delta,second);
-                if(denominator>1e-6f)
-                {
-                    var next=math.clamp(t-math.dot(delta,derivative)/denominator,0,1);
-                    if(math.isfinite(next))parameters[i]=next;
-                }
-            }
-            for(var i=1;i<parameters.Length;i++)parameters[i]=math.max(parameters[i],parameters[i-1]);
-        }
-        return null;
+            SourceNodeAliases=a.SourceNodeAliases.Concat(b.SourceNodeAliases).Distinct().ToArray(),
+            SourceGeometry=reference,OriginalGeometry=original,FinalDeckCurve=null,HorizontalParent=null,ParentStartT=0,ParentEndT=1};
+        // Use the same physical-arc support and box-constrained reach policy as
+        // source spans and whole approaches. Compaction may not accumulate drift
+        // away from either the immutable source or the current pair of curves.
+        reason="bounded-source-fit";
+        if(!NetworkSourceFit.TryFit(points,a.CourseStart,b.CourseEnd,da,db,NetworkNormalizer.Tolerance(a.Kind),token,out var curve,out _))return null;
+        var candidate=template with{Control1=(float3)curve.P1,Control2=(float3)curve.P2,HorizontalEmissionReference=curve};
+        var rawValid=NetworkNormalizer.WithinTolerance(candidate);
+        var pairValid=NetworkNormalizer.WithinTolerance(candidate with{SourceGeometry=points});
+        reason=rawValid&&pairValid?"accepted":!rawValid&&!pairValid?"raw-reference-and-pair-tolerance":!rawValid?"raw-reference-tolerance":"current-pair-tolerance";
+        return rawValid&&pairValid?candidate:null;
     }
 }

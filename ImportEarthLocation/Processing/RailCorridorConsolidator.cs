@@ -21,6 +21,8 @@ public static class RailCorridorConsolidator
         public readonly Dictionary<int,List<(float t,long node,float3 point)>> Knots = new();
         public readonly List<(float lo,float hi)> PairedIntervals = new();
         public readonly List<(float lo,float hi,PreparedSegment source)> PairedSources = new();
+        public readonly HashSet<long> Nodes=new();
+        public readonly Dictionary<long,float> NodeStations=new();
     }
     private readonly struct Projection
     {
@@ -28,6 +30,35 @@ public static class RailCorridorConsolidator
         public readonly float T,Distance;
         public readonly float3 Point;
         public Projection(int edge,float t,float distance,float3 point){Edge=edge;T=t;Distance=distance;Point=point;}
+    }
+    internal static void ResolveJunctions(Dictionary<(int Layer,long Node),(long node,float3 point)> map)
+    {
+        var resolved=new Dictionary<(int,long),(long node,float3 point)>();
+        foreach(var key in map.Keys)
+        {
+            if(resolved.ContainsKey(key))continue;
+            var path=new List<long>();var positions=new Dictionary<long,int>();var current=key.Node;
+            (long node,float3 point) terminal;
+            while(true)
+            {
+                if(resolved.TryGetValue((key.Layer,current),out terminal))break;
+                if(positions.TryGetValue(current,out var cycleStart))
+                {
+                    // These identities have already been declared equivalent by
+                    // exact transfer operations. Pick one stable representative
+                    // and its existing point; never leave a different one per arm.
+                    var canonical=path.Skip(cycleStart).Min();
+                    terminal=map[(key.Layer,path.Skip(cycleStart).First(n=>map[(key.Layer,n)].node==canonical))];
+                    break;
+                }
+                positions[current]=path.Count;path.Add(current);
+                var next=map[(key.Layer,current)];
+                if(next.node==current||!map.ContainsKey((key.Layer,next.node))){terminal=next;break;}
+                current=next.node;
+            }
+            foreach(var node in path)resolved[(key.Layer,node)]=terminal;
+        }
+        foreach(var pair in resolved)map[pair.Key]=pair.Value;
     }
     public static IReadOnlyList<PreparedSegment> Prepare(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
     {
@@ -72,7 +103,7 @@ public static class RailCorridorConsolidator
             if(retained<0){result.Add(s);continue;}
             var kept=result[retained];
             var provenance=kept.SourceWayIds.Concat(s.SourceWayIds).Concat(new[]{kept.WayId,s.WayId}).Distinct().OrderBy(id=>id).ToArray();
-            result[retained]=kept with{SourceWayIds=provenance};merged++;
+            result[retained]=kept with{SourceWayIds=provenance,SourceNodeAliases=kept.SourceNodeAliases.Concat(s.SourceNodeAliases).Distinct().ToArray()};merged++;
             if(merged<=64)log.Diagnostic($"PROCESS exact-rail-demand retainedWay={kept.WayId}; equivalentWay={s.WayId}; rawTagsIdentical=true; originalGeometryIdentical=true; sourceNodesIdentical=true; provenanceCount={provenance.Length}; proximityMerge=false");
         }
         log.Count("Exact duplicate rail physical demands consolidated",merged);
@@ -88,6 +119,7 @@ public static class RailCorridorConsolidator
         if(groups.Length==0)return source;
         var axes=new List<Axis>();var grid=new Dictionary<(int,int),HashSet<int>>();
         var removed=new HashSet<PreparedSegment>();var map=new Dictionary<(int,long),(long node,float3 point)>();
+        var sourceJunctions=new Dictionary<long,(long node,float3 point)>();
         var protectedNodes=new HashSet<long>(source.Where(s=>s.Kind==NetworkKind.Road).SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));
         var ids=new HashSet<long>(source.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));long next=-7_800_000_000_000_000_000;
         long NewNode(){while(ids.Contains(next))next++;var id=next++;ids.Add(id);return id;}
@@ -117,6 +149,8 @@ public static class RailCorridorConsolidator
             for(var i=0;i<edges.Length;i++)
             {
                 var edge=edges[i];axis.LengthPrefix[i+1]=axis.LengthPrefix[i]+math.distance(edge.Start.xz,edge.End.xz);
+                axis.Nodes.Add(edge.StartNodeId);axis.Nodes.Add(edge.EndNodeId);
+                axis.NodeStations.TryAdd(edge.StartNodeId,axis.LengthPrefix[i]);axis.NodeStations.TryAdd(edge.EndNodeId,axis.LengthPrefix[i+1]);
                 axis.BreakPrefix[i+1]=axis.BreakPrefix[i]+(i>0&&edges[i-1].EndNodeId!=edge.StartNodeId?1:0);
                 foreach(var cell in Cells(edge))
                 {
@@ -160,18 +194,53 @@ public static class RailCorridorConsolidator
                     // not an arbitrary number of parallel routes. Allow disjoint
                     // continuation partners, but never fold a third overlapping track.
                     var intervalLo=Math.Min(aDistance,bDistance);var intervalHi=Math.Max(aDistance,bDistance);
+                    if(axis.PairedIntervals.Any(p=>intervalLo<p.hi-.05f&&intervalHi>p.lo+.05f))continue;
                     if(map.TryGetValue((edge.Layer,edge.StartNodeId),out var oldA)&&math.distance(oldA.point.xz,a.Point.xz)>.5f ||
                        map.TryGetValue((edge.Layer,edge.EndNodeId),out var oldB)&&math.distance(oldB.point.xz,b.Point.xz)>.5f)continue;
+                    // Layer changes do not give a shared OSM junction two
+                    // identities. Reuse its retained axis, or keep this span
+                    // distinct rather than publishing an ambiguous portal.
+                    if(sourceJunctions.TryGetValue(edge.StartNodeId,out var sharedA)&&
+                        (!axis.Nodes.Contains(sharedA.node)||math.distance(sharedA.point.xz,a.Point.xz)>.5f)||
+                       sourceJunctions.TryGetValue(edge.EndNodeId,out var sharedB)&&
+                        (!axis.Nodes.Contains(sharedB.node)||math.distance(sharedB.point.xz,b.Point.xz)>.5f))continue;
                     spans.Add((edge,a,b));length+=originalLength;distance+=(a.Distance+b.Distance)*.5f*originalLength;
                 }
+                // A connected source run must have one continuous, monotone
+                // station map. Independent nearest-edge projections can jump
+                // between nearby switch/loop legs even when every edge fits.
+                var ports=new Dictionary<long,List<(float Here,float Away)>>();
+                foreach(var span in spans)
+                {
+                    float Station(Projection p)=>axis.LengthPrefix[p.Edge]+p.T*(axis.LengthPrefix[p.Edge+1]-axis.LengthPrefix[p.Edge]);
+                    var a=Station(span.Item2);var b=Station(span.Item3);
+                    void Port(long node,float here,float away)
+                    {if(!ports.TryGetValue(node,out var list))ports[node]=list=new();list.Add((here,away));}
+                    Port(span.Item1.StartNodeId,a,b);Port(span.Item1.EndNodeId,b,a);
+                }
+                if(ports.Values.Any(p=>p.Max(v=>v.Here)-p.Min(v=>v.Here)>.5f||
+                    p.Count==2&&(p[0].Away-p[0].Here)*(p[1].Away-p[1].Here)>=0))continue;
                 // Fold even a short overlapping interval. Unique extensions are
                 // retained and reattached, not dropped because the whole way differs.
-                if(length>=40 && distance/length>=1.5f)options.Add((index,spans,length,distance/length));
+                // An abutment/tag boundary can split an otherwise identified
+                // rail route into a short pair. The usual 40 m overlap cannot
+                // be required there: it leaves two overlapping native double
+                // tracks at a shared junction. A shared canonical source junction and
+                // the same nonempty route ref supplement (never replace) all
+                // geometric, layer/mode and monotone projection checks above.
+                var connectedRoute=length>0&&retainedSource.Reference.Length>0&&retainedSource.Reference==candidateSource.Reference&&
+                    retainedSource.Classification==candidateSource.Classification&&retainedSource.RailService==candidateSource.RailService&&
+                    spans.Any(p=>axis.Nodes.Contains(p.Item1.StartNodeId)||axis.Nodes.Contains(p.Item1.EndNodeId));
+                if((length>=40||connectedRoute)&&length>0&&distance/length>=1.5f)options.Add((index,spans,length,distance/length));
             }
             var ranked=options.OrderByDescending(o=>o.length).ThenBy(o=>o.distance).ThenBy(o=>o.axis).ToArray();
             var best=ranked.FirstOrDefault();
             if(ranked.Length>1&&ranked[1].length>=best.length*.9f&&Math.Abs(ranked[1].distance-best.distance)<1f)
-                log.Count("Rail ambiguous axes resolved by retained corridor priority");
+            {
+                // Candidate ordering is not source evidence. Keep the distinct
+                // route rather than folding it into an arbitrary neighbouring fan.
+                log.Count("Rail ambiguous axes retained for source review");AddAxis(group);continue;
+            }
             if(best.spans==null){AddAxis(group);continue;}
             var retained=axes[best.axis];
             (long node,float3 point) Junction(Projection p)
@@ -184,13 +253,20 @@ public static class RailCorridorConsolidator
                 if(math.distance(p.Point.xz,edge.End.xz)<4f)return(edge.EndNodeId,edge.End);
                 if(!retained.Knots.TryGetValue(p.Edge,out var knots))retained.Knots[p.Edge]=knots=new List<(float,long,float3)>();
                 foreach(var knot in knots)if(math.distance(knot.point.xz,p.Point.xz)<4f)return(knot.node,knot.point);
-                var node=NewNode();knots.Add((p.T,node,p.Point));return(node,p.Point);
+                var node=NewNode();knots.Add((p.T,node,p.Point));retained.Nodes.Add(node);
+                retained.NodeStations[node]=retained.LengthPrefix[p.Edge]+p.T*(retained.LengthPrefix[p.Edge+1]-retained.LengthPrefix[p.Edge]);
+                return(node,p.Point);
             }
             foreach(var span in best.spans)
             {
-                map[(span.edge.Layer,span.edge.StartNodeId)]=Junction(span.a);map[(span.edge.Layer,span.edge.EndNodeId)]=Junction(span.b);removed.Add(span.edge);
+                var a=sourceJunctions.TryGetValue(span.edge.StartNodeId,out var existingA)?existingA:Junction(span.a);
+                var b=sourceJunctions.TryGetValue(span.edge.EndNodeId,out var existingB)?existingB:Junction(span.b);
+                sourceJunctions[span.edge.StartNodeId]=a;sourceJunctions[span.edge.EndNodeId]=b;
+                map[(span.edge.Layer,span.edge.StartNodeId)]=a;map[(span.edge.Layer,span.edge.EndNodeId)]=b;removed.Add(span.edge);
                 float Station(Projection p)=>retained.LengthPrefix[p.Edge]+p.T*(retained.LengthPrefix[p.Edge+1]-retained.LengthPrefix[p.Edge]);
-                var first=Station(span.a);var last=Station(span.b);retained.PairedIntervals.Add((Math.Min(first,last),Math.Max(first,last)));
+                var first=retained.NodeStations.TryGetValue(a.node,out var stationA)?stationA:Station(span.a);
+                var last=retained.NodeStations.TryGetValue(b.node,out var stationB)?stationB:Station(span.b);
+                retained.PairedIntervals.Add((Math.Min(first,last),Math.Max(first,last)));
                 retained.PairedSources.Add((Math.Min(first,last),Math.Max(first,last),span.edge));
             }
             // Unique extensions remain and are later reattached to the retained axis.
@@ -205,21 +281,36 @@ public static class RailCorridorConsolidator
             replacements[e]=pieces;
         }
         var output=new List<PreparedSegment>();var reconnected=0;
+        // A transferred junction may itself be transferred by a later source
+        // group in this pass. Geometry and provenance must consume the same
+        // terminal identity, rather than geometry taking one hop while aliases
+        // follow the complete remapping chain.
+        ResolveJunctions(map);
         var pairedAxes=axes.Where(a=>a.PairedIntervals.Count>0).SelectMany(a=>a.Edges.Select(e=>(e.WayId,axis:a))).GroupBy(p=>p.WayId).ToDictionary(g=>g.Key,g=>g.Select(p=>p.axis).Distinct().ToArray());
         // Portal ways commonly change layer tags. A source node shared across that
         // transition must follow its unique canonical junction, not the old axis.
         var portalMap=map.GroupBy(p=>p.Key.Item2).Where(g=>g.Select(p=>p.Value.node).Distinct().Count()==1)
             .ToDictionary(g=>g.Key,g=>g.First().Value);
+        // OSM source identity is shared across a layer/tag boundary. Resolve
+        // unique portal transfers together too: two individually acyclic layer
+        // maps can otherwise form an A->B, B->A cycle at that boundary.
+        var portalTransfers=portalMap.ToDictionary(p=>(0,p.Key),p=>p.Value);
+        ResolveJunctions(portalTransfers);
+        foreach(var entry in portalTransfers)portalMap[entry.Key.Item2]=entry.Value;
+        foreach(var key in map.Keys.ToArray())
+        {
+            if(portalMap.TryGetValue(key.Item2,out var canonical))map[key]=canonical;
+            else if(portalMap.TryGetValue(map[key].node,out canonical))map[key]=canonical;
+        }
         foreach(var edge in source)
         {
             token.ThrowIfCancellationRequested();if(removed.Contains(edge))continue;
             foreach(var original in replacements.TryGetValue(edge,out var pieces)?(IEnumerable<PreparedSegment>)pieces:new[]{edge})
             {
-                var paired=original.Kind==NetworkKind.Rail&&axisFor(original);
+                var absorbed=original.Kind==NetworkKind.Rail?AbsorbedSources(original).Distinct().ToArray():Array.Empty<PreparedSegment>();
                 var s=original.Kind==NetworkKind.Rail?original with{Lanes=2,PhysicalTracks=2,OneWay=false,ExplicitWallSides=NetworkSides.None,RetainingWallSides=NetworkSides.None}:original;
-                if(paired&&pairedAxes.TryGetValue(original.WayId,out var owners))
+                if(absorbed.Length>0)
                 {
-                    var absorbed=owners.SelectMany(axis=>axis.PairedSources.Where(p=>NetworkNormalizer.DistanceToSegment((s.Start+s.End)*.5f,p.source.Start,p.source.End)<=CorridorDistance+1).Select(p=>p.source)).ToArray();
                     s=s with{SourceWayIds=new[]{s}.Concat(absorbed).SelectMany(p=>p.SourceWayIds.Count>0?p.SourceWayIds:new[]{p.WayId}).Distinct().ToArray(),
                         OriginalGeometry=new[]{s}.Concat(absorbed).SelectMany(p=>p.OriginalGeometry).ToArray()};
                 }
@@ -235,12 +326,13 @@ public static class RailCorridorConsolidator
         }
         log.Count("Rail parallel spans consolidated",removed.Count);
         log.Diagnostic($"RAIL TOTAL waysConsolidated={merged}; spansConsolidated={removed.Count}; endpointsReconnected={reconnected}; corridorDistanceMeters={CorridorDistance}; outputRailSpans={output.Count(s=>s.Kind==NetworkKind.Rail)}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.###}; bridgeTunnelSeparationPreserved=true; differentLayersPreserved=true; oneSegmentPerAxis=true; yardBranchesPrunedByBackbone=true");
-        return RailJunctionRepair.Prepare(output,log,token);
+        var aliased=SourceTopologyObligations.Transfer(source,output,NetworkKind.Rail,portalMap.ToDictionary(p=>p.Key,p=>p.Value.node));
+        return RailJunctionRepair.Prepare(aliased,log,token);
 
-        bool axisFor(PreparedSegment section)
+        IEnumerable<PreparedSegment> AbsorbedSources(PreparedSegment section)
         {
             // Only intervals which actually absorbed a second physical track are doubled.
-            if(!pairedAxes.TryGetValue(section.WayId,out var owners))return false;
+            if(!pairedAxes.TryGetValue(section.WayId,out var owners))yield break;
             foreach(var axis in owners)
             {
                 if(axis.PairedIntervals.Count==0)continue;
@@ -251,10 +343,10 @@ public static class RailCorridorConsolidator
                     var mid=(section.Start.xz+section.End.xz)*.5f;
                     var t=math.dot(mid-e.Start.xz,delta)/sq;if(t<0||t>1||math.distance(mid,math.lerp(e.Start.xz,e.End.xz,t))>.1f)continue;
                     var station=math.lerp(axis.LengthPrefix[i],axis.LengthPrefix[i+1],t);
-                    if(axis.PairedIntervals.Any(p=>station>=p.lo&&station<=p.hi))return true;
+                    foreach(var interval in axis.PairedSources)
+                        if(station>=interval.lo&&station<=interval.hi)yield return interval.source;
                 }
             }
-            return false;
         }
     }
 }

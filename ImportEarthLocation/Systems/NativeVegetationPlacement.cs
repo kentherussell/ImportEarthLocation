@@ -74,11 +74,13 @@ public sealed class NativeVegetationPlacement
     private readonly int[] _assetCounts;
     private readonly int[] _formCounts=new int[4];
     private readonly EntityArchetype _archetype;
+    private readonly Func<float3,bool>? _localRoadExclusion;
     private readonly List<Entity> _definitions=new(8192);
     private readonly IReadOnlyList<Entity> _view;
-    public NativeVegetationPlacement(EntityManager manager,StockPrefab[] catalog,ImportLog log)
+    public NativeVegetationPlacement(EntityManager manager,StockPrefab[] catalog,ImportLog log,Func<float3,bool>? localRoadExclusion=null)
     {
         _manager=manager;_log=log;_epoch=new ImportEpoch(ImportSession.Map,ImportSession.Generation,manager.World.SequenceNumber);
+        _localRoadExclusion=localRoadExclusion;
         _catalog=(StockPrefab[])catalog.Clone();_valid=new bool[catalog.Length];_assetCounts=new int[catalog.Length];_view=_definitions.AsReadOnly();
         for(var form=0;form<4;form++)
         {
@@ -120,6 +122,8 @@ public sealed class NativeVegetationPlacement
             {
                 var candidate=points[start+offset];var point=candidate.Position;var seed=candidate.Seed;
                 if(!math.all(math.isfinite(point))){_manager.DestroyEntity(entity);nonfinite++;continue;}
+                if(_localRoadExclusion?.Invoke(point)==true)
+                {_manager.DestroyEntity(entity);_log.Count("Vegetation excluded by revised road footprint");continue;}
                 var form=(int)candidate.Form;
                 if(form<0||form>=4){_manager.DestroyEntity(entity);failures++;continue;}
                 var palette=_palettes[form];
@@ -155,6 +159,7 @@ public sealed class NativeVegetationPlacement
         if(nonfinite>0)_log.Count("Vegetation invalid coordinates omitted",nonfinite);
         if(retired>0)_log.Count("Vegetation retired prefabs omitted",retired);
         if(failures>0){_log.Count("Trees skipped",failures);_log.Count("Vegetation definition failures",failures);}
+        NetworkCommitSystem.DescribeFoliageDefinitions(count,_definitions.Count);
         if(_log.DiagnosticsEnabled)_log.Diagnostic($"VEGETATION ALLOCATION requested={count}; definitions={_definitions.Count}; bulkArchetypeAllocation=true; nativeInitializationPreserved=true; catalogCached=true");
         if(_definitions.Count==0)NetworkCommitSystem.ReleaseEmptyDefinitions(_manager);
         return _view; // Remains unchanged until settlement and the next CreateBatch.

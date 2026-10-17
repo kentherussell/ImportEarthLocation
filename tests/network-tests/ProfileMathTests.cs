@@ -15,6 +15,32 @@ static class ProfileMathTests
     }
     public static void Run()
     {
+        ProfileReplay.SelfTest();
+        var chunked=new SparseProfileRows(8);var expectedObjective=0d;var expectedGradient=new double[8];
+        var chunkPoint=Enumerable.Range(0,8).Select(i=>i*.7).ToArray();
+        for(var r=0;r<9000;r++)
+        {
+            var count=1+r%8;var ii=Enumerable.Range(0,count).ToArray();var aa=ii.Select(j=>(j+1)*.13).ToArray();
+            var target=r%11-5d;var weight=1+(r%3)*.2;var kind=r%2==0?ProfileRowKind.EqualityCost:ProfileRowKind.UpperHingeCost;
+            chunked.Append(ii,aa,count,target,weight,kind);
+            var residual=-target;for(var j=0;j<count;j++)residual+=aa[j]*chunkPoint[j];
+            if(kind==ProfileRowKind.UpperHingeCost)residual=Math.Max(0,residual);
+            expectedObjective+=.5*weight*residual*residual;
+            for(var j=0;j<count;j++)expectedGradient[j]+=weight*residual*aa[j];
+        }
+        chunked.Freeze();var chunkGradient=new double[8];
+        Close(chunked.Evaluate(chunkPoint,chunkGradient,default),expectedObjective,0,"Chunk-local objective changed accumulation");
+        for(var j=0;j<8;j++)Close(chunkGradient[j],expectedGradient[j],0,"Chunk boundary gradient changed accumulation");
+        var metric=Enumerable.Range(0,8).Select(i=>1d+i*.3).ToArray();var numerator=0d;var denominator=0d;
+        for(var j=0;j<8;j++)denominator+=chunkGradient[j]*(chunkGradient[j]/metric[j]);
+        for(long r=0;r<chunked.Count;r++)
+        {
+            var row=chunked.Row(r);var directional=0d;
+            for(var j=0;j<row.Count;j++){var v=chunked.Index(row.Offset+j);directional+=chunked.Coefficient(row.Offset+j)*(chunkGradient[v]/metric[v]);}
+            numerator+=row.Weight*directional*directional;
+        }
+        Close(chunked.DirectionalLipschitz(chunkGradient,metric,double.MaxValue,new double[8],default),1.01*(numerator/denominator),0,
+            "Chunk-local directional curvature changed arithmetic across sparse chunk boundaries");
         var rows=new SparseProfileRows(3);
         rows.Append(new[]{0,1,0},new[]{1d,2d,3d},3,5,2,ProfileRowKind.EqualityCost);
         rows.Append(new[]{1,2},new[]{2d,-1d},2,1,3,ProfileRowKind.UpperHingeCost);
@@ -92,5 +118,9 @@ static class ProfileMathTests
             (Math.Abs(stiffResult.Heights[0]-optimum)<.0005&&Math.Abs(stiffResult.Heights[1]-optimum)<.0005),
             "The prescribed stopping criteria declare convergence far from the independently known optimum under poor conditioning.");
         Console.WriteLine("PASS V-PROFILE poor-conditioning analytical convergence check.");
+        var trace=new List<string>();
+        var traced=NetworkProfileSolve.SolveComponent(stiff,new[]{0d,0d},new ProfileHardProjector(2,20,Array.Empty<ProfileStar>()),diagnostic:trace.Add);
+        Check(trace.Any(s=>s.Contains("conditioning-start"))&&trace.Any(s=>s.Contains("conditioning-complete"))&&trace.Any(s=>s.Contains("component-complete")),"Profile diagnostic stage evidence missing");
+        Check(traced.Report==stiffResult.Report&&traced.Heights.SequenceEqual(stiffResult.Heights),"Diagnostic callback changed profile mathematical result");
     }
 }

@@ -15,6 +15,7 @@ public static class NetworkOverlapConsolidator
     {
         var removed=new HashSet<int>();var tails=new Dictionary<int,List<PreparedSegment>>();
         var knots=new Dictionary<int,List<(float t,long id,float3 point)>>();var remap=new Dictionary<long,(long id,float3 point)>();
+        var absorbed=new Dictionary<int,List<(float Begin,float End,PreparedSegment Source)>>();
         var ids=new HashSet<long>(source.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));var next=long.MinValue+7000000;
         long Id(){while(ids.Contains(next))next++;var id=next++;ids.Add(id);return id;}
         (long id,float3 point) Knot(int index,float t)
@@ -49,6 +50,8 @@ public static class NetworkOverlapConsolidator
                     else remap[s.StartNodeId]=first;
                     if(endT<.999f)unique.Add(s with{StartNodeId=last.id,Start=last.point,Control1=null,Control2=null,SourceGeometry=new[]{last.point,s.End}});
                     else remap[s.EndNodeId]=last;
+                    if(!absorbed.TryGetValue(index,out var aliases))absorbed[index]=aliases=new();
+                    aliases.Add((lo,hi,s));
                     tails[entry.i]=unique;removed.Add(entry.i);overlaps++;handled=true;break;
                 }
                 if(!handled)retained.Add(entry.i);
@@ -71,6 +74,13 @@ public static class NetworkOverlapConsolidator
             foreach(var piece in pieces)
             {
                 var p=piece;
+                if(absorbed.TryGetValue(i,out var aliases))
+                {
+                    var direction=s.End.xz-s.Start.xz;var square=math.lengthsq(direction);
+                    var station=square>0?math.dot((p.Start.xz+p.End.xz)/2-s.Start.xz,direction)/square:0;
+                    var represented=aliases.Where(a=>station>=a.Begin&&station<=a.End).Select(a=>a.Source).ToArray();
+                    p=p with{SourceWayIds=new[]{p}.Concat(represented).SelectMany(e=>e.SourceWayIds.Count>0?e.SourceWayIds:new[]{e.WayId}).Distinct().ToArray()};
+                }
                 if(p.Kind==NetworkKind.Road)
                 {
                     if(remap.TryGetValue(p.StartNodeId,out var a))p=p with{StartNodeId=a.id,Start=a.point,Control1=null};
@@ -81,6 +91,6 @@ public static class NetworkOverlapConsolidator
         }
         log.Count("Highway coincident intervals consolidated",overlaps);
         log.Diagnostic($"HIGHWAY INTERVALS overlappingIntervalsConsolidated={overlaps}; uniqueExtensionsRetained=true; incidentNodesTransferred={remap.Count}; oppositeCarriagewaysPreserved=true; rawCenterToleranceMeters=1.5; generationGates=false");
-        return output;
+        return SourceTopologyObligations.Transfer(source,output,NetworkKind.Road,remap.ToDictionary(p=>p.Key,p=>p.Value.id));
     }
 }

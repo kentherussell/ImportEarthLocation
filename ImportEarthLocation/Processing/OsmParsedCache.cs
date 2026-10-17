@@ -33,15 +33,7 @@ public static class OsmParsedCache
             if (File.Exists(path))
             {
                 var envelope = File.ReadAllBytes(path);
-                token.ThrowIfCancellationRequested();
-                if (envelope.Length < 48) throw new InvalidDataException("Truncated parsed cache.");
-                using var sha = SHA256.Create();
-                if (!sha.ComputeHash(envelope, 32, envelope.Length - 32).SequenceEqual(envelope.Take(32)))
-                    throw new InvalidDataException("Parsed cache checksum mismatch.");
-                using var stream = new MemoryStream(envelope, 32, envelope.Length - 32, writable: false);
-                using var reader = new BinaryReader(stream);
-                var result = Read(reader, token);
-                if (stream.Position != stream.Length) throw new InvalidDataException("Trailing parsed cache data.");
+                var result = ReadEnvelope(envelope,token);
                 log.Count("Parsed OSM cache hits");
                 log.Count("Malformed OSM features skipped", result.MalformedFeaturesSkipped);
                 log.Info($"Parsed OSM cache hit: {result.Nodes.Count:N0} nodes, {result.Ways.Count:N0} ways, {result.Relations.Count:N0} relations in {clock.Elapsed.TotalSeconds:0.###}s.");
@@ -110,6 +102,20 @@ public static class OsmParsedCache
 
     private static void WriteTags(BinaryWriter writer, IReadOnlyDictionary<string, string> tags)
     { writer.Write(tags.Count); foreach (var tag in tags) { writer.Write(tag.Key); writer.Write(tag.Value); } }
+
+    // Read-only snapshot entry for deterministic offline processing. It shares
+    // exactly the live cache validation/decoder and never downloads or writes.
+    internal static OsmDataset LoadSnapshot(string path,CancellationToken token)
+        =>ReadEnvelope(File.ReadAllBytes(path),token);
+    private static OsmDataset ReadEnvelope(byte[] envelope,CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if(envelope.Length<48)throw new InvalidDataException("Truncated parsed cache.");
+        using var sha=SHA256.Create();
+        if(!sha.ComputeHash(envelope,32,envelope.Length-32).SequenceEqual(envelope.Take(32)))throw new InvalidDataException("Parsed cache checksum mismatch.");
+        using var stream=new MemoryStream(envelope,32,envelope.Length-32,writable:false);using var reader=new BinaryReader(stream);
+        var result=Read(reader,token);if(stream.Position!=stream.Length)throw new InvalidDataException("Trailing parsed cache data.");return result;
+    }
 
     private static int Count(BinaryReader reader, int minimumBytes)
     {

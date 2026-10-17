@@ -17,6 +17,8 @@
     <Compile Include="..\..\ImportEarthLocation\Geo\GeoMath.cs" Link="GeoMath.cs" />
     <Compile Include="..\..\ImportEarthLocation\Processing\NetworkProcessor.cs" Link="NetworkProcessor.cs" />
     <Compile Include="..\..\ImportEarthLocation\Processing\NetworkNormalizer.cs" Link="NetworkNormalizer.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkSourceFit.cs" Link="NetworkSourceFit.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkDesignChecks.cs" Link="NetworkDesignChecks.cs" />
     <Compile Include="..\..\ImportEarthLocation\Processing\OsmParser.cs" Link="OsmParser.cs" />
     <Compile Include="..\..\ImportEarthLocation\Processing\OsmParsedCache.cs" Link="OsmParsedCache.cs" />
     <Compile Include="..\..\ImportEarthLocation\Processing\ForestProcessor.cs" Link="ForestProcessor.cs" />

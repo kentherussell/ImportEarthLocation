@@ -9,6 +9,73 @@ namespace ImportEarthLocation.Processing;
 
 public static class NetworkRoadbed
 {
+    public sealed record Patch(int X,int Z,int Width,int Height,ushort[] Samples,int Resolution,double MapWidth)
+    {
+        public float2 Minimum=>new((float)((X/(double)(Resolution-1)-.5)*MapWidth),(float)((Z/(double)(Resolution-1)-.5)*MapWidth));
+        public float2 Maximum=>new((float)(((X+Width-1)/(double)(Resolution-1)-.5)*MapWidth),(float)(((Z+Height-1)/(double)(Resolution-1)-.5)*MapWidth));
+        public double Encoded(double x,double z)=>TerrainSampling.Encoded(Samples,Width,Height,
+            (x-Minimum.x)/Math.Max(1e-8,Maximum.x-Minimum.x),(z-Minimum.y)/Math.Max(1e-8,Maximum.y-Minimum.y));
+        public void CopyTo(ushort[] destination)
+        {for(var z=0;z<Height;z++)Array.Copy(Samples,z*Width,destination,(Z+z)*Resolution+X,Width);}
+    }
+
+    public static Patch BuildLocalPatch(PreparedImport prepared,ushort[] current,IReadOnlyList<PreparedSegment> plan,int start,
+        IReadOnlyList<PreparedSegment> revision,ImportLog log,CancellationToken token)
+    {
+        var baseline=prepared.RoadbedBaseline;var n=TerrainSampling.Resolution(baseline);
+        if(current.Length!=baseline.Length||n<2)throw new InvalidOperationException("Local roadbed baseline is unavailable.");
+        var lo=new float2(float.PositiveInfinity);var hi=new float2(float.NegativeInfinity);
+        foreach(var s in plan.Skip(start).Take(revision.Count).Concat(revision))
+            foreach(var p in new[]{s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd}){lo=math.min(lo,p.xz);hi=math.max(hi,p.xz);}
+        var width=prepared.Request.MapSize.WidthMeters;var cell=width/(n-1);var margin=240+revision.Max(s=>s.NativeWidth)+2*cell;
+        lo-=new float2((float)margin);hi+=new float2((float)margin);
+        int Pixel(double x)=>(int)math.clamp(Math.Floor((x/width+.5)*(n-1)),0,n-1);
+        var region=new int4(Pixel(lo.x),Pixel(lo.y),Math.Min(n-1,Pixel(hi.x)+1),Math.Min(n-1,Pixel(hi.y)+1));
+        var all=plan.ToArray();for(var i=0;i<revision.Count;i++)all[start+i]=revision[i];
+        bool Nearby(PreparedSegment s)
+        {
+            var min=math.min(math.min(s.CourseStart.xz,s.CourseControl1.xz),math.min(s.CourseControl2.xz,s.CourseEnd.xz));
+            var max=math.max(math.max(s.CourseStart.xz,s.CourseControl1.xz),math.max(s.CourseControl2.xz,s.CourseEnd.xz));
+            var reach=240+Math.Max(0,s.NativeWidth)+2*cell;
+            return math.all(max>=lo-(float)reach)&&math.all(min<=hi+(float)reach);
+        }
+        var neighbours=all.Where(Nearby).ToArray();
+        var rebuilt=Prepare(baseline,prepared.HeightScaleMeters,width,neighbours,prepared.RoadbedProtectedAreas,prepared.RoadbedProtectedLines,log,token,region);
+        var issued=all.Take(start).Where(s=>!NetworkStructure.IsStructure(s)&&Nearby(s)).ToArray();
+        var w=region.z-region.x+1;var h=region.w-region.y+1;var samples=new ushort[w*h];var preserved=0;
+        var protectedCores=new bool[w*h];
+        foreach(var s in issued)
+        {
+            var steps=Math.Max(1,(int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(s)/Math.Max(1,cell*.5)));
+            var radius=s.NativeWidth/2+cell;var previous=NetworkNormalizer.Evaluate(s,0);
+            for(var step=1;step<=steps;step++)
+            {
+                token.ThrowIfCancellationRequested();var next=NetworkNormalizer.Evaluate(s,step/(float)steps);
+                var low=math.min(previous.xz,next.xz)-(float)radius;var high=math.max(previous.xz,next.xz)+(float)radius;
+                for(var z=Math.Max(region.y,Pixel(low.y));z<=Math.Min(region.w,Pixel(high.y)+1);z++)
+                    for(var x=Math.Max(region.x,Pixel(low.x));x<=Math.Min(region.z,Pixel(high.x)+1);x++)
+                    {
+                        var point=new float3((float)((x/(double)(n-1)-.5)*width),0,(float)((z/(double)(n-1)-.5)*width));
+                        if(NetworkNormalizer.DistanceToSegment(point,previous,next)<=radius)protectedCores[(z-region.y)*w+x-region.x]=true;
+                    }
+                previous=next;
+            }
+        }
+        for(var z=0;z<h;z++)for(var x=0;x<w;x++)
+        {
+            token.ThrowIfCancellationRequested();var gx=region.x+x;var gz=region.y+z;var id=gz*n+gx;
+            // Preserve already-issued ground cores, including an interpolation
+            // cell of support. A local retry owns only its unissued support.
+            var edits=prepared.RoadbedLaterEdits;
+            var protectedCore=protectedCores[z*w+x]||edits?.Mask.Length==current.Length&&edits.Mask[id]!=0;
+            samples[z*w+x]=protectedCore?current[id]:rebuilt[id];if(protectedCore)preserved++;
+        }
+        log.Diagnostic($"LOCAL ROADBED staged samples={samples.Length}; neighbourSections={neighbours.Length}; issuedCoreSamplesPreserved={preserved}; baselineImmutable=true; nativeMutation=false");
+        var patch=new Patch(region.x,region.y,w,h,samples,n,width);
+        patch.CopyTo(rebuilt);
+        NetworkTerrainSupport.Validate(revision,rebuilt,prepared.HeightScaleMeters,width,log,token,scope:$"native-unit-{revision[0].NativeUnitId}");
+        return patch;
+    }
     public static ushort[] Refresh(ushort[] baseline,ushort[] previousRoadbed,ushort[] finalRaster,float scale,double width,
         IReadOnlyList<PreparedSegment> previousProfiles,IReadOnlyList<PreparedSegment> finalProfiles,
         IEnumerable<float3[]> protectedAreas,IEnumerable<float3[]> protectedLines,ImportLog log,CancellationToken token,TerrainEditSet? laterEdits=null)
@@ -40,18 +107,18 @@ public static class NetworkRoadbed
 
     // Work on a copy. Structural spans never become broad terrain embankments.
     public static ushort[] Prepare(ushort[] source,float scale,double width,IReadOnlyList<PreparedSegment> segments,
-        IEnumerable<float3[]> protectedAreas,IEnumerable<float3[]> protectedLines,ImportLog log,CancellationToken token)
+        IEnumerable<float3[]> protectedAreas,IEnumerable<float3[]> protectedLines,ImportLog log,CancellationToken token,int4? dirtyRegion=null)
     {
         var n=(int)Math.Sqrt(source.Length);if(n*n!=source.Length||n<2||width<=0||scale<=0)throw new InvalidOperationException("Invalid roadbed terrain.");
-        var cell=(float)(width/(n-1));var protectedMask=new bool[source.Length];
+        var cell=(float)(width/(n-1));var protectedMask=new bool[source.Length];var region=dirtyRegion??new int4(0,0,n-1,n-1);
         var coordinates=new float[n];for(var i=0;i<n;i++)coordinates[i]=(i/(float)(n-1)-.5f)*(float)width;
         int Pixel(float value)=>(int)Math.Round((value/width+.5)*(n-1));
         void Guard(float3 a,float3 b,float margin)
         {
             var lo=math.min(a.xz,b.xz)-margin;var hi=math.max(a.xz,b.xz)+margin;
             var delta=b.xz-a.xz;var denominator=Math.Max(.001f,math.lengthsq(delta));
-            for(var z=Math.Max(0,Pixel(lo.y));z<=Math.Min(n-1,Pixel(hi.y));z++)
-                for(var x=Math.Max(0,Pixel(lo.x));x<=Math.Min(n-1,Pixel(hi.x));x++)
+            for(var z=Math.Max(region.y,Pixel(lo.y));z<=Math.Min(region.w,Pixel(hi.y));z++)
+                for(var x=Math.Max(region.x,Pixel(lo.x));x<=Math.Min(region.z,Pixel(hi.x));x++)
                 {
                     var p=new float2(coordinates[x],coordinates[z]);
                     var t=math.clamp(math.dot(p-a.xz,delta)/denominator,0,1);
@@ -65,11 +132,11 @@ public static class NetworkRoadbed
         {
             token.ThrowIfCancellationRequested();if(ring.Length<3)continue;
             var crossings=new List<float>(ring.Length);
-            for(var z=Math.Max(0,Pixel(ring.Min(p=>p.z)));z<=Math.Min(n-1,Pixel(ring.Max(p=>p.z)));z++)
+            for(var z=Math.Max(region.y,Pixel(ring.Min(p=>p.z)));z<=Math.Min(region.w,Pixel(ring.Max(p=>p.z)));z++)
             {
                 token.ThrowIfCancellationRequested();var y=coordinates[z];crossings.Clear();
                 for(var i=0;i<ring.Length;i++){var a=ring[i];var b=ring[(i+1)%ring.Length];if((a.z>y)==(b.z>y))continue;crossings.Add(a.x+(y-a.z)*(b.x-a.x)/(b.z-a.z));}
-                crossings.Sort();for(var i=1;i<crossings.Count;i+=2)for(var x=Math.Max(0,Pixel(crossings[i-1]));x<=Math.Min(n-1,Pixel(crossings[i]));x++)protectedMask[z*n+x]=true;
+                crossings.Sort();for(var i=1;i<crossings.Count;i+=2)for(var x=Math.Max(region.x,Pixel(crossings[i-1]));x<=Math.Min(region.z,Pixel(crossings[i]));x++)protectedMask[z*n+x]=true;
             }
             for(var i=0;i<ring.Length;i++)Guard(ring[i],ring[(i+1)%ring.Length],cell);
         }
@@ -84,7 +151,58 @@ public static class NetworkRoadbed
             for(var i=1;i<=steps;i++){token.ThrowIfCancellationRequested();var next=NetworkNormalizer.Evaluate(tunnel,i/(float)steps);Guard(previous,next,margin);previous=next;}
         }
         var targets=new Dictionary<int,(float target,float budget,float blend,float distance)>();var protectedSamples=0;var beyondBudget=0;var clock=System.Diagnostics.Stopwatch.StartNew();var nextProgress=5d;var processed=0;
-        foreach(var s in segments.Where(s=>!NetworkStructure.IsStructure(s)))
+        // A shared ground profile owns one formation, including its
+        // median. Do not let two nearest-road stamps independently select the
+        // elevation across that same cross-section. Mixed structural modes and
+        // explicit walls keep their separate footprints.
+        var formations=new List<PreparedSegment>();var consumed=new HashSet<PreparedSegment>();var sharedFormations=0;
+        var mixedFormations=0;var incompatibleFormations=0;
+        // Unit subdivision retains the parent profile ID. Match its actual
+        // reference interval too; the micrometre key absorbs arithmetic noise
+        // in exact subdivision, without moving any geometry or terrain sample.
+        foreach(var group in segments.Where(s=>s.PairedProfileId!=0).GroupBy(s=>(s.PairedProfileId,
+            Begin:Math.Round(Math.Min(s.PairedReferenceBegin,s.PairedReferenceEnd),6),
+            End:Math.Round(Math.Max(s.PairedReferenceBegin,s.PairedReferenceEnd),6))))
+        {
+            token.ThrowIfCancellationRequested();var pair=group.ToArray();
+            if(pair.Length!=2||pair[0].PairedReversed==pair[1].PairedReversed)continue;
+            if(pair.Any(s=>s.ExplicitWallSides!=0||s.QuaySides!=0))continue;
+            var grounds=pair.Where(s=>!NetworkStructure.IsStructure(s)).ToArray();if(grounds.Length==0)continue;
+            var mixed=grounds.Length==1;var a=mixed?grounds[0]:pair[0];var b=ReferenceEquals(a,pair[0])?pair[1]:pair[0];
+            var aa=new[]{a.CourseStart,a.CourseControl1,a.CourseControl2,a.CourseEnd};
+            var bb=new[]{b.CourseEnd,b.CourseControl2,b.CourseControl1,b.CourseStart};
+            if(Enumerable.Range(0,4).Any(i=>Math.Abs(aa[i].y-bb[i].y)>.01f)){incompatibleFormations++;continue;}
+            var gap=Enumerable.Range(0,4).Max(i=>math.distance(aa[i].xz,bb[i].xz));
+            var center=Enumerable.Range(0,4).Select(i=>
+            {
+                if(!mixed)return(aa[i]+bb[i])*.5f;
+                var separation=math.distance(aa[i].xz,bb[i].xz);
+                // Ground outer edge to common median bisector. Do not build a
+                // full ground platform underneath the structural carriageway.
+                var fraction=separation>a.NativeWidth?(1-a.NativeWidth/separation)/4:0;
+                return math.lerp(aa[i],bb[i],fraction);
+            }).ToArray();
+            formations.Add(a with{Start=center[0],Control1=center[1],Control2=center[2],End=center[3],
+                StartCurveOffset=default,EndCurveOffset=default,FinalDeckCurve=new(center[0],center[1],center[2],center[3]),
+                HorizontalParent=null,NativeWidth=mixed?Math.Max(a.NativeWidth,(gap+a.NativeWidth)/2):gap+Math.Max(a.NativeWidth,b.NativeWidth)});
+            consumed.Add(a);
+            if(!mixed){consumed.Add(b);sharedFormations++;}
+            else
+            {
+                mixedFormations++;
+                // The interpolation footprint is protected too. A coarse grid
+                // may consequently fail ground support; retain that conflict
+                // rather than bury a bridge or cut a tunnel roof to hide it.
+                var steps=Math.Max(1,(int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(b)/Math.Max(1,cell*.5)));
+                var previous=NetworkNormalizer.Evaluate(b,0);
+                for(var step=1;step<=steps;step++){var next=NetworkNormalizer.Evaluate(b,step/(float)steps);Guard(previous,next,b.NativeWidth/2+cell);previous=next;}
+            }
+        }
+        formations.AddRange(segments.Where(s=>!consumed.Contains(s)&&!NetworkStructure.IsStructure(s)));
+        log.Quality(new("planned","mixed-mode-formation","roadbed",mixedFormations+incompatibleFormations,0,incompatibleFormations,0,0,
+            "Trusted common profile; ground/median half-formation only; structural interpolation support protected; actual raster support checked separately"));
+        log.Diagnostic($"ROADBED FORMATIONS sharedGroundProfiles={sharedFormations}; sharedMixedModeHalfFormations={mixedFormations}; incompatibleProfiles={incompatibleFormations}; structuralFootprintsProtected=true; explicitWallsRetainedSeparately=true; profileHeightsNotReoptimized=true");
+        foreach(var s in formations)
         {
             token.ThrowIfCancellationRequested();processed++;
             var budget=NetworkVerticalProfiles.CutFillBudget(s);
@@ -106,7 +224,7 @@ public static class NetworkRoadbed
                 var radius=half+earthBlend;var reach=(int)Math.Ceiling(radius/cell);
                 var tangent=math.normalizesafe((NetworkNormalizer.Evaluate(s,Math.Min(1,t+.01f))-NetworkNormalizer.Evaluate(s,Math.Max(0,t-.01f))).xz);
                 var leftNormal=new float2(-tangent.y,tangent.x);
-                for(var z=Math.Max(0,pz-reach);z<=Math.Min(n-1,pz+reach);z++)for(var x=Math.Max(0,px-reach);x<=Math.Min(n-1,px+reach);x++)
+                for(var z=Math.Max(region.y,pz-reach);z<=Math.Min(region.w,pz+reach);z++)for(var x=Math.Max(region.x,px-reach);x<=Math.Min(region.z,px+reach);x++)
                 {
                     var sample=new float2(coordinates[x],coordinates[z]);
                     var station=spanLengthSquared>.00001f?math.clamp(math.dot(sample-previous.xz,span)/spanLengthSquared,0,1):1;

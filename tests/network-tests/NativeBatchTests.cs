@@ -27,6 +27,8 @@ internal static class NativeBatchTests
     {
         NativeOwnershipTests.Run();
         NativeOwnerLineageTests.Run();
+        NativeUnitPartition();
+        WholeApproachTapers();
         Check(NativeBatchBindings.Target("preview","null",false,false)=="preview","New native entity should survive as itself");
         Check(NativeBatchBindings.Target("preview","original",true,false)=="original","Ordinary native update must bind Original");
         Check(NativeBatchBindings.Target("preview","original",true,true)=="preview","Native replacement must not bind the deleted Original");
@@ -48,7 +50,10 @@ internal static class NativeBatchTests
         Refuses(()=>Match(s,new[]{edge with{End=new float3(40,float.PositiveInfinity,0)}}),"non-finite","Non-finite native height");
         Refuses(()=>Match(s,new[]{edge},new Dictionary<string,string>{{"Road:1","wrong-node"}}),"0 qualified","Known source identity must not migrate to another entity");
         Refuses(()=>Match(s,new[]{edge},new Dictionary<string,string>{{"Road:99","a"}}),"merged unrelated","A generated node cannot steal a different committed identity");
-        Refuses(()=>Match(s,new[]{edge},new Dictionary<string,string>{{"Road:99","old"},{"Road:100","old"}}),"conflicting source","Previously aliased committed identities");
+        Check(Match(s,new[]{edge},new Dictionary<string,string>{{"Road:99","old"},{"Road:100","old"}}).Edges.Count==1,
+            "An unrelated committed identity conflict poisoned a disjoint safe batch");
+        Refuses(()=>Match(s,new[]{edge},new Dictionary<string,string>{{"Road:1","a"},{"Road:100","a"}}),
+            "conflicting source","A required port used an ambiguously owned committed identity");
         Refuses(()=>NativeBatchBindings.Match(new[]{new NativeBatchBindings.Expected<string>(s,"stock"),new NativeBatchBindings.Expected<string>(s,"stock")},new[]{edge},Empty),"same native edge","Duplicate edge coverage");
 
         var next=s with{WayId=11,StartNodeId=2,EndNodeId=3,Start=s.End,End=new float3(80,181,0)};
@@ -103,6 +108,119 @@ internal static class NativeBatchTests
         OverlapCoalescenceRegressions();
         ManifestRoundTrip();
         Console.WriteLine("PASS: production native batch bindings recover height-only drift, preserve portals/mode/source identity and control handles, reject missing/ambiguous/parallel/aliased/non-finite graphs; 71,059 synthetic sections complete across 556 batches (not a native-game import).");
+    }
+
+    private static void NativeUnitPartition()
+    {
+        var log=new ImportLog();
+        PreparedSegment Road(long way,long a,long b,float3 start,float3 end)=>
+            new(way,a,b,start,end,NetworkKind.Road,"motorway",2,true,false,false,0)
+            {NativeWidth=8,NativeAssetKey="two"};
+        var assets=new[]{new NativeAssetContract("two",new[]{new NativeCompositionEnvelope(NativeStructureMode.Ground,0,8,0,0,0,0,4,true)},Array.Empty<float>())};
+        var source=new[]{Road(10,1,2,new(-200,20,0),new(0,20,0)),Road(11,2,3,new(0,20,0),new(200,20,0)),
+            Road(12,2,4,new(0,20,0),new(0,20,200))};
+        var partition=NativeDesignUnits.Prepare(source,assets,log,default);
+        var junction=partition.Where(s=>s.StartNodeId==2||s.EndNodeId==2).ToArray();
+        Check(junction.Length==3&&junction.Select(s=>s.NativeUnitId).Distinct().Count()==1,"A source junction's native prefixes split across units");
+        Check(partition.Count==9&&partition.Select(s=>s.NativeUnitId).Distinct().Count()==7,"Long corridors did not retain separate terminal, corridor and junction cores");
+        foreach(var group in partition.GroupBy(s=>s.WayId))
+        {
+            var pieces=group.ToArray();var original=source.Single(s=>s.WayId==group.Key);
+            Check(math.all(pieces[0].CourseStart==original.CourseStart)&&math.all(pieces[^1].CourseEnd==original.CourseEnd),"Unit cut moved external float ports");
+            for(var i=1;i<pieces.Length;i++)
+                Check(pieces[i-1].EndNodeId==pieces[i].StartNodeId&&math.all(pieces[i-1].End==pieces[i].Start)&&math.all(pieces[i-1].CourseEnd==pieces[i].CourseStart),"Unit boundary independently rounded its shared anchor");
+            Check(Math.Abs(pieces.Sum(s=>math.distance(s.CourseStart,s.CourseEnd))-200)<.001,"Exact straight subdivision changed coverage");
+        }
+        var plan=new NativeSubmissionPlan(partition);var seen=new HashSet<int>();var progress=0;
+        while(progress<plan.Sections.Count)
+        {
+            var batch=plan.Batch(progress,2);Check(batch.Count>0,"Atomic scheduler stalled");
+            foreach(var unit in batch.GroupBy(s=>s.NativeUnitId))
+            {Check(seen.Add(unit.Key),"One native unit appeared in multiple batches");Check(unit.Count()==partition.Count(s=>s.NativeUnitId==unit.Key),"Batch truncated an indivisible junction unit");}
+            progress+=batch.Count;
+        }
+        var shortBridge=Road(13,2,5,new(0,20,0),new(10,20,0)) with{Bridge=true,NativeAssetKey="bridge"};
+        var joined=NativeDesignUnits.Prepare(source.Concat(new[]{shortBridge,Road(14,5,6,new(10,20,0),new(210,20,0))}).ToArray(),assets,log,default);
+        Check(joined.Where(s=>s.StartNodeId==2||s.EndNodeId==2||s.StartNodeId==5||s.EndNodeId==5).Select(s=>s.NativeUnitId).Distinct().Count()==1,"Overlapping structure-transition cores were not unioned");
+        var dense=new NativeSubmissionPlan(Enumerable.Range(0,65).Select(i=>source[0] with{WayId=i,NativeUnitId=7}).ToArray());
+        Check(dense.Batch(0,32).Count==65&&dense.GatherPendingJunction(0,65,100,new[]{"Road:1"})==0,"Oversized core was split or legacy recovery mutated it");
+        Refuses(()=>dense.Batch(1,32),"inside","Scheduling inside a native unit");
+        var longRoad=Enumerable.Range(0,200).Select(i=>Road(100+i,1000+i,1001+i,new(i*10,20,0),new((i+1)*10,20,0))).ToArray();
+        var corridor=NativeDesignUnits.Prepare(longRoad,assets,log,default);
+        Check(corridor.GroupBy(s=>s.NativeUnitId).Max(g=>g.Count())<=33&&corridor.Select(s=>s.WayId).ToHashSet().SetEquals(longRoad.Select(s=>s.WayId))&&
+            Math.Abs(corridor.Sum(s=>math.distance(s.CourseStart,s.CourseEnd))-2000)<.01,
+            "A long corridor became an unnecessarily city-sized indivisible native unit");
+        var unsafeCurve=NativeDesignUnits.Prepare(new[]{source[0] with{Control1=new(float.NaN,0,0)}},assets,log,default);
+        Check(unsafeCurve.Count==1&&!math.all(math.isfinite(unsafeCurve[0].CourseControl1)),"Nonfinite unit geometry was recursively repaired or silently certified");
+        Console.WriteLine("PASS: exact native core/corridor cuts, shared float ports, short-core union, complete unit packing and oversized indivisible units; engine acceptance remains unexercised.");
+    }
+
+    private static void WholeApproachTapers()
+    {
+        IReadOnlyList<PreparedSegment> Fit(float[] knots)
+        {
+            var input=new List<PreparedSegment>();var shifts=new List<NetworkApproachTapers.Shift>();
+            for(var i=1;i<knots.Length;i++)
+            {
+                var a=knots[i-1];var b=knots[i];
+                input.Add(new(90,100+i,101+i,new float3(a,10,0),new float3(b,10,0),NetworkKind.Road,"motorway",3,true,false,false,0)
+                {StartCurveOffset=new(0,0,-(float)NetworkDesignChecks.QuinticShift(4,a,220).Value),
+                    EndCurveOffset=new(0,0,-(float)NetworkDesignChecks.QuinticShift(4,b,220).Value)});
+                shifts.Add(new(i-1,a,b-a,220,4));
+            }
+            return NetworkApproachTapers.Materialize(input,shifts,new ImportLog(),default);
+        }
+        var whole=Fit(new[]{0f,220});var divided=Fit(new[]{0f,80,160,220});
+        var invalid=whole[0] with{Control1=new(float.NaN,0,0),FinalDeckCurve=null};
+        var retained=NetworkApproachTapers.Materialize(new[]{invalid},new[]{new NetworkApproachTapers.Shift(0,0,220,220,4)},new ImportLog(),default);
+        Check(retained.Count==1&&!math.all(math.isfinite(retained[0].CourseControl1)),"Invalid taper input was expanded or silently replaced before native safety validation");
+        float Sample(IReadOnlyList<PreparedSegment> pieces,float x)
+        {var s=pieces.First(s=>s.Start.x<=x&&s.End.x>=x);return NetworkNormalizer.Evaluate(s,(x-s.Start.x)/(s.End.x-s.Start.x)).z;}
+        for(var x=0;x<=220;x++)
+        {
+            var expected=-NetworkDesignChecks.QuinticShift(4,x,220).Value;
+            Check(Math.Abs(Sample(whole,x)-expected)<.05&&Math.Abs(Sample(divided,x)-expected)<.05,"Whole-approach Hermite fit escaped its continuous error budget");
+            Check(Math.Abs(Sample(whole,x)-Sample(divided,x))<.05,"Adding source knots changed the taper shape");
+        }
+        var before=divided.Single(s=>s.EndNodeId==102);var after=divided.Single(s=>s.StartNodeId==102);
+        var d0=(before.CourseEnd-before.CourseControl2);var d1=after.CourseControl1-after.CourseStart;
+        Check(Math.Abs(d0.z/d0.x-d1.z/d1.x)<1e-5&&Math.Abs(d0.z/d0.x)>1e-3,"Intermediate source knot restarted the taper at zero derivative");
+        var curved=new PreparedSegment(92,1,2,new(0,10,0),new(220,10,30),NetworkKind.Road,"motorway",3,true,false,false,0)
+            {Control1=new(70,10,0),Control2=new(150,10,30)};
+        double3 Normal(Cubic3d c,double t){var d=NetworkDesignChecks.Derivative(c,t).xz;return new double3(d.y,0,-d.x)/math.length(d);}
+        var reference=new Cubic3d(curved.CourseStart,curved.CourseControl1,curved.CourseControl2,curved.CourseEnd);
+        curved=curved with{StartCurveOffset=(float3)(Normal(reference,0)*4)};
+        var curvePieces=NetworkApproachTapers.Materialize(new[]{curved},new[]{new NetworkApproachTapers.Shift(0,0,220,220,4)},new ImportLog(),default);
+        Check(curvePieces.Count>1&&curvePieces.All(s=>math.all(math.isfinite(s.CourseControl1))&&math.all(math.isfinite(s.CourseControl2))),"Curved-normal taper was not represented by finite fitted spans");
+        for(var i=1;i<curvePieces.Count;i++)
+        {
+            var a=math.normalizesafe((curvePieces[i-1].CourseEnd-curvePieces[i-1].CourseControl2).xz);
+            var b=math.normalizesafe((curvePieces[i].CourseControl1-curvePieces[i].CourseStart).xz);
+            Check(math.dot(a,b)>.99999f,"Curved reference normal derivative introduced a point corner");
+        }
+        var incoming=curved with{StartNodeId=11,EndNodeId=12,Start=new(0,10,0),End=new(100,10,20),Control1=new(30,10,0),Control2=new(70,10,20),
+            StartCurveOffset=new(0,0,-4),EndCurveOffset=new(0,0,-2)};
+        var outgoing=incoming with{StartNodeId=12,EndNodeId=13,Start=incoming.End,End=new(200,10,80),Control1=new(130,10,20),Control2=new(170,10,80),
+            StartCurveOffset=new(0,0,-2),EndCurveOffset=default};
+        var differentCurvatures=NetworkApproachTapers.Materialize(new[]{incoming,outgoing},new[]{new NetworkApproachTapers.Shift(0,0,100,200,4),new NetworkApproachTapers.Shift(1,100,100,200,4)},new ImportLog(),default);
+        var beforeKnot=differentCurvatures.Single(s=>s.EndNodeId==12);var afterKnot=differentCurvatures.Single(s=>s.StartNodeId==12);
+        Check(math.dot(math.normalizesafe((beforeKnot.CourseEnd-beforeKnot.CourseControl2).xz),math.normalizesafe((afterKnot.CourseControl1-afterKnot.CourseStart).xz))>.99999f,
+            "Offset of C1-but-not-C2 reference curves retained a point corner");
+        foreach(var piece in differentCurvatures)
+        {
+            var input=piece.End.x<=100.001?incoming:outgoing;
+            var c=new Cubic3d(input.Start,input.Control1!.Value,input.Control2!.Value,input.End);
+            double Parameter(float x)
+            {var lo=0d;var hi=1d;for(var i=0;i<45;i++){var middle=(lo+hi)/2;if(NetworkDesignChecks.Evaluate(c,middle).x<x)lo=middle;else hi=middle;}return (lo+hi)/2;}
+            var first=Parameter(piece.Start.x);var last=Parameter(piece.End.x);
+            for(var i=0;i<=50;i++)
+            {
+                var t=math.lerp(first,last,i/50d);var station=(input.StartNodeId==11?0:100)+100*t;
+                var expected=NetworkDesignChecks.Evaluate(c,t)+Normal(c,t)*NetworkDesignChecks.QuinticShift(4,station,200).Value;
+                Check(math.distance(expected,NetworkNormalizer.Evaluate(piece,i/50f))<.05,"Shared derivative reconciliation exceeded the taper's value-error budget");
+            }
+        }
+        Console.WriteLine("PASS: whole-approach quintic fit/error, segmentation-independent straight taper, nonzero shared-knot derivative and curved normal derivative continuity.");
     }
 
     private static void LaterBatchRegressions()
@@ -310,6 +428,19 @@ internal static class NativeBatchTests
         try
         {
             var archive=new RunArchive(root,new{fixture=true},typeof(NativeBatchTests).Assembly.Location);
+            archive.ExpectNativeSections(new[]{"Road:10:1:2"});
+            archive.WriteCompressedRecords("native-unit-final-fixture.ndjson.gz",new object[]{new{entity="edge"}});
+            archive.WriteCompressedRecords("native-unit-final-fixture-port-movements.ndjson.gz",Array.Empty<object>());
+            archive.ObserveNativeSections("native-unit-final-fixture",new[]{("Road:10:1:2",true)});
+            Check((bool)JObject.FromObject(archive.CaptureStatus())["completeNativeSectionCapture"]!,"Complete gzip native tables were incorrectly classified as missing chunk manifests");
+            archive.RecordFailure("native-unit-final-fixture.ndjson.gz",new IOException("Failed later capture"));
+            Check(!(bool)JObject.FromObject(archive.CaptureStatus())["completeNativeSectionCapture"]!,"Failed later capture retained stale complete coverage");
+            archive.WriteCompressedRecords("native-unit-final-fixture.ndjson.gz",new object[]{new{entity="replacement"}});
+            Check((bool)JObject.FromObject(archive.CaptureStatus())["completeNativeSectionCapture"]!,"Successful recapture did not restore artifact coverage");
+            for(var i=0;i<130;i++)archive.RecordFailure("other-failure-"+i,new IOException("Bounded ledger fixture"));
+            archive.RecordFailure("native-unit-final-fixture.ndjson.gz",new IOException("Failure after message ledger saturation"));
+            Check(!(bool)JObject.FromObject(archive.CaptureStatus())["completeNativeSectionCapture"]!,"Saturated failure message ledger prevented coverage invalidation");
+            archive.WriteCompressedRecords("native-unit-final-fixture.ndjson.gz",new object[]{new{entity="replacement-after-saturation"}});
             var records=Enumerable.Range(0,600).Select(i=>(object)new{index=i}).ToArray();
             var full=archive.WriteRecords("over-64.ndjson",records);
             Check(full.Records==600&&!full.Truncated,"Diagnostic writer still imposes the old 64-record cap");
@@ -318,6 +449,17 @@ internal static class NativeBatchTests
             Check(chunks.Chunks.All(c=>c.Records<=256)&&chunks.Chunks.Sum(c=>c.Records)==600,"Diagnostic chunk limits or cumulative counts are incorrect");
             var sequence=chunks.Chunks.SelectMany(c=>File.ReadLines(Path.Combine(archive.DirectoryPath,c.File))).Select(line=>(int)JObject.Parse(line)["index"]!).ToArray();
             Check(sequence.SequenceEqual(Enumerable.Range(0,600)),"Chunked diagnostic readback reordered or duplicated records");
+            var compressedChunks=archive.WriteRecordChunks("compressed-chunked.ndjson",records,final:true,compress:true);
+            var compressedSequence=new List<int>();
+            foreach(var chunk in compressedChunks.Chunks)
+            {
+                Check(chunk.Encoding=="gzip-ndjson"&&chunk.File.EndsWith(".gz"),"Compressed chunk manifest omitted its decoder contract");
+                using var file=File.OpenRead(Path.Combine(archive.DirectoryPath,chunk.File));
+                using var gzip=new System.IO.Compression.GZipStream(file,System.IO.Compression.CompressionMode.Decompress);
+                using var reader=new StreamReader(gzip);string? line;
+                while((line=reader.ReadLine())!=null)compressedSequence.Add((int)JObject.Parse(line)["index"]!);
+            }
+            Check(!compressedChunks.Truncated&&compressedSequence.SequenceEqual(Enumerable.Range(0,600)),"Compressed chunk roundtrip lost ordered coverage");
             var s=Section() with{NativeWidth=32};
             void Write(string stem,bool valid)
             {
@@ -334,6 +476,13 @@ internal static class NativeBatchTests
             var path=Path.Combine(archive.DirectoryPath,"native-batch-000128-032-attempt-01-graph.ndjson");
             var preserved=archive.WriteRecords(Path.GetFileName(path),new object[]{new{oversized=true}},maximumBytes:1);
             Check(preserved.PreservedPrevious&&new FileInfo(path).Length>0,"Budget exhaustion erased valid prior graph evidence");
+            archive.WriteRecords("complete.ndjson",Enumerable.Range(0,10).Select(i=>(object)new{i}));
+            var partial=archive.WriteRecords("complete.ndjson",Enumerable.Range(0,10).Select(i=>(object)new{i}),maximumBytes:13);
+            Check(partial.Truncated&&partial.PreservedPrevious&&File.ReadLines(Path.Combine(archive.DirectoryPath,"complete.ndjson")).Count()==10,"Partial truncation replaced a complete artifact");
+            var exact=archive.WriteRecords("exact-ids.ndjson",new object[]{new{node=long.MinValue+123}});
+            Check(JObject.Parse(File.ReadAllText(Path.Combine(archive.DirectoryPath,exact.File)))["node"]!.Type==JTokenType.String,"Int64 identity lost its exact JSON representation");
+            var completeChunks=archive.WriteRecordChunks("preserved-chunks.ndjson",records.Take(10));
+            var completeManifest=File.ReadAllText(Path.Combine(archive.DirectoryPath,completeChunks.Manifest));
             Replay(archive.DirectoryPath);
             archive.WriteRecords("native-batch-000256-032-attempt-00-expected.ndjson",new object[]{new{kind="expected-course",prefab="stock",StartCenterBudget=18,EndCenterBudget=18,section=DiagnosticArtifacts.NetworkRecords(new[]{s}).First()}});
             archive.WriteRecords("native-batch-000256-032-attempt-00-owners.ndjson",new object[]{new{source="Road:1",entity="committed"}});
@@ -341,6 +490,9 @@ internal static class NativeBatchTests
             Refuses(()=>Replay(archive.DirectoryPath),"Incomplete batch artifact","Truncated captured graph may not establish coverage");
             var filler=new{payload=new string('x',32768)};
             for(var i=0;i<6;i++)archive.WriteRecords($"budget-{i}.ndjson",Enumerable.Repeat((object)filler,300));
+            archive.WriteRecords("budget-tail.ndjson",Enumerable.Repeat((object)new{i=0},100000));
+            var failedChunks=archive.WriteRecordChunks("preserved-chunks.ndjson",records.Take(10));
+            Check(failedChunks.Truncated&&failedChunks.PreservedPrevious&&File.ReadAllText(Path.Combine(archive.DirectoryPath,completeChunks.Manifest))==completeManifest,"Failed recapture replaced a complete chunk manifest");
             var finalRecord=new object[]{new{payload=new string('y',65536)}};
             Check(archive.WriteRecords("ordinary-full.ndjson",finalRecord).Truncated,"Ordinary-budget exhaustion fixture did not fill its budget");
             Check(archive.WriteRecords("reserved-final.ndjson",finalRecord,final:true).Records==1,"Early transcripts consumed final-readback reserve");

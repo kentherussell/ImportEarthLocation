@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using Game;
+using PrefabRef = Game.Prefabs.PrefabRef;
 using Game.Common;
 using Game.Net;
 using Game.Tools;
@@ -277,16 +278,17 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
                 if(!EntityManager.HasComponent<Edge>(entity))continue;
                 if((EntityManager.GetComponentData<Temp>(entity).m_Flags&TempFlags.Delete)!=0)continue;
                 var edge=EntityManager.GetComponentData<Edge>(entity);
-                if(edge.m_Start==Entity.Null||edge.m_End==Entity.Null||edge.m_Start==edge.m_End||
-                    !EntityManager.HasComponent<Node>(edge.m_Start)||!EntityManager.HasComponent<Node>(edge.m_End))
-                {invalidNativeGraph=true;s_Log?.Warn($"Native temporary edge {entity} has incomplete node references; this native preview will be cleared, not applied to an invalid engine graph.");}
-                if(EntityManager.HasComponent<Curve>(entity))
-                {
-                    var curve=EntityManager.GetComponentData<Curve>(entity).m_Bezier;
-                    if(!Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(curve.a))||!Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(curve.b))||
-                       !Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(curve.c))||!Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(curve.d)))
-                    {invalidNativeGraph=true;s_Log?.Warn($"Native temporary edge {entity} has a non-finite curve; native preview defect recorded.");}
-                }
+                var nodes=edge.m_Start!=Entity.Null&&edge.m_End!=Entity.Null&&edge.m_Start!=edge.m_End&&
+                    EntityManager.HasComponent<Node>(edge.m_Start)&&EntityManager.HasComponent<Node>(edge.m_End);
+                var hasCurve=EntityManager.HasComponent<Curve>(entity);
+                var prefab=EntityManager.HasComponent<PrefabRef>(entity)?EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab:Entity.Null;
+                var curve=hasCurve?EntityManager.GetComponentData<Curve>(entity).m_Bezier:default;
+                var finite=nodes&&hasCurve&&Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(EntityManager.GetComponentData<Node>(edge.m_Start).m_Position))&&
+                    Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(EntityManager.GetComponentData<Node>(edge.m_End).m_Position))&&
+                    Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(curve.a))&&Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(curve.b))&&
+                    Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(curve.c))&&Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(curve.d));
+                try { NativePreviewSafety.RequireEdge(nodes,prefab!=Entity.Null&&EntityManager.Exists(prefab),hasCurve,finite); }
+                catch(NativeSafetyException error){invalidNativeGraph=true;s_Log?.Warn($"Native temporary edge {entity}: {error.Message} Unissued preview will be cleared.");}
             }
             if(invalidNativeGraph)
             {
@@ -297,6 +299,19 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
                 s_ClearingPreview=true;s_WaitFrames=0;return;
             }
             try { s_BeforeApply?.Invoke(temporary.ToArray()); }
+            catch(NativeRefitRequest)
+            {
+                s_Failure="Owned unapplied structural unit requires its one numeric boundary refit.";
+                s_Recoverable=true;
+                foreach(var entity in _claimedTemps)s_Submitted.Add(entity);
+                IssueOwnedClear(lastTool);s_ClearingPreview=true;s_WaitFrames=0;return;
+            }
+            catch(NativeSafetyException error)
+            {
+                s_Failure="Native contract unavailable: "+error.Message;
+                foreach(var entity in temporary)s_Submitted.Add(entity);
+                IssueOwnedClear(lastTool);s_ClearingPreview=true;s_WaitFrames=0;return;
+            }
             catch(Exception error) when(error is not OutOfMemoryException && error is not OperationCanceledException)
             {
                 // This callback certifies source geometry/lineage, not native

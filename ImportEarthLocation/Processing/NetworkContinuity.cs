@@ -19,7 +19,7 @@ public static class NetworkContinuity
             {
                 var key=(s.Kind,end.id);
                 if(positions.TryGetValue(key,out var p)&&math.distance(p,end.point)>.02f)
-                {conflicts++;if(conflicts<=25)log.Warn($"Network portal/junction {s.Kind}:{end.id} has conflicting positions; application blocked.");}
+                {conflicts++;if(conflicts<=25)log.Warn($"Network portal/junction {s.Kind}:{end.id} has conflicting positions; {(allowQualityWarnings?"RequiresReview; safe placement continues":"strict validation fails")}.");}
                 positions[key]=end.point;if(!graph.TryGetValue(key,out var list))graph[key]=list=new List<long>();list.Add(end.next);
             }
         }
@@ -34,7 +34,7 @@ public static class NetworkContinuity
         {
             token.ThrowIfCancellationRequested();
             if(!components.TryGetValue((s.Kind,s.StartNodeId),out var a)||!components.TryGetValue((s.Kind,s.EndNodeId),out var b)||a!=b)
-            {lost++;if(lost<=25)log.Warn($"Network continuity not verified for {s.Kind} way {s.WayId}; application blocked.");}
+            {lost++;if(lost<=25)log.Warn($"Network continuity not verified for {s.Kind} way {s.WayId}; {(allowQualityWarnings?"RequiresReview; safe placement continues":"strict validation fails")}.");}
         }
         var samples=new Dictionary<(int,int),List<(int edge,float3 point,float2 heading)>>();var rails=after.Where(s=>s.Kind==NetworkKind.Rail).ToArray();
         for(var edge=0;edge<rails.Length;edge++)
@@ -62,7 +62,7 @@ public static class NetworkContinuity
             }
         }
         log.Count("Network continuity unresolved sections",lost);log.Count("Network junction position conflicts",conflicts);log.Count("Rail overlap observations",overlaps);
-        log.Diagnostic($"PROCESS continuity checked; verified={conflicts+lost+overlaps==0}; sourceSections={before.Count}; finalSections={after.Count}; components={index}; sharedPortalConflicts={conflicts}; unresolvedSections={lost}; railOverlapObservations={overlaps}; failClosed={!allowQualityWarnings}; topologyFailClosed=true; nativeAcceptanceNotYetTested=true");
+        log.Diagnostic($"PROCESS continuity checked; verified={conflicts+lost+overlaps==0}; sourceSections={before.Count}; finalSections={after.Count}; components={index}; sharedPortalConflicts={conflicts}; unresolvedSections={lost}; railOverlapObservations={overlaps}; failClosed={!allowQualityWarnings}; topologyFailClosed={!allowQualityWarnings}; nativeAcceptanceNotYetTested=true");
         if(conflicts+lost>0){log.Count("Network repair quality observations",conflicts+lost);log.Warn($"Network continuity observations: {conflicts} conflicting junctions, {lost} unresolved sections. Generation continues for visual diagnosis.");}
         if(overlaps>0)
         {log.Count("Network repair quality observations",overlaps);log.Warn($"Iteration retains {overlaps} rail overlap observations for testing. Known endpoint connections remain intact.");}

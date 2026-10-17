@@ -156,9 +156,11 @@ public static class AvenueConsolidator
             matches[i]=matches[i].OrderBy(m=>m.score).ThenBy(m=>m.other).ToList();
         }
         bool ClearBest(int i) => matches[i].Count>0&&(matches[i].Count==1||matches[i][1].score-matches[i][0].score>=3);
-        var removed=new HashSet<PreparedSegment>(); var remap=new Dictionary<(int,long),(long node,float3 point)>();
+        var removed=new HashSet<PreparedSegment>(); var remap=new Dictionary<long,(long node,float3 point)>();
         var created=new List<PreparedSegment>();var tails=new List<PreparedSegment>(); var used=new HashSet<int>(); var pairs=0;
-        var degree=source.Where(s=>s.Kind==NetworkKind.Road).SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}).GroupBy(id=>id).ToDictionary(g=>g.Key,g=>g.Count());
+        var incident=source.Where(s=>s.Kind==NetworkKind.Road).SelectMany(s=>new[]{(Id:s.StartNodeId,Section:s),(Id:s.EndNodeId,Section:s)})
+            .GroupBy(p=>p.Id).ToDictionary(g=>g.Key,g=>g.Select(p=>p.Section).ToArray());
+        var degree=incident.ToDictionary(p=>p.Key,p=>p.Value.Length);
         var ids=new HashSet<long>(source.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));
         long nextNode=-8_000_000_000_000_000_000;long nextWay=-7_900_000_000_000_000_000;
         var wayIds=new HashSet<long>(source.Select(s=>s.WayId));
@@ -204,7 +206,7 @@ public static class AvenueConsolidator
                    (fractions[k+1]-fractions[k])*Math.Min(a.Length,b.Length)<12)fractions.RemoveAt(k);
             var positions=fractions.Select(t=>(a.Point(t)+b.Point(1-t))*.5f).ToArray();
             var nodes=positions.Select(_=>NewNode()).ToArray();
-            var local=new Dictionary<(int,long),(long node,float3 point)>(); var conflict=false;
+            var local=new Dictionary<long,(long node,float3 point)>(); var conflict=false;
             void Map(Chain chain,bool reversed)
             {
                 for(var k=0;k<=chain.Edges.Length;k++)
@@ -212,7 +214,7 @@ public static class AvenueConsolidator
                     var original=k==chain.Edges.Length?chain.Edges[k-1].EndNodeId:chain.Edges[k].StartNodeId;
                     var t=chain.Distances[k]/chain.Length;if(reversed)t=1-t;
                     var closest=0;for(var n=1;n<fractions.Count;n++)if(Math.Abs(fractions[n]-t)<Math.Abs(fractions[closest]-t))closest=n;
-                    var key=(layer,original);var value=(node:nodes[closest],point:positions[closest]);
+                    var key=original;var value=(node:nodes[closest],point:positions[closest]);
                     if(remap.TryGetValue(key,out var old))
                     { if(math.distance(old.point.xz,value.point.xz)>.1f){conflict=true;return;}nodes[closest]=old.node;value.node=old.node; }
                     if(local.TryGetValue(key,out var prior)&&math.distance(prior.point.xz,value.point.xz)>.1f){conflict=true;return;}
@@ -221,6 +223,10 @@ public static class AvenueConsolidator
             }
             Map(a,false);Map(b,true);
             if(conflict){log.Count("Avenue pairs retained for junction conflicts");continue;}
+            long Mapped(long id)=>local.TryGetValue(id,out var mapped)?mapped.node:remap.TryGetValue(id,out mapped)?mapped.node:id;
+            if(local.Keys.Where(incident.ContainsKey).SelectMany(id=>incident[id]).Distinct()
+                .Any(s=>(s.Bridge||s.Tunnel)&&Mapped(s.StartNodeId)==Mapped(s.EndNodeId)))
+            {log.Count("Avenue pairs retained for collapsed structure connections");continue;}
             // Reject unstable/tiny centerline pieces rather than removing either original carriageway.
             if(positions.Zip(positions.Skip(1),(p,q)=>math.distance(p.xz,q.xz)).Any(d=>d<.5f))
             {log.Count("Avenue pairs retained for tiny junction spacing");continue;}
@@ -262,10 +268,14 @@ public static class AvenueConsolidator
         {
             token.ThrowIfCancellationRequested();if(removed.Contains(edge))continue;
             var s=edge;
-            if(s.Kind==NetworkKind.Road&&!s.Bridge&&!s.Tunnel)
+            // One OSM road node denotes one connection, including a bridge or
+            // tunnel portal whose layer differs from the approach. Remap every
+            // incident road arm together; never leave a structural arm on the
+            // replaced node. Different source node IDs remain independent.
+            if(s.Kind==NetworkKind.Road)
             {
-                if(remap.TryGetValue((s.Layer,s.StartNodeId),out var start)){s=s with{StartNodeId=start.node,Start=start.point};reconnected++;}
-                if(remap.TryGetValue((s.Layer,s.EndNodeId),out var end)){s=s with{EndNodeId=end.node,End=end.point};reconnected++;}
+                if(remap.TryGetValue(s.StartNodeId,out var start)){s=s with{StartNodeId=start.node,Start=start.point};reconnected++;}
+                if(remap.TryGetValue(s.EndNodeId,out var end)){s=s with{EndNodeId=end.node,End=end.point};reconnected++;}
                 if(s.StartNodeId==s.EndNodeId)
                 { // A median crossover has become an internal connection at one avenue junction.
                     log.Count("Avenue median crossovers consolidated");continue;
@@ -279,6 +289,7 @@ public static class AvenueConsolidator
         foreach(var i in Enumerable.Range(0,chains.Count).Where(i=>!used.Contains(i)&&matches[i].Count>0).Take(40))
             log.Diagnostic($"AVENUE UNRESOLVED opposingCandidate=true; sourceWay={chains[i].Edges[0].WayId}; candidateWay={chains[matches[i][0].other].Edges[0].WayId}; separationMeters={matches[i][0].score:0.###}; lengthMeters={chains[i].Length:0.###}; reason={(ClearBest(i)?"non-reciprocal-or-attachment-transition":"multiple-near-equal-candidates")}; noBlindDirectionConversion=true");
         log.Diagnostic($"AVENUE TOTAL eligibleSections={eligible.Length}; chains={chains.Count}; comparisons={comparisons}; pairsMerged={pairs}; sourceSectionsReplaced={removed.Count}; outputAvenueSections={created.Count}; attachmentEndpointsReconnected={reconnected}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.###}; ambiguousOrUnmatchedChainsPreserved={chains.Count-used.Count}; structuresPreserved=true");
-        return AvenueJunctionRepair.Prepare(result,log,token);
+        var aliased=SourceTopologyObligations.Transfer(source,result,NetworkKind.Road,remap.ToDictionary(p=>p.Key,p=>p.Value.node));
+        return AvenueJunctionRepair.Prepare(aliased,log,token);
     }
 }

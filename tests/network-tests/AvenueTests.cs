@@ -11,7 +11,7 @@ static class AvenueTests
         var a=S(1,1,2,0,0,100,0);var b=S(2,3,4,100,10,0,10);
         IReadOnlyList<PreparedSegment> Run(params PreparedSegment[] edges)=>AvenueConsolidator.Prepare(edges,new ImportLog(),default);
         var pair=Run(a,b);
-        Check(Run(a with{Lanes=1},b with{Lanes=1}).All(e=>e.ConsolidatedAvenue&&e.Lanes==4&&e.ForwardLanes==2&&e.BackwardLanes==2&&!e.OneWay),"Approved minimum 2+2 boulevard layout missing");
+        Check(Run(a with{Lanes=1},b with{Lanes=1}).All(e=>e.ConsolidatedAvenue&&e.Lanes==2&&e.ForwardLanes==1&&e.BackwardLanes==1&&!e.OneWay),"Specified nearest 2/4/6 stock avenue representation inflated a 1+1 corridor");
         Check(pair.Count>0&&pair.All(e=>e.ConsolidatedAvenue&&!e.OneWay&&e.Lanes==4&&Math.Abs(e.Start.z-5)<.001&&Math.Abs(e.End.z-5)<.001),"Opposing carriageways did not become a four-lane centerline avenue");
         Check(math.distance(pair[0].Start.xz,new float2(0,5))<.001&&math.distance(pair[pair.Count-1].End.xz,new float2(100,5))<.001,"Avenue discarded corridor endpoints");
         Check(Run(b,a).Select(e=>(e.WayId,e.StartNodeId,e.EndNodeId,e.Start,e.End,e.Lanes,e.OneWay)).SequenceEqual(pair.Select(e=>(e.WayId,e.StartNodeId,e.EndNodeId,e.Start,e.End,e.Lanes,e.OneWay))),"Input ordering changes consolidation");
@@ -20,9 +20,19 @@ static class AvenueTests
         Check(Run(a with{Classification="motorway"},b with{Classification="motorway"}).Count==2,"Highways converted into avenues");
         Check(Run(a with{Classification="trunk"},b with{Classification="trunk"}).Count==2,"Trunk highways converted into avenues");
         Check(Run(a with{Classification="primary_link"},b with{Classification="primary_link"}).Count==2,"Ramps converted into avenues");
-        Check(Run(a with{Bridge=true},b with{Bridge=true}).Count==2,"Elevated structures unexpectedly rewritten");
+        Check(Run(a with{Bridge=true},b with{Bridge=true}).All(e=>e.ConsolidatedAvenue&&e.Bridge&&e.Layer==0),"Same-structure avenue consolidation lost the elevated mode or source layer");
         Check(Run(a,b with{Layer=1}).Count==2,"Different elevations merged");
-        Check(Run(a,b,S(9,2,20,100,0,150,0) with{Bridge=true}).All(e=>!e.ConsolidatedAvenue),"Structural transition node disconnected by avenue remapping");
+        var structural=Run(a,b,S(9,2,20,100,0,150,0) with{Bridge=true});var tie=structural.Single(e=>e.WayId==9);
+        Check(tie.Bridge&&math.all(tie.End==new float3(150,0,0))&&structural.Any(e=>e.ConsolidatedAvenue&&
+            (e.StartNodeId==tie.StartNodeId&&math.all(e.Start==tie.Start)||e.EndNodeId==tie.StartNodeId&&math.all(e.End==tie.Start))),
+            "Avenue consolidation must preserve the actual bridge tie-in and exact shared transition rather than banning the entire corridor");
+        var differentLayer=Run(a,b,S(9,2,20,100,0,150,0) with{Bridge=true,Layer=1});var bridgePort=differentLayer.Single(e=>e.WayId==9);
+        Check(bridgePort.Bridge&&bridgePort.Layer==1&&differentLayer.Any(e=>e.ConsolidatedAvenue&&
+            (e.StartNodeId==bridgePort.StartNodeId&&math.all(e.Start==bridgePort.Start)||e.EndNodeId==bridgePort.StartNodeId&&math.all(e.End==bridgePort.Start))),
+            "An explicit shared bridge portal lost its canonical source connection because its layer differs from the road");
+        var acrossMedian=Run(a,b,S(9,2,3,100,0,100,10) with{Bridge=true,Layer=1});
+        Check(acrossMedian.All(e=>e.StartNodeId!=e.EndNodeId)&&acrossMedian.Any(e=>e.WayId==9&&e.Bridge&&e.StartNodeId==2&&e.EndNodeId==3),
+            "Avenue remapping collapsed a real structure into a self-loop or removed it");
         Check(Run(a,b,S(9,2,20,100,0,150,0) with{Kind=NetworkKind.Rail}).All(e=>!e.ConsolidatedAvenue),"Rail crossing remapped without a verified shared transition");
         Check(Run(a,b with{Start=new(100,0,50),End=new(0,0,50)}).All(e=>!e.ConsolidatedAvenue),"Widely separated roads merged");
         var ambiguous=S(3,10,11,0,20,100,20);

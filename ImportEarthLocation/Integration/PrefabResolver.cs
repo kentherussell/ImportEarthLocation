@@ -37,7 +37,7 @@ public sealed class PrefabResolver
     public bool CanResolveRail(out string error)
     {
         var ok = ResolveRail(2) != Entity.Null;
-        error = ok ? "" : "No usable vanilla two-track prefab could be resolved; network application is blocked before map replacement.";
+        error = ok ? "" : "No usable vanilla two-track prefab could be resolved; affected railway definitions are unavailable. Independent roads can continue.";
         return ok;
     }
 
@@ -55,7 +55,7 @@ public sealed class PrefabResolver
             entity = ResolveRoad(segment);
         }
         _cache[key] = entity;
-        if (entity == Entity.Null) _log.Warn($"No prefab matched {key}; complete network preflight must succeed before replacing the map.");
+        if (entity == Entity.Null) _log.Warn($"No prefab matched {key}; affected sections are unavailable and will be reported. Other supported sections remain available.");
         return entity;
     }
 
@@ -170,7 +170,7 @@ public sealed class PrefabResolver
             catch(Exception error) when(error is not OutOfMemoryException&&error is not OperationCanceledException)
             { _log.Warn($"Native lane metadata for way {s.WayId} could not be refreshed: {error.Message}. Previously captured lane positions retained."); }
         }
-        return s with{NativeWidth=width,NativeLaneOffsets=offsets};
+        return s with{NativeWidth=width,NativeLaneOffsets=offsets,NativeAssetKey=SizedPaletteKey(s)};
     }
     public Entity ResolveNarrowest(PreparedSegment segment)
     {

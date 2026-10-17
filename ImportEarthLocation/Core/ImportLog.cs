@@ -15,6 +15,25 @@ public sealed class ImportLog
     private readonly object _archiveGate = new();
     private int _lineHead;
     private readonly SortedDictionary<string, double> _metrics = new(StringComparer.Ordinal);
+    private readonly Dictionary<string,NetworkQualityFinding> _quality=new(StringComparer.Ordinal);
+    public void Quality(NetworkQualityFinding finding)
+    {lock(_gate)_quality[finding.Stage+"/"+finding.Category+"/"+finding.Scope]=finding;}
+    public void PublishQualityLedger()
+    {
+        NetworkQualityFinding[] findings;lock(_gate)findings=_quality.Values.OrderBy(f=>f.Stage).ThenBy(f=>f.Category).ThenBy(f=>f.Scope).ToArray();
+        Artifact("quality-ledger",archive=>archive.WriteJson("quality-ledger.json",new
+        {
+            schemaVersion=1,releaseState="RequiresReview",humanVisualAndTrafficAcceptance="Unavailable",
+            findings,summary=findings.GroupBy(f=>(f.Stage,f.Category)).Select(g=>new
+            {
+                stage=g.Key.Stage,category=g.Key.Category,scopes=g.Count(),checkedObservations=g.Sum(f=>(long)f.Checked),
+                failedObservations=g.Sum(f=>(long)f.Failed),unavailableObservations=g.Sum(f=>(long)f.Unavailable),
+                worst=g.Max(f=>f.Worst),affectedLengthMeters=g.Sum(f=>f.AffectedLengthMeters),
+                observationScopesMayOverlap=g.Key.Stage=="native-unit",subdivisionCountIsNotAffectedLength=true
+            }).ToArray(),
+            evidenceCompleteness=archive.CaptureStatus(),generationCompletionIsNotAcceptance=true
+        }));
+    }
     private RunArchive? _archive;
     private readonly List<string> _archivePending = new();
     private string? _archiveFailure;
@@ -47,7 +66,7 @@ public sealed class ImportLog
         // Called on the game thread: workers never read Unity's persistent-data path.
         lock (_archiveGate) lock (_gate)
         {
-            _archive = null; _archivePending.Clear(); _archiveFailure = null; _artifactWarning=false; _finalCapture=false; _failureCapture=false; _artifactSeconds=0;
+            _archive = null; _archivePending.Clear(); _archiveFailure = null; _artifactWarning=false; _finalCapture=false; _failureCapture=false; _artifactSeconds=0;_quality.Clear();
             if(!DiagnosticsEnabled)return;
             try
             {
@@ -72,7 +91,7 @@ public sealed class ImportLog
         FlushArchive("preparing");
     }
 
-    public void FlushArchive(string? state = null)
+    public void FlushArchive(string? state = null,bool force=false)
     {
         if(!DiagnosticsEnabled)
         {
@@ -82,7 +101,7 @@ public sealed class ImportLog
         var now = System.Diagnostics.Stopwatch.GetTimestamp();
         lock (_gate)
         {
-            if (state == null && _lastArchiveFlush != 0 && (now - _lastArchiveFlush) / (double)System.Diagnostics.Stopwatch.Frequency < 10) return;
+            if (!force&&state == null && _lastArchiveFlush != 0 && (now - _lastArchiveFlush) / (double)System.Diagnostics.Stopwatch.Frequency < 10) return;
             _lastArchiveFlush = now;
         }
         string? failure=null;
@@ -102,7 +121,11 @@ public sealed class ImportLog
                 archive?.Write(lines, metrics, state);
             }
             catch (Exception exception)
-            {failure=exception.Message;lock (_gate){if(ReferenceEquals(_archive,archive)){_archive=null;_archivePending.Clear();}}}
+            {
+                archive?.RecordFailure("archive-checkpoint",exception);
+                Count("Diagnostic archive flush failures");
+                if(!_artifactWarning){_artifactWarning=true;failure=exception.Message;}
+            }
         }
         if (failure != null) Warn("Diagnostic history unavailable; import continues normally: " + failure);
     }
@@ -120,7 +143,8 @@ public sealed class ImportLog
             catch (Exception error)
             {
                 if (!_artifactWarning) { _artifactWarning=true; failure=error.GetBaseException().Message; }
-                lock (_gate) { _archive=null; _archivePending.Clear(); }
+                archive.RecordFailure(label,error);
+                Count("Diagnostic artifact failures");
             }
             _artifactSeconds+=clock.Elapsed.TotalSeconds;seconds=_artifactSeconds;
         }
@@ -139,19 +163,41 @@ public sealed class ImportLog
         Artifact("checkpoint", archive => archive.Checkpoint(phase, intent));
     }
 
-    public void DiagnosticRecords(string name, IEnumerable<object> records, long maximumBytes = 8L * 1024 * 1024, bool critical = false)
+    public void DiagnosticRecords(string name, IEnumerable<object> records, long maximumBytes = 8L * 1024 * 1024, bool critical = false, bool final = false)
         => Artifact(name, archive =>
         {
-            var result = archive.WriteRecords(name, records, maximumBytes,critical:critical);
-            Diagnostic($"ARTIFACT file={result.File}; records={result.Records}; bytes={result.Bytes}; truncated={result.Truncated}; preservedPrevious={result.PreservedPrevious}; criticalReserve={critical}; localOnly=true");
+            if(!critical&&!final&&!archive.CaptureIntermediate(name))return;
+            var result = archive.WriteRecords(name, records, maximumBytes,critical:critical,final:final);
+            Diagnostic($"ARTIFACT file={result.File}; attemptFile={result.AttemptFile}; records={result.Records}; bytes={result.Bytes}; truncated={result.Truncated}; preservedPrevious={result.PreservedPrevious}; criticalReserve={critical}; localOnly=true");
         });
 
     public void DiagnosticRecordChunks(string name,IEnumerable<object> records)
         => Artifact(name,archive=>
         {
             var result=archive.WriteRecordChunks(name,records,final:true);
-            Diagnostic($"ARTIFACT CHUNKS manifest={result.Manifest}; chunks={result.Chunks.Length}; records={result.Records}; truncated={result.Truncated}; boundedRunByteBudget=true; localOnly=true");
+            Diagnostic($"ARTIFACT CHUNKS manifest={result.Manifest}; attemptManifest={result.AttemptManifest}; preservedPrevious={result.PreservedPrevious}; chunks={result.Chunks.Length}; records={result.Records}; truncated={result.Truncated}; boundedRunByteBudget=true; localOnly=true");
         });
+
+    public void ExpectNativeCapture(IReadOnlyList<PreparedSegment> sections)
+        =>Artifact("native-coverage-expectations",archive=>archive.ExpectNativeSections(sections.Select(DiagnosticArtifacts.SectionIdentity)));
+
+    public void DiagnosticCompressedRecords(string name,IEnumerable<object> records)
+        =>Artifact(name,archive=>
+        {
+            var result=archive.WriteCompressedRecords(name,records);
+            Diagnostic($"ARTIFACT REPLAY file={result.File}; records={result.Records}; compressedBytes={result.Bytes}; complete=true; encoding=gzip-ndjson; finalBudget=true");
+        });
+
+    public void DiagnosticHeights(string name,ushort[] heights)=>Artifact(name,archive=>archive.WriteHeights(name,heights));
+    public void DiagnosticJson(string name,object value)=>Artifact(name,archive=>archive.WriteJson(name,value));
+
+    // Exact replay records use the protected, bounded replay reserve. Capture
+    // completeness remains in each manifest; a partial archive is never a fixture.
+    public void CaptureReplayBoundary(string name,IEnumerable<object> records)
+        =>Artifact(name,archive=>archive.WriteRecordChunks("offline-"+name+".ndjson",records,final:true,compress:true));
+
+    public void ObserveNativeCapture(string stem,IEnumerable<(string Identity,bool Resolved)> sections)
+        =>Artifact("native-coverage-observation",archive=>archive.ObserveNativeSections(stem,sections));
 
     public void CaptureGeometry(string stage, IReadOnlyList<PreparedSegment> sections, ushort[] heights, float scale, double width)
     {
@@ -172,14 +218,38 @@ public sealed class ImportLog
         {
             var records=prepared.Segments.Select(s=>(object)new
             {
-                s.WayId,s.StartNodeId,s.EndNodeId,kind=s.Kind.ToString(),s.Classification,s.Reference,s.CorridorId,s.Lanes,s.OneWay,s.Bridge,s.Tunnel,s.Layer,s.NativeWidth,
+                s.WayId,s.StartNodeId,s.EndNodeId,s.SourceWayIds,s.SourceNodeAliases,kind=s.Kind.ToString(),s.Classification,s.Reference,s.CorridorId,s.Lanes,s.OneWay,s.Bridge,s.Tunnel,s.Layer,s.NativeWidth,s.NativeAssetKey,s.NativeUnitId,s.NativeCenterlineCurvatureLimit,
                 a=DiagnosticArtifacts.Point(s.CourseStart),b=DiagnosticArtifacts.Point(s.CourseControl1),c=DiagnosticArtifacts.Point(s.CourseControl2),d=DiagnosticArtifacts.Point(s.CourseEnd),
+                horizontalEmissionReference=DiagnosticArtifacts.Curve(s.HorizontalEmissionReference),
                 nodeStart=DiagnosticArtifacts.Point(s.Start),nodeEnd=DiagnosticArtifacts.Point(s.End),s.StartElevation,s.EndElevation
             });
-            var result=archive.WriteRecordChunks("final-prepared-network.ndjson",records,final:true);
+            var result=archive.WriteRecordChunks("final-prepared-network.ndjson",records,final:true,compress:true);
+            var assets=archive.WriteRecords("final-native-asset-contracts.ndjson",prepared.NativeAssets.Cast<object>(),1024L*1024,final:true);
+            if(prepared.Design?.Source!=null)
+                archive.WriteRecordChunks("immutable-source-network.ndjson",DiagnosticArtifacts.SourceRecords(prepared.Design.Source),final:true,compress:true);
+            archive.WriteHeights("final-design-heightmap.u16",prepared.Heightmap);
+            archive.WriteJson("final-design.json",new{schemaVersion=1,fingerprint=prepared.Design?.Fingerprint,quality=prepared.Design?.Quality.ToString()??"RequiresReview",
+                sections=prepared.Segments.Count,nativeAssets=prepared.NativeAssets.Count,sourceChains=prepared.Design?.Source?.Chains.Count,
+                fingerprintScope="final-section-anchors-curves-provenance-and-native-asset-contracts",networkManifest=result.Manifest,assetsFile=assets.File,
+                networkTruncated=result.Truncated,assetsTruncated=assets.Truncated,exactFloatDeckFrozen=prepared.Design!=null,nativeAcceptanceVerified=false,
+                terrainFile="final-design-heightmap.u16",heightSamples=prepared.Heightmap.Length,heightScaleMeters=prepared.HeightScaleMeters,
+                mapWidthMeters=prepared.Request.MapSize.WidthMeters,terrainEncoding="little-endian uint16, row-major z/x; local centred metres; metres=value/65535*heightScaleMeters"});
             Diagnostic($"PREPARED ARTIFACT manifest={result.Manifest}; records={result.Records}/{prepared.Segments.Count}; truncated={result.Truncated}; compactFinalCurves=true; reservedFinalBudget=true; nativeAppearanceNotCertified=true");
         });
     }
+
+    public void CaptureProfileInput(IReadOnlyList<PreparedSegment> sections,ushort[] heights,float scale,double width,
+        IReadOnlyDictionary<string,NativeAssetContract>? assets)
+        =>Artifact("profile-input",archive=>
+        {
+            var geometry=archive.WriteRecordChunks("profile-horizontal-input.ndjson",DiagnosticArtifacts.ExactNetworkRecords(sections),final:true,compress:true);
+            var contracts=archive.WriteRecords("profile-native-contracts.ndjson",assets==null?Array.Empty<object>():assets.Values.Cast<object>(),final:true);
+            archive.WriteHeights("profile-baseline-heightmap.u16",heights);
+            archive.WriteJson("profile-input.json",new{schemaVersion=1,networkManifest=geometry.Manifest,assetsFile=contracts.File,
+                terrainFile="profile-baseline-heightmap.u16",heightScaleMeters=scale,mapWidthMeters=width,sections=sections.Count,
+                geometryTruncated=geometry.Truncated,assetsTruncated=contracts.Truncated,geometryEncoding="prepared-segment-exact-v1",
+                scope="frozen-horizontal-profile-input-before-roadbed-stamp",heightEncoding="little-endian-uint16-corner-grid"});
+        });
 
     public void ResetMetrics() { lock (_gate) { _metrics.Clear();Array.Clear(_legacyRepeats,0,_legacyRepeats.Length);_suppressedLines=0;_archiveDrops=0;_lastArchiveFlush=0; } }
     public void Clear() { lock (_gate) { _lines.Clear(); _lineHead=0; _metrics.Clear(); } Changed?.Invoke(); }

@@ -84,6 +84,6 @@ public static class AvenueJunctionRepair
         log.Count("Avenue median junction connectors canonicalized",collapsed.Count);
         log.Count("Avenue internal duplicate intervals collapsed",internalIntervals);
         log.Diagnostic($"AVENUE JUNCTION RECOVERY complete; connectors={collapsed.Count}; internalIntervals={internalIntervals}; armsReconnected={reconnected}; outputSections={result.Count}; nearbyUnconnectedRoadsUntouched=true");
-        return result;
+        return SourceTopologyObligations.Transfer(source,result,NetworkKind.Road,parent.Keys.ToDictionary(id=>id,Root));
     }
 }

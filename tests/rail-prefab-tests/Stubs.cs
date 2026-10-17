@@ -74,7 +74,7 @@ namespace ImportEarthLocation.Core
 {
     public enum NetworkKind { Road, Rail }
     public record PreparedSegment(long WayId, long StartNodeId, long EndNodeId, object? Start, object? End, NetworkKind Kind, string Classification, int Lanes, bool OneWay, bool Bridge, bool Tunnel, int Layer)
-    { public bool ConsolidatedAvenue; public int PhysicalTracks; public float MaximumNativeWidth = float.PositiveInfinity; public float NativeWidth; public IReadOnlyList<float> NativeLaneOffsets = Array.Empty<float>(); }
+    { public bool ConsolidatedAvenue; public int PhysicalTracks; public float MaximumNativeWidth = float.PositiveInfinity; public float NativeWidth; public string NativeAssetKey = ""; public IReadOnlyList<float> NativeLaneOffsets = Array.Empty<float>(); }
     public class ImportLog
     {
         public readonly List<string> Messages = new();

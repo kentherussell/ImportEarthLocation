@@ -2,6 +2,30 @@ using System;
 
 namespace ImportEarthLocation.Core;
 
+// A quality observer may not downgrade missing native structure or ambiguous
+// entity replacement contracts to RequiresReview and proceed with Apply.
+public sealed class NativeSafetyException : InvalidOperationException
+{
+    public NativeSafetyException(string message):base(message){}
+}
+
+// Quality-driven, once-only repair request. It is neither a fatal native
+// safety exception nor permission to replay an already issued Apply.
+public sealed class NativeRefitRequest : InvalidOperationException
+{
+    public NativeRefitRequest():base("One owned unapplied unit refit requested against verified native boundary poses."){}
+}
+
+public static class NativePreviewSafety
+{
+    public static void RequireEdge(bool validNodes,bool hasPrefab,bool hasCurve,bool finiteGeometry)
+    {
+        if(!validNodes)throw new NativeSafetyException("Native edge has invalid or identical node references.");
+        if(!hasPrefab||!hasCurve)throw new NativeSafetyException("Native edge is missing its required prefab/curve contract.");
+        if(!finiteGeometry)throw new NativeSafetyException("Native node or curve geometry is nonfinite.");
+    }
+}
+
 // Only a rejected, uncommitted graph can be regenerated. Never replay Apply
 // after a timeout/readback failure: that can duplicate already-live networks.
 public sealed class NativePreviewException : InvalidOperationException

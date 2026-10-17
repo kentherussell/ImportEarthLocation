@@ -112,6 +112,7 @@ public sealed record PreparedSegment(
     public string Reference { get; init; } = "";
     public string RailService { get; init; } = "";
     public IReadOnlyList<long> SourceWayIds { get; init; } = Array.Empty<long>();
+    public IReadOnlyList<SourceNodeAlias> SourceNodeAliases { get; init; } = Array.Empty<SourceNodeAlias>();
     public IReadOnlyList<float3> OriginalGeometry { get; init; } = Array.Empty<float3>();
     public IReadOnlyDictionary<string,string> SourceTags { get; init; } = new Dictionary<string,string>();
     public IReadOnlyDictionary<string,string> RawSourceTags { get; init; } = new Dictionary<string,string>();
@@ -135,15 +136,33 @@ public sealed record PreparedSegment(
     public NetworkSides RetainingWallSides { get; init; }
     public NetworkSides QuaySides { get; init; }
     public float? ExplicitIncline { get; init; }
+    public bool? SignedInclinePriorAccepted { get; init; }
     public long CorridorId { get; init; }
     public bool ConsolidatedAvenue { get; init; }
     public float MaximumNativeWidth { get; init; } = float.PositiveInfinity;
     public float NativeWidth { get; init; }
+    public string NativeAssetKey { get; init; } = "";
+    public int NativeUnitId { get; init; } = -1;
+    public long PairedCorridorId { get; init; }
+    public long PairedSpanId { get; init; }
+    public long PairedProfileId { get; init; }
+    public double PairedReferenceBegin { get; init; }
+    public double PairedReferenceEnd { get; init; }
+    public long StartHeightFamily { get; init; }
+    public long EndHeightFamily { get; init; }
+    public bool PairedReversed { get; init; }
+    public double ReferenceSpan { get; init; }
+    public double StartReferenceSpeed { get; init; }
+    public double EndReferenceSpeed { get; init; }
+    public double? NativeCenterlineCurvatureLimit { get; init; }
     // Native curves can meet a lane off the shared node's axis. The node anchor
     // stays exact for topology; these offsets affect the deck, not connectivity.
     public float3 StartCurveOffset { get; init; }
     public float3 EndCurveOffset { get; init; }
     public Cubic3f? FinalDeckCurve { get; init; }
+    // Intended XZ controls before float emission. Y is not used: the profile
+    // solver owns heights. Absent or stale reference means rounding is unknown.
+    public Cubic3d? HorizontalEmissionReference { get; init; }
     public float3 CourseStart => FinalDeckCurve?.P0 ?? Start + StartCurveOffset;
     public float3 CourseEnd => FinalDeckCurve?.P3 ?? End + EndCurveOffset;
     public float3 CourseControl1 => FinalDeckCurve?.P1 ?? (Control1 ?? Unity.Mathematics.math.lerp(Start,End,1f/3)) + StartCurveOffset;
@@ -182,10 +201,16 @@ public sealed class PreparedImport
     public ImportRequest Request { get; init; } = new(0, 0, MapSizeProfile.Vanilla, false);
     public GeoBounds Bounds { get; init; }
     public ushort[] Heightmap { get; init; } = Array.Empty<ushort>();
+    public ushort[] RoadbedBaseline { get; init; } = Array.Empty<ushort>();
+    public TerrainEditSet? RoadbedLaterEdits { get; init; }
+    public Func<float3,float?>? NetworkWaterSurface { get; init; }
+    public IReadOnlyList<float3[]> RoadbedProtectedAreas { get; init; } = Array.Empty<float3[]>();
+    public IReadOnlyList<float3[]> RoadbedProtectedLines { get; init; } = Array.Empty<float3[]>();
     public float HeightScaleMeters { get; init; }
     public float SeaLevelMeters { get; init; }
     public IReadOnlyList<PreparedSegment> Segments { get; init; } = Array.Empty<PreparedSegment>();
     public IReadOnlyList<NativeAssetContract> NativeAssets { get; init; } = Array.Empty<NativeAssetContract>();
+    public FinalNetworkDesign? Design { get; init; }
     public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
     public int SourceWayCount { get; init; }
     public IReadOnlyList<float3> Trees { get; init; } = Array.Empty<float3>();

@@ -10,6 +10,7 @@ static class Program
 {
     static long ticks;
     static readonly string CacheRoot=Path.Combine(Path.GetTempPath(),"IEL-overpass-smoke-"+Guid.NewGuid().ToString("N"));
+    internal static string SettingsRoot=>Path.Combine(CacheRoot,"settings");
     static CacheStore NewCache()=>new(Path.Combine(CacheRoot,Guid.NewGuid().ToString("N")));
     static void Check(bool value,string message) { if(!value) throw new Exception(message); }
     static Task Delay(TimeSpan time,CancellationToken token) { token.ThrowIfCancellationRequested(); Interlocked.Add(ref ticks,time.Ticks); return Task.CompletedTask; }
@@ -36,9 +37,12 @@ static class Program
             Check(geographyQuery.Contains("residential")==painting&&geographyQuery.Contains("paving_stones")==painting,"Desert non-sand protection missing or requested with painting disabled");
             Check(geographyQuery.EndsWith("(._;>>;)->.features;(way.features;relation.features;);out body qt;node.features;out skel qt;"),"Geography lost recursive members or member tags");
         }
-        Check(OverpassProviders.Endpoints.Length==4&&new Uri(OverpassProviders.Endpoints[0]).Host=="overpass.nextgis.com","Temporary OSM primary not first");
+        var testPrimary=ServicePreferences.Normalize("https://overpass.nextgis.com/test-service");
+        Check(OverpassProviders.Endpoints.Length==3&&!OverpassProviders.Endpoints.Any(e=>e.Contains("nextgis")),"Default provider set unexpectedly contains a personal service");
+        Check(OverpassProviders.BuildEndpoints(testPrimary).Length==4&&OverpassProviders.BuildEndpoints(testPrimary)[0]==testPrimary,"Configured OSM primary not first");
+        Check(ServicePreferences.Save(testPrimary,log),"Isolated service fixture could not be saved");
         Check(OverpassProviders.BuildEndpoints(null).Length==3&&OverpassProviders.BuildEndpoints(null).All(e=>!e.Contains("nextgis")),"Removing the temporary setting does not restore public-only providers");
-        var primaryPreference=new OverpassRequestScheduler();primaryPreference.RecordSuccess(2,Now(),1);
+        var primaryPreference=new OverpassRequestScheduler(4,0);primaryPreference.RecordSuccess(2,Now(),1);
         Check(Enumerable.Range(0,16).All(tile=>primaryPreference.ProviderOrder(tile,Now())[0]==0),"Recent fallback success or tile rotation overrides temporary primary");
         var primaryHandler=new Handler((tile,attempt,total)=>Good(tile));
         PublicHttpClient.Instance=new HttpClient(primaryHandler);
@@ -46,7 +50,7 @@ static class Program
         {
             var primaryLog=new ImportLog();
             await new OverpassClient(NewCache(),primaryLog,forestOnly:category=="forests",geography:category=="geography").DownloadMapAsync(default,false,default);
-            Check(!primaryLog.Lines.Any(line=>line.Contains(new Uri(OverpassProviders.Endpoints[0]).AbsolutePath)),"Provider access key leaked into diagnostics");
+            Check(!primaryLog.Lines.Any(line=>line.Contains("test-service")),"Provider access key leaked into diagnostics");
         }
         Check(primaryHandler.Total==48&&primaryHandler.Counts.Keys.All(k=>k.host=="overpass.nextgis.com")&&primaryHandler.PeakPerProvider==1,"A new OSM request bypassed the primary while it was busy");
         var preference=new OverpassRequestScheduler(3,null);
@@ -86,7 +90,7 @@ static class Program
         var handler=new Handler((tile,attempt,total)=>Good(tile));
         var client=new OverpassClient(cache,log,new HttpClient(handler),Delay,Now);
         var result=await client.Download16Async(default,false,default);
-        Check(handler.Peak==1 && handler.Duplicated==0,"Primary-first queue or duplicate request violation");
+        Check(handler.Peak>=1&&handler.Peak<=2&&handler.PeakPerProvider==1&&handler.Duplicated==0,"Public fallback concurrency or duplicate request violation");
         Check(result.Select((bytes,i)=>System.Text.Encoding.UTF8.GetString(bytes).Contains($"id='{i+1}'")).All(x=>x),"Output not in geographic tile order");
         Check(Directory.GetFiles(Path.Combine(cache.Root,"overpass"),"*.osm").Length==16,"Cache incomplete");
         await client.Download16Async(default,false,default); Check(handler.Total==16,"Cache not resumed");
@@ -108,8 +112,8 @@ static class Program
         handler=new Handler((tile,attempt,total)=>Bad(HttpStatusCode.GatewayTimeout,"<html>Server overloaded\nplease retry</html>"));
         log=new ImportLog(); client=new OverpassClient(NewCache(),log,new HttpClient(handler),Delay,Now);
         try { await client.Download16Async(default,false,default); throw new Exception("Expected exhaustion"); }
-        catch(HttpRequestException e) { Check(e.Message.Contains("24 attempts total"),"Failure budget message missing"); }
-        Check(handler.Counts.GroupBy(pair=>pair.Key.tile).Any(group=>group.Count()==4 && group.All(pair=>pair.Value==6)),"Six attempts per provider not honored");
+        catch(HttpRequestException e) { Check(e.Message.Contains($"{6*OverpassProviders.Endpoints.Length} attempts total"),"Failure budget message missing"); }
+        Check(handler.Counts.GroupBy(pair=>pair.Key.tile).Any(group=>group.Count()==OverpassProviders.Endpoints.Length && group.All(pair=>pair.Value==6)),"Six attempts per provider not honored");
         Check(handler.Counts.Keys.All(key=>key.tile<3),"Continued tiles after exhausted geographic coverage");
         Check(log.Lines.Any(x=>x.Contains("HTTP 504") && x.Contains("Server overloaded please retry")),"Server details missing");
         var partialCache=NewCache();
@@ -157,10 +161,11 @@ static class Program
             Check(providerHandler.Counts.Keys.Any(k=>k.host!="overpass.nextgis.com"),"Provider rejection did not use existing fallback");
             Check(log.Lines.Any(l=>l.Contains("existingFallbacksAllowed=true")),"Provider fallback not diagnosed");
         }
-        handler=new Handler((tile,attempt,total)=>total==1?throw new HttpRequestException("Failed "+OverpassProviders.Endpoints[0]):Good(tile));
-        log=new ImportLog();client=new OverpassClient(NewCache(),log,new HttpClient(handler),Delay,Now);
+        handler=new Handler((tile,attempt,total)=>total==1?throw new HttpRequestException("Failed "+testPrimary):Good(tile));
+        PublicHttpClient.Instance=new HttpClient(handler);
+        log=new ImportLog();client=new OverpassClient(NewCache(),log);
         await client.Download16Async(default,false,default);
-        Check(!log.Lines.Any(l=>l.Contains(new Uri(OverpassProviders.Endpoints[0]).AbsolutePath)),"Access key leaked from HTTP exception details");
+        Check(!log.Lines.Any(l=>l.Contains("test-service")),"Access key leaked from HTTP exception details");
         Check(log.Lines.Any(l=>l.Contains("OSM REQUEST")&&l.Contains("queryId=")),"Request fingerprint missing");
         // Keep a small real-time test of the unchanged default production wait
         // paths. Most fake responses yield instead of sleeping for every request.
@@ -291,4 +296,4 @@ namespace ImportEarthLocation.Data
     public static class PublicHttpClient { public static HttpClient Instance=new(); }
 }
 namespace ImportEarthLocation { public static class Mod { public const string Id="OverpassSmoke"; } }
-namespace UnityEngine { public static class Application { public static string persistentDataPath=>Path.GetTempPath(); } }
+namespace UnityEngine { public static class Application { public static string persistentDataPath=>Program.SettingsRoot; } }

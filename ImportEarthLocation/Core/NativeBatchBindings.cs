@@ -93,9 +93,10 @@ public static class NativeBatchBindings
 
         var anchors = new Dictionary<string,Anchor<T>>(StringComparer.Ordinal);
         var owners = new Dictionary<T,string>();
+        var ambiguousOwners=new HashSet<T>();
         foreach(var old in committed)
             if(owners.TryGetValue(old.Value,out var owner)&&owner!=old.Key)
-                throw new NativePreviewException("Previously committed native node has conflicting source identities.",0,owner,old.Key);
+                ambiguousOwners.Add(old.Value);
             else owners[old.Value]=old.Key;
         var edges = new List<Binding<T>>(expected.Count);
         var requiredNodes=new Dictionary<T,float3>();
@@ -112,6 +113,11 @@ public static class NativeBatchBindings
             }
             var aKey=NativeEndpointPolicy.Identity(s,s.StartNodeId);var bKey=NativeEndpointPolicy.Identity(s,s.EndNodeId);
             var knownA=committed.TryGetValue(aKey,out var priorA);var knownB=committed.TryGetValue(bKey,out var priorB);
+            // A conflict elsewhere in the city is not a failure of this unit.
+            // Using that conflicted owner still requires explicit canonical
+            // alias/station reconciliation; never guess an attachment.
+            if(knownA&&ambiguousOwners.Contains(priorA!)||knownB&&ambiguousOwners.Contains(priorB!))
+                throw new NativePreviewException("Required native port has conflicting source identities; unrelated units remain qualifiable.",s.WayId,aKey,bKey);
             if(anchors.TryGetValue(aKey,out var batchA)){knownA=true;priorA=batchA.Entity;}
             if(anchors.TryGetValue(bKey,out var batchB)){knownB=true;priorB=batchB.Entity;}
             if(item.OwnedRoute&&(!knownA||!knownB))throw new NativePreviewException("Regenerated route requires both previously verified source owners.",s.WayId,aKey,bKey);
@@ -298,6 +304,17 @@ public static class NativeBatchBindings
         var a=start?.Generated??s.Start;var b=end?.Generated??s.End;
         var deck=new Cubic3f(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd);
         return s with{Start=a,End=b,FinalDeckCurve=deck};
+    }
+
+    public static Anchor<T> LocalRevisionAnchor<T>(Anchor<T> original,float3 revised) where T:notnull
+    {
+        if(!math.all(math.isfinite(original.Generated))||!math.all(math.isfinite(revised))||!math.all(math.isfinite(original.Planned))||
+            !math.isfinite(original.CenterLimit)||original.CenterLimit<=0||original.CenterLimit>32||
+            math.distance(original.Generated.xz,original.Planned.xz)>original.CenterLimit||math.distance(original.Generated,revised)>.001f)
+            throw new NativeSafetyException("Local revision does not retain its exact owned boundary within original source provenance.");
+        // This is an attachment view for one revised course. Never replace the
+        // stored original footprint datum with a rolling revision centre.
+        return original with{Planned=revised};
     }
 
     // Preview movement is qualified against ORIGINAL source coordinates, not

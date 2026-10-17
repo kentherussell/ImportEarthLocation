@@ -10,6 +10,7 @@ static class Program
         var terrain = new TerrainSystem();
         var water = new WaterSystem { Loaded = true };
         var bridge = new TerrainBridge(terrain, water);
+        Check(!bridge.BeginRestamp(new(new(0),new(1)),new(),100,new()),"Unverified stand-in engine MVID allowed native restamping");
         // Deliberately no m_Loaded field: readiness must use the real resource APIs.
         Check(bridge.CanApply(out var reason), "Loaded terrain falsely rejected: " + reason);
         terrain.heightmap = null;
@@ -60,7 +61,13 @@ namespace UnityEngine
         public static RenderTexture GetTemporary(int w,int h,int depth,RenderTextureFormat format,RenderTextureReadWrite read)=>new(){width=w,height=h,Raw=new byte[w*h*2]};
         public static void ReleaseTemporary(RenderTexture value){}
     }
-    public static class Graphics { public static void Blit(Texture source,Texture target)=>target.Raw=source.Raw.Length==source.width*source.height*2?source.Raw.ToArray():new byte[source.width*source.height*2]; }
+    public static class Graphics
+    {
+        public static void Blit(Texture source,Texture target)=>target.Raw=source.Raw.Length==source.width*source.height*2?source.Raw.ToArray():new byte[source.width*source.height*2];
+        public static void CopyTexture(Texture source,int sourceElement,int sourceMip,int sourceX,int sourceY,int width,int height,Texture target,int targetElement,int targetMip,int targetX,int targetY)
+            =>throw new NotSupportedException("Native restamp GPU calls must not execute in this readiness harness");
+    }
+    public static class Time { public static int frameCount=>0; }
 }
 namespace Game.Simulation
 {
@@ -69,6 +76,7 @@ namespace Game.Simulation
     public readonly record struct TerrainBounds(Unity.Mathematics.float3 min, Unity.Mathematics.float3 max);
     public static class TerrainUtils
     {
+        public static float SampleHeight(ref TerrainHeightData data,Unity.Mathematics.float3 point)=>throw new NotSupportedException("Native CPU publication is not simulated");
         public static TerrainBounds GetBounds(ref TerrainHeightData data) =>
             new(new(-28672, 0, -28672), new(28672, 1000, 28672));
     }
@@ -79,6 +87,8 @@ namespace Game.Simulation
         public Unity.Mathematics.float2 heightScaleOffset=new(80,0),playableOffset=new(-28672,-28672),playableArea=new(57344,57344),worldOffset=new(-57344,-57344),worldSize=new(114688,114688),worldHeightMinMax=new(0,1000);
         public object? worldMapAsset;
         public bool FailFinalizeOnce;
+        public bool freezeCascadeUpdates=>false;
+        public void RenderCascades()=>throw new NotSupportedException("Native cascades are not simulated");
         public TerrainHeightData Data = new() { heights = new() { IsCreated = true, Length = 16 }, resolution = new() { x = 4, z = 4 } };
         public TerrainHeightData GetHeightData(bool sync) => Data;
         public void SetTerrainProperties(Unity.Mathematics.float2 value) { }
@@ -88,12 +98,14 @@ namespace Game.Simulation
         public void FinalizeTerrainData(Texture2D map,Texture2D? world,Unity.Mathematics.float2 scale,Unity.Mathematics.float2 corner,Unity.Mathematics.float2 area,Unity.Mathematics.float2 worldCorner,Unity.Mathematics.float2 worldArea,Unity.Mathematics.float2 range)
         {if(FailFinalizeOnce){FailFinalizeOnce=false;throw new InvalidOperationException("Injected finalization failure");}heightScaleOffset=scale;playableOffset=corner;playableArea=area;}
     }
-    public class WaterSystem { public bool Loaded; public float SeaLevel; public bool UseActiveCellsCulling=true; public void TerrainWillChange(){} }
+    public class WaterSystem { public bool Loaded; public float SeaLevel; public bool UseActiveCellsCulling=true; public void TerrainWillChange(){} public void TerrainWillChangeFromBrush(Colossal.Mathematics.Bounds2 bounds)=>throw new NotSupportedException("Native brush notification is not simulated"); }
 }
 namespace ImportEarthLocation.Core
 {
     public class TestMapSize { public double WidthMeters = 57344; }
     public class TestRequest { public TestMapSize MapSize = new(); }
+    public class ImportRequest : TestRequest { public long MapSessionId,Generation; }
+    public static class ImportSession { public static bool Matches(long map,long generation)=>false; }
     public class PreparedImport { public ushort[] Heightmap = new ushort[16]; public float HeightScaleMeters, SeaLevelMeters; public TestRequest Request = new(); }
     public class ImportLog { public void Diagnostic(string s){} }
 }

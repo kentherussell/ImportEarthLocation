@@ -97,13 +97,16 @@ static class SafetyTests
             var b=S(52,2,3,new(0,100,0),new(300,100,0)) with{Lanes=4,NativeLaneOffsets=new[]{-5.25f,-1.75f,1.75f,5.25f}};
             var r=S(53,4,2,new(-150,100,side*80),new(0,100,0)) with{Classification="motorway_link",Lanes=1,NativeLaneOffsets=new[]{0f}};
             var result=NetworkLaneAlignment.Prepare(new[]{a,b,r},new ImportLog(),default);
+            var incoming=result.Single(s=>s.WayId==51&&s.EndNodeId==2);
+            var outgoing=result.Single(s=>s.WayId==52&&s.StartNodeId==2);
+            var ramp=result.Single(s=>s.WayId==53&&s.EndNodeId==2);
             var normal=new float3(0,0,-1);var rampSide=-side;
             var oppositeLaneBefore=rampSide>0?-3.5f:3.5f;var oppositeLaneAfter=rampSide>0?-5.25f:5.25f;
-            Check(math.distance(result[0].CourseEnd+normal*oppositeLaneBefore,result[1].CourseStart+normal*oppositeLaneAfter)<.001f,"Width change did not keep the through lanes aligned");
+            Check(math.distance(incoming.CourseEnd+normal*oppositeLaneBefore,outgoing.CourseStart+normal*oppositeLaneAfter)<.001f,"Width change did not keep the through lanes aligned");
             var outerAfter=rampSide>0?5.25f:-5.25f;
-            Check(math.distance(result[2].CourseEnd,result[1].CourseStart+normal*outerAfter)<.001f,"Ramp lane centre still joins the highway centre instead of its closest lane");
-            Check(math.all(result[0].End==result[1].Start)&&math.all(result[2].End==result[1].Start),"Lane offset broke exact shared native anchors");
-            Check(math.distance(result[2].CourseEnd,result[2].End)>3,"Test did not exercise an actually offset curve endpoint");
+            Check(math.distance(ramp.CourseEnd,outgoing.CourseStart+normal*outerAfter)<.001f,"Ramp lane centre still joins the highway centre instead of its closest lane");
+            Check(math.all(incoming.End==outgoing.Start)&&math.all(ramp.End==outgoing.Start),"Lane offset broke exact shared native anchors");
+            Check(math.distance(ramp.CourseEnd,ramp.End)>3,"Test did not exercise an actually offset curve endpoint");
         }
     }
 }

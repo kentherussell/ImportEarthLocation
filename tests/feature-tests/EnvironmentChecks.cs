@@ -16,14 +16,17 @@ static class EnvironmentChecks
         float3[] Ring(float x,float z,float width)=>new[]{new float3(x,0,z),new float3(x+width,0,z),new float3(x+width,0,z+width),new float3(x,0,z+width)};
         var sand=Enumerable.Range(0,6).Select(i=>new GeographicPolygon(i+1,new Dictionary<string,string>{{"natural","sand"}},new(){Ring(-16000+i*6000,-500,1000)},new())).ToArray();
         var woods=new GeographicPolygon(20,new Dictionary<string,string>{{"natural","wood"}},new(){Ring(-500,-500,1000)},new());
-        var masks=sand.Concat(new[]{woods}).ToArray();var log=new ImportLog();
+        var paving=new GeographicPolygon(21,new Dictionary<string,string>{{"surface","asphalt"}},new(){Ring(12000,-500,1000)},new());
+        var masks=sand.Concat(new[]{woods,paving}).ToArray();var log=new ImportLog();
         var arid=SurfacePlanner.Prepare(masks,request,terrain,log,default,resolution:256,climate:dry);
         var rainy=SurfacePlanner.Prepare(masks,request,terrain,log,default,resolution:256,climate:dry with{Precipitation=Enumerable.Repeat(3f,12).ToArray()});
         int Pixel(float x,float z)=>(int)((z/57344+.5)*256)*256+(int)((x/57344+.5)*256);
         Check(arid.Material[Pixel(22000,10000)]==(byte)GroundMaterial.Sand&&arid.Intensity[Pixel(22000,10000)]>200,"Large-map sand evidence was diluted and flat arid desert stayed grassy");
-        Check(arid.Material[Pixel(0,0)]!=(byte)GroundMaterial.Sand&&rainy.Material[Pixel(22000,10000)]==0,"Climate overwrote mapped woodland or invented a wet-region desert");
-        var beaches=SurfacePlanner.Prepare(sand.Select(p=>p with{Tags=new Dictionary<string,string>{{"natural","beach"}}}).ToArray(),request,terrain,log,default,resolution:256,climate:dry);
-        Check(beaches.Material[Pixel(22000,10000)]==0,"Beach evidence became an arid-map desert trigger");
+        Check(arid.Material[Pixel(0,0)]==(byte)GroundMaterial.Sand&&arid.Material[Pixel(12500,0)]==0&&rainy.Material[Pixel(22000,10000)]!=(byte)GroundMaterial.Sand,"Requested desert override, actual paving exclusion or wet-region desert gate failed");
+        // Hot, arid normals independently permit desert inference. Use wet normals
+        // to isolate whether beach evidence incorrectly opens the regional gate.
+        var beaches=SurfacePlanner.Prepare(sand.Select(p=>p with{Tags=new Dictionary<string,string>{{"natural","beach"}}}).ToArray(),request,terrain,log,default,resolution:256,climate:dry with{Precipitation=Enumerable.Repeat(3f,12).ToArray()});
+        Check(beaches.Material[Pixel(22000,10000)]!=(byte)GroundMaterial.Sand,"Beach evidence became an arid-map desert trigger");
         request=request with{Latitude=0,Longitude=0,MapSize=new("vegetation","vegetation",1000,false)};
         var positions=new[]{new float3(-100,0,0),new float3(100,0,0),new float3(0,0,150)};
         var nodes=positions.Select((p,i)=>new OsmNode(i+1,p.z/6378137d*180/Math.PI,p.x/6378137d*180/Math.PI)).ToDictionary(n=>n.Id);
@@ -42,6 +45,6 @@ static class EnvironmentChecks
         Check(trees.Select(t=>(t.SourceId,t.Seed,t.Form)).SequenceEqual(raised.Select(t=>(t.SourceId,t.Seed,t.Form))),"A terrain height change changed vegetation seed/palette");
         var wetTrees=Vegetation(dry with{Precipitation=Enumerable.Repeat(3f,12).ToArray()},terrain);
         Check(wetTrees.Single(t=>t.SourceId==1).Form==VegetationForm.Broadleaf,"Mean daily rainfall wrongly classified a wet climate as arid");
-        Console.WriteLine("PASS: large-map corroborated desert, mapped non-sand/beach protection, rainfall units, arid existing-site palms, explicit oak/pine/shrub overrides, uncapped center-out ordering and height-independent seeds.");
+        Console.WriteLine("PASS: large-map corroborated desert style, actual paving/beach-trigger protection, rainfall units, arid existing-site palms, explicit oak/pine/shrub overrides, uncapped center-out ordering and height-independent seeds.");
     }
 }

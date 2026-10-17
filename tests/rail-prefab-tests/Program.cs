@@ -60,7 +60,7 @@ static class Program
         foreach(var name in new[]{"Twoway Train Track - Station Side", "LiftBridge01", "Custom Train Track"})
             Check(!Setup(name, Piece(0)).Resolver.CanResolveRail(out _), "Special prefab accepted: " + name);
         var absent = new PrefabResolver(new PrefabSystem(), new ImportLog());
-        Check(!absent.CanResolveRail(out var reason) && reason.Contains("blocked before map replacement"), "Missing rail failed unsafely");
+        Check(!absent.CanResolveRail(out var reason) && reason.Contains("affected railway definitions are unavailable"), "Missing rail did not clearly report the affected native contract");
         var roads=new PrefabSystem();
         foreach(var lanes in new[]{1,2,3,4,5})
         {
@@ -112,15 +112,17 @@ static class Program
         var root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../"));
         var ui = File.ReadAllText(Path.Combine(root, "ImportEarthLocation/Systems/ImportEarthLocationUISystem.cs"));
         var apply = File.ReadAllText(Path.Combine(root, "ImportEarthLocation/Systems/ImportApplySystem.cs"));
-        Check(ui.Contains("errors.Add(railReason)"), "Missing rail prefab can silently become an empty railway import");
-        Check(apply.Contains("Application stopped before replacing the map") && apply.Contains("NetworkGeometrySafety.Validate"), "Missing rail/unsafe network must stop before map replacement");
+        Check(ui.Contains("CanResolveRail(out var railReason)")&&ui.Contains("_log.Warn(railReason)"), "Unavailable rail must be reported without aborting independent roads");
+        Check(apply.Contains("Native entity/ownership safety still applies") && apply.Contains("NetworkGeometrySafety.Validate"), "Native safety/geometry-quality distinction missing");
         var placement=File.ReadAllText(Path.Combine(root,"ImportEarthLocation/Systems/NativeNetworkPlacement.cs"));
         Check(!placement.Contains("Lanes=s.OneWay?1:2"),"Placement fallback still rewrites source lane counts");
         Check(!placement.Contains("Major network placement failure"),"Partial source failures still discard every valid native definition");
-        Check(placement.Contains("Preparation stopped before replacing the map; no disconnected road or rail subset"),"Unsupported native sections can leave gaps in an applied map");
-        Check(apply.IndexOf("CreateDefinitions(_networkBatch",StringComparison.Ordinal)>=0&&apply.IndexOf("CreateDefinitions(_networkBatch",StringComparison.Ordinal)<apply.IndexOf("MapContentCleaner.MarkForDeletion",StringComparison.Ordinal)&&apply.Contains("RemainingNetworks"),"Batch definition preflight/old-network retirement guard missing");
-        Check(ui.Contains("RepairNativeFootprintsAsync")&&ui.Contains("NativeFootprintsRepaired")&&ui.Contains("NetworkTerrain=networkTerrain"),"Native metadata mismatch has no bounded complete-network repair against retained pre-roadbed terrain");
-        Check(placement.Contains("pending batch rolled back")&&!placement.Contains("skipped++;"),"Native definition exceptions retain a disconnected subset");
+        Check(placement.Contains("Native metadata unavailable for")&&placement.Contains("supported sections retained for generation"),"Unsupported native contracts must be visible and scoped to affected sections");
+        Check(apply.Contains("RemainingNetworks")&&apply.Contains("Old native network teardown did not settle"),"Old-network retirement guard missing");
+        Check(ui.IndexOf("NativeAssets=CaptureNativeAssets(result.Segments)",StringComparison.Ordinal)<ui.IndexOf("_processTask=FinalizeNetworkDesignAsync",StringComparison.Ordinal)&&ui.Contains("DesignPasses>=2")&&ui.Contains("NetworkTerrain=networkTerrain"),"Native snapshot must precede design, with bounded contract refresh from pre-roadbed terrain");
+        Check(placement.Contains("pending batch rolled back")&&placement.Contains("continuing other sections"),"Definition failure must clean its pending work and report unavailable sections");
+        var commit=File.ReadAllText(Path.Combine(root,"ImportEarthLocation/Systems/NetworkCommitSystem.cs"));
+        Check(commit.Contains("NativePreviewSafety.RequireEdge")&&commit.Contains("catch(NativeSafetyException")&&commit.Contains("IssueOwnedClear"),"Unsafe native contracts must not be downgraded into quality warnings");
         Console.WriteLine("PASS: production resolver with offline native stand-ins: double-track fallback, strict direction/assets, highway 1-5 lanes, six-lane VA 123 footprint, ordinary one-way fallback, elevated widths, native lane positions; bounded reconciliation and atomic replacement guards.");
     }
 }

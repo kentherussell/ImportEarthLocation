@@ -9,7 +9,33 @@ namespace ImportEarthLocation.Core;
 // graphs. Local evidence only; no endpoint credentials, uploads or game mutation.
 public static class DiagnosticArtifacts
 {
+    public static IEnumerable<object> ExactNetworkRecords(IReadOnlyList<PreparedSegment> sections)
+    {
+        foreach(var s in sections)
+            yield return s with{HorizontalParent=null,FinalDeckCurve=new(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd)};
+    }
+    public static string SectionIdentity(PreparedSegment s)
+        =>FormattableString.Invariant($"{s.Kind}:{s.WayId}:{s.StartNodeId}:{s.EndNodeId}");
+    public static IEnumerable<object> SourceRecords(SourceManifest source)
+    {
+        foreach(var chain in source.Chains)
+        {
+            yield return new{record="chain",chainId=chain.Id,points=chain.OrderedPoints.Count,
+                tags=chain.Tags.Where(p=>EvidenceTag(p.Key)).ToDictionary(p=>p.Key,p=>p.Value)};
+            for(var i=0;i<chain.OrderedPoints.Count;i++)
+            {
+                var point=chain.OrderedPoints[i];
+                yield return new{record="point",chainId=chain.Id,ordinal=i,kind=point.Node.Kind.ToString(),nodeId=point.Node.Id,
+                    x=point.Position.x,y=point.Position.y,z=point.Position.z,
+                    incomingSpan=i>0?(SourceSpanKey?)chain.OrderedSpans[i-1]:null};
+            }
+        }
+    }
+
     public static object Point(float3 p) => new { x = p.x, y = p.y, z = p.z };
+    public static object Point(double3 p) => new { x = p.x, y = p.y, z = p.z };
+    public static object? Curve(Cubic3d? curve)=>curve.HasValue?new
+        {a=Point(curve.Value.P0),b=Point(curve.Value.P1),c=Point(curve.Value.P2),d=Point(curve.Value.P3)}:null;
     private static object? Point(float3? p) => p.HasValue ? Point(p.Value) : null;
     private static bool EvidenceTag(string key) => key == "name" || key == "ref" || key == "highway" || key == "railway" ||
         key == "oneway" || key == "junction" || key == "layer" || key == "bridge" || key == "tunnel" || key == "covered" ||
@@ -28,11 +54,14 @@ public static class DiagnosticArtifacts
                 DeckStart = Point(s.CourseStart), DeckControl1 = Point(s.CourseControl1),
                 DeckControl2 = Point(s.CourseControl2), DeckEnd = Point(s.CourseEnd),
                 ExactFinalDeckStored = s.FinalDeckCurve.HasValue,
+                HorizontalEmissionReference=Curve(s.HorizontalEmissionReference),
                 GeometryEvidence = "prepared-course-not-native-readback",
-                s.Lanes, s.OneWay, s.Bridge, s.Tunnel, s.Layer, s.Name, s.Reference, s.RailService, s.SourceWayIds,
+                s.Lanes, s.OneWay, s.Bridge, s.Tunnel, s.Layer, s.Name, s.Reference, s.RailService, s.SourceWayIds,s.SourceNodeAliases,
                 s.StartTerminal, s.EndTerminal, s.PhysicalTracks, s.BothWaysLanes, s.ForwardLanes, s.BackwardLanes,
-                s.ExplicitLanes, s.SourceWidthMeters, s.SourceSpeedKph, s.ExplicitIncline, s.CorridorId, s.ConsolidatedAvenue,
-                s.NativeWidth, s.MaximumNativeWidth, s.NativeLaneOffsets, s.StartElevation, s.EndElevation,
+                s.ExplicitLanes, s.SourceWidthMeters, s.SourceSpeedKph, s.ExplicitIncline, s.SignedInclinePriorAccepted, s.CorridorId, s.ConsolidatedAvenue,
+                s.NativeAssetKey, s.NativeUnitId, s.NativeCenterlineCurvatureLimit, s.NativeWidth, s.MaximumNativeWidth, s.NativeLaneOffsets, s.StartElevation, s.EndElevation,
+                s.PairedCorridorId,s.PairedSpanId,s.StartHeightFamily,s.EndHeightFamily,s.PairedReversed,s.ReferenceSpan,s.StartReferenceSpeed,s.EndReferenceSpeed,
+                s.PairedProfileId,s.PairedReferenceBegin,s.PairedReferenceEnd,
                 StartCurveOffset = Point(s.StartCurveOffset), EndCurveOffset = Point(s.EndCurveOffset),
                 s.StartMiniRoundabout, s.EndMiniRoundabout, s.StartRoundaboutRadius, s.EndRoundaboutRadius, s.Roundabout,
                 ExplicitCutSides = (int)s.ExplicitCutSides, ExplicitWallSides = (int)s.ExplicitWallSides, RetainingWallSides = (int)s.RetainingWallSides,

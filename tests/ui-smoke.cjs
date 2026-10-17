@@ -4,7 +4,7 @@ const assert = require('assert');
 const root = require('path').resolve(__dirname, '..', 'ImportEarthLocation.UI');
 const ts = require(root + '/node_modules/typescript');
 const React = require(root + '/node_modules/react');
-const bindings = { isEditor: false, mapSession: 'standalone-session', panelOpen: false, busy: false, ready: false, stage: 0, mapExtDetected: false };
+const bindings = { isEditor: false, mapSession: 'standalone-session', panelOpen: false, busy: false, ready: false, stage: 0, mapExtDetected: false, serviceUrl:'https://overpass.nextgis.com/test-service/api/interpreter' };
 const events = [];
 const hooks = [];
 let hookIndex = 0;
@@ -26,18 +26,22 @@ vm.runInNewContext(code, { exports: output.exports, console,
   window: { addEventListener: (name, cb) => handlers.set(name, cb), removeEventListener: (name, cb) => { if (handlers.get(name) === cb) handlers.delete(name); } },
   require(name) {
     if (name === 'react') return react;
+    if (name === 'react-dom') return { createPortal: (children, container) => ({type:'DOMPortal',props:{children,container}}) };
     if (name === 'react/jsx-runtime') return require(root + '/node_modules/react/jsx-runtime');
     if (name === 'cs2/ui') return ui;
     if (name === 'cs2/api') return { bindValue: (_, name, value) => ({name, value}), useValue: b => bindings[b.name] ?? b.value,
       trigger: (_, name, ...args) => { events.push([name, ...args]); if (name === 'setPanelOpen') bindings.panelOpen = args[0]; if(name === 'setRoadLevel') {bindings.roadLevel=args[0];bindings.ready=false;} if(name === 'setImportRail') {bindings.importRail=args[0];bindings.ready=false;} if(name === 'setImportForests') {bindings.importForests=args[0];bindings.ready=false;} if(acknowledgeActions&&(name==='prepare'||name==='confirm')) bindings.actionRevision=String(Number(bindings.actionRevision??0)+1); } };
     if (name.endsWith('.scss')) return { __esModule: true, default: new Proxy({}, { get: (_, p) => p }) };
     if (name === './location-picker') return { LocationPicker: 'LocationPicker' };
+    if (name.endsWith('.png')) return { __esModule:true, default:'fixture-import-icon.png' };
     throw Error(name);
   }
 });
 function render() {
   let tree;
-  for(let pass=0;pass<5;pass++){cleanup=[];hookIndex=0;dirty=false;tree=output.exports.ImportEarthLocationContent();cleanup.forEach(fn=>fn());if(!dirty)break;}
+  // Launcher and panel are separate public render entries. DOM host discovery
+  // remains a Gameface check, not something this element-tree harness simulates.
+  for(let pass=0;pass<5;pass++){cleanup=[];hookIndex=0;dirty=false;tree=[output.exports.ImportEarthLocationContent(),output.exports.ImportLauncher({})];cleanup.forEach(fn=>fn());if(!dirty)break;}
   const nodes = [];
   function visit(node) { if (!node || typeof node !== 'object') return; if (Array.isArray(node)) { node.forEach(visit); return; }
     nodes.push(node); visit(node.props?.children); visit(node.props?.content); }
@@ -80,19 +84,18 @@ nodes.find(n => n.type === 'DropdownItem' && n.props.value === 'mapext28').props
 assert.deepEqual(events.at(-1), ['setMapSize', 'mapext28']);
 assert(nodes.find(n => n.type === 'Dropdown').props.theme.dropdownPopup, 'Popup must have explicit foreground theme');
 assert(!nodes.some(n => n.type === 'input' && n.props.type === 'checkbox'), 'Unsupported browser checkbox must not render');
-assert.equal(nodes.filter(n=>n.props?.role==='radio').length,4);
-for (const radio of nodes.filter(n=>n.props?.role==='radio')) {
- const indicator=radio.props.children[0];assert(indicator.props.className.includes('radioIndicator'),'Road choice needs a circular radio indicator');
- assert(!indicator.props.className.includes('checkbox'),'Road radio must not inherit the square checkbox box');
- assert.equal(indicator.props['aria-hidden'],'true');
- assert.equal(indicator.props.className.includes('radioSelected'),radio.props['aria-checked']);
-}
-assert.equal(button(nodes,'iel-roads-primary').props['aria-checked'],true);assert.equal(button(nodes,'iel-rail').props['aria-checked'],true);
+assert.equal(nodes.filter(n=>n.props?.role==='radio').length,0);
+assert(nodes.filter(n=>n.type==='DropdownItem').every(n=>n.props.disabled),'Alpha map-size choices must remain visible but disabled');
+assert.equal(button(nodes,'iel-roads-routes').props.role,'checkbox');assert.equal(button(nodes,'iel-rail').props['aria-checked'],true);
 assert.equal(button(nodes,'iel-forests').props['aria-checked'],true);
 button(nodes,'iel-forests').props.onSelect();nodes=render();assert.equal(button(nodes,'iel-forests').props['aria-checked'],false);assert.equal(button(nodes,'iel-rail').props['aria-checked'],true);
-for(const tier of ['none','highways','primary','secondary']) {
- button(nodes,`iel-roads-${tier}`).props.onSelect();nodes=render();assert.equal(nodes.filter(n=>n.props?.role==='radio'&&n.props['aria-checked']).length,1);assert.equal(button(nodes,'iel-rail').props['aria-checked'],true);
- button(nodes,'iel-rail').props.onSelect();nodes=render();assert.equal(button(nodes,`iel-roads-${tier}`).props['aria-checked'],true);assert.equal(button(nodes,'iel-rail').props['aria-checked'],false);
+// Exercise all eight independent road combinations without relying on a mock
+// backend to implement the bitmask policy itself. Each click requests an atomic toggle.
+for(let mask=0;mask<8;mask++) {
+ const groups=['highways','routes','streets'];bindings.roadLevel=groups.filter((_,i)=>mask&(1<<i)).join('|');nodes=render();
+ for(let i=0;i<groups.length;i++)assert.equal(button(nodes,`iel-roads-${groups[i]}`).props['aria-checked'],!!(mask&(1<<i)));
+ for(const group of groups){button(nodes,`iel-roads-${group}`).props.onSelect();assert.deepEqual(events.at(-1),['toggleRoadGroup',group]);}
+ const before=bindings.roadLevel;button(nodes,'iel-rail').props.onSelect();nodes=render();assert.equal(bindings.roadLevel,before);assert.equal(button(nodes,'iel-rail').props['aria-checked'],false);
  button(nodes,'iel-rail').props.onSelect();nodes=render();
 }
 const prepareButton=button(nodes,'iel-prepare');const beforePrepare=events.filter(e=>e[0]==='prepare').length;prepareButton.props.onSelect();prepareButton.props.onSelect();assert.equal(events.filter(e=>e[0]==='prepare').length,beforePrepare+1,'Rapid duplicate prepare accepted');assert.equal(events.at(-1)[0],'prepare');

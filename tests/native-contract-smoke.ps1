@@ -4,6 +4,13 @@ $ErrorActionPreference = 'Stop'
 $contractAssembly = [Colossal.Mono.Cecil.AssemblyDefinition]::ReadAssembly((Join-Path $ManagedPath 'Game.dll'))
 try {
     $contractTypes = $contractAssembly.MainModule.Types
+    $pathNode=$contractTypes | Where-Object FullName -eq 'Game.Pathfind.PathNode'
+    $laneIndex=$pathNode.Methods | Where-Object Name -eq 'GetLaneIndex'
+    if(!(($laneIndex.Body.Instructions | ForEach-Object ToString) -match 'ldc.i4 65535')){throw 'Native lane-slot index mask changed'}
+    $laneConstructor=$pathNode.Methods | Where-Object {$_.Name -eq '.ctor' -and $_.Parameters.Count -eq 3 -and $_.Parameters[1].ParameterType.Name -eq 'Byte'}
+    if(!(($laneConstructor.Body.Instructions | ForEach-Object ToString) -match 'ldc.i4.8')){throw 'Native lane/segment byte packing changed'}
+    $compositionLane=$contractTypes | Where-Object FullName -eq 'Game.Prefabs.NetCompositionLane'
+    if(!($compositionLane.Fields | Where-Object Name -eq 'm_Index')){throw 'Native composed physical lane index unavailable'}
     $nodeGenerator=$contractTypes | Where-Object FullName -eq 'Game.Tools.GenerateNodesSystem'
     $nodeKey=$nodeGenerator.NestedTypes | Where-Object Name -eq 'NodeKey'
     $nodeEquals=$nodeKey.Methods | Where-Object Name -eq 'Equals'

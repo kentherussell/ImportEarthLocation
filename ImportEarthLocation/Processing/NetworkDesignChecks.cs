@@ -28,6 +28,18 @@ public static class NetworkDesignChecks
         return speed>0?Cross(d,a)/(speed*speed*speed):double.NaN;
     }
     public static double Cross(double2 a,double2 b)=>a.x*b.y-a.y*b.x;
+    public static double HorizontalArcLength(Cubic3d curve,double begin=0,double end=1)
+    {
+        if(!Finite(curve))return double.NaN;
+        if(end<1)curve=Split(curve,end).Left;if(begin>0)curve=Split(curve,begin/end).Right;
+        double Length(Cubic3d c,double tolerance,int depth)
+        {
+            var chord=math.distance(c.P0.xz,c.P3.xz);var polygon=math.distance(c.P0.xz,c.P1.xz)+math.distance(c.P1.xz,c.P2.xz)+math.distance(c.P2.xz,c.P3.xz);
+            if(polygon-chord<=tolerance||depth==18)return (chord+polygon)/2;
+            var pair=Split(c,.5);return Length(pair.Left,tolerance/2,depth+1)+Length(pair.Right,tolerance/2,depth+1);
+        }
+        return Length(curve,.001,0);
+    }
     // Exact two-variable box-constrained least squares. Stable candidate order,
     // no iterative fitter or unconstrained handle that reverses progression.
     public static Cubic3d FitHandles(double3 start,double3 end,double2 startTangent,double2 endTangent,
@@ -43,7 +55,7 @@ public static class NetworkDesignChecks
         {
             var t=stations[i];var u=1-t;var b0=u*u*u;var b1=3*u*u*t;var b2=3*u*t*t;var b3=t*t*t;
             var v1=b1*startTangent;var v2=-b2*endTangent;var residual=observations[i].xz-((b0+b1)*start.xz+(b2+b3)*end.xz);
-            var w=support[i];if(!SparseProfileRows.Finite(w)||w<0||t<0||t>1)throw new ArgumentException("Invalid physical observation support.");
+            var w=support[i];if(double.IsNaN(w)||double.IsInfinity(w)||w<0||t<0||t>1)throw new ArgumentException("Invalid physical observation support.");
             a11+=w*math.dot(v1,v1);a12+=w*math.dot(v1,v2);a22+=w*math.dot(v2,v2);
             c1+=w*math.dot(v1,residual);c2+=w*math.dot(v2,residual);
         }
@@ -63,12 +75,17 @@ public static class NetworkDesignChecks
             new(end.x-bestB*endTangent.x,math.lerp(start.y,end.y,2/3d),end.z-bestB*endTangent.y),end);
     }
     public static bool Finite(Cubic3d c)=>math.all(math.isfinite(c.P0))&&math.all(math.isfinite(c.P1))&&math.all(math.isfinite(c.P2))&&math.all(math.isfinite(c.P3));
-    public static CurveCertificate Certify(Cubic3d curve,double maximumCurvature,double maximumGrade,double numericalSpeed=1e-10,CancellationToken token=default)
+    public static bool HasHorizontalExtent(Cubic3d c)=>
+        math.lengthsq(c.P1.xz-c.P0.xz)+math.lengthsq(c.P2.xz-c.P0.xz)+math.lengthsq(c.P3.xz-c.P0.xz)>0;
+    public static CurveCertificate Certify(Cubic3d curve,double maximumCurvature,double maximumGrade,double numericalSpeed=1e-10,CancellationToken token=default,int maximumLeaves=int.MaxValue)
     {
         if(!Finite(curve))return new(DesignQuality.RequiresReview,double.PositiveInfinity,double.PositiveInfinity,0,true);
         var curvature=0d;var grade=0d;var leaves=0;var certified=true;var visits=0;
         void Visit(Cubic3d c,int depth)
         {
+            // Exhausting analysis effort means unknown quality, not a proof,
+            // a geometry deletion, or another chance to reshape the curve.
+            if(leaves>=maximumLeaves){certified=false;curvature=grade=double.PositiveInfinity;return;}
             if((visits++&1023)==0)token.ThrowIfCancellationRequested();
             var d0=3*(c.P1-c.P0);var d1=3*(c.P2-c.P1);var d2=3*(c.P3-c.P2);
             if(math.lengthsq(d0.xz)+math.lengthsq(d1.xz)+math.lengthsq(d2.xz)==0)

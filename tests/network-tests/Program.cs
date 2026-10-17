@@ -15,10 +15,22 @@ static class Program
     }
     static void Run(string[] args)
     {
+        if(args.Length==3&&args[0]=="--captured-problem-audit"){CapturedProblemAudit.Run(args[1],args[2]);return;}
+        if(args.Length==3&&args[0]=="--profile-kernels"){ProfileReplay.BenchmarkKernels(args[1],args[2]);return;}
+        if(args.Length==3&&args[0]=="--native-physical-replay"){CapturedNativePhysicalReplay.Run(args[1],args[2]);return;}
+        if(args.Length==3&&args[0]=="--captured-feasibility"){CapturedDesignReplay.Run(args[1],args[2],true,true);return;}
+        if(args.Length==4&&args[0]=="--source-cleanup-replay"){CapturedSourceCleanup.Run(args[1],args[2],args[3]);return;}
+        if(args.Length==3&&(args[0]=="--captured-fixtures"||args[0]=="--captured-design"))
+        {CapturedDesignReplay.Run(args[1],args[2],args[0]=="--captured-design");return;}
+        if(args.Length==1&&args[0]=="--critical-rework-only"){CriticalReworkTests.Run();return;}
+        if(args.Length==1&&args[0]=="--offline-completion-only"){OfflineCompletionTests.Run();return;}
+        CriticalReworkTests.Run();
+        OfflineCompletionTests.Run();
         if(args.Length==1&&args[0]=="--corridor-quality-only"){CorridorQualityTests.Run();return;}
         if(args.Length==2&&args[0]=="--corridor-quality-replay"){CorridorQualityTests.Replay(args[1]);return;}
         if(args.Length==1&&args[0]=="--design-math-only"){DesignMathTests.Run();return;}
         if(args.Length==1&&args[0]=="--profile-math-only"){ProfileMathTests.Run();return;}
+        if(args.Length==2&&args[0]=="--profile-replay"){ProfileReplay.Run(args[1]);return;}
         if(args.Length==2&&args[0]=="--audit-local-compaction")
         {NativeImportRegressionTests.ReplayLocalCompaction(args[1]);return;}
         if(args.Length>=2&&args[0]=="--audit-compaction")
@@ -118,7 +130,8 @@ static class Program
         Check(gradingSource.SelectMany(s=>new[]{s.Start,s.End}).All(p=>p.y==0),"Grading mutated source geometry");
         Check(log.Lines.Any(s=>s.Contains("PROCESS road-grading begin"))&&log.Lines.Any(s=>s.Contains("PROCESS road-grading complete")),"Post-download grading diagnostics missing");
         var explicitUrban=new OsmDataset{Nodes=nodes,Ways=new Dictionary<long,OsmWay>{{100,new(100,new long[]{1,2},new Dictionary<string,string>{{"highway","trunk"},{"motorroad","no"}})}}};
-        Check(NetworkProcessor.BuildSegments(explicitUrban,request,log).Single().Classification=="primary","Explicit ordinary trunk section still imported as highway");
+        var explicitRoute=NetworkProcessor.BuildSegments(explicitUrban,request with{RoadLevel=RoadImportLevel.Routes},log).Single();
+        Check(explicitRoute.Classification=="trunk"&&explicitRoute.SourceTags["motorroad"]=="no","Selected source class was overwritten by an expressway inference instead of preserving the explicit road-group policy");
         var cliff=new ushort[128*128];for(var z=0;z<128;z++)for(var x=0;x<128;x++)cliff[z*128+x]=(ushort)(x<64?0:65535);
         var relaxed=NetworkVerticalProfiles.Prepare(new[]{S(51,52,53,-10,0,10,0)},cliff,1000,1000,log,default);
         Check(relaxed.Count==1&&relaxed[0].StartNodeId==52&&relaxed[0].EndNodeId==53&&!relaxed[0].Bridge,"Difficult road aborted or lost connectivity/changed to bridge");
@@ -132,9 +145,14 @@ static class Program
         Check(tunneled.Count>0&&NetworkNormalizer.Evaluate(tunneled[0],.5f).y<60,"Tunnel climbed toward mountain summit");
         var tracks=new List<PreparedSegment>();for(var i=0;i<7;i++)tracks.Add(S(100+i,1000+i*2,1001+i*2,0,i*2,100,i*2,NetworkKind.Rail,false) with{Classification="rail",RailService="yard"});
         var simplified=NetworkHardener.Prepare(NetworkNormalizer.Normalize(RailCorridorConsolidator.Prepare(tracks,log,default),log,default),log,default,true);
-        Check(simplified.Count==tracks.Count&&simplified.All(s=>s.Lanes==2),"Independent yard/service tracks were deleted as redundant corridors");
-        var pairedRails=RailCorridorConsolidator.Prepare(tracks.Select(s=>s with{RailService="",Lanes=1}).ToArray(),log,default);
-        Check(pairedRails.Count<tracks.Count&&pairedRails.Count>=2&&pairedRails.All(s=>s.Lanes<=2),"Mainline pairing lost the two-physical-track limit or consolidated tracks outside the evidence radius");
+        Check(simplified.Count==1&&simplified.All(s=>s.Lanes==2&&s.PhysicalTracks==2&&!s.OneWay)&&
+            simplified.SelectMany(s=>s.SourceWayIds).Distinct().OrderBy(id=>id).SequenceEqual(tracks.Select(s=>s.WayId)),
+            "Starter-corridor yard simplification must use one double-track segment and retain every folded source way");
+        Check(NetworkHardener.Prepare(tracks,log,default,true).Count==tracks.Count,"Hardening unexpectedly repeated rail consolidation or dropped an independent supplied track");
+        var distantRail=S(999,9990,9991,0,100,100,100,NetworkKind.Rail,false) with{Classification="rail"};
+        var pairedRails=RailCorridorConsolidator.Prepare(tracks.Select(s=>s with{RailService="",Lanes=1}).Append(distantRail).ToArray(),log,default);
+        Check(pairedRails.Count==2&&pairedRails.All(s=>s.Lanes==2&&s.PhysicalTracks==2&&!s.OneWay)&&
+            pairedRails.Any(s=>s.WayId==999||s.SourceWayIds.Contains(999)),"Mainline pairing lost the one-double-track-axis policy or consolidated a track outside the evidence radius");
         Check(NetworkHardener.Prepare(tracks,log,default,false).Count==0,"Disabled rail processed/retained");
         ImportSession.ChangeMap(true);var map=ImportSession.Map;var generation=ImportSession.Begin();Check(ImportSession.Matches(map,generation),"New session not accepted");
         ImportSession.InvalidateOperation();Check(!ImportSession.Matches(map,generation),"Changed configuration retained stale preparation");
@@ -147,7 +165,31 @@ static class Program
     }
 }
 namespace ImportEarthLocation { public static class Mod { public const string Id="ImportEarthLocation"; } }
-namespace ImportEarthLocation.Core { public sealed class ImportLog { public readonly List<string> Lines=new();private readonly Dictionary<string,double> _metrics=new();public bool DiagnosticsEnabled=>false;public void Info(string s)=>Lines.Add(s);public void Warn(string s)=>Lines.Add(s);public void Diagnostic(string s)=>Lines.Add(s);public void Count(string s,int count=1){_metrics.TryGetValue(s,out var old);_metrics[s]=old+count;}public void AddCounter(string s,long count){_metrics.TryGetValue(s,out var old);_metrics[s]=old+count;}public void AddDuration(string s,double seconds){_metrics.TryGetValue(s+" time (s)",out var old);_metrics[s+" time (s)"]=old+seconds;}public void DiagnosticRecords(string s,IEnumerable<object> records){} public void Time(string s,double seconds){_metrics[s+" time (s)"]=seconds;}public double Metric(string s)=>_metrics.TryGetValue(s,out var value)?value:0; } }
+namespace ImportEarthLocation.Core
+{
+    public sealed class ImportLog
+    {
+        public readonly List<string> Lines=new();
+        public readonly List<NetworkQualityFinding> Findings=new();
+        private readonly Dictionary<string,double> _metrics=new();
+        public bool CaptureRecords { get; init; }
+        public readonly Dictionary<string,object[]> Records=new();
+        public bool DiagnosticsEnabled=>CaptureRecords;
+        public void Info(string s)=>Lines.Add(s);
+        public void Warn(string s)=>Lines.Add(s);
+        public void Diagnostic(string s)=>Lines.Add(s);
+        public void Quality(NetworkQualityFinding finding)=>Findings.Add(finding);
+        public void Count(string s,int count=1){_metrics.TryGetValue(s,out var old);_metrics[s]=old+count;}
+        public void AddCounter(string s,long count){_metrics.TryGetValue(s,out var old);_metrics[s]=old+count;}
+        public void AddDuration(string s,double seconds){_metrics.TryGetValue(s+" time (s)",out var old);_metrics[s+" time (s)"]=old+seconds;}
+        public void DiagnosticRecords(string s,IEnumerable<object> records,long maximumBytes=8L*1024*1024,bool critical=false){}
+        public void DiagnosticCompressedRecords(string s,IEnumerable<object> records){}
+        public void DiagnosticRecordChunks(string s,IEnumerable<object> records){if(CaptureRecords)Records[s]=records.ToArray();}
+        public void CaptureProfileInput(IReadOnlyList<PreparedSegment> s,ushort[] heights,float scale,double width,IReadOnlyDictionary<string,NativeAssetContract>? assets){}
+        public void Time(string s,double seconds){_metrics[s+" time (s)"]=seconds;}
+        public double Metric(string s)=>_metrics.TryGetValue(s,out var value)?value:0;
+    }
+}
 namespace ImportEarthLocation.Processing { public static class TerrainBuilder { public const int Resolution=128; } }
 namespace ImportEarthLocation.Data
 {

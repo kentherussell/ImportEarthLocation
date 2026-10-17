@@ -17,6 +17,10 @@ public sealed class TerrainBridge
     private readonly MethodInfo? _setHeightmap;
     private readonly MethodInfo? _setWorldHeightmap;
     private readonly MethodInfo? _finalizeTerrain;
+    private readonly MethodInfo? _areaChanged,_updateCascades;
+    private readonly FieldInfo? _heightChanged,_heightReaders,_downsampleReaders;
+    private Restamp? _restamp;
+    private sealed record Restamp(Texture2D Backup,int X,int Z,int Frame,ImportRequest Request,Processing.NetworkRoadbed.Patch Patch,float Scale);
 
     public TerrainBridge(TerrainSystem terrainSystem, WaterSystem waterSystem)
     {
@@ -38,6 +42,113 @@ public sealed class TerrainBridge
         _setHeightmap=typeof(TerrainSystem).GetMethod("SetHeightmap",flags,null,new[]{typeof(Texture2D)},null);
         _setWorldHeightmap=typeof(TerrainSystem).GetMethod("SetWorldHeightmap",flags,null,new[]{typeof(Texture2D),typeof(bool)},null);
         _finalizeTerrain=typeof(TerrainSystem).GetMethod("FinalizeTerrainData",flags,null,new[]{typeof(Texture2D),typeof(Texture2D),typeof(float2),typeof(float2),typeof(float2),typeof(float2),typeof(float2),typeof(float2)},null);
+        _areaChanged=typeof(TerrainSystem).GetMethod("OnAreaChanged",flags,null,new[]{typeof(Colossal.Mathematics.Bounds2).MakeByRefType()},null);
+        _updateCascades=typeof(TerrainSystem).GetMethod("UpdateCascades",flags,null,new[]{typeof(bool),typeof(bool)},null);
+        _heightChanged=typeof(TerrainSystem).GetField("m_HeightMapChanged",flags);
+        _heightReaders=typeof(TerrainSystem).GetField("m_CPUHeightReaders",flags);
+        _downsampleReaders=typeof(TerrainSystem).GetField("m_CPUDownSampleHeightReaders",flags);
+    }
+
+    public bool BeginRestamp(Processing.NetworkRoadbed.Patch patch,ImportRequest request,float scale,ImportLog log)
+    {
+        // These private stages were inspected in the installed Game.dll. A new
+        // engine build must be inspected again, not invoked by matching names.
+        if(typeof(TerrainSystem).Module.ModuleVersionId!=new Guid("e15551e9-3dea-4855-8dde-1da3cea7d7ef")||
+            _areaChanged==null||_updateCascades==null||_heightChanged==null||_heightReaders==null||_downsampleReaders==null||
+            _terrainSystem.freezeCascadeUpdates||_restamp!=null||_terrainSystem.heightmap is not RenderTexture target)
+        {log.Diagnostic("LOCAL TERRAIN unavailable native dirty-region contract; original unit retained");return false;}
+        if(!ImportSession.Matches(request.MapSessionId,request.Generation))return false;
+        _terrainSystem.GetHeightData(true);
+        CompleteReaders();
+        var data=_terrainSystem.GetHeightData(false);var bounds=TerrainUtils.GetBounds(ref data);
+        var half=request.MapSize.WidthMeters/2;var tolerance=request.MapSize.WidthMeters/(target.width-1)*2;
+        if(Math.Abs(bounds.min.x+half)>tolerance||Math.Abs(bounds.max.x-half)>tolerance||Math.Abs(bounds.min.z+half)>tolerance||Math.Abs(bounds.max.z-half)>tolerance)return false;
+        int X(float x)=>(int)math.clamp(Math.Floor((x-bounds.min.x)/(bounds.max.x-bounds.min.x)*(target.width-1)),0,target.width-1);
+        int Z(float z)=>(int)math.clamp(Math.Floor((z-bounds.min.z)/(bounds.max.z-bounds.min.z)*(target.height-1)),0,target.height-1);
+        var x0=X(patch.Minimum.x);var z0=Z(patch.Minimum.y);var x1=X(patch.Maximum.x);var z1=Z(patch.Maximum.y);
+        var width=x1-x0+1;var height=z1-z0+1;var samples=new ushort[width*height];
+        for(var z=0;z<height;z++)for(var x=0;x<width;x++)
+        {
+            var wx=math.lerp(bounds.min.x,bounds.max.x,(x0+x)/(float)(target.width-1));
+            var wz=math.lerp(bounds.min.z,bounds.max.z,(z0+z)/(float)(target.height-1));
+            samples[z*width+x]=(ushort)Math.Round(patch.Encoded(wx,wz));
+        }
+        var backup=new Texture2D(width,height,TextureFormat.R16,false,true);var active=RenderTexture.active;Texture2D? upload=null;
+        try
+        {
+            RenderTexture.active=target;backup.ReadPixels(new Rect(x0,z0,width,height),0,0,false);backup.Apply(false,false);
+            _restamp=new(backup,x0,z0,Time.frameCount,request,patch,scale);
+            upload=new Texture2D(width,height,TextureFormat.R16,false,true);var bytes=new byte[samples.Length*2];Buffer.BlockCopy(samples,0,bytes,0,bytes.Length);
+            upload.LoadRawTextureData(bytes);upload.Apply(false,false);
+            Graphics.CopyTexture(upload,0,0,0,0,width,height,target,0,0,x0,z0);
+            PublishDirty(patch);
+            log.Diagnostic($"LOCAL TERRAIN published nativeRect={x0},{z0},{width},{height}; outsidePixelsPreserved=true; CPUReadbackPending=true; fullMapReplacement=false");
+            return true;
+        }
+        catch
+        {
+            if(_restamp!=null)CancelRestamp(log);else UnityEngine.Object.Destroy(backup);
+            throw;
+        }
+        finally{RenderTexture.active=active;if(upload!=null)UnityEngine.Object.Destroy(upload);}
+    }
+
+    private void CompleteReaders()
+    {
+        foreach(var field in new[]{_heightReaders,_downsampleReaders})
+            if(field?.GetValue(_terrainSystem) is Unity.Jobs.JobHandle handle){handle.Complete();field.SetValue(_terrainSystem,default(Unity.Jobs.JobHandle));}
+    }
+
+    private void PublishDirty(Processing.NetworkRoadbed.Patch patch)
+    {
+        var area=new Colossal.Mathematics.Bounds2(patch.Minimum,patch.Maximum);
+        _waterSystem.TerrainWillChangeFromBrush(area);
+        _areaChanged!.Invoke(_terrainSystem,new object[]{area});
+        // Native OnUpdate runs these same cascade/render stages. RenderCascades
+        // records the dirty GPU extent and triggers asynchronous CPU publication.
+        _updateCascades!.Invoke(_terrainSystem,new object[]{false,false});
+        _terrainSystem.RenderCascades();
+    }
+
+    public bool PollRestamp(ImportLog log,out bool published)
+    {
+        published=false;var operation=_restamp;if(operation==null)return true;
+        if(!ImportSession.Matches(operation.Request.MapSessionId,operation.Request.Generation)){CancelRestamp(log);return true;}
+        var frames=Time.frameCount-operation.Frame;
+        if(frames<2||_heightChanged?.GetValue(_terrainSystem) is true)
+        {
+            if(frames<180)return false;
+            log.Diagnostic("LOCAL TERRAIN publication timeout; restoring the owned patch, not submitting revised geometry");CancelRestamp(log);return true;
+        }
+        var data=_terrainSystem.GetHeightData(false);var maximum=0f;var samples=0;
+        for(var z=0;z<3;z++)for(var x=0;x<3;x++)
+        {
+            var point=math.lerp(operation.Patch.Minimum,operation.Patch.Maximum,new float2(x/2f,z/2f));
+            var actual=TerrainUtils.SampleHeight(ref data,new float3(point.x,0,point.y));
+            if(!math.isfinite(actual)){CancelRestamp(log);return true;}
+            var expected=(float)(operation.Patch.Encoded(point.x,point.y)*operation.Scale/65535d);
+            maximum=Math.Max(maximum,Math.Abs(actual-expected));samples++;
+        }
+        log.Diagnostic($"LOCAL TERRAIN readback samples={samples}; maximumDifferenceMeters={maximum:R}; frames={frames}; CPUAvailable=true; targetMatched={maximum<=Math.Max(.25f,operation.Scale/65535f*4)}; sampledNotContinuous=true; nativeRoadAdjustmentsMayDiffer=true");
+        UnityEngine.Object.Destroy(operation.Backup);_restamp=null;published=true;return true;
+    }
+
+    public void CancelRestamp(ImportLog? log)
+    {
+        var operation=_restamp;if(operation==null)return;
+        try
+        {
+            if(ImportSession.Matches(operation.Request.MapSessionId,operation.Request.Generation)&&_terrainSystem.heightmap is RenderTexture target)
+            {
+                _terrainSystem.GetHeightData(true);CompleteReaders();
+                Graphics.CopyTexture(operation.Backup,0,0,0,0,operation.Backup.width,operation.Backup.height,target,0,0,operation.X,operation.Z);
+                PublishDirty(operation.Patch);
+                // A retry must not sample the cancelled candidate's CPU data.
+                _terrainSystem.GetHeightData(true);
+                log?.Diagnostic("LOCAL TERRAIN rollback published; original unapplied unit retained; outside pixels unchanged");
+            }
+        }
+        finally{UnityEngine.Object.Destroy(operation.Backup);_restamp=null;}
     }
 
     public bool CanApply(out string reason)

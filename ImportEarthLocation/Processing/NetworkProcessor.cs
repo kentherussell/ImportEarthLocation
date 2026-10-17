@@ -20,16 +20,12 @@ public static class NetworkProcessor
     {
         var segments = new List<PreparedSegment>();
         var dedupe = new HashSet<string>(StringComparer.Ordinal);
-        var tunnelPorts=new HashSet<long>(dataset.Ways.Values.Where(w=>w.Tags.TryGetValue("highway",out var c)&&(c=="motorway"||c=="trunk")&&IsYes(w.Tags,"tunnel")).SelectMany(w=>w.NodeIds));
-        var undergroundLinks=new HashSet<long>();
-        var links=dataset.Ways.Values.Where(w=>w.Tags.TryGetValue("highway",out var c)&&(c=="motorway_link"||c=="trunk_link")).ToArray();
-        var linkNodes=new HashSet<long>(tunnelPorts);
-        bool changed;do{changed=false;foreach(var link in links)if(!undergroundLinks.Contains(link.Id)&&link.NodeIds.Any(linkNodes.Contains))
-        {undergroundLinks.Add(link.Id);linkNodes.UnionWith(link.NodeIds);changed=true;}}while(changed);
+        // Underground-link omission belongs to TunnelIntervals on the selected,
+        // clipped segment graph. Whole-way flood filling here crossed branches
+        // and discarded surface continuations before that classifier could see them.
         foreach (var way in dataset.Ways.Values.OrderBy(way => way.Id))
         {
             token.ThrowIfCancellationRequested();
-            if(undergroundLinks.Contains(way.Id)){log.Count("Underground highway links intentionally excluded");continue;}
             if(way.Tags.TryGetValue("highway",out var policyClass)&&policyClass=="trunk_link"&&(request.RoadLevel&RoadImportLevel.Streets)==0)
             {log.Count("Trunk links excluded without Streets");continue;}
             if(way.Tags.TryGetValue("highway",out var excluded)&&NetworkSelection.IsExcludedStreetLink(excluded)){log.Count("Street links explicitly excluded");continue;}

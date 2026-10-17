@@ -27,6 +27,7 @@ public sealed partial class NetworkCommitSystem
     private static ulong s_DetachedWorld;
     private static bool s_DetachedRetirement;
     private readonly HashSet<Entity> _ownedDefinitions = new();
+    private int _foliageRequested=-1,_foliageDefinitions=-1;
     private readonly HashSet<Entity> _baselineTemps = new();
     private readonly HashSet<Entity> _claimedTemps = new();
     private readonly NativeEntityOwnership<Entity> _ownedEntities = new();
@@ -97,6 +98,7 @@ public sealed partial class NetworkCommitSystem
         s_Applied=false;s_ClearingPreview=false;s_ApplyInvocations=0;s_Submitted.Clear();
         owner._capturedActive=owner._toolSystem.activeTool;owner._capturedLast=last;owner._capturedSerial=owner._toolSerial;
         owner._ownedDefinitions.Clear();owner._baselineTemps.Clear();owner._claimedTemps.Clear();
+        owner._foliageRequested=owner._foliageDefinitions=-1;
         owner._foliageCandidates.Clear();
         owner._ownedEntities.DiscardBatch();
         using var temps = manager.CreateEntityQuery(ComponentType.ReadOnly<Temp>());
@@ -114,6 +116,14 @@ public sealed partial class NetworkCommitSystem
         if(owner==null||!owner._hasLease) throw new InvalidOperationException("No owner for the native allocation.");
         try { owner._ownedDefinitions.Add(entity);owner.TransactionState=NativeTransactionState.DefinitionsLive; }
         catch { AllocationUncertain(); throw; }
+    }
+
+    public static void DescribeFoliageDefinitions(int requested,int definitions)
+    {
+        var owner=s_Instance;
+        if(owner==null||!owner._hasLease||requested<0||definitions<0||definitions>requested)
+            throw new InvalidOperationException("Foliage definition counts require the current owned native lease.");
+        owner._foliageRequested=requested;owner._foliageDefinitions=definitions;
     }
 
     public static void AllocationUncertain()
@@ -227,7 +237,7 @@ public sealed partial class NetworkCommitSystem
 
     private void RecordSettlement()
     {
-        if(s_Applied&&_foliageCandidates.Count>0)
+        if(s_Applied&&_foliageRequested>=0)
         {
             var accepted=0;var unverified=0;
             foreach(var pair in _foliageCandidates)
@@ -242,6 +252,7 @@ public sealed partial class NetworkCommitSystem
             }
             _leaseLog?.Count("Vegetation accepted native objects",accepted);
             _leaseLog?.Count("Vegetation native outcomes unverified",unverified);
+            _leaseLog?.Diagnostic($"VEGETATION OUTCOME batch={_diagnosticBatchStem}; candidatesProcessed={_foliageRequested}; definitionsSubmitted={_foliageDefinitions}; capturedNewPlantTemps={_foliageCandidates.Count}; acceptedCapturedObjects={accepted}; unverifiedCapturedObjects={unverified}; definitionToObjectMatching=false; definitionMinusCapturedDifference={_foliageDefinitions-_foliageCandidates.Count}; differenceIsNotProvenLoss=true; mapSession={_leaseEpoch.MapSession}; generation={_leaseEpoch.Generation}");
         }
         _foliageCandidates.Clear();
         if(s_Applied)
@@ -260,15 +271,19 @@ public sealed partial class NetworkCommitSystem
     private void CaptureFoliageCandidates()
     {
         _foliageCandidates.Clear();
+        var missingContract=0;var retiredOrCancelled=0;var originalUpdates=0;var nonPlant=0;var wrongPrefab=0;
         foreach(var id in _claimedTemps)
         {
-            if(!EntityManager.HasComponent<Temp>(id)||EntityManager.HasComponent<Deleted>(id)||!EntityManager.HasComponent<PrefabRef>(id))continue;
+            if(!EntityManager.HasComponent<Temp>(id)||!EntityManager.HasComponent<PrefabRef>(id)){missingContract++;continue;}
             var temp=EntityManager.GetComponentData<Temp>(id);
-            if(temp.m_Original!=Entity.Null||(temp.m_Flags&(TempFlags.Delete|TempFlags.Cancel))!=0)continue;
-            if(!EntityManager.HasComponent<Game.Objects.Plant>(id)&&!EntityManager.HasComponent<Game.Objects.Tree>(id))continue;
+            if(EntityManager.HasComponent<Deleted>(id)||(temp.m_Flags&(TempFlags.Delete|TempFlags.Cancel))!=0){retiredOrCancelled++;continue;}
+            if(temp.m_Original!=Entity.Null){originalUpdates++;continue;}
+            if(!EntityManager.HasComponent<Game.Objects.Plant>(id)&&!EntityManager.HasComponent<Game.Objects.Tree>(id)){nonPlant++;continue;}
             var prefab=EntityManager.GetComponentData<PrefabRef>(id).m_Prefab;
             if(EntityManager.HasComponent<PlantData>(prefab))_foliageCandidates.Add(id,(prefab,EntityManager.HasComponent<TreeData>(prefab)));
+            else wrongPrefab++;
         }
+        if(_foliageRequested>=0)_leaseLog?.Diagnostic($"VEGETATION PREVIEW FUNNEL batch={_diagnosticBatchStem}; candidatesProcessed={_foliageRequested}; definitionsSubmitted={_foliageDefinitions}; claimedTemps={_claimedTemps.Count}; eligibleNewPlantTemps={_foliageCandidates.Count}; missingTempOrPrefabRef={missingContract}; deletedOrCancelled={retiredOrCancelled}; originalUpdates={originalUpdates}; nonPlantObjects={nonPlant}; missingPlantPrefabData={wrongPrefab}; filtersPartitionClaimedTemps=true; definitionToObjectMatching=false");
     }
 
     private void CaptureOwnershipCandidates()

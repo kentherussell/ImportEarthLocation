@@ -20,6 +20,7 @@ public static class NetworkLaneAlignment
             foreach(var start in new[]{true,false})
             {var id=start?result[i].StartNodeId:result[i].EndNodeId;if(!nodes.TryGetValue(id,out var list))nodes[id]=list=new();list.Add((i,start));}
         var ramps=0;var transitions=0;var tapered=0;var limited=0;
+        var directions=new List<NetworkApproachTapers.DirectionRequest>();
         var laneCache=new Dictionary<PreparedSegment,float[]>();
         float[] Lanes(PreparedSegment s)
         {
@@ -46,6 +47,7 @@ public static class NetworkLaneAlignment
             var incoming=inputs[0];var outgoing=outputs[0];
             var a=result[incoming.index];var b=result[outgoing.index];var heading=Heading(a,false);
             if(math.dot(heading,Heading(b,true))<.9f||a.Tunnel!=b.Tunnel)continue;
+            heading=math.normalizesafe(heading+Heading(b,true));
             var normal=new float3(heading.y,0,-heading.x);var anchor=a.End;
             var attached=entries.Where(e=>result[e.index].ProtectedLink&&result[e.index].OneWay&&result[e.index].Tunnel==a.Tunnel).ToArray();
             var side=1f;
@@ -58,27 +60,33 @@ public static class NetworkLaneAlignment
             // Keep the opposite through-lane edge fixed when a lane is added or
             // removed on the ramp side. Never centre a wider road on a narrower one.
             var aAnchor=side>0?al[0]:al[al.Length-1];var bAnchor=side>0?bl[0]:bl[bl.Length-1];
+            if(attached.Length>0||Math.Abs(aAnchor-bAnchor)>.01)
+            {directions.Add(new(incoming.index,false,-(double2)heading));directions.Add(new(outgoing.index,true,(double2)heading));}
             // Fix the continuing lane edge, not the centers of different-width
             // roads. Propagate this deck offset over the approach, never node IDs.
             joins.Add((incoming,outgoing,normal,attached,aAnchor-bAnchor));
         }
         var continuation=joins.ToDictionary(j=>j.incoming.index,j=>j);
         const float taperLength=220;
+        var referenceLengths=result.Select(s=>NetworkVerticalProfiles.ArcLength(s)).ToArray();
+        var stationShifts=new List<NetworkApproachTapers.Shift>();
         foreach(var join in joins)
         {
             token.ThrowIfCancellationRequested();if(Math.Abs(join.delta)<.01f)continue;
             transitions++;var index=join.outgoing.index;var distance=0f;var startNormal=join.normal;var visited=new HashSet<int>();
             var path=new List<(int index,float length)>();var available=0f;
-            while(available<taperLength&&visited.Add(index)&&path.Count<64)
+            var requestedReach=(float)Math.Max(taperLength,1.875*Math.Abs(join.delta)/Math.Tan(Math.PI/90));
+            while(available<requestedReach&&visited.Add(index))
             {
-                token.ThrowIfCancellationRequested();var length=NetworkVerticalProfiles.ArcLength(result[index]);path.Add((index,length));available+=length;
+                token.ThrowIfCancellationRequested();var length=referenceLengths[index];path.Add((index,length));available+=length;
                 if(!continuation.TryGetValue(index,out var next))break;index=next.outgoing.index;
             }
-            var reach=Math.Max(.01f,Math.Min(taperLength,available));
-            float Weight(float d){var t=math.clamp(d/reach,0,1);return 1-t*t*(3-2*t);}
+            var reach=Math.Max(.01f,Math.Min(requestedReach,available));
+            float Weight(float d)=>(float)NetworkDesignChecks.QuinticShift(1,d,reach).Value;
             foreach(var step in path)
             {
                 index=step.index;var s=result[index];var length=step.length;var endHeading=Heading(s,false);var endNormal=new float3(endHeading.y,0,-endHeading.x);
+                stationShifts.Add(new(index,distance,length,reach,join.delta,result[join.incoming.index].EndNodeId));
                 Offset((index,true),s.StartCurveOffset+startNormal*(join.delta*Weight(distance)));
                 Offset((index,false),s.EndCurveOffset+endNormal*(join.delta*Weight(distance+length)));
                 distance+=length;tapered++;
@@ -87,17 +95,16 @@ public static class NetworkLaneAlignment
                 startNormal=endNormal;
             }
         }
-        // Guard only pathological stacks of width changes, preserving shared
-        // corrections wherever normal native lane geometry stays within budget.
+        // A large correction is review evidence, not permission to independently
+        // clamp adjacent ports and introduce another kink. Reach grows with shift.
         for(var i=0;i<result.Length;i++)
         {
             var s=result[i];var maximum=Math.Max(math.length(s.StartCurveOffset),math.length(s.EndCurveOffset));
-            float3 Bounded(float3 offset)=>math.length(offset)>12?offset*(12/math.length(offset)):offset;
-            if(maximum>12){limited++;result[i]=s with{StartCurveOffset=Bounded(s.StartCurveOffset),EndCurveOffset=Bounded(s.EndCurveOffset)};}
+            if(maximum>12)limited++;
         }
         foreach(var join in joins)
         {
-            var incoming=join.incoming;var outgoing=join.outgoing;var a=result[incoming.index];var b=result[outgoing.index];var normal=join.normal;var anchor=a.End;var heading=Heading(a,false);
+                var incoming=join.incoming;var outgoing=join.outgoing;var a=result[incoming.index];var b=result[outgoing.index];var normal=join.normal;var anchor=a.End;var heading=new float2(-normal.z,normal.x);
             foreach(var entry in join.ramps)
             {
                 var ramp=result[entry.index];var far=entry.start?ramp.End:ramp.Start;var rampSide=math.dot(far-anchor,normal)>=0?1:-1;
@@ -107,34 +114,21 @@ public static class NetworkLaneAlignment
                 // Ramp local lane coordinates rotate with its own approach.
                 // Subtracting both offsets in the mainline frame picks the wrong
                 // receiving lane when the ramp enters at a substantial angle.
-                var rampHeading=Heading(ramp,entry.start);var rampNormal=new float3(rampHeading.y,0,-rampHeading.x);
                 var addedLane=entry.start?a.Lanes>b.Lanes:b.Lanes>a.Lanes;
                 // Without an added receiving lane, use a real merging junction,
                 // not almost coincident decks with crossing lane markings.
-                var offset=addedLane?targetOffset+normal*lane-rampNormal*rampLane:targetOffset;
-                if(math.length(offset)>12)offset=math.normalizesafe(offset)*12;
-                var control=entry.start?ramp.Control1??math.lerp(ramp.Start,ramp.End,1f/3):ramp.Control2??math.lerp(ramp.Start,ramp.End,2f/3);
                 var approach=heading;
                 if(!addedLane)
                 {
-                    var chord=math.normalizesafe((ramp.End-ramp.Start).xz);
-                    // Use available approach geometry, bounded away from a nearly
-                    // parallel overlapping merge. No uniform forced 20-degree hook.
-                    var angle=math.clamp((float)Math.Acos(math.clamp(math.dot(chord,heading),-1,1))*.5f,.17453293f,.5235988f);
+                    // Preserve the selected 20-degree no-added-lane contract,
+                    // but rotate the whole approach rather than one short handle.
+                    var angle=20f*(float)Math.PI/180;
                     var sign=entry.start?rampSide:-rampSide;
                     approach=heading*(float)Math.Cos(angle)+new float2(normal.x,normal.z)*sign*(float)Math.Sin(angle);
                 }
-                var reach=Math.Min(math.distance(ramp.Start.xz,ramp.End.xz)/3,120);
-                var aligned=anchor+new float3(approach.x,0,approach.y)*reach*(entry.start?1:-1);
-                var mainGrade=(target.End.y-target.Start.y)/Math.Max(1,math.distance(target.Start.xz,target.End.xz));
-                aligned.y=anchor.y+mainGrade*reach*(entry.start?1:-1);
-                var travel=math.normalizesafe((ramp.End-ramp.Start).xz);
-                var farHeading=Heading(ramp,!entry.start);
-                if(math.dot(farHeading,travel)<.35f)farHeading=travel;
-                var farReach=Math.Min(120,math.distance(ramp.Start.xz,ramp.End.xz)/3);
-                var farControl=(entry.start?ramp.End:ramp.Start)+new float3(farHeading.x,0,farHeading.y)*farReach*(entry.start?-1:1);
-                farControl.y=math.lerp(ramp.Start.y,ramp.End.y,entry.start?2f/3:1f/3);
-                result[entry.index]=entry.start?ramp with{Control1=aligned,Control2=farControl,StartCurveOffset=offset}:ramp with{Control1=farControl,Control2=aligned,EndCurveOffset=offset};ramps++;
+                var rampNormal=new float3(approach.y,0,-approach.x);
+                var offset=addedLane?targetOffset+normal*lane-rampNormal*rampLane:targetOffset;
+                Offset(entry,offset);directions.Add(new(entry.index,entry.start,(double2)approach*(entry.start?1:-1)));ramps++;
             }
         }
         var bundles=0;
@@ -147,22 +141,48 @@ public static class NetworkLaneAlignment
             if(!merging&&!splitting)continue;
             var receiver=merging?outputs[0]:inputs[0];var target=result[receiver.index];
             var heading=Heading(target,merging);var normal=new float3(heading.y,0,-heading.x);
-            var branches=(merging?inputs:outputs).OrderBy(e=>math.dot((e.start?result[e.index].End:result[e.index].Start)-target.Start,normal)).ToArray();
+            var branchPorts=merging?inputs:outputs;var anchor=merging?target.Start:target.End;
+            var reach=Math.Max(30,2*node.Value.Max(e=>result[e.index].NativeWidth));
+            float Across((int index,bool start) port,float distance)
+            {
+                var index=port.index;var start=port.start;var seen=new HashSet<int>();var point=start?source[index].Start:source[index].End;
+                while(seen.Add(index))
+                {
+                    var section=source[index];var previous=start?section.CourseStart:section.CourseEnd;
+                    for(var j=1;j<=32;j++)
+                    {
+                        var next=NetworkNormalizer.Evaluate(section,start?j/32f:1-j/32f);var span=math.distance(previous.xz,next.xz);
+                        if(span>=distance){point=math.lerp(previous,next,span>0?distance/span:0);return math.dot(point-anchor,normal);}
+                        distance-=span;previous=next;point=next;
+                    }
+                    var id=start?section.EndNodeId:section.StartNodeId;
+                    if(!nodes.TryGetValue(id,out var arms)||arms.Count!=2)break;
+                    var continuation=arms.First(e=>e.index!=index);
+                    if(continuation.start!=start||source[continuation.index].ProtectedLink!=section.ProtectedLink)break;
+                    index=continuation.index;start=continuation.start;
+                }
+                return math.dot(point-anchor,normal);
+            }
+            var ordered=branchPorts.Select(e=>(Port:e,Half:Across(e,reach*.5f),Full:Across(e,reach),Far:Across(e,reach*2)))
+                .OrderBy(p=>p.Full).ThenBy(p=>source[p.Port.index].WayId).ToArray();
+            var ambiguous=false;
+            for(var j=1;j<ordered.Length;j++)
+                if(ordered[j].Full-ordered[j-1].Full<=.001f||ordered[j].Half-ordered[j-1].Half<=.001f||ordered[j].Far-ordered[j-1].Far<=.001f)ambiguous=true;
+            if(ambiguous){log.Count("Lane bundles with ambiguous immutable branch order");continue;}
+            var branches=ordered.Select(p=>p.Port).ToArray();
             var slots=Lanes(target);var total=branches.Sum(e=>Math.Max(1,result[e.index].Lanes));var cursor=0;
             if(total!=slots.Length){log.Count("Lane bundles requiring native lane merge");continue;}
+            directions.Add(new(receiver.index,receiver.start,(double2)heading*(receiver.start?1:-1)));
             foreach(var branch in branches)
             {
                 var s=result[branch.index];var count=Math.Max(1,s.Lanes);var laneCenter=slots.Skip(cursor).Take(count).Average();cursor+=count;
                 var branchCenter=Lanes(s).Average();var offset=normal*(laneCenter-branchCenter)+(merging?target.StartCurveOffset:target.EndCurveOffset);
-                Offset(branch,offset);var p=branch.start?s.Start:s.End;var reach=Math.Min(180,math.distance(s.Start.xz,s.End.xz)*.4f);
-                var control=p+new float3(heading.x,0,heading.y)*reach*(branch.start?1:-1);
-                var grade=(target.End.y-target.Start.y)/Math.Max(1,math.distance(target.Start.xz,target.End.xz));control.y=p.y+grade*reach*(branch.start?1:-1);
-                var revised=result[branch.index];result[branch.index]=branch.start?revised with{Control1=control}:revised with{Control2=control};
+                Offset(branch,offset);directions.Add(new(branch.index,branch.start,(double2)heading*(branch.start?1:-1)));
             }
             bundles++;
         }
         log.Count("Highway lane bundles aligned",bundles);
-        log.Diagnostic($"LANE BUNDLES junctions={bundles}; laneOrder=travel-frame-left-to-right; separateNodeIdentitiesCreated=false; noAddedLaneMergeAngleDegrees=10-to-30-from-approach; appliedBeforeVerticalSolve=true");
+        log.Diagnostic($"LANE BUNDLES junctions={bundles}; laneOrder=travel-frame-left-to-right; separateNodeIdentitiesCreated=false; noAddedLaneMergeAngleDegrees=20; appliedBeforeVerticalSolve=true");
         // Offset handles and ramp tangents cannot extend past a clipped map end.
         // Roll back the whole affected join, not one incident curve endpoint:
         // otherwise the guard itself could introduce another misaligned join.
@@ -182,10 +202,9 @@ public static class NetworkLaneAlignment
             result[i]=s;
         }
         if(boundaryNodes.Count>0)log.Warn($"Lane alignment constrained at {boundaryNodes.Count} map-boundary joins. Shared connections preserved; the affected lane correction was rolled back, not the road.");
-        // The intentional lateral correction becomes the grading reference.
-        for(var i=0;i<result.Length;i++)if(math.lengthsq(result[i].StartCurveOffset)+math.lengthsq(result[i].EndCurveOffset)>0)
-            result[i]=result[i] with{SourceGeometry=Enumerable.Range(0,65).Select(j=>NetworkNormalizer.Evaluate(result[i],j/64f)).ToArray(),HorizontalParent=null};
-        log.Diagnostic($"LANE ALIGNMENT ramps={ramps}; widthTransitions={transitions}; taperedSections={tapered}; taperMeters={taperLength}; boundedOffsetSections={limited}; boundaryJoinsRolledBack={boundaryNodes.Count}; curveEndpointsOffset=true; exactSharedNodeAnchorsPreserved=true; nativeMeshRequiresVerification=true");
-        return result;
+        if(boundaryNodes.Count>0)stationShifts.RemoveAll(s=>boundaryNodes.Contains(result[s.Index].StartNodeId)||boundaryNodes.Contains(result[s.Index].EndNodeId));
+        log.Diagnostic($"LANE ALIGNMENT ramps={ramps}; widthTransitions={transitions}; taperedSections={tapered}; minimumTaperMeters={taperLength}; largeOffsetsRequiringReview={limited}; boundaryJoinsRolledBack={boundaryNodes.Count}; curveEndpointsOffset=true; exactSharedNodeAnchorsPreserved=true; nativeMeshRequiresVerification=true");
+        directions.RemoveAll(r=>boundaryNodes.Contains(r.Start?result[r.Index].StartNodeId:result[r.Index].EndNodeId));
+        return NetworkApproachTapers.Materialize(result,stationShifts,log,token,directions,fallback:source);
     }
 }

@@ -134,7 +134,8 @@ public static class RoundaboutPlanner
                     var irregularReach=math.distance(a.Start.xz,b.End.xz)/3;
                     var originalPoints=a.SourceGeometry.Concat(b.SourceGeometry.Skip(1)).ToArray();
                     var irregular=a with{End=b.End,EndNodeId=b.EndNodeId,Control1=a.Start+new float3(taIrregular.x,0,taIrregular.y)*irregularReach,Control2=b.End-new float3(tbIrregular.x,0,tbIrregular.y)*irregularReach,
-                        SourceWayIds=a.SourceWayIds.Concat(b.SourceWayIds).Distinct().ToArray(),OriginalGeometry=a.OriginalGeometry.Concat(b.OriginalGeometry).ToArray(),SourceGeometry=originalPoints};
+                        SourceWayIds=a.SourceWayIds.Concat(b.SourceWayIds).Distinct().ToArray(),SourceNodeAliases=a.SourceNodeAliases.Concat(b.SourceNodeAliases).Distinct().ToArray(),
+                        OriginalGeometry=a.OriginalGeometry.Concat(b.OriginalGeometry).ToArray(),SourceGeometry=originalPoints};
                     if(!NetworkNormalizer.WithinTolerance(irregular,3f))break;
                     result[i]=irregular;outgoing[a.StartNodeId]=new[]{irregular};outgoing.Remove(b.StartNodeId);arcRemoved.Add(b);compactedIrregular++;continue;
                 }
@@ -146,7 +147,8 @@ public static class RoundaboutPlanner
                 var reach=4f/3*circle.radius*(float)Math.Tan(sweep/4);
                 var ta=math.normalizesafe(new float2(-startVector.y,startVector.x))*sign;var tb=math.normalizesafe(new float2(-endVector.y,endVector.x))*sign;
                 var merged=a with{End=b.End,EndNodeId=b.EndNodeId,Control1=a.Start+new float3(ta.x,0,ta.y)*reach,Control2=b.End-new float3(tb.x,0,tb.y)*reach,
-                    SourceWayIds=a.SourceWayIds.Concat(b.SourceWayIds).Distinct().ToArray(),OriginalGeometry=a.OriginalGeometry.Concat(b.OriginalGeometry).ToArray(),SourceGeometry=new[]{a.Start,b.End}};
+                    SourceWayIds=a.SourceWayIds.Concat(b.SourceWayIds).Distinct().ToArray(),SourceNodeAliases=a.SourceNodeAliases.Concat(b.SourceNodeAliases).Distinct().ToArray(),
+                    OriginalGeometry=a.OriginalGeometry.Concat(b.OriginalGeometry).ToArray(),SourceGeometry=new[]{a.Start,b.End}};
                 result[i]=merged;outgoing[a.StartNodeId]=new[]{merged};outgoing.Remove(b.StartNodeId);arcRemoved.Add(b);compactedArcs++;
             }
         }
@@ -154,7 +156,7 @@ public static class RoundaboutPlanner
         log.Count("Roundabout degree-two nodes simplified",compactedArcs);
         log.Count("Irregular roundabout degree-two nodes simplified",compactedIrregular);
         log.Diagnostic($"ROUNDABOUT PREPARATION curvedRingSections={smooth}; nativeSmallJunctions={compact}; circularizedRingNodes={ringPositions.Count}; taggedMiniApproaches={result.Count(s=>s.StartMiniRoundabout||s.EndMiniRoundabout)}; incompleteRingsPreserved=true; oversizedRingPalette=regular-oneway-two-lanes");
-        return result;
+        return SourceTopologyObligations.Transfer(source,result,NetworkKind.Road,remap.ToDictionary(p=>p.Key,p=>p.Value.id));
     }
 }
 

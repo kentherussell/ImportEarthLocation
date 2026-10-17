@@ -33,7 +33,8 @@ public static class NetworkNormalizer
             }
             if(match<0){candidates.Add(result.Count);result.Add(s);continue;}
             var old=result[match];var keeper=s.Roundabout&&!old.Roundabout?s:old;
-            result[match]=keeper with{SourceWayIds=old.SourceWayIds.Concat(s.SourceWayIds).Append(old.WayId).Append(s.WayId).Distinct().ToArray()};
+            result[match]=keeper with{SourceWayIds=old.SourceWayIds.Concat(s.SourceWayIds).Append(old.WayId).Append(s.WayId).Distinct().ToArray(),
+                SourceNodeAliases=old.SourceNodeAliases.Concat(s.SourceNodeAliases).Distinct().ToArray()};
             log.Count("Final coincident courses coalesced");
             log.Diagnostic($"NETWORK COINCIDENT COURSE retainedWay={keeper.WayId}; aliasWay={s.WayId}; ports={a}/{b}; toleranceMeters=0.5; sourceAliasesRetained=true");
         }
@@ -59,6 +60,8 @@ public static class NetworkNormalizer
         }
         foreach(var segment in input)
         {
+            foreach(var alias in segment.SourceNodeAliases.Where(a=>a.Mandatory))
+            {var key=NodeKey(segment,alias.CanonicalNodeId);if(degree.ContainsKey(key))degree[key]+=100;}
             if(segment.StartMiniRoundabout)degree[NodeKey(segment,segment.StartNodeId)]+=100;
             if(segment.EndMiniRoundabout)degree[NodeKey(segment,segment.EndNodeId)]+=100;
         }
@@ -126,20 +129,37 @@ public static class NetworkNormalizer
         }
         log.Count("Segments merged", Math.Max(0, input.Count - output.Count));
         var unique = new List<PreparedSegment>();
-        var equivalents = new Dictionary<string, List<PreparedSegment>>(StringComparer.Ordinal);
+        var equivalents = new Dictionary<string, List<int>>(StringComparer.Ordinal);
         foreach (var segment in output)
         {
             token.ThrowIfCancellationRequested();
             var a = segment.OneWay ? segment.StartNodeId : Math.Min(segment.StartNodeId, segment.EndNodeId);
             var b = segment.OneWay ? segment.EndNodeId : Math.Max(segment.StartNodeId, segment.EndNodeId);
             var key = $"{segment.Kind}:{segment.Classification}:{segment.Lanes}:{segment.OneWay}:{segment.Bridge}:{segment.Tunnel}:{segment.Layer}:{a}:{b}";
-            if (!equivalents.TryGetValue(key, out var candidates)) equivalents[key] = candidates = new List<PreparedSegment>();
+            if (!equivalents.TryGetValue(key, out var candidates)) equivalents[key] = candidates = new List<int>();
             // Only equivalent topology endpoints AND nearly coincident curves qualify.
             // Parallel tracks/carriageways with different OSM node IDs never qualify.
-            var duplicate = candidates.Any(other => Enumerable.Range(0, 33).All(i =>
-                math.distance(Evaluate(segment, i / 32f).xz, Evaluate(other, (segment.StartNodeId == other.StartNodeId ? i : 32 - i) / 32f).xz) < 0.05f));
-            if (duplicate) { log.Count("Duplicates/artifacts removed"); continue; }
-            candidates.Add(segment); unique.Add(segment);
+            var duplicate=-1;
+            foreach(var index in candidates)
+            {
+                var other=unique[index];
+                if(Enumerable.Range(0,33).All(i=>math.distance(Evaluate(segment,i/32f).xz,
+                    Evaluate(other,(segment.StartNodeId==other.StartNodeId?i:32-i)/32f).xz)<.05f)){duplicate=index;break;}
+            }
+            if(duplicate>=0)
+            {
+                // Equivalent geometry is one physical demand, not permission
+                // to erase the source routes which the retained course carries.
+                var retained=unique[duplicate];
+                unique[duplicate]=retained with
+                {
+                    SourceWayIds=retained.SourceWayIds.Concat(segment.SourceWayIds).Concat(new[]{retained.WayId,segment.WayId}).Distinct().ToArray(),
+                    SourceNodeAliases=retained.SourceNodeAliases.Concat(segment.SourceNodeAliases).Distinct().ToArray(),
+                    OriginalGeometry=retained.OriginalGeometry.Concat(segment.OriginalGeometry).ToArray()
+                };
+                log.Count("Duplicates/artifacts removed");continue;
+            }
+            candidates.Add(unique.Count);unique.Add(segment);
         }
         log.Time("Smoothing", clock.Elapsed.TotalSeconds);
         SmoothJoins(unique, log, token, (float)(mapWidth / 2));
@@ -149,13 +169,16 @@ public static class NetworkNormalizer
 
     private static IEnumerable<PreparedSegment> OrderSections(IEnumerable<PreparedSegment> source,Dictionary<string,int> degree)
     {
-        var items=source.ToArray();var remaining=new HashSet<int>(Enumerable.Range(0,items.Length));
+        var items=source.OrderBy(s=>s.OneWay?s.StartNodeId:Math.Min(s.StartNodeId,s.EndNodeId)).ThenBy(s=>s.WayId)
+            .ThenBy(s=>s.StartNodeId).ThenBy(s=>s.EndNodeId).ToArray();var remaining=new HashSet<int>(Enumerable.Range(0,items.Length));
         var nodes=new Dictionary<string,List<int>>();
         for(var i=0;i<items.Length;i++)foreach(var id in new[]{items[i].StartNodeId,items[i].EndNodeId})
         {var key=NodeKey(items[i],id);if(!nodes.TryGetValue(key,out var list))nodes[key]=list=new();list.Add(i);}
         while(remaining.Count>0)
         {
-            var seed=remaining.Min();remaining.Remove(seed);var chain=new LinkedList<PreparedSegment>();chain.AddLast(items[seed]);
+            var seed=remaining.Min();remaining.Remove(seed);var chain=new LinkedList<PreparedSegment>();var first=items[seed];
+            if(!first.OneWay&&first.StartNodeId>first.EndNodeId)first=Reverse(first);
+            chain.AddLast(first);
             foreach(var prepend in new[]{false,true})while(true)
             {
                 var tip=prepend?chain.First!.Value:chain.Last!.Value;var id=prepend?tip.StartNodeId:tip.EndNodeId;var key=NodeKey(tip,id);
@@ -174,6 +197,11 @@ public static class NetworkNormalizer
     {
         NetworkSides Swap(NetworkSides value)=>((value&NetworkSides.Left)!=0?NetworkSides.Right:0)|((value&NetworkSides.Right)!=0?NetworkSides.Left:0);
         return s with{StartNodeId=s.EndNodeId,EndNodeId=s.StartNodeId,Start=s.End,End=s.Start,Control1=s.Control2,Control2=s.Control1,
+            FinalDeckCurve=s.FinalDeckCurve.HasValue?new(s.FinalDeckCurve.Value.P3,s.FinalDeckCurve.Value.P2,s.FinalDeckCurve.Value.P1,s.FinalDeckCurve.Value.P0):null,
+            HorizontalEmissionReference=s.HorizontalEmissionReference.HasValue?new(s.HorizontalEmissionReference.Value.P3,s.HorizontalEmissionReference.Value.P2,s.HorizontalEmissionReference.Value.P1,s.HorizontalEmissionReference.Value.P0):null,
+            StartHeightFamily=s.EndHeightFamily,EndHeightFamily=s.StartHeightFamily,PairedReversed=s.PairedSpanId!=0?!s.PairedReversed:s.PairedReversed,
+            PairedReferenceBegin=s.PairedReferenceEnd,PairedReferenceEnd=s.PairedReferenceBegin,
+            StartReferenceSpeed=s.EndReferenceSpeed,EndReferenceSpeed=s.StartReferenceSpeed,
             StartCurveOffset=s.EndCurveOffset,EndCurveOffset=s.StartCurveOffset,StartElevation=s.EndElevation,EndElevation=s.StartElevation,
             ForwardLanes=s.BackwardLanes,BackwardLanes=s.ForwardLanes,ExplicitIncline=s.ExplicitIncline.HasValue?-s.ExplicitIncline.Value:null,
             ExplicitCutSides=Swap(s.ExplicitCutSides),ExplicitWallSides=Swap(s.ExplicitWallSides),RetainingWallSides=Swap(s.RetainingWallSides),
@@ -254,26 +282,28 @@ public static class NetworkNormalizer
             }
             var ai=Neighbor(s.StartNodeId);var bi=Neighbor(s.EndNodeId);if(ai<0||bi<0||ai==bi)continue;
             var a=input[ai];var b=input[bi];
-            bool Compatible(PreparedSegment p)=>!p.ProtectedLink&&p.Classification==s.Classification&&p.OneWay==s.OneWay&&p.Layer==s.Layer&&p.Tunnel==s.Tunnel;
+            bool Compatible(PreparedSegment p)=>!p.ProtectedLink&&!p.Roundabout&&p.Classification==s.Classification&&p.OneWay==s.OneWay&&p.Layer==s.Layer&&p.Tunnel==s.Tunnel&&p.Bridge==s.Bridge;
             if(!Compatible(a)||!Compatible(b)||a.Lanes!=b.Lanes||a.Lanes==s.Lanes)continue;
             result[i]=s with{Lanes=Numeric.Clamp(a.Lanes,1,5)};changed++;
         }
         log.Count("Short highway lane fluctuations normalized",changed);
         // Remove short lane-count runs bounded on both sides by the same size.
-        // Follow route-compatible continuations through ramp junctions, but never
-        // normalize a ramp or erase a sustained lane-count change.
+        // A real branch can explain a lane addition/drop. Stop there rather than
+        // following the through route and erasing a legitimate exit/merge lane.
         var runChanged=0;var seenRuns=new HashSet<int>();
-        bool SameRoute(PreparedSegment a,PreparedSegment b)=>!b.ProtectedLink&&a.Kind==b.Kind&&a.Classification==b.Classification&&a.OneWay==b.OneWay&&a.Layer==b.Layer&&a.Tunnel==b.Tunnel&&
+        bool SameRoute(PreparedSegment a,PreparedSegment b)=>!b.ProtectedLink&&!b.Roundabout&&a.Kind==b.Kind&&a.Classification==b.Classification&&a.OneWay==b.OneWay&&a.Layer==b.Layer&&a.Tunnel==b.Tunnel&&a.Bridge==b.Bridge&&
             (a.WayId==b.WayId||a.CorridorId!=0&&a.CorridorId==b.CorridorId||a.Reference.Length>0&&a.Reference==b.Reference||a.Name.Length>0&&a.Name==b.Name);
         int Continuation(int index,long node)
         {
+            if(nodes[node].Count!=2)return -1;
             var candidates=nodes[node].Where(i=>i!=index&&SameRoute(result[index],result[i])).ToArray();
             return candidates.Length==1?candidates[0]:-1;
         }
         for(var seed=0;seed<result.Length;seed++)
         {
             token.ThrowIfCancellationRequested();var s=result[seed];
-            if(s.Kind!=NetworkKind.Road||s.ExplicitLanes||s.ProtectedLink||!(s.Classification is "motorway" or "trunk")||seenRuns.Contains(seed))continue;
+            if(s.Kind!=NetworkKind.Road||s.ExplicitLanes||s.ProtectedLink||s.Roundabout||
+                !(s.Classification is "motorway" or "trunk" or "primary" or "secondary" or "tertiary")||seenRuns.Contains(seed))continue;
             var run=new HashSet<int>{seed};var ends=new List<int>();var length=math.distance(s.Start.xz,s.End.xz);
             foreach(var startNode in new[]{s.StartNodeId,s.EndNodeId})
             {
@@ -290,7 +320,7 @@ public static class NetworkNormalizer
             foreach(var index in run){result[index]=result[index] with{Lanes=result[ends[0]].Lanes};runChanged++;}
         }
         log.Count("Corridor lane fluctuation sections normalized",runChanged);
-        log.Diagnostic("LANE POLICY syntheticAuxiliaryWidening=false; sustainedSourceLaneChangesPreserved=true; maximumNormalizedRunMeters=350; rampsNotWidened=true");
+        log.Diagnostic("LANE POLICY syntheticAuxiliaryWidening=false; sustainedSourceLaneChangesPreserved=true; maximumNormalizedRunMeters=350; rampsNotWidened=true; realBranchesAndStructureBoundariesStopNormalization=true; explicitLaneEvidenceUnchanged=true");
         return result;
     }
 
@@ -347,7 +377,7 @@ public static class NetworkNormalizer
         token.ThrowIfCancellationRequested();
         if (source.Count == 1) { output.Add(source[0] with { SourceGeometry = points.ToArray() }); return; }
         var first = source[0]; var last = source[source.Count - 1];
-        var distance = math.distance(points[0], points[points.Count - 1]);
+        var distance = math.distance(points[0].xz, points[points.Count - 1].xz);
         // Estimate direction over a short arc, rather than trusting one noisy OSM edge.
         var reach = Math.Min(first.Kind==NetworkKind.Rail?80f:first.Classification=="motorway"||first.Classification=="trunk"?60f:35f, distance * .2f);
         float3 Tangent(bool end)
@@ -363,17 +393,19 @@ public static class NetworkNormalizer
             }
             return math.normalizesafe(last.End - first.Start);
         }
-        var c1 = points[0] + Tangent(false) * distance / 3f;
-        var c2 = points[points.Count - 1] - Tangent(true) * distance / 3f;
+        var fitValid=NetworkSourceFit.TryFit(points,points[0],points[points.Count-1],Tangent(false).xz,Tangent(true).xz,
+            tolerance??Tolerance(first.Kind),token,out var fitted,out var worstStation);
+        var c1=(float3)fitted.P1;var c2=(float3)fitted.P2;
         var candidate = first with { End = last.End, EndNodeId = last.EndNodeId, EndRoundaboutRadius=last.EndRoundaboutRadius,
             EndMiniRoundabout=last.EndMiniRoundabout,EndTerminal=last.EndTerminal,
             SourceWayIds=source.SelectMany(s=>s.SourceWayIds.Count>0?s.SourceWayIds:new[]{s.WayId}).Distinct().ToArray(),
+            SourceNodeAliases=source.SelectMany(s=>s.SourceNodeAliases).Distinct().ToArray(),
             OriginalGeometry=source.SelectMany(s=>s.OriginalGeometry.Count>0?s.OriginalGeometry:new[]{s.Start,s.End}).ToArray(),
             ExplicitLanes=source.Any(s=>s.ExplicitLanes),Control1 = c1, Control2 = c2, SourceGeometry = points.ToArray() };
-        if (distance > 0.05f && Math.Abs(c1.x) <= halfWidth && Math.Abs(c1.z) <= halfWidth &&
+        if (fitValid&&distance > 0.05f && Math.Abs(c1.x) <= halfWidth && Math.Abs(c1.z) <= halfWidth &&
             Math.Abs(c2.x) <= halfWidth && Math.Abs(c2.z) <= halfWidth && WithinTolerance(candidate,tolerance)) { output.Add(candidate); return; }
         // A rejected fit increases the section count, never deletes source geometry.
-        var split = source.Count / 2;
+        var split = Math.Max(1,Math.Min(source.Count-1,worstStation));
         Fit(points.Take(split + 1).ToList(), source.Take(split).ToArray(), output, token, halfWidth,tolerance);
         Fit(points.Skip(split).ToList(), source.Skip(split).ToArray(), output, token, halfWidth,tolerance);
     }

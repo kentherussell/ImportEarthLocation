@@ -21,13 +21,13 @@ export const ImportLauncher = ({ theme, className }: { theme?: any; className?: 
   if (!editor) return null;
   return <Tooltip tooltip="Import Earth" direction="up"><Button variant="icon"
     focusKey="import-earth-location-launcher" className={className} theme={theme}
-    style={{ width: "44rem", height: "44rem", minWidth: "44rem", maxWidth: "44rem", minHeight: "44rem", maxHeight: "44rem", overflow: "hidden", flexShrink: 0 }}
     selected={open}
     onSelect={() => trigger(group, "setPanelOpen", !open)} aria-label="Import Earth"><img className={styles.launcherIcon} src={importIcon} alt="" width={32} height={32} style={{ width: "32rem", height: "32rem", maxWidth: "32rem", maxHeight: "32rem", flexShrink: 0, objectFit: "contain" }} /></Button></Tooltip>;
 };
 const AnchoredLauncher = () => {
   const editor = useValue(isEditor$);
   const [host, setHost] = useState<HTMLElement | null>(null);
+  const [nativeButtonClass, setNativeButtonClass] = useState("");
   useEffect(() => {
     if (!editor) return;
     const container = document.createElement("div");
@@ -45,8 +45,19 @@ const AnchoredLauncher = () => {
         .filter(button => !container.contains(button)) : [];
       let row = buttons.length > 1 ? buttons[0].parentElement : toolbar;
       const last = buttons[buttons.length - 1];
-      // Gameface cannot resolve CSS var() fallbacks reliably. Keep both the
-      // button and image explicitly bounded instead of inheriting auto sizes.
+      // Reuse only native button style classes, never a neighbor's selected,
+      // disabled, or mod-specific state. Native rules own colors and hover state.
+      const peer = buttons.find(button => Array.from(button.classList).some(name => /^(button|tool-button|icon-button)_/.test(name)));
+      const peerClasses = peer ? Array.from(peer.classList).filter(name => /^(button|tool-button|icon-button)_/.test(name)).join(" ") : "";
+      setNativeButtonClass(previous => previous === peerClasses ? previous : peerClasses);
+      if (peer) {
+        const size = window.getComputedStyle(peer);
+        container.style.width = size.width;
+        container.style.height = size.height;
+      } else {
+        container.style.width = "48rem";
+        container.style.height = "48rem";
+      }
       while (row && toolbar && last && !row.contains(last)) row = row.parentElement;
       if (row && toolbar && !toolbar.contains(row)) row = toolbar;
       const target = row || toolbar || document.body;
@@ -76,7 +87,7 @@ const AnchoredLauncher = () => {
       container.remove();
     };
   }, [editor]);
-  return editor && host ? createPortal(<ImportLauncher className={styles.launcherButton} />, host) : null;
+  return editor && host ? createPortal(<ImportLauncher className={`${nativeButtonClass} ${styles.launcherButton}`} />, host) : null;
 };
 const busy$ = bindValue<boolean>(group, "busy", false);
 const ready$ = bindValue<boolean>(group, "ready", false);

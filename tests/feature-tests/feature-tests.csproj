@@ -19,6 +19,8 @@
     <Compile Include="../../ImportEarthLocation/Processing/VegetationPlanner.cs" Link="VegetationPlanner.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/ForestProcessor.cs" Link="ForestProcessor.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkNormalizer.cs" Link="NetworkNormalizer.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkSourceFit.cs" Link="NetworkSourceFit.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkDesignChecks.cs" Link="NetworkDesignChecks.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/WaterBodyPlanner.cs" Link="WaterBodyPlanner.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkVerticalProfiles.cs" Link="NetworkVerticalProfiles.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/ConnectedRoadGrades.cs" Link="ConnectedRoadGrades.cs" />

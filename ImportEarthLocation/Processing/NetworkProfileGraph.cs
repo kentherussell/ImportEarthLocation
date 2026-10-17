@@ -11,6 +11,8 @@ public sealed class NetworkProfileGraph
 {
     private readonly ProfileGraphArc[][] _adjacency;
     private readonly List<(double Distance, int Node)> _heap = new();
+    private double[]? _queryDistances;
+    private readonly List<int> _queryTouched=new();
     public long Relaxations { get; private set; }
     public int Nodes => _adjacency.Length;
     public NetworkProfileGraph(IReadOnlyList<ProfileGraphArc[]> adjacency)
@@ -66,5 +68,30 @@ public sealed class NetworkProfileGraph
             }
         }
         _heap.Clear();return distances;
+    }
+
+    // Bounded point-to-point witnesses reuse storage and reset only visited
+    // vertices. No N-vector allocation/reset for each footprint candidate.
+    public double Distance(int source,int target,double maximum,CancellationToken token)
+    {
+        if(source<0||source>=Nodes||target<0||target>=Nodes||double.IsNaN(maximum)||maximum<0)throw new ArgumentException("Invalid witness query.");
+        if(_queryDistances==null){_queryDistances=new double[Nodes];for(var i=0;i<Nodes;i++)_queryDistances[i]=double.PositiveInfinity;}
+        foreach(var node in _queryTouched)_queryDistances[node]=double.PositiveInfinity;
+        _queryTouched.Clear();_heap.Clear();_queryDistances[source]=0;_queryTouched.Add(source);Push((0,source));
+        var visits=0;
+        while(_heap.Count>0)
+        {
+            if((visits++&1023)==0)token.ThrowIfCancellationRequested();
+            var current=Pop();if(current.Distance!=_queryDistances[current.Node])continue;
+            if(current.Node==target){_heap.Clear();return current.Distance;}
+            foreach(var arc in _adjacency[current.Node])
+            {
+                var next=current.Distance+arc.Cost;
+                if(next>maximum||next>=_queryDistances[arc.To])continue;
+                if(double.IsPositiveInfinity(_queryDistances[arc.To]))_queryTouched.Add(arc.To);
+                _queryDistances[arc.To]=next;Push((next,arc.To));
+            }
+        }
+        return double.PositiveInfinity;
     }
 }

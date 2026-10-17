@@ -26,7 +26,7 @@ static class WaterTests
         IndexedMaskChecks();
         var pulseLog=new ImportLog();var details=new List<string>();
         WaterBodyPlanner.Prepare(dataset,new[]{river},request,terrain,pulseLog,default,28,details.Add);
-        foreach(var phase in new[]{"indexing mapped water","mapped lakes","connecting river reaches","solving river levels pass","conditioning river beds and placing controls","publishing conditioned water terrain"})
+        foreach(var phase in new[]{"indexing mapped water","mapped lakes","connecting river reaches","sampling contained river stage bounds","solving directed water stages","conditioning river beds and placing controls","publishing conditioned water terrain"})
             Check(details.Any(s=>s.Contains(phase,StringComparison.Ordinal)),"Water phase missing from UI progress: "+phase);
         Check(pulseLog.Lines.Any(s=>s.Contains("WATER PLAN PROGRESS")&&s.Contains("bedCellsVisited=")&&s.Contains("reachSamples=")),"Water diagnostics omit work counters");
         Check(plan.Sources.Count>1&&plan.Sources.Select(s=>s.BodyId).Distinct().Count()==1,"Connected split river lost its durable body identity or distributed controls");
@@ -49,15 +49,29 @@ static class WaterTests
         Check(Plan(new[]{river},cell:float.NaN).Sources.Count==0,"Unknown native water-grid size should not create controls");
         var intermittent=new OsmDataset{Nodes=nodes,Ways=new Dictionary<long,OsmWay>{{1,way with{Tags=new Dictionary<string,string>{{"waterway","river"},{"intermittent","yes"}}}}}};
         Check(Plan(new[]{river},data:intermittent).Sources.Count==0,"Intermittent river received permanent sources");
-        Check(Plan(new[]{river},terrain with{SeaLevelMeters=50}).Sources.Count==0,"A high receiving level bypassed bank containment");
+        // Nominal sea metadata is not an evidenced receiving boundary for an
+        // inland/no-coast fixture. It must neither raise stages nor relax banks.
+        var highNominalSea=Plan(new[]{river},terrain with{SeaLevelMeters=50});
+        Check(!highNominalSea.Coastal&&highNominalSea.Sources.Count==plan.Sources.Count&&
+            highNominalSea.Sources.Select(s=>s.TargetSurfaceLevel).SequenceEqual(plan.Sources.Select(s=>s.TargetSurfaceLevel))&&
+            highNominalSea.Sources.All(s=>s.TargetSurfaceLevel<=s.BankLevel-.35f),"Nominal sea metadata changed an unconnected river stage or bypassed bank containment");
         var narrow=new OsmDataset{Nodes=nodes,Ways=new Dictionary<long,OsmWay>{{1,way with{Tags=new Dictionary<string,string>{{"waterway","canal"},{"width","4"}}}}}};
         Check(Plan(Array.Empty<GeographicPolygon>(),data:narrow).Sources.Count==0,"Sub-grid canal received a source spilling beyond its known width");
         var earthworks=plan.ConditionedHeightmap.ToArray();var source=plan.Sources.First();
-        earthworks[Pixel(source.Position.x,source.Position.z)]=(ushort)((source.TargetSurfaceLevel!.Value+.5f)/100*65535);
+        var obstruction=Pixel(source.Position.x,source.Position.z);
+        // Raise the complete bilinear neighbourhood. One nearest raster sample
+        // did not actually obstruct the off-grid source's interpolated bed.
+        for(var z=Math.Max(0,obstruction/64-1);z<=Math.Min(63,obstruction/64+1);z++)
+            for(var x=Math.Max(0,obstruction%64-1);x<=Math.Min(63,obstruction%64+1);x++)
+                earthworks[z*64+x]=(ushort)((source.TargetSurfaceLevel!.Value+.5f)/100*65535);
+        Check(NetworkProcessor.Sample(source.Position.x,source.Position.z,earthworks,100,1000)>source.TargetSurfaceLevel!.Value,"Protected-source fixture does not actually obstruct the bilinear bed");
         var revisionLog=new ImportLog();var revised=WaterBodyPlanner.Revalidate(plan,terrain with{Heightmap=earthworks},1000,revisionLog,default);
         Check(revised.Sources.Count==plan.Sources.Count&&revised.ConditionedHeightmap!=null,"Small final-earthworks obstruction was not recovered: "+string.Join(" | ",revisionLog.Lines));
         var protectedRoad=new PreparedSegment(5,10,11,source.Position-new float3(100,0,0),source.Position+new float3(100,0,0),NetworkKind.Road,"primary",2,false,false,false,0){NativeWidth=16};
-        var noControls=plan with{Sources=Array.Empty<RiverSourcePlan>()};var emptyLog=new ImportLog();
+        var ownedWithoutControls=plan with{Sources=Array.Empty<RiverSourcePlan>()};
+        var restoredOwnedBed=WaterBodyPlanner.Revalidate(ownedWithoutControls,terrain with{Heightmap=earthworks},1000,new ImportLog(),default);
+        Check(restoredOwnedBed.ConditionedHeightmap!=null&&restoredOwnedBed.ConditionedHeightmap[Pixel(source.Position.x,source.Position.z)]==plan.PlannedBedHeightmap![Pixel(source.Position.x,source.Position.z)],"Accepted water-owned bed depended on a native regulator being present");
+        var noControls=ownedWithoutControls with{BedEdits=null,PlannedBedHeightmap=null};var emptyLog=new ImportLog();
         var beforeFinal=earthworks.ToArray();
         var noControlRevision=WaterBodyPlanner.Revalidate(noControls,terrain with{Heightmap=earthworks},1000,emptyLog,default,new[]{protectedRoad});
         Check(noControlRevision.ConditionedHeightmap==null&&earthworks.SequenceEqual(beforeFinal),"No-control revalidation restored stale preparation terrain over newer earthworks");
@@ -109,7 +123,11 @@ static class WaterTests
         // Co-located controls make a precedence error observable as a wrong level.
         var broad=huge with{Inner=new()};var small=local with{Inner=new()};
         RiverSourcePlan Source(long body,float stage)=>new(body,"test","fixture",float3.zero,28,1,100,float3.zero){BodyKind="lake",BodyId=body,TargetSurfaceLevel=stage};
-        var water=new WaterPlan(false,0,2,0,"fixture"){Sources=new[]{Source(broad.Id,42),Source(small.Id,19)}};
+        // Surface sampling consumes canonical typed area stages, not the
+        // optional native control list. Retain both products in this fixture.
+        var water=new WaterPlan(false,0,2,0,"fixture")
+        {Sources=new[]{Source(broad.Identity,42),Source(small.Identity,19)},
+            AreaStages=new[]{new WaterAreaStage(broad.Identity,"lake",42),new WaterAreaStage(small.Identity,"lake",19)}};
         Check(WaterBodyPlanner.SurfaceSampler(water,new[]{broad,small})(float3.zero)==42,"Global area lost precedence over later local area");
         Check(WaterBodyPlanner.SurfaceSampler(water,new[]{small,broad})(float3.zero)==19,"Local area lost precedence over later global area");
     }

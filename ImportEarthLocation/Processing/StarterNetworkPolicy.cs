@@ -40,12 +40,16 @@ public static class StarterNetworkPolicy
             // Split at setbacks, preserving the exact existing cubic and real
             // endpoint identity. Wall upgrades only cover the central interval.
             var cuts=new List<float>{0};if(begin>1)cuts.Add(begin/length);if(end<length-1)cuts.Add(end/length);cuts.Add(1);
-            var node=s.StartNodeId;
-            float3 Derivative(float t){var u=1-t;return 3*u*u*(s.CourseControl1-s.CourseStart)+6*u*t*(s.CourseControl2-s.CourseControl1)+3*t*t*(s.CourseEnd-s.CourseControl2);}
+            var remaining=s;var previous=0d;
             for(var j=1;j<cuts.Count;j++)
-            {var lo=cuts[j-1];var hi=cuts[j];var id=j==cuts.Count-1?s.EndNodeId:Node();var offsetA=math.lerp(s.StartCurveOffset,s.EndCurveOffset,lo);var offsetB=math.lerp(s.StartCurveOffset,s.EndCurveOffset,hi);
-                var p=NetworkNormalizer.Evaluate(s,lo);var q=NetworkNormalizer.Evaluate(s,hi);var active=(lo+hi)*.5f>=begin/length&&(lo+hi)*.5f<=end/length;
-                output.Add(s with{Start=p-offsetA,End=q-offsetB,StartNodeId=node,EndNodeId=id,Control1=p+Derivative(lo)*(hi-lo)/3-offsetA,Control2=q-Derivative(hi)*(hi-lo)/3-offsetB,StartCurveOffset=offsetA,EndCurveOffset=offsetB,StartElevation=p.y-NetworkProcessor.Sample(p.x,p.z,raster,scale,width),EndElevation=q.y-NetworkProcessor.Sample(q.x,q.z,raster,scale,width),StartMiniRoundabout=lo==0&&s.StartMiniRoundabout,EndMiniRoundabout=hi==1&&s.EndMiniRoundabout,StartTerminal=lo==0&&s.StartTerminal,EndTerminal=hi==1&&s.EndTerminal,QuaySides=active?side:NetworkSides.None,RetainingWallSides=active?NetworkSides.None:s.RetainingWallSides,HorizontalParent=null});node=id;}
+            {
+                var hi=(double)cuts[j];PreparedSegment child;
+                if(j<cuts.Count-1){var pair=NativeDesignUnits.Split(remaining,(hi-previous)/(1-previous),Node());child=pair.Left;remaining=pair.Right;}
+                else child=remaining;
+                var p=child.CourseStart;var q=child.CourseEnd;var active=(previous+hi)*.5>=begin/length&&(previous+hi)*.5<=end/length;
+                output.Add(child with{StartElevation=p.y-NetworkProcessor.Sample(p.x,p.z,raster,scale,width),EndElevation=q.y-NetworkProcessor.Sample(q.x,q.z,raster,scale,width),
+                    QuaySides=active?side:NetworkSides.None,RetainingWallSides=active?NetworkSides.None:s.RetainingWallSides});previous=hi;
+            }
             placed++;log.Diagnostic($"ROAD QUAY way={s.WayId}; side={side}; beginMeters={begin:R}; endMeters={end:R}; intersectionSetbackMeters={setback:R}; bothSidesAllowed=false; nativeRaisedSideRenderingRequiresGameReview=true");
         }
         log.Diagnostic($"ROAD QUAY PLAN eligibleSections={placed}; bothSidesExcluded={both}; shortSetbackIntervalsExcluded={setbackSkipped}; railExcluded=true");return output;
