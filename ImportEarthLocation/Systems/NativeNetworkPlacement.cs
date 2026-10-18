@@ -1225,14 +1225,8 @@ public sealed class NativeNetworkPlacement
             m_FixedIndex = -1
         });
         _entityManager.AddComponentData(entity, default(Updated));
-        // GenerateNodes/GenerateEdges consume Upgraded on creation definitions.
-        // Negative elevation chooses tunnels; never force a positive elevated node.
-        var upgrades=default(CompositionFlags);
-        if(segment.Kind==NetworkKind.Road&&(segment.RetainingWallSides&NetworkSides.Left)!=0)upgrades.m_Left|=CompositionFlags.Side.Lowered;
-        if(segment.Kind==NetworkKind.Road&&(segment.RetainingWallSides&NetworkSides.Right)!=0)upgrades.m_Right|=CompositionFlags.Side.Lowered;
-        if(segment.Kind==NetworkKind.Road&&(segment.QuaySides&NetworkSides.Left)!=0)upgrades.m_Left|=CompositionFlags.Side.Raised;
-        if(segment.Kind==NetworkKind.Road&&(segment.QuaySides&NetworkSides.Right)!=0)upgrades.m_Right|=CompositionFlags.Side.Raised;
-        if(upgrades!=default(CompositionFlags))_entityManager.AddComponentData(entity,new Upgraded{m_Flags=upgrades});
+        // No manual side upgrades, including stale flags from a prepared object.
+        // Native bridge/tunnel composition and terrain handling remain native.
         _submittedCourses.Add(new(segment,prefab){StartCenterBudget=_centerBudgets[Identity(segment,segment.StartNodeId)],EndCenterBudget=_centerBudgets[Identity(segment,segment.EndNodeId)]});
         return entity;
         }

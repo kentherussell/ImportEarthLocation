@@ -181,15 +181,21 @@ public sealed class ImportLog
     public void ExpectNativeCapture(IReadOnlyList<PreparedSegment> sections)
         =>Artifact("native-coverage-expectations",archive=>archive.ExpectNativeSections(sections.Select(DiagnosticArtifacts.SectionIdentity)));
 
-    public void DiagnosticCompressedRecords(string name,IEnumerable<object> records)
-        =>Artifact(name,archive=>
+    public bool DiagnosticCompressedRecords(string name,IEnumerable<object> records)
+    {
+        var captured=false;
+        Artifact(name,archive=>
         {
             var result=archive.WriteCompressedRecords(name,records);
+            captured=true;
             Diagnostic($"ARTIFACT REPLAY file={result.File}; records={result.Records}; compressedBytes={result.Bytes}; complete=true; encoding=gzip-ndjson; finalBudget=true");
         });
+        return captured;
+    }
 
     public void DiagnosticHeights(string name,ushort[] heights)=>Artifact(name,archive=>archive.WriteHeights(name,heights));
     public void DiagnosticJson(string name,object value)=>Artifact(name,archive=>archive.WriteJson(name,value));
+    public void DiagnosticSvg(string name,string svg)=>Artifact(name,archive=>archive.WriteSvg(name,svg));
 
     // Exact replay records use the protected, bounded replay reserve. Capture
     // completeness remains in each manifest; a partial archive is never a fixture.

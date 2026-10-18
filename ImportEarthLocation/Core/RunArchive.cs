@@ -82,10 +82,15 @@ public sealed class RunArchive
     private sealed class ScalarVectorConverter : JsonConverter
     {
         public override bool CanRead=>false;
-        public override bool CanConvert(Type type)=>type==typeof(float2)||type==typeof(float3)||type==typeof(float4)||
-            type==typeof(double2)||type==typeof(double3)||type==typeof(int3);
+        public override bool CanConvert(Type type)
+        {
+            type=Nullable.GetUnderlyingType(type)??type;
+            return type==typeof(float2)||type==typeof(float3)||type==typeof(float4)||
+                type==typeof(double2)||type==typeof(double3)||type==typeof(int3);
+        }
         public override void WriteJson(JsonWriter writer,object? value,JsonSerializer serializer)
         {
+            if(value==null){writer.WriteNull();return;}
             writer.WriteStartObject();
             void Number(string name,double coordinate){writer.WritePropertyName(name);writer.WriteValue(coordinate);}
             switch(value)
@@ -184,7 +189,11 @@ public sealed class RunArchive
         // still has room. Old files remain recoverable, but are not this attempt.
         var recordsName=name.EndsWith(".gz",StringComparison.Ordinal)?name.Substring(0,name.Length-3):name;
         _captures.Remove(recordsName);_captures.Remove(recordsName+".gz");_chunkCaptures.Remove(recordsName);
-        if(_failedArtifacts.Count<128||_failedArtifacts.ContainsKey(name))
+        // Optional per-unit detail can fill the ordinary message ledger before
+        // final replay capture. Reserve 64 additional entries for essential
+        // inputs/census so their actual failure reason does not disappear.
+        var essential=IsCensus(name)||IsReplay(name)||name=="profile-input"||name.StartsWith("design-pass-",StringComparison.Ordinal);
+        if(_failedArtifacts.Count<(essential?192:128)||_failedArtifacts.ContainsKey(name))
             _failedArtifacts[name]=error.GetType().Name+": "+error.GetBaseException().Message;
         _chunkCaptures.Remove(name);
     }
@@ -261,6 +270,14 @@ public sealed class RunArchive
             stream.Flush(durable);
         }
         Publish(temporary, path);
+    }
+
+    public void WriteSvg(string name,string svg)
+    {
+        if(!name.EndsWith(".svg",StringComparison.OrdinalIgnoreCase)||Encoding.UTF8.GetByteCount(svg)>1024*1024)
+            throw new ArgumentException("Diagnostic SVG must have a bounded .svg payload.");
+        var path=ArtifactPath(name);var temporary=path+".tmp";
+        File.WriteAllText(temporary,svg,new UTF8Encoding(false));Publish(temporary,path);
     }
 
     public ArtifactResult WriteRecords(string name, IEnumerable<object> records, long maximumBytes = 64L * 1024 * 1024, int maximumRecords = 250000, bool critical = false,bool final = false,bool census = false,bool replay=false)

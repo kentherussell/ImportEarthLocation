@@ -156,12 +156,12 @@ public static class NetworkApproachTapers
                 // Account for the explicitly shared source-knot derivative;
                 // do not claim the unmodified-function error theorem alone.
                 error+=4d/27*(end-begin)*(math.distance(a.Derivative,Desired(index,begin).Derivative)+math.distance(b.Derivative,Desired(index,end).Derivative));
-                if(error>.045&&depth<12&&leaves<127&&NetworkEmissionStations.CanSplit(fitted,.5))
+                if(error>.245&&depth<12&&leaves<127&&NetworkEmissionStations.CanSplit(fitted,.5))
                 {var middle=(begin+end)/2;Fit(begin,middle,depth+1);Fit(middle,end,depth+1);return;}
                 var rounded=new Cubic3f((float3)fitted.P0,(float3)fitted.P1,(float3)fitted.P2,(float3)fitted.P3);
                 var rounding=Math.Max(Math.Max(math.distance(fitted.P0,rounded.P0),math.distance(fitted.P1,rounded.P1)),
                     Math.Max(math.distance(fitted.P2,rounded.P2),math.distance(fitted.P3,rounded.P3)));
-                leaves++;if(error+rounding>.05)review++;else boundMaximum=Math.Max(boundMaximum,error);
+                leaves++;if(error+rounding>.25)review++;else boundMaximum=Math.Max(boundMaximum,error);
                 var p=Port(begin);var q=Port(end);var p0=(float3)fitted.P0;var p3=(float3)fitted.P3;
                 var startOffset=p0-p.Anchor;var endOffset=p3-q.Anchor;
                 var materialized=s with{Start=p.Anchor,End=q.Anchor,StartNodeId=p.Id,EndNodeId=q.Id,

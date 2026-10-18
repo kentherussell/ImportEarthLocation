@@ -10,6 +10,38 @@ namespace ImportEarthLocation.Processing;
 // intersected, including parallel decks; no centreline-angle rejection is used.
 public static class NetworkPhysicalContacts
 {
+    // Owned by one sequential design invocation. Only XZ-dependent proofs are
+    // retained; any geometry, topology, width, mode, asset or grade-limit change
+    // invalidates the model before reuse. Heights never enter these footprints.
+    public sealed class GeometryCache
+    {
+        internal PreparedSegment[]? Source;
+        internal IReadOnlyDictionary<string,NativeAssetContract>? Assets;
+        internal List<FootprintLeaf>? Leaves;
+        internal NativeCompositionEnvelope[]? Envelopes;
+        internal NetworkContactTopology? Topology;
+        internal NetworkFootprintIndex? Index;
+        internal int Missing,Uncertified;
+        internal double Epsilon;
+        public int Builds { get; internal set; }
+        public int Reuses { get; internal set; }
+        internal bool Matches(IReadOnlyList<PreparedSegment> source,IReadOnlyDictionary<string,NativeAssetContract> assets,double epsilon)
+        {
+            if(Source==null||Source.Length!=source.Count||!ReferenceEquals(Assets,assets)||Epsilon!=epsilon)return false;
+            for(var i=0;i<source.Count;i++)
+            {
+                var a=Source[i];var b=source[i];
+                if(!NetworkDesignChecks.Finite(new(b.CourseStart,b.CourseControl1,b.CourseControl2,b.CourseEnd))||
+                    a.Kind!=b.Kind||a.StartNodeId!=b.StartNodeId||a.EndNodeId!=b.EndNodeId||a.Layer!=b.Layer||
+                    a.NativeAssetKey!=b.NativeAssetKey||a.NativeWidth!=b.NativeWidth||a.Bridge!=b.Bridge||a.Tunnel!=b.Tunnel||
+                    NetworkGeometrySafety.GradeLimit(a)!=NetworkGeometrySafety.GradeLimit(b)||
+                    !math.all(a.Start.xz==b.Start.xz)||!math.all(a.End.xz==b.End.xz)||
+                    !math.all(a.CourseStart.xz==b.CourseStart.xz)||!math.all(a.CourseControl1.xz==b.CourseControl1.xz)||
+                    !math.all(a.CourseControl2.xz==b.CourseControl2.xz)||!math.all(a.CourseEnd.xz==b.CourseEnd.xz))return false;
+            }
+            return true;
+        }
+    }
     public readonly record struct Report(int Leaves,int UncertifiedLeaves,int MissingAssets,long Regions,long Rows,long CandidateTests,
         long LocalTransitionPairs=0,long PairedFormationPairs=0,long GradeContradictionPairs=0,long HorizontalConflictPairs=0,long CoalescedRows=0);
     private readonly record struct Family(long Upper,long Lower,NativeStructureMode UpperMode,NativeStructureMode LowerMode);
@@ -20,24 +52,33 @@ public static class NetworkPhysicalContacts
 
     public static Report Append(IReadOnlyList<PreparedSegment> source,IReadOnlyDictionary<string,NativeAssetContract> assets,
         int[] from,int[] c1,int[] c2,int[] to,SparseProfileRows rows,double epsilon,CancellationToken token,Action<string>? progress=null,
-        Action<object>? constantWitness=null,Action<object>? horizontalWitness=null,Action<ContactEvidence>? evidence=null)
+        Action<object>? constantWitness=null,Action<object>? horizontalWitness=null,Action<ContactEvidence>? evidence=null,GeometryCache? geometry=null)
     {
         if(source.Count==0)return default;
         var leaves=new List<FootprintLeaf>();var envelopes=new NativeCompositionEnvelope[source.Count];
         var missing=0;var uncertified=0;
-        for(var i=0;i<source.Count;i++)
+        NetworkContactTopology topology;NetworkFootprintIndex index;
+        if(geometry!=null&&geometry.Matches(source,assets,epsilon))
+        {leaves=geometry.Leaves!;envelopes=geometry.Envelopes!;missing=geometry.Missing;uncertified=geometry.Uncertified;topology=geometry.Topology!;index=geometry.Index!;geometry.Reuses++;}
+        else
         {
-            token.ThrowIfCancellationRequested();var s=source[i];
-            if((i&127)==0)progress?.Invoke($"Building road/rail deck footprints {i+1}/{source.Count}");
-            if(!assets.TryGetValue(s.NativeAssetKey,out var asset)||!asset.TryEnvelope(NativeAssetContract.Mode(s),out envelopes[i])){missing++;continue;}
-            var before=leaves.Count;
-            NetworkFootprintMath.BuildLeaves(new(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd),
-                Math.Max(s.NativeWidth,envelopes[i].Width)/2,i,leaves,token);
-            for(var j=before;j<leaves.Count;j++)if(!leaves[j].Certified)uncertified++;
+            for(var i=0;i<source.Count;i++)
+            {
+                token.ThrowIfCancellationRequested();var s=source[i];
+                if((i&127)==0)progress?.Invoke($"Building road/rail deck footprints {i+1}/{source.Count}");
+                if(!assets.TryGetValue(s.NativeAssetKey,out var asset)||!asset.TryEnvelope(NativeAssetContract.Mode(s),out envelopes[i])){missing++;continue;}
+                var before=leaves.Count;
+                NetworkFootprintMath.BuildLeaves(new(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd),
+                    Math.Max(s.NativeWidth,envelopes[i].Width)/2,i,leaves,token);
+                for(var j=before;j<leaves.Count;j++)if(!leaves[j].Certified)uncertified++;
+            }
+            topology=new NetworkContactTopology(source,envelopes,token,epsilon);
+            leaves=topology.SplitFormationLeaves(leaves,envelopes,token);
+            index=new NetworkFootprintIndex(leaves,token);
+            if(geometry!=null)
+            {geometry.Source=new List<PreparedSegment>(source).ToArray();geometry.Assets=assets;geometry.Epsilon=epsilon;geometry.Leaves=leaves;geometry.Envelopes=envelopes;geometry.Topology=topology;geometry.Index=index;geometry.Missing=missing;geometry.Uncertified=uncertified;geometry.Builds++;}
         }
-        var topology=new NetworkContactTopology(source,envelopes,token,epsilon);
-        leaves=topology.SplitFormationLeaves(leaves,envelopes,token);
-        var index=new NetworkFootprintIndex(leaves,token);var families=new Dictionary<Family,Measure>();
+        var initialCandidateTests=index.CandidateTests;var families=new Dictionary<Family,Measure>();
         var measurementOnly=rows.MeasurementOnly;var unitMeasure=new Measure();
         var localTransitions=0L;var pairedFormations=0L;var contradictions=0L;var horizontalConflicts=0L;var coalesced=0L;
         var witnessed=new HashSet<(int,int)>();
@@ -67,7 +108,11 @@ public static class NetworkPhysicalContacts
             // Only immutable source structure evidence establishes an ordering.
             // An overlap on the same level is a horizontal-quality observation,
             // never permission to lift one road over its neighbour.
-            var sameLevel=sa.Layer==sb.Layer&&ma==mb;
+            // A same-layer opposing mainline does not become an overpass merely
+            // because one abutment/water interval selected a bridge composition.
+            // Keep its footprint conflict visible; never solve it by stacking.
+            var opposingMainlines=ma!=mb&&sa.Layer==sb.Layer&&NetworkContactPolicy.OpposingMainlines(sa,sb,(float2)(a.B-a.A),(float2)(b.B-b.A));
+            var sameLevel=sa.Layer==sb.Layer&&ma==mb||opposingMainlines;
             // Same-level overlaps only produce observations in pass zero.
             // Re-clipping their polygons cannot contribute family weights or
             // clearance rows in the second pass.
@@ -87,7 +132,7 @@ public static class NetworkPhysicalContacts
                 var formation=SharedFormation(sa,sb,envelopes[a.Curve],envelopes[b.Curve]);var outside=formation==null;
                 if(formation.HasValue)for(var j=0;j<count;j++)
                     if(math.cmax(math.abs(rectangle[j]+origin-formation.Value.Center))>formation.Value.Radius)outside=true;
-                Evidence(outside?"ambiguous-same-level-conflict":"explicit-local-at-grade-formation");
+                Evidence(outside?(opposingMainlines?"opposing-mainline-horizontal-conflict":"ambiguous-same-level-conflict"):"explicit-local-at-grade-formation");
                 if(outside&&witnessed.Add(a.Curve<b.Curve?(a.Curve,b.Curve):(b.Curve,a.Curve)))
                 {
                     horizontalConflicts++;
@@ -214,7 +259,7 @@ public static class NetworkPhysicalContacts
             double Parameter(FootprintLeaf leaf,int part,double2 p)=>leaf.Begin+(leaf.End-leaf.Begin)*
                 (part==0?0:part==2?1:NetworkFootprintMath.Parameter(leaf,p+origin));
         }
-        return new(leaves.Count,uncertified,missing,regionCount,rowCount,index.CandidateTests,localTransitions,pairedFormations,contradictions,horizontalConflicts,coalesced);
+        return new(leaves.Count,uncertified,missing,regionCount,rowCount,index.CandidateTests-initialCandidateTests,localTransitions,pairedFormations,contradictions,horizontalConflicts,coalesced);
     }
 
     private static (double2 Center,double Radius)? SharedFormation(PreparedSegment a,PreparedSegment b,

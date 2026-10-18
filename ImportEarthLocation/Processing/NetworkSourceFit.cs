@@ -28,7 +28,11 @@ public static class NetworkSourceFit
             support[i]=((i>0?stations[i]-stations[i-1]:0)+(i+1<points.Count?stations[i+1]-stations[i]:0))*.5;
         }
         for(var i=0;i<points.Count;i++)stations[i]/=length;
-        try{curve=NetworkDesignChecks.FitHandles(start,end,startTangent,endTangent,observations,stations,support,1e-5);}
+        var direct=math.normalizesafe(end.xz-start.xz);
+        var straight=math.dot(math.normalizesafe(startTangent),direct)>1-1e-10&&math.dot(math.normalizesafe(endTangent),direct)>1-1e-10&&
+            points.All(p=>NetworkNormalizer.DistanceToSegment(p,(float3)start,(float3)end)<tolerance*.5);
+        try{curve=straight?new(start,math.lerp(start,end,1d/3),math.lerp(start,end,2d/3),end):
+            NetworkDesignChecks.FitHandles(start,end,startTangent,endTangent,observations,stations,support,1e-5);}
         catch(ArgumentException){return false;}
         var axis=math.normalizesafe(end.xz-start.xz);
         if(math.lengthsq(axis)==0||Math.Min(math.dot((curve.P1-curve.P0).xz,axis),

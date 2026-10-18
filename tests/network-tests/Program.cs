@@ -15,16 +15,21 @@ static class Program
     }
     static void Run(string[] args)
     {
+        if(args.Length==1&&args[0]=="--visual-design-only"){VisualDesignTests.Run();return;}
+        if(args.Length==4&&args[0]=="--compare-run-quality"){NetworkQualityComparison.Run(args[1],args[2],args[3]);return;}
+        if(args.Length==1&&args[0]=="--paired-corridors-only"){PairedCorridorTests.Run();return;}
         if(args.Length==3&&args[0]=="--captured-problem-audit"){CapturedProblemAudit.Run(args[1],args[2]);return;}
         if(args.Length==3&&args[0]=="--profile-kernels"){ProfileReplay.BenchmarkKernels(args[1],args[2]);return;}
         if(args.Length==3&&args[0]=="--native-physical-replay"){CapturedNativePhysicalReplay.Run(args[1],args[2]);return;}
         if(args.Length==3&&args[0]=="--captured-feasibility"){CapturedDesignReplay.Run(args[1],args[2],true,true);return;}
         if(args.Length==4&&args[0]=="--source-cleanup-replay"){CapturedSourceCleanup.Run(args[1],args[2],args[3]);return;}
+        if(args.Length==4&&args[0]=="--route-cleanup-replay"){CapturedSourceCleanup.Run(args[1],args[2],args[3],true);return;}
         if(args.Length==3&&(args[0]=="--captured-fixtures"||args[0]=="--captured-design"))
         {CapturedDesignReplay.Run(args[1],args[2],args[0]=="--captured-design");return;}
         if(args.Length==1&&args[0]=="--critical-rework-only"){CriticalReworkTests.Run();return;}
         if(args.Length==1&&args[0]=="--offline-completion-only"){OfflineCompletionTests.Run();return;}
         CriticalReworkTests.Run();
+        VisualDesignTests.Run();
         OfflineCompletionTests.Run();
         if(args.Length==1&&args[0]=="--corridor-quality-only"){CorridorQualityTests.Run();return;}
         if(args.Length==2&&args[0]=="--corridor-quality-replay"){CorridorQualityTests.Replay(args[1]);return;}
@@ -169,6 +174,9 @@ namespace ImportEarthLocation.Core
 {
     public sealed class ImportLog
     {
+        public Dictionary<string,object> Artifacts { get; }=new();
+        public void DiagnosticJson(string name,object value)=>Artifacts[name]=value;
+        public void DiagnosticSvg(string name,string svg)=>Artifacts[name]=svg;
         public readonly List<string> Lines=new();
         public readonly List<NetworkQualityFinding> Findings=new();
         private readonly Dictionary<string,double> _metrics=new();

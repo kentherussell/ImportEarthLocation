@@ -26,7 +26,11 @@ static class AcceptancePipelineTests
         var contract=new NativeAssetContract("fixture",new[]{envelope,envelope with{Mode=NativeStructureMode.Elevated}},Array.Empty<float>());
         var shortRoad=Line(3,30,31,new(0,100,0),new(60,100,0));
         var units=NativeDesignUnits.Prepare(new[]{shortRoad},new[]{contract},new ImportLog(),default);
-        Check(units.Select(s=>s.NativeUnitId).Distinct().Count()==3,"Heuristic 2width envelopes alone unioned a representable corridor");
+        Check(units.Count==2&&units.Select(s=>s.NativeUnitId).Distinct().Count()==2&&
+            units[0].EndNodeId==units[1].StartNodeId&&units[0].StartNodeId==shortRoad.StartNodeId&&units[1].EndNodeId==shortRoad.EndNodeId&&
+            math.distance(units[0].CourseEnd,shortRoad.CourseStart)>envelope.NodeOffset&&
+            math.distance(units[1].CourseStart,shortRoad.CourseEnd)>envelope.NodeOffset,
+            "A single fitted span lost separate native core ownership or used redundant corridor cuts");
         var tooShort=NativeDesignUnits.Prepare(new[]{shortRoad with{End=new(10,100,0)}},new[]{contract},new ImportLog(),default);
         Check(tooShort.Select(s=>s.NativeUnitId).Distinct().Count()==1,"Genuinely overlapping central native formations were split");
         var paired=new[]{Line(4,40,41,new(10000,100,0),new(10500,100,0)) with{PairedProfileId=10,PairedReferenceEnd=1},

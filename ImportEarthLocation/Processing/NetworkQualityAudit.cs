@@ -25,10 +25,12 @@ public static class NetworkQualityAudit
         var gradeFailures=0;var curvatureFailures=0;var curvatureUnknown=0;var finiteFailures=0;var regularityUnknown=0;
         var gradeLength=0d;var curvatureLength=0d;var maximumGrade=0d;var maximumCurvature=0d;
         var incident=new Dictionary<SourceNodeKey,List<(PreparedSegment Section,bool Start)>>();
+        var observations=new NetworkCurveObservations.Observation[sections.Count];var ordinal=0;
         foreach(var s in sections)
         {
             token.ThrowIfCancellationRequested();var curve=new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd);
             var observation=NetworkCurveObservations.Measure(curve);var finite=observation.Finite;
+            observations[ordinal++]=observation;
             if(!finite)finiteFailures++;
             maximumGrade=Math.Max(maximumGrade,observation.SampledMaximumGrade);
             if(s.Kind==NetworkKind.Rail)maximumCurvature=Math.Max(maximumCurvature,observation.SampledMaximumCurvature);
@@ -112,5 +114,6 @@ public static class NetworkQualityAudit
         Put("paired-height",paired,pairedFailures,pairedUnknown,pairedWorst,0,"Maximum corresponding height-control difference; exact common reference interval");
         Put("source-topology",sections.Count,(int)(log.Metric("Missing mandatory selected-source ports")+log.Metric("Unresolved selected-source reachability obligations")),sourceTopologyAvailable?0:1,0,0,"Exact selected-source aliases and directional reachability, not proximity");
         if(log.DiagnosticsEnabled)log.DiagnosticRecords("planned-continuation-witnesses.ndjson",joinWitnesses,critical:true);
+        NetworkVisualQuality.Audit(sections,observations,log,token);
     }
 }

@@ -217,7 +217,7 @@ export const ImportEarthLocationContent = () => {
         <AnchoredLauncher />
 
         {panelOpen && (
-          <Panel header="Import Earth" className={styles.panel} onClose={closePanel}>
+          <Panel header="Import Earth" className={styles.panel} theme={{ header: styles.panelHeader, content: styles.panelContent }} onClose={closePanel}>
             <Scrollable vertical className={styles.panelBody}>
             <div className={styles.section}>
               <div className={styles.notice}>Editor-only full-map import. Roads and rail are independently selectable.</div>
@@ -247,39 +247,36 @@ export const ImportEarthLocationContent = () => {
               <div className={styles.field} role="group" aria-label="Road groups">
                 <span>Road groups</span>
                 {[["highways", "Highways"], ["routes", "Main Roads"], ["streets", "Streets — experimental"]].map(([id,label]) =>
-                  <Button key={id} variant="flat" className={styles.check} focusKey={`iel-roads-${id}`} role="checkbox" aria-checked={roadGroups.includes(id)} selected={roadGroups.includes(id)} disabled={busy || starting} onSelect={() => toggleRoadGroup(id)}>
+                  <Button key={id} variant="flat" className={styles.check} focusKey={`iel-roads-${id}`} role="checkbox" aria-checked={roadGroups.includes(id)} disabled={busy || starting} onSelect={() => toggleRoadGroup(id)}>
                     <span className={styles.checkbox}>{roadGroups.includes(id) ? "✓" : ""}</span><span>{label}</span>
                   </Button>)}
               </div>
-              <Button variant="flat" className={styles.check} focusKey="iel-rail" role="checkbox" aria-checked={rail} selected={rail} disabled={busy || starting} onSelect={() => trigger(group, "setImportRail", !rail)}>
+              <Button variant="flat" className={styles.check} focusKey="iel-rail" role="checkbox" aria-checked={rail} disabled={busy || starting} onSelect={() => trigger(group, "setImportRail", !rail)}>
                 <span className={styles.checkbox}>{rail ? "✓" : ""}</span><span>Import rail</span>
               </Button>
-              <Button variant="flat" className={styles.check} focusKey="iel-forests" role="checkbox" aria-checked={forests} selected={forests} disabled={busy || starting} onSelect={() => trigger(group, "setImportForests", !forests)}>
+              <Button variant="flat" className={styles.check} focusKey="iel-forests" role="checkbox" aria-checked={forests} disabled={busy || starting} onSelect={() => trigger(group, "setImportForests", !forests)}>
                 <span className={styles.checkbox}>{forests ? "✓" : ""}</span><span>Import forests</span>
               </Button>
-              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={surfaces} selected={surfaces} disabled={busy} onSelect={() => {
+              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={surfaces} disabled={busy} onSelect={() => {
                 trigger(group, "setGroundSurfaces", !surfaces);
               }}><span className={styles.checkbox}>{surfaces ? "✓" : ""}</span><span>Apply real-world ground surfaces</span></Button>
-              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={airConnections} selected={airConnections} disabled={busy} onSelect={() => {
+              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={airConnections} disabled={busy} onSelect={() => {
                 trigger(group, "setAirConnections", !airConnections);
               }}><span className={styles.checkbox}>{airConnections ? "✓" : ""}</span><span>Create air connections</span></Button>
-              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={seaConnections} selected={seaConnections} disabled={busy} onSelect={() => trigger(group, "setSeaConnections", !seaConnections)}>
+              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={seaConnections} disabled={busy} onSelect={() => trigger(group, "setSeaConnections", !seaConnections)}>
                 <span className={styles.checkbox}>{seaConnections ? "✓" : ""}</span><span>Create water connections</span>
               </Button>
-              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={diagnostics} selected={diagnostics} disabled={busy || starting} onSelect={() => trigger(group,"setDiagnostics",!diagnostics)}>
+              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={diagnostics} disabled={busy || starting} onSelect={() => trigger(group,"setDiagnostics",!diagnostics)}>
                 <span className={styles.checkbox}>{diagnostics ? "✓" : ""}</span><span>Enable diagnostics</span>
               </Button>
               <div className={styles.helper}>Detailed generation logs and diagnostic files. Off by default; status updates and important messages remain available.</div>
             </div>
 
             <div className={styles.section}>
-              <div className={styles.status} role="status">{status}</div>
-              {summary && <Scrollable vertical className={styles.summary}>{summary}</Scrollable>}
-              {error && <div className={styles.error}>{error}</div>}
               <div className={styles.actions}>
-                {!ready && (
+                {!ready && !busy && (
                   <Button variant="flat" className={`${styles.actionButton} ${styles.primary}`} focusKey="iel-prepare" disabled={busy || starting} onSelect={() => { if(actionGate.current) return; actionGate.current = "prepare"; setStarting(true); trigger(group, "prepare"); }}>
-                    {busy ? "Preparing…" : "Prepare import"}
+                    Prepare import
                   </Button>
                 )}
                 {busy && !applying && (
@@ -288,7 +285,7 @@ export const ImportEarthLocationContent = () => {
                 {busy && applying && (
                   <Button variant="flat" className={`${styles.actionButton} ${styles.danger}`} focusKey="iel-stop" onSelect={() => trigger(group, "stopGeneration")}>Stop generation</Button>
                 )}
-                {ready && (
+                {ready && !busy && (
                   <Button variant="flat" focusKey="iel-replace" className={`${styles.actionButton} ${styles.danger}`} disabled={busy || starting} onSelect={() => setConfirming(true)}>
                     Replace current map…
                   </Button>
@@ -300,6 +297,11 @@ export const ImportEarthLocationContent = () => {
               {showLog && <Scrollable className={styles.logViewport} vertical horizontal={false} trackVisibility="always">
                 <pre className={styles.log}>{log || "No log entries yet."}</pre>
               </Scrollable>}
+              <div className={styles.feedback}>
+                <div className={styles.status} role="status">{status}</div>
+                {summary && <Scrollable vertical className={styles.summary}>{summary}</Scrollable>}
+                {error && <div className={styles.error} role="alert">{error}</div>}
+              </div>
             </div>
 
             </Scrollable>

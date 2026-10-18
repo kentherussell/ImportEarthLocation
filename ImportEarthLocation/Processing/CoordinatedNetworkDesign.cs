@@ -80,7 +80,8 @@ public static class CoordinatedNetworkDesign
 
     public static IReadOnlyList<PreparedSegment> Prepare(IReadOnlyList<PreparedSegment> source,ushort[] raster,float scale,double width,
         ImportLog log,CancellationToken token,Func<float3,float?>? water=null,bool structureIntervalsResolved=false,
-        IReadOnlyDictionary<string,NativeAssetContract>? assets=null,Action<string>? progress=null)
+        IReadOnlyDictionary<string,NativeAssetContract>? assets=null,Action<string>? progress=null,
+        IReadOnlyList<float3[]>? protectedAreas=null,IReadOnlyList<float3[]>? protectedLines=null,SourceTopologyManifest? sourceTopology=null)
     {
         var invalid=source.Count(s=>!NetworkDesignChecks.Finite(new(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd))||!math.all(math.isfinite(s.Start))||!math.all(math.isfinite(s.End)));
         if(invalid>0)
@@ -99,6 +100,7 @@ public static class CoordinatedNetworkDesign
             log.Diagnostic($"DESIGN STAGE name={name}; elapsedSeconds={seconds:F6}; sections={sections}; scope=coordinated-design; includesDiagnosticOverhead=true");
             stageClock.Restart();
         }
+        source=RailCorridorConsolidator.NativeJunctionFootprints(source,log,token);
         var edges=(structureIntervalsResolved?source:StructureIntervals(source,raster,scale,width,log,token,water))
             .OrderBy(s=>s.Kind).ThenBy(s=>s.WayId).ThenBy(s=>s.StartNodeId).ThenBy(s=>s.EndNodeId).ToArray();
         var graph=new Dictionary<Key,List<int>>();var positions=new Dictionary<Key,float3>();
@@ -226,7 +228,9 @@ public static class CoordinatedNetworkDesign
         Stage("route-and-junction-frames",edges.Length);
         var approaches=NetworkApproachTapers.Materialize(edges,Array.Empty<NetworkApproachTapers.Shift>(),log,token,railDirections,includeLaneOffsets:false);
         Stage("turnout-approach-fit",approaches.Count);
-        IReadOnlyList<PreparedSegment> horizontal=NativeChainCompactor.Prepare(approaches,log,token);
+        if(protectedAreas!=null&&protectedLines!=null)
+            approaches=NetworkVisualDesign.FitBudgets(approaches,width,protectedAreas,protectedLines,water,log,token);
+        IReadOnlyList<PreparedSegment> horizontal=NativeChainCompactor.Prepare(approaches,log,token,sourceTopology);
         Stage("chain-compaction",horizontal.Count);
         horizontal=NetworkHorizontalRegularity.Prepare(horizontal,log,token);
         horizontal=NetworkLaneAlignment.Prepare(horizontal,log,token,width);
@@ -234,19 +238,22 @@ public static class CoordinatedNetworkDesign
         Stage("regularity-lane-alignment-portals",horizontal.Count);
         horizontal=NetworkPairedCorridors.Prepare(horizontal,log,token,progress);
         Stage("paired-corridors",horizontal.Count);
+        horizontal=PortalSpans(NetworkVisualDesign.StructureIntent(horizontal,raster,scale,width,assets,log,token),token);
         horizontal=NetworkHorizontalRegularity.Prepare(horizontal,log,token);
         log.CaptureProfileInput(horizontal,raster,scale,width,assets);
         var cover=NetworkGeometrySafety.TunnelCoverSamples(horizontal,raster,scale,width,token,assets).ToArray();
         Stage("profile-input-and-cover",horizontal.Count);
         progress?.Invoke("Building fixed slope, structure-clearance and tunnel-cover equations");
         NetworkTunnelProfile.PhysicalQuality? physicalQuality=null;
-        var result=NetworkTunnelProfile.Solve(horizontal,scale,cover,log,token,design:new NetworkTunnelProfile.TerrainReference(raster,width,water,assets,progress),
+        var contactGeometry=new NetworkPhysicalContacts.GeometryCache();
+        var result=NetworkTunnelProfile.Solve(horizontal,scale,cover,log,token,design:new NetworkTunnelProfile.TerrainReference(raster,width,water,assets,progress){ContactGeometry=contactGeometry},
             physicalQuality:value=>physicalQuality=value);
         Stage("profile-formulation-and-solve",result.Count);
         result=NetworkPhysicalReconstruction.Once(horizontal,result,raster,scale,width,assets,water,log,token,progress,physicalQuality);
         Stage("bounded-physical-reconstruction",result.Count);
         progress?.Invoke("Certifying final road/rail physical outcomes against the immutable terrain");
-        var finalPhysical=NetworkTunnelProfile.MeasurePhysical(result,raster,scale,width,assets,token);
+        var finalPhysical=NetworkTunnelProfile.MeasurePhysical(result,raster,scale,width,assets,token,contactGeometry);
+        log.Diagnostic($"CONTACT GEOMETRY CACHE builds={contactGeometry.Builds}; reuses={contactGeometry.Reuses}; scope=one-design; xzAndContractsChecked=true; heightResidualsAlwaysRecomputed=true");
         Stage("final-physical-certification",result.Count);
         log.Quality(new("planned","full-width-clearance","final-design",(int)Math.Min(int.MaxValue,finalPhysical.ClearanceRows),
             (int)Math.Min(int.MaxValue,finalPhysical.ClearanceFailures),assets==null?1:finalPhysical.UncertifiedClearance,

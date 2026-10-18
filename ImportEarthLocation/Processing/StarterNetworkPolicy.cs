@@ -11,6 +11,10 @@ namespace ImportEarthLocation.Processing;
 // roads for actual source connections.
 public static class StarterNetworkPolicy
 {
+    public static IReadOnlyList<PreparedSegment> WithoutSideStructures(IReadOnlyList<PreparedSegment> source)
+        =>source.Select(s=>s.ExplicitWallSides==NetworkSides.None&&s.RetainingWallSides==NetworkSides.None&&s.QuaySides==NetworkSides.None?s:
+            s with{ExplicitWallSides=NetworkSides.None,RetainingWallSides=NetworkSides.None,QuaySides=NetworkSides.None}).ToArray();
+
     public static IReadOnlyList<PreparedSegment> Quays(IReadOnlyList<PreparedSegment> source,ushort[] raster,float scale,double width,ImportLog log,CancellationToken token)
     {
         var incident=new Dictionary<long,List<PreparedSegment>>();foreach(var s in source.Where(s=>s.Kind==NetworkKind.Road))foreach(var id in new[]{s.StartNodeId,s.EndNodeId})

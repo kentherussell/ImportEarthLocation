@@ -12,7 +12,10 @@ public static class DiagnosticArtifacts
     public static IEnumerable<object> ExactNetworkRecords(IReadOnlyList<PreparedSegment> sections)
     {
         foreach(var s in sections)
-            yield return s with{HorizontalParent=null,FinalDeckCurve=new(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd)};
+            // FinalDeckCurve also indicates frozen geometry to preprocessing.
+            // Preserve its presence/absence: manufacturing it changes replay
+            // behavior even when the four evaluated controls are identical.
+            yield return s with{HorizontalParent=null};
     }
     public static string SectionIdentity(PreparedSegment s)
         =>FormattableString.Invariant($"{s.Kind}:{s.WayId}:{s.StartNodeId}:{s.EndNodeId}");

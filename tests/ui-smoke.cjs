@@ -87,6 +87,8 @@ assert(!nodes.some(n => n.type === 'input' && n.props.type === 'checkbox'), 'Uns
 assert.equal(nodes.filter(n=>n.props?.role==='radio').length,0);
 assert(nodes.filter(n=>n.type==='DropdownItem').every(n=>n.props.disabled),'Alpha map-size choices must remain visible but disabled');
 assert.equal(button(nodes,'iel-roads-routes').props.role,'checkbox');assert.equal(button(nodes,'iel-rail').props['aria-checked'],true);
+assert(nodes.filter(n=>n.props?.role==='checkbox').every(n=>n.props.selected===undefined),'Checkbox selection must not activate the native full-width selected background');
+assert.deepEqual(nodes.find(n=>n.type==='Panel').props.theme,{header:'panelHeader',content:'panelContent'},'Panel header and body need a shared translucent surface');
 assert.equal(button(nodes,'iel-forests').props['aria-checked'],true);
 button(nodes,'iel-forests').props.onSelect();nodes=render();assert.equal(button(nodes,'iel-forests').props['aria-checked'],false);assert.equal(button(nodes,'iel-rail').props['aria-checked'],true);
 // Exercise all eight independent road combinations without relying on a mock
@@ -105,6 +107,12 @@ assert.equal(nodes.find(isLogViewport).props.trackVisibility, 'always');
 assert.equal(nodes.find(isLogViewport).props.controller,undefined,'Rollback must not install a custom scroll controller');
 bindings.log='new latest line';nodes=render();assert(nodes.some(n=>n.type==='pre'&&n.props.children==='new latest line'),'Scrollable log stopped updating');
 bindings.busy = true; nodes = render(); assert(nodes.some(isLogViewport));
+assert(!nodes.some(n=>n.props?.focusKey==='iel-prepare'||n.props?.focusKey==='iel-replace'),'Busy panel must hide inactive primary actions');
+button(nodes,'iel-cancel');button(nodes,'iel-log');
+assert(nodes.findIndex(n=>n.props?.className==='actions')<nodes.findIndex(isLogViewport),'Logs must follow the action buttons');
+assert(nodes.findIndex(isLogViewport)<nodes.findIndex(n=>n.props?.className==='feedback'),'Status and results must follow logs');
+bindings.status='A longer preparation status that wraps onto several lines';nodes=render();
+assert(nodes.findIndex(n=>n.props?.className==='actions')<nodes.findIndex(n=>n.props?.role==='status'),'Status updates must stay below the buttons');
 bindings.busy = false; bindings.stage = 0; bindings.error = 'All providers exhausted';
 nodes = render(); assert(nodes.some(isLogViewport), 'Failure must preserve the logs');
 button(nodes, 'iel-prepare').props.onSelect();
@@ -145,6 +153,7 @@ assert.equal(button(nodes,'iel-replace').props.disabled,true,'Status tick unlock
 acknowledgeActions=true;
 bindings.busy = true; bindings.stage = 6; bindings.ready = false;
 nodes = render(); assert(!nodes.some(n => n.props?.focusKey === 'iel-cancel'));
+button(nodes,'iel-stop');assert(!nodes.some(n=>n.props?.focusKey==='iel-prepare'||n.props?.focusKey==='iel-replace'),'Generation must show stop rather than an inactive primary action');
 nodes.find(n => n.type === 'Panel').props.onClose(); assert(!bindings.panelOpen);
 bindings.panelOpen=true;bindings.busy=false;bindings.ready=true;nodes=render();button(nodes,'iel-replace').props.onSelect();nodes=render();assert(nodes.some(n=>n.props?.focusKey==='iel-confirm-replace'));
 const selectedRoads=bindings.roadLevel,selectedRail=bindings.importRail;bindings.mapSession='map-B';bindings.ready=false;bindings.status='Map session reset';nodes=render();

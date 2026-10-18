@@ -49,6 +49,26 @@ static class OfflineCompletionTests
             "A source-connected short structural pair remained two overlapping native double-track corridors");
         var unrelated=RailCorridorConsolidator.Prepare(new[]{shortRailA,shortRailB with{Reference="other"}},new ImportLog(),default);
         Check(unrelated.Count==2,"Short-pair consolidation used proximity without matching route evidence");
+        var tinySwitch=new[]{
+            Line(940,9400,9401,new(-100,50,0),new(0,50,0),NetworkKind.Rail),
+            Line(941,9401,9402,new(0,50,0),new(.25f,50,0),NetworkKind.Rail),
+            Line(942,9402,9403,new(.25f,50,0),new(100,50,0),NetworkKind.Rail),
+            Line(943,9401,9404,new(0,50,0),new(-50,50,100),NetworkKind.Rail),
+            Line(944,9402,9405,new(.25f,50,0),new(50,50,-100),NetworkKind.Rail)};
+        var switchLog=new ImportLog();var switchResult=RailCorridorConsolidator.Prepare(tinySwitch,switchLog,default);
+        var switchTopology=new ImportLog();SourceTopologyObligations.Validate(SourceTopologyObligations.Capture(tinySwitch),switchResult,switchTopology,default);
+        Check(switchLog.Metric("Sub-footprint connected rail links consolidated")==1&&switchResult.All(s=>math.distance(s.Start,s.End)>3)&&
+            switchTopology.Metric("Missing mandatory selected-source ports")==0&&switchTopology.Metric("Unresolved selected-source reachability obligations")==0,
+            "Connected sub-footprint rail preprocessing lost a switch port/route or retained the tiny solver edge");
+        var portalTiny=tinySwitch.Select(s=>s.WayId==942?s with{Bridge=true}:s).ToArray();
+        var portalTinyLog=new ImportLog();RailCorridorConsolidator.Prepare(portalTiny,portalTinyLog,default);
+        Check(portalTinyLog.Metric("Sub-footprint connected rail links consolidated")==0,"Short-link preprocessing collapsed a structural portal");
+        var isolatedTiny=RailCorridorConsolidator.Prepare(new[]{tinySwitch[1]},new ImportLog(),default);
+        Check(isolatedTiny.Count==1,"Short-link preprocessing deleted an isolated selected source component");
+        var untouchedRail=Line(945,9450,9451,new(1000,50,0),new(1100,50,0),NetworkKind.Rail) with
+            {Control1=new float3(1030,50,10),SourceGeometry=new[]{new float3(1000,50,0),new float3(1050,50,5),new float3(1100,50,0)}};
+        var preservedRail=RailCorridorConsolidator.Prepare(tinySwitch.Append(untouchedRail).ToArray(),new ImportLog(),default).Single(s=>s.WayId==945);
+        Check(preservedRail.SourceGeometry.SequenceEqual(untouchedRail.SourceGeometry),"Short-link preprocessing replaced unaffected source geometry");
         var portalFan=new[]{
             Line(910,9100,9101,new(0,50,0),new(100,50,0),NetworkKind.Rail),
             Line(911,9110,9111,new(0,50,4),new(100,50,4),NetworkKind.Rail),
@@ -145,6 +165,25 @@ static class OfflineCompletionTests
             "Short rail formation removed a required source port or route obligation");
         var evidence=new List<NetworkPhysicalContacts.ContactEvidence>();var physicalRows=new SparseProfileRows(8);
         var report=NetworkPhysicalContacts.Append(new[]{lower,upper},new Dictionary<string,NativeAssetContract>{{"fixture",contract}},new[]{0,4},new[]{1,5},new[]{2,6},new[]{3,7},physicalRows,.05,default,evidence:evidence.Add);
+        var mainlineA=lower with{Classification="motorway",Reference="I-95"};
+        var mainlineB=Line(930,9300,9301,new(100,59,4),new(-100,59,4)) with{Classification="motorway",Reference="I-95",Bridge=true};
+        NetworkPhysicalContacts.Report Contact(PreparedSegment other)
+        {
+            var rows=new SparseProfileRows(8);
+            return NetworkPhysicalContacts.Append(new[]{mainlineA,other},new Dictionary<string,NativeAssetContract>{{"fixture",contract}},
+                new[]{0,4},new[]{1,5},new[]{2,6},new[]{3,7},rows,.05,default);
+        }
+        var parallelContact=Contact(mainlineB);
+        Check(parallelContact.Rows==0&&parallelContact.HorizontalConflictPairs>0,
+            "Unpaired same-layer opposing mainlines were vertically stacked across a composition boundary");
+        Check(Contact(mainlineB with{Layer=1}).Rows>0&&Contact(mainlineB with{Reference="other"}).Rows>0&&
+            Contact(mainlineB with{Start=new(100,59,8),End=new(-100,59,-8)}).Rows>0,
+            "The opposing-mainline rule removed explicit-level, unrelated-route or shallow true-crossing clearance");
+        var sideFlags=mainlineA with{ExplicitWallSides=NetworkSides.Left,RetainingWallSides=NetworkSides.Right,QuaySides=NetworkSides.Left};
+        var noSides=StarterNetworkPolicy.WithoutSideStructures(new[]{sideFlags}).Single();
+        Check(noSides.ExplicitWallSides==NetworkSides.None&&noSides.RetainingWallSides==NetworkSides.None&&noSides.QuaySides==NetworkSides.None&&
+            Curve(noSides)==Curve(sideFlags)&&noSides.StartNodeId==sideFlags.StartNodeId&&noSides.EndNodeId==sideFlags.EndNodeId,
+            "Disabling manual walls/quays reshaped or subdivided the solved deck");
         Check(report.Rows>0&&evidence.Sum(e=>e.RowCount)==report.Rows&&evidence.Where(e=>e.RowCount>0).All(e=>e.FirstLeaf>=0&&e.SecondLeaf>=0&&e.Classification=="independent-source-ordered-levels"),
             "Physical row ranges lost their frozen contact/source identity");
         var measuredOrdinal=0L;

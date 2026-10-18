@@ -15,7 +15,7 @@ static class CapturedSourceCleanup
         }
         else if(token is JArray array)foreach(var child in array)NormalizeIds(child);
     }
-    public static void Run(string folder,string cachePath,string output)
+    public static void Run(string folder,string cachePath,string output,bool compact=false)
     {
         var watch=System.Diagnostics.Stopwatch.StartNew();var raw=OsmParsedCache.LoadSnapshot(cachePath,default);
         var run=JObject.Parse(File.ReadAllText(CapturedRunFiles.Resolve(folder,"run.json")));
@@ -69,10 +69,12 @@ static class CapturedSourceCleanup
         Stage("roundabouts",()=>segments=RoundaboutPlanner.Prepare(segments,log,default));
         var flags=System.Reflection.BindingFlags.Static|System.Reflection.BindingFlags.NonPublic;
         var demands=typeof(RailCorridorConsolidator).GetMethod("ExactPhysicalDemands",flags)!;
+        var shortLinks=typeof(RailCorridorConsolidator).GetMethod("CollapseShortConnections",flags)!;
         var pass=typeof(RailCorridorConsolidator).GetMethod("PreparePass",flags)!;
         Stage("rail-physical-demands",()=>
         {
             segments=segments.Select(s=>s.Kind==NetworkKind.Rail?s with{Lanes=2,PhysicalTracks=2,OneWay=false,ExplicitWallSides=NetworkSides.None,RetainingWallSides=NetworkSides.None}:s).ToArray();
+            segments=(IReadOnlyList<PreparedSegment>)shortLinks.Invoke(null,new object[]{segments,log,default(CancellationToken),3d})!;
             segments=(IReadOnlyList<PreparedSegment>)demands.Invoke(null,new object[]{segments,log,default(CancellationToken)})!;
         });
         for(var iteration=0;iteration<8;iteration++)
@@ -85,14 +87,17 @@ static class CapturedSourceCleanup
         Stage("normalization",()=>segments=NetworkNormalizer.Normalize(segments,log,default,request.MapSize.WidthMeters));
         Stage("hardening",()=>segments=NetworkHardener.Prepare(segments,log,default,request.ImportRail));
         Stage("geometry-safety",()=>segments=OsmRecovery.RepairGeometry(segments,request.MapSize.WidthMeters,log,default));
+        if(compact)Stage("whole-route-compaction",()=>segments=NativeChainCompactor.Prepare(segments,log,default,topology));
         SourceTopologyObligations.Validate(topology,segments,log,default);
         using var sha=SHA256.Create();using var cache=File.OpenRead(cachePath);
         File.WriteAllText(output,JsonConvert.SerializeObject(new{capture=Path.GetFileName(folder),cacheSha256=Convert.ToHexString(sha.ComputeHash(cache)),
-            immutableSourceMatchedExactly=true,scope="live-source-cleanup-and-normalization-before-native-metadata",stages,
+            immutableSourceMatchedExactly=true,scope=compact?"source-cleanup-and-whole-route-compaction-before-native-metadata":"live-source-cleanup-and-normalization-before-native-metadata",stages,
             metrics=new{missingPorts=log.Metric("Missing mandatory selected-source ports"),unresolvedRoutes=log.Metric("Unresolved selected-source reachability obligations"),
-                consolidatedRailSpans=log.Metric("Rail parallel spans consolidated")},
-            sourceDiagnostics=log.Lines.Where(l=>l.StartsWith("RAIL TOTAL")||l.StartsWith("SOURCE OBLIGATIONS")).ToArray(),
+                consolidatedRailSpans=log.Metric("Rail parallel spans consolidated"),shortConnectedRailLinks=log.Metric("Sub-footprint connected rail links consolidated")},
+            sourceDiagnostics=log.Lines.Where(l=>l.StartsWith("RAIL TOTAL")||l.StartsWith("RAIL SHORT LINKS")||l.StartsWith("SOURCE OBLIGATIONS")||l.StartsWith("NATIVE CHAIN")).ToArray(),
             elapsedSeconds=watch.Elapsed.TotalSeconds,profileSolved=false,terrainOrWaterReplayed=false,nativeOutcomePredicted=false},Formatting.Indented));
         Console.WriteLine("Source cleanup replay saved: "+output);
+        if(log.Metric("Missing mandatory selected-source ports")>0||log.Metric("Unresolved selected-source reachability obligations")>0)
+            throw new InvalidDataException("Captured source replay lost required ports or directional routes; see the saved stage witnesses.");
     }
 }

@@ -453,7 +453,7 @@ public static class NetworkNormalizer
         var c2 = segment.Control2 ?? math.lerp(segment.Start, segment.End, 2f / 3f);
         var a = segment.Start; var d = segment.End; a.y = c1.y = c2.y = d.y = 0;
         var arcBound = math.distance(a, c1) + math.distance(c1, c2) + math.distance(c2, d);
-        var tolerance = requestedTolerance??Tolerance(segment.Kind);
+        var tolerance = requestedTolerance??segment.SourceFitToleranceMeters??Tolerance(segment.Kind);
         // Adapt sampling to curve length while preserving the same continuous-error
         // reserve. Short curves no longer need 256 samples; long curves get more.
         var sampleCount = Math.Min(2048, Math.Max(32, (int)Math.Ceiling(6 * arcBound / tolerance)));

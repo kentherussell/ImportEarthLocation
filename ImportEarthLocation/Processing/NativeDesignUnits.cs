@@ -115,7 +115,12 @@ public static class NativeDesignUnits
         {
             token.ThrowIfCancellationRequested();var startUnit=Core(chain.Start);var endUnit=Core(chain.End);
             var boundaries=new SortedSet<double>();var corridorUnits=new List<int>();
+            // One already-fitted span needs one safe handoff, not two cuts
+            // enclosing a third, otherwise empty corridor batch. The boundary
+            // remains inside neutral space beyond both native cores/guards.
+            var singleHandoff=!chain.Indivisible&&chain.Spans.Count==1&&chain.Start!=chain.End;
             if(chain.Indivisible)indivisible++;
+            else if(singleHandoff)boundaries.Add((chain.StartCore+chain.Length-chain.EndCore)/2);
             else
             {
                 var prefix=new double[chain.Spans.Count+1];
@@ -166,7 +171,8 @@ public static class NativeDesignUnits
                     var unit=startUnit;
                     if(!chain.Indivisible)
                     {
-                        if(station>chain.Length-chain.EndCore)unit=endUnit;
+                        if(singleHandoff)unit=station<stations[0]?startUnit:endUnit;
+                        else if(station>chain.Length-chain.EndCore)unit=endUnit;
                         else if(station>=chain.StartCore)
                         {var bucket=Array.BinarySearch(stations,station);if(bucket<0)bucket=~bucket-1;unit=corridorUnits[Math.Min(bucket,corridorUnits.Count-1)];}
                     }
@@ -201,6 +207,16 @@ public static class NativeDesignUnits
         {c.Start,c.End,c.Length,c.StartCore,c.EndCore,c.RequiredStartCore,c.RequiredEndCore,c.Guard,c.Indivisible,
             candidateStartCore=cores[c.Start],candidateEndCore=cores[c.End],footprint="projected-central-port-rectangles-not-taper-influence",nativePreviewLegalityUnverified=true}));
         log.Count("Native design units",sizes.Length);log.Count("Native unit exact boundary splits",splits);
+        if(log.DiagnosticsEnabled)log.DiagnosticJson("native-segmentation-reasons.json",new
+        {
+            inputSections=source.Count,emittedSections=result.Count,ownershipHandoffSplits=splits,
+            pairedSynchronizationSplits=result.Count-source.Count-splits,
+            branchNodes=incident.Count(p=>p.Value.Count>2),terminalNodes=incident.Count(p=>p.Value.Count==1),
+            semanticOrModeBoundaryNodes=critical.Count(p=>incident[p].Count==2),
+            retainedDegreeTwoNodes=incident.Count(p=>p.Value.Count==2&&!critical.Contains(p.Key)),
+            sampledStationsCreateNativeNodes=false,countsAreNotMutuallyExclusive=true,
+            nativeSafetyAndAtomicCoreBoundariesPreserved=true
+        });
         log.Diagnostic($"NATIVE DESIGN UNITS units={sizes.Length}; sections={result.Count}; exactBoundarySplits={splits}; indivisibleChains={indivisible}; largestUnit={sizes.Max()}; overlappingCoresOnly=true; taperInfluenceDoesNotUnion=true; heuristicAloneUnions=false; centralFootprintProjected=true; nativeAcceptance=RequiresReview");
         return result;
     }
@@ -225,7 +241,9 @@ public static class NativeDesignUnits
     private static double Parameter(Cubic3d curve,double distance)
     {
         var lo=0d;var hi=1d;
-        for(var i=0;i<30;i++){var t=(lo+hi)/2;if(Length(curve,0,t)<distance)lo=t;else hi=t;}
+        // Opposite parameterizations must publish the same paired station to
+        // the existing 1e-7 m agreement, even for a 400 m source span.
+        for(var i=0;i<36;i++){var t=(lo+hi)/2;if(Length(curve,0,t)<distance)lo=t;else hi=t;}
         return (lo+hi)/2;
     }
 

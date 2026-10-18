@@ -713,10 +713,12 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
                 log.DiagnosticJson("offline-design-entry.json",new{schemaVersion=2,inputFile,requiresCompleteManifests=true});
             }
             var sections=CoordinatedNetworkDesign.Prepare(reference,roadbedBaseline,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token,
-                WaterBodyPlanner.SurfaceSampler(result.Water,result.HabitatPolygons),structureIntervalsResolved:true,assets:assets,progress:progress.Detail);
-            progress.Detail("Selecting road cuts and retaining-wall intervals");
-            sections=NetworkCutPlanner.Prepare(sections,terrain.Heightmap,terrain.HeightScaleMeters,request.MapSize.WidthMeters,result.ProtectedAreas,result.ProtectedLines,result.ExplicitWallLines,log,token);
-            sections=StarterNetworkPolicy.Quays(sections,roadbedBaseline,terrain.HeightScaleMeters,request.MapSize.WidthMeters,log,token);
+                WaterBodyPlanner.SurfaceSampler(result.Water,result.HabitatPolygons),structureIntervalsResolved:true,assets:assets,progress:progress.Detail,
+                protectedAreas:result.ProtectedAreas,protectedLines:result.ProtectedLines,sourceTopology:result.Source?.Topology);
+            // Do not add manual retaining-wall/quay upgrades or split solved
+            // decks merely to apply decorative side-composition intervals.
+            sections=StarterNetworkPolicy.WithoutSideStructures(sections);
+            log.Diagnostic("SIDE STRUCTURES manualRetainingWalls=false; manualQuays=false; postProfileSideSplits=0; nativeAutomaticTerrainBehaviorUnchanged=true");
             sections=NativeDesignUnits.Prepare(sections,result.NativeAssets,log,token);
             SourceTopologyObligations.Validate(result.Source?.Topology,sections,log,token);
             NetworkQualityAudit.Planned(sections,log,token,result.Source?.Topology!=null);

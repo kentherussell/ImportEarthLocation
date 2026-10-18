@@ -14,7 +14,8 @@ static class PairedCorridorTests
         Check(paired[0].StartHeightFamily==paired[1].EndHeightFamily&&paired[0].EndHeightFamily==paired[1].StartHeightFamily&&paired[0].StartNodeId!=paired[1].EndNodeId,"Height-family sharing merged topology IDs or ignored reverse station orientation");
         var unitCuts=NativeDesignUnits.Prepare(new[]{paired[0],paired[1] with{NativeWidth=24}},Array.Empty<NativeAssetContract>(),new ImportLog(),default);
         double[] Stations(long way)=>unitCuts.Where(s=>s.WayId==way).SelectMany(s=>new[]{s.PairedReferenceBegin,s.PairedReferenceEnd}).Distinct().Order().ToArray();
-        Check(Stations(1).Length>3&&Stations(1).Zip(Stations(2),(x,y)=>Math.Abs(x-y)<1e-7).All(x=>x)&&Stations(1).Length==Stations(2).Length,"Asymmetric native core cuts desynchronized the shared reference profile");
+        Check(Stations(1).Length>=3&&Stations(1).Zip(Stations(2),(x,y)=>Math.Abs(x-y)<1e-7).All(x=>x)&&Stations(1).Length==Stations(2).Length,
+            "Asymmetric native core cuts desynchronized the shared reference profile: "+string.Join(",",Stations(1))+" / "+string.Join(",",Stations(2)));
         var reversed=NetworkNormalizer.Reverse(paired[0]);
         Check(math.all(reversed.CourseStart==paired[0].CourseEnd)&&math.all(reversed.CourseControl1==paired[0].CourseControl2)&&reversed.StartHeightFamily==paired[0].EndHeightFamily,"Reversal ignored final float curve or paired station lineage");
         var terrain=Enumerable.Repeat((ushort)32768,17*17).ToArray();
@@ -41,6 +42,18 @@ static class PairedCorridorTests
         var curvedLog=new ImportLog();var curved=NetworkPairedCorridors.Prepare(new[]{ca,cb},curvedLog,default);
         Check(curvedLog.Metric("Trusted paired intervals")>0&&curved.Where(s=>s.PairedSpanId>0).GroupBy(s=>s.PairedSpanId).All(g=>g.Count()==2),"Valid shallow curves fell back to whole-edge chord pairing");
         Check(curved.Count<40,"Analysis samples leaked into native emission as a dense node chain");
+        foreach(var span in curved.Where(s=>s.PairedSpanId>0).GroupBy(s=>s.PairedSpanId))
+        {
+            var members=span.ToArray();
+            for(var j=0;j<=64;j++)
+            {
+                var distance=math.distance(NetworkNormalizer.Evaluate(members[0],j/64f).xz,NetworkNormalizer.Evaluate(members[1],1-j/64f).xz);
+                Check(distance>=(members[0].NativeWidth+members[1].NativeWidth)/2+2-.001,
+                    "Coarser internal paired fitting spent the physical two-metre median");
+            }
+        }
+        Check(curvedLog.Metric("Paired continuous projections excluded by hull bounds")>0,"Conservative pairing broad phase was not exercised");
+        Console.WriteLine($"PAIR FIXTURE shallowCurveSections={curved.Count}; trustedIntervals={curvedLog.Metric("Trusted paired intervals")}; projectionCandidates={curvedLog.Metric("Paired continuous projection candidates")}; hullExcluded={curvedLog.Metric("Paired continuous projections excluded by hull bounds")}");
         var reverseInput=NetworkPairedCorridors.Prepare(new[]{b,a},new ImportLog(),default).OrderBy(s=>s.WayId).ThenBy(s=>s.PairedReferenceBegin).ToArray();
         var ordered=paired.OrderBy(s=>s.WayId).ThenBy(s=>s.PairedReferenceBegin).ToArray();
         Check(reverseInput.Length==ordered.Length&&reverseInput.Zip(ordered,(x,y)=>math.all(x.CourseStart==y.CourseStart)&&math.all(x.CourseEnd==y.CourseEnd)).All(x=>x),"Source enumeration order changed the trusted corridor geometry");

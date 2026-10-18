@@ -10,6 +10,11 @@ static class ArchiveTests
         try
         {
             var archive = new RunArchive(root, new { latitude = 38.9, roads = "primary" }, typeof(ArchiveTests).Assembly.Location);
+            archive.WriteSvg("visual-quality-worst.svg","<svg xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M0,0 L1,1\"/></svg>");
+            if(!File.ReadAllText(Path.Combine(archive.DirectoryPath,"visual-quality-worst.svg")).StartsWith("<svg"))throw new Exception("Diagnostic SVG was not written as viewable XML");
+            var oversizedSvgRejected=false;
+            try{archive.WriteSvg("oversized.svg",new string('x',1024*1024+1));}catch(ArgumentException){oversizedSvgRejected=true;}
+            if(!oversizedSvgRejected)throw new Exception("Diagnostic SVG bypassed its fixed byte bound");
             var second = new RunArchive(root, new { latitude = 38.9 }, "missing.dll");
             if (archive.DirectoryPath == second.DirectoryPath) throw new Exception("Runs overwrite each other");
             var metrics = new SortedDictionary<string,double> { ["Trees prepared"] = 60000, ["Network cleanup time (s)"] = 1.55 };
@@ -134,8 +139,10 @@ static class ArchiveTests
             if(enumerated)throw new Exception("Repeated compression continued after a bucket overflow");
             var model=new PreparedSegment(123,1,2,new(12345.125f,45,32),new(12445.5f,47,36),NetworkKind.Road,"motorway",2,true,false,false,0)
                 {SourceGeometry=Enumerable.Range(0,600).Select(i=>new float3(i,1,2)).ToArray(),
+                    Control1=new float3(12370,46,33),Control2=new float3(12420,46.5f,35),
                     HorizontalEmissionReference=new(new(1,2,3),new(4,5,6),new(7,8,9),new(10,11,12))};
-            var modelFile=archive.WriteCompressedRecords("offline-roundtrip.ndjson.gz",DiagnosticArtifacts.ExactNetworkRecords(new[]{model with{HorizontalParent=model}}));
+            var frozenModel=model with{FinalDeckCurve=new(model.CourseStart,model.CourseControl1,model.CourseControl2,model.CourseEnd)};
+            var modelFile=archive.WriteCompressedRecords("offline-roundtrip.ndjson.gz",DiagnosticArtifacts.ExactNetworkRecords(new[]{model with{HorizontalParent=model},frozenModel}));
             using(var stream=File.OpenRead(Path.Combine(archive.DirectoryPath,modelFile.File)))
             using(var gzip=new System.IO.Compression.GZipStream(stream,System.IO.Compression.CompressionMode.Decompress))
             using(var reader=new StreamReader(gzip))
@@ -143,9 +150,33 @@ static class ArchiveTests
                 var modelRecord=JObject.Parse(reader.ReadLine()!);var recovered=modelRecord.ToObject<PreparedSegment>()!;
                 if(modelRecord["Start"]!.Children().Count()!=3||modelRecord["HorizontalParent"]!.Type!=JTokenType.Null||
                     recovered.SourceGeometry.Count!=600||!math.all(recovered.CourseStart==model.CourseStart)||
-                    recovered.HorizontalEmissionReference!=model.HorizontalEmissionReference)
+                    !Nullable.Equals(recovered.Control1,model.Control1)||!Nullable.Equals(recovered.Control2,model.Control2)||
+                    recovered.HorizontalEmissionReference!=model.HorizontalEmissionReference||
+                    !Nullable.Equals(recovered.FinalDeckCurve,model.FinalDeckCurve))
                     throw new Exception("Exact replay lost coordinates/source points or serialized recursive vector/parent properties");
+                var frozen=JObject.Parse(reader.ReadLine()!).ToObject<PreparedSegment>()!;
+                if(!Nullable.Equals(frozen.FinalDeckCurve,frozenModel.FinalDeckCurve))throw new Exception("Exact replay lost an existing frozen-curve marker");
             }
+            var nullableVectors=archive.WriteRecords("nullable-vectors.ndjson",new object[]{new
+            {
+                F2=(float2?)new float2(1,2),F3=(float3?)new float3(1,2,3),F4=(float4?)new float4(1,2,3,4),
+                D2=(double2?)new double2(1,2),D3=(double3?)new double3(1,2,3),I3=(int3?)new int3(1,2,3),Missing=(float3?)null
+            }});
+            var vectors=JObject.Parse(File.ReadAllText(Path.Combine(archive.DirectoryPath,nullableVectors.File)));
+            foreach(var name in new[]{"F2","F3","F4","D2","D3","I3"})
+                if(vectors[name] is not JObject vector||vector.Properties().Any(p=>p.Name is not ("x" or "y" or "z" or "w")))
+                    throw new Exception("Nullable vector used a recursive Unity property contract: "+name);
+            if(vectors["Missing"]!.Type!=JTokenType.Null)throw new Exception("Null optional vector was not preserved");
+            var failureArchive=new RunArchive(root,new{},"missing.dll");
+            for(var i=0;i<160;i++)failureArchive.RecordFailure("optional-"+i,new IOException("optional limit"));
+            failureArchive.RecordFailure("profile-input",new IOException("essential profile failure"));
+            failureArchive.RecordFailure("native-owned-final-physical-models.ndjson.gz",new IOException("essential model failure"));
+            failureArchive.Write(Array.Empty<string>(),metrics,"completed");
+            var failureLedger=JObject.Parse(File.ReadAllText(Path.Combine(failureArchive.DirectoryPath,"capture-completeness.json")));
+            if(failureLedger["failedArtifacts"]!["profile-input"]==null||
+                failureLedger["failedArtifacts"]!["native-owned-final-physical-models.ndjson.gz"]==null||
+                ((JObject)failureLedger["failedArtifacts"]!).Count!=130||(int)failureLedger["artifactFailures"]! !=162)
+                throw new Exception("Optional failures hid essential replay failures or exceeded the bounded message ledger");
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
     }

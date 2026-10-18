@@ -11,13 +11,17 @@ namespace ImportEarthLocation.Processing;
 // profile families. Ambiguous or uncertified intervals retain independent curves.
 public static class NetworkPairedCorridors
 {
+    // Internal spline-to-native approximation, not the source-fit, clearance or
+    // paired-height tolerance. Actual emitted separation is certified below.
+    private const double EmissionFitTolerance=.25;
     private sealed class Chain
     {
         public int Id;public readonly List<int> Edges=new();public readonly List<Piece> Pieces=new();
         public readonly Dictionary<int,(int First,int Last)> Ranges=new();
+        public readonly List<(double Begin,double End)> JunctionCores=new();
         public double Length,StartCore,EndCore;
     }
-    private sealed record Piece(int Chain,int Edge,double Begin,double End,double Station,double Length,double2 A,double2 B);
+    private sealed record Piece(int Chain,int Edge,double Begin,double End,double Station,double Length,double2 A,double2 B,double2 Minimum,double2 Maximum,int Ordinal);
     private readonly record struct Projection(int Chain,int Edge,double Parameter,double Station,double2 Point,double2 Heading,double Distance);
     private readonly record struct Match(double A,double B,double2 PA,double2 PB,int Side);
     private sealed record Interval(Chain A,Chain B,Match[] Samples);
@@ -34,7 +38,7 @@ public static class NetworkPairedCorridors
         var incident=new Dictionary<long,List<int>>();
         for(var i=0;i<source.Count;i++)if(source[i].Kind==NetworkKind.Road)foreach(var id in new[]{source[i].StartNodeId,source[i].EndNodeId})
         {if(!incident.TryGetValue(id,out var list))incident[id]=list=new();list.Add(i);}
-        var chains=new List<Chain>();var visited=new bool[source.Count];
+        var chains=new List<Chain>();var visited=new bool[source.Count];var pieceCount=0;
         var requiredAliases=new HashSet<long>(source.Where(s=>s.Kind==NetworkKind.Road).SelectMany(s=>s.SourceNodeAliases).Where(a=>a.Mandatory).Select(a=>a.CanonicalNodeId));
         // Correspondence survives an abutment or lane-width boundary. Emission
         // cuts at every source edge below retain each side's actual asset/mode.
@@ -43,7 +47,12 @@ public static class NetworkPairedCorridors
         int Next(int edge,bool backwards)
         {
             var s=source[edge];var node=backwards?s.StartNodeId:s.EndNodeId;
-            if(incident[node].Count!=2||requiredAliases.Contains(node))return -1;var next=incident[node][0]==edge?incident[node][1]:incident[node][0];
+            // A ramp branch does not end the mainline corridor identity. Its
+            // footprint is excluded below, while source edge cuts keep the port.
+            var main=incident[node].Where(i=>!source[i].ProtectedLink).ToArray();
+            if(main.Length!=2||incident[node].Any(i=>i!=edge&&!source[i].ProtectedLink&&!Eligible(source[i])))return -1;
+            var next=main[0]==edge?main[1]:main[0];
+            if(requiredAliases.Contains(node)&&incident[node].Count==2)return -1;
             return Continue(edge,next)&&(backwards?source[next].EndNodeId:source[next].StartNodeId)==node?next:-1;
         }
         foreach(var seed in Enumerable.Range(0,source.Count).OrderBy(i=>source[i].WayId).ThenBy(i=>source[i].StartNodeId))
@@ -55,6 +64,8 @@ public static class NetworkPairedCorridors
             while(!visited[index])
             {
                 visited[index]=true;chain.Edges.Add(index);var c=Curve(source[index]);var firstPiece=chain.Pieces.Count;
+                if(incident[source[index].StartNodeId].Count>2)
+                {var radius=2*source[index].NativeWidth;chain.JunctionCores.Add((chain.Length-radius,chain.Length+radius));}
                 if(NetworkDesignChecks.Finite(c))Flatten(c,0,1,0);
                 void Flatten(Cubic3d part,double begin,double end,int depth)
                 {
@@ -63,7 +74,9 @@ public static class NetworkPairedCorridors
                     if((math.distance(a,b)>10||error>.01)&&depth<18)
                     {var split=NetworkDesignChecks.Split(part,.5);var middle=(begin+end)/2;Flatten(split.Left,begin,middle,depth+1);Flatten(split.Right,middle,end,depth+1);return;}
                     var length=math.distance(a,b);if(length<=1e-8)return;
-                    chain.Pieces.Add(new(chain.Id,index,begin,end,chain.Length,length,a,b));chain.Length+=length;
+                    var minimum=math.min(math.min(part.P0.xz,part.P1.xz),math.min(part.P2.xz,part.P3.xz));
+                    var maximum=math.max(math.max(part.P0.xz,part.P1.xz),math.max(part.P2.xz,part.P3.xz));
+                    chain.Pieces.Add(new(chain.Id,index,begin,end,chain.Length,length,a,b,minimum,maximum,pieceCount++));chain.Length+=length;
                 }
                 if(chain.Pieces.Count>firstPiece)chain.Ranges[index]=(firstPiece,chain.Pieces.Count-1);
                 var next=Next(index,false);if(next<0||visited[next])break;index=next;
@@ -77,18 +90,30 @@ public static class NetworkPairedCorridors
         var grid=new Dictionary<(int,int),List<Piece>>();
         foreach(var chain in chains)foreach(var p in chain.Pieces)
         {
-            var min=math.min(p.A,p.B);var max=math.max(p.A,p.B);
+            var min=p.Minimum;var max=p.Maximum;
             for(var z=(int)Math.Floor(min.y/64);z<=(int)Math.Floor(max.y/64);z++)for(var x=(int)Math.Floor(min.x/64);x<=(int)Math.Floor(max.x/64);x++)
             {if(!grid.TryGetValue((x,z),out var list))grid[(x,z)]=list=new();list.Add(p);}
         }
-        bool Interior(Projection p)=>p.Station>=chains[p.Chain].StartCore&&p.Station<=chains[p.Chain].Length-chains[p.Chain].EndCore;
+        bool Interior(Projection p)=>p.Station>=chains[p.Chain].StartCore&&p.Station<=chains[p.Chain].Length-chains[p.Chain].EndCore&&
+            !chains[p.Chain].JunctionCores.Any(c=>p.Station>=c.Begin&&p.Station<=c.End);
+        var projected=new int[pieceCount];var query=0;
+        long projectionCandidates=0,projectionBoundsRejected=0;
         Projection? Closest(int own,double2 point,double2 heading)
         {
+            if(query==int.MaxValue){Array.Clear(projected,0,projected.Length);query=0;}query++;
             var candidates=new Dictionary<int,Projection>();var gx=(int)Math.Floor(point.x/64);var gz=(int)Math.Floor(point.y/64);
             var reference=source[chains[own].Edges[0]];
             for(var z=gz-2;z<=gz+2;z++)for(var x=gx-2;x<=gx+2;x++)if(grid.TryGetValue((x,z),out var pieces))foreach(var p in pieces)
             {
+                if(projected[p.Ordinal]==query)continue;projected[p.Ordinal]=query;
                 if(p.Chain==own||!Related(reference,source[p.Edge]))continue;
+                projectionCandidates++;
+                // Precomputed exact control-hull bounds reject only pieces
+                // outside the radius or unable to improve this chain's best
+                // certified projection. Keep the existing nearest-root proof.
+                var lower=math.distance(point,math.clamp(point,p.Minimum,p.Maximum));
+                if(lower>96||candidates.TryGetValue(p.Chain,out var nearest)&&lower>nearest.Distance)
+                {projectionBoundsRejected++;continue;}
                 var u=math.clamp(math.dot(point-p.A,p.B-p.A)/math.lengthsq(p.B-p.A),0,1);var t=p.Begin+(p.End-p.Begin)*u;
                 var c=Curve(source[p.Edge]);
                 if(!TryProject(c,point,p.Begin,p.End,t,out t))continue;
@@ -227,7 +252,7 @@ public static class NetworkPairedCorridors
                 return Separated(left.Left,right.Left,minimum,depth+1)&&Separated(left.Right,right.Right,minimum,depth+1);
             }
             double fitBegin=0,fitEnd=0;
-            bool Fits(double begin,double end,Cubic3d fitted,int sign,int depth,double tolerance=.045)
+            bool Fits(double begin,double end,Cubic3d fitted,int sign,int depth,double tolerance=EmissionFitTolerance-.005)
             {
                 // Independent check subdivision: the native curve is not split
                 // merely because a proof needs a tighter reference interval.
@@ -266,9 +291,9 @@ public static class NetworkPairedCorridors
                 double Rounding(Cubic3d c)=>new[]{c.P0,c.P1,c.P2,c.P3}.Max(p=>math.distance(p,(double3)(float3)p));
                 if(Rounding(a)>.005||Rounding(b)>.005){invalid=true;return;}
                 var valid=end-begin<=400+1e-7&&Fits(begin,end,a,side,0)&&Fits(begin,end,b,-side,0)&&
-                    // The reference reserves 2*0.05 m fitting error above the
-                    // physical 2 m median. Check the emitted pair against that
-                    // physical minimum; do not spend the reserve twice.
+                    // The reference includes a 0.1 m median reserve. Certify
+                    // the actual emitted 2 m median independently of the
+                    // 0.25 m internal spline approximation allowance.
                     Separated(a,b,RequiredAt((begin+end)/2)-.1,0);
                 for(var j=0;j<=16;j++)
                 {
@@ -392,6 +417,8 @@ public static class NetworkPairedCorridors
             Original(cursor,1);
         }
         log.Count("Trusted paired intervals",accepted);log.Count("Paired intervals requiring independent fit",rejected);
+        log.AddCounter("Paired continuous projection candidates",projectionCandidates);
+        log.AddCounter("Paired continuous projections excluded by hull bounds",projectionBoundsRejected);
         var candidateEdges=new HashSet<int>(intervals.SelectMany(p=>p.A.Edges.Concat(p.B.Edges)));
         var eligibleLength=0d;var pairedLength=0d;var independentLength=0d;var coverage=log.DiagnosticsEnabled?new List<object>():null;
         for(var i=0;i<source.Count;i++)
@@ -409,7 +436,7 @@ public static class NetworkPairedCorridors
         }
         if(coverage!=null)log.DiagnosticCompressedRecords("paired-correspondence-coverage.ndjson.gz",coverage);
         log.Diagnostic($"PAIR COVERAGE eligibleSourceLengthMeters={eligibleLength:R}; pairedSourceLengthMeters={pairedLength:R}; independentSourceLengthMeters={independentLength:R}; bothCarriagewaysCounted=true; sourceStationsNotSubdivisionCounts=true; unmatchedIsNotAutomaticallyAnError=true");
-        log.Diagnostic($"TRUSTED PAIRS chains={chains.Count}; candidateIntervals={intervals.Count}; accepted={accepted}; independentFallbacks={rejected}; nonreciprocalOrAmbiguousStations={ambiguous}; sharedHeightSpans={spanId}; sourceBased=true; radiusMeters=96; minimumOverlapMeters=80; continuousProjection=true; synchronizedEmission=true; qualityFailureBlocksPlacement=false");
+        log.Diagnostic($"TRUSTED PAIRS chains={chains.Count}; candidateIntervals={intervals.Count}; accepted={accepted}; independentFallbacks={rejected}; nonreciprocalOrAmbiguousStations={ambiguous}; sharedHeightSpans={spanId}; projectionCandidates={projectionCandidates}; projectionBoundsRejected={projectionBoundsRejected}; sourceBased=true; radiusMeters=96; minimumOverlapMeters=80; continuousProjection=true; synchronizedEmission=true; qualityFailureBlocksPlacement=false");
         return output;
     }
     private static Cubic3d Subcurve(Cubic3d c,double begin,double end)

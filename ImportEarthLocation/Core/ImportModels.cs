@@ -108,6 +108,9 @@ public sealed record PreparedSegment(
     public float3? Control1 { get; init; }
     public float3? Control2 { get; init; }
     public IReadOnlyList<float3> SourceGeometry { get; init; } = Array.Empty<float3>();
+    // Explicit per-design geographic allowance; never a native safety tolerance.
+    // Null retains the original road/rail fitting policy in old captures.
+    public float? SourceFitToleranceMeters { get; init; }
     public string Name { get; init; } = "";
     public string Reference { get; init; } = "";
     public string RailService { get; init; } = "";

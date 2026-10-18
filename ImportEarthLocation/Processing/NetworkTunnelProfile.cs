@@ -21,7 +21,7 @@ public static class NetworkTunnelProfile
         public double CoverAffectedLength { get; init; }
     }
     public static PhysicalQuality MeasurePhysical(IReadOnlyList<PreparedSegment> source,ushort[] terrain,float scale,double width,
-        IReadOnlyDictionary<string,NativeAssetContract>? assets,CancellationToken token)
+        IReadOnlyDictionary<string,NativeAssetContract>? assets,CancellationToken token,NetworkPhysicalContacts.GeometryCache? geometry=null)
     {
         var from=new int[source.Count];var c1=new int[source.Count];
         var c2=new int[source.Count];var to=new int[source.Count];var heights=new double[source.Count*4];
@@ -45,7 +45,7 @@ public static class NetworkTunnelProfile
         });
         if(assets!=null)
         {
-            var contactReport=NetworkPhysicalContacts.Append(source,assets,from,c1,c2,to,rows,epsilon,token);
+            var contactReport=NetworkPhysicalContacts.Append(source,assets,from,c1,c2,to,rows,epsilon,token,geometry:geometry);
             contacts=contactReport.Rows;uncertifiedClearance=contactReport.UncertifiedLeaves+contactReport.MissingAssets;horizontalConflicts=contactReport.HorizontalConflictPairs;
             coverPhase=true;
             var tunnelReport=NetworkTunnelContacts.Append(source,terrain,scale,width,assets,from,c1,c2,to,rows,epsilon,token);
@@ -59,7 +59,8 @@ public static class NetworkTunnelProfile
                 CoverAffectedLength=failedCoverSections.Sum(i=>NetworkCurveObservations.Measure(new(source[i].CourseStart,source[i].CourseControl1,source[i].CourseControl2,source[i].CourseEnd)).SampledLengthMeters)};
     }
     public sealed record TerrainReference(ushort[] Heights,double Width,Func<float3,float?>? Water=null,
-        IReadOnlyDictionary<string,NativeAssetContract>? Assets=null,Action<string>? Progress=null,bool CaptureReplay=true,string EvidenceScope="local");
+        IReadOnlyDictionary<string,NativeAssetContract>? Assets=null,Action<string>? Progress=null,bool CaptureReplay=true,string EvidenceScope="local")
+    {public NetworkPhysicalContacts.GeometryCache? ContactGeometry { get; init; }}
     public static IReadOnlyList<PreparedSegment> Solve(IReadOnlyList<PreparedSegment> source,float scale,
         IReadOnlyList<(int index,float t,float ceiling)> cover,ImportLog log,CancellationToken token,
         IReadOnlyDictionary<SourceNodeKey,double>? verifiedBoundaryHeights=null,TerrainReference? design=null,
@@ -309,17 +310,27 @@ public static class NetworkTunnelProfile
                     log.Diagnostic($"PROFILE INCLINE review way={s.WayId}; nodes={s.StartNodeId},{s.EndNodeId}; signedGrade={incline:R}; immutableArcMeters={length:R}; immutableHeightDifference={s.CourseEnd.y-s.CourseStart.y:R}; toleranceMeters=3; enforced=false; rawTagRetained=true");
                 }
             }
-            for(var sample=0;sample<=8;sample++)
+            // Observations are virtual physical stations, not a reason to add
+            // native nodes. The coordinated route already supplies a smoothed
+            // height intent; immutable terrain still defines cut/fill bounds.
+            var observationCount=design==null?8:Math.Min(64,Math.Max(2,(int)Math.Ceiling(length/40)));
+            for(var sample=0;sample<=observationCount;sample++)
             {
-                var t=sample/8d;var u=1-t;
+                var t=sample/(double)observationCount;var u=1-t;
                 coefficients[0]=u*u*u/budget;coefficients[1]=3*u*u*t/budget;
                 coefficients[2]=3*u*t*t/budget;coefficients[3]=t*t*t/budget;
-                var weight=support/8*(sample==0||sample==8?.5:1);
-                Row(4,(design==null?NetworkNormalizer.Evaluate(s,(float)t).y:Ground(NetworkNormalizer.Evaluate(s,(float)t)))/budget,weight,ProfileRowKind.EqualityCost);
+                var weight=support/observationCount*(sample==0||sample==observationCount?.5:1);
+                Row(4,NetworkNormalizer.Evaluate(s,(float)t).y/budget,weight,ProfileRowKind.EqualityCost);
                 if(design!=null)
                 {
                     var p=NetworkNormalizer.Evaluate(s,(float)t);var ground=Ground(p);
-                    var lower=ground-budget;var upper=ground+budget;
+                    // Cut/fill is terrain-relative only for ground roads. A
+                    // bridge/tunnel has a structural alignment datum; pulling
+                    // it toward every valley/crest sample recreates the very
+                    // earthwork it was selected to avoid. Physical deck/roof
+                    // clearance rows remain independent and unchanged.
+                    var datum=NetworkStructure.IsStructure(s)?NetworkNormalizer.Evaluate(s,(float)t).y:ground;
+                    var lower=datum-budget;var upper=datum+budget;
                     // Fixed terrain-relative observations: never increase these
                     // limits in response to another road's current iteration.
                     Row(4,upper/budget,weight,ProfileRowKind.UpperHingeCost);
@@ -408,7 +419,7 @@ public static class NetworkTunnelProfile
             var contacts=NetworkPhysicalContacts.Append(source,design.Assets,from,c1,c2,to,rows,eps,token,design.Progress,
                 log.DiagnosticsEnabled?witness=>{constantCount++;if(constantWitnesses.Count<128)constantWitnesses.Add(witness);}:null,
                 log.DiagnosticsEnabled?witness=>{if(horizontalWitnesses.Count<128)horizontalWitnesses.Add(witness);}:null,
-                contactEvidence==null?null:contactEvidence.Add);
+                contactEvidence==null?null:contactEvidence.Add,design.ContactGeometry);
             if(log.DiagnosticsEnabled)
             {
                 var prefix=design.CaptureReplay?"":$"{design.EvidenceScope}-unit-{source[0].NativeUnitId}-";

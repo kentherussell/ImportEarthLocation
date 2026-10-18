@@ -47,13 +47,19 @@ public static class NetworkApproachFrames
         {
             if(used.Contains(request.Index)||!directions.ContainsKey((request.Index,request.Start)))continue;
             token.ThrowIfCancellationRequested();var path=new List<(int Index,bool Forward)>();var seen=new HashSet<int>();
+            var requestedCurve=Curve(source[request.Index]);
+            var originalOutward=math.normalizesafe((request.Start?requestedCurve.P1-requestedCurve.P0:requestedCurve.P2-requestedCurve.P3).xz);
+            var deflection=Math.Acos(math.clamp(math.dot(originalOutward,directions[(request.Index,request.Start)]),-1,1));
+            // Reserve a whole approach for the heading change. A severe turn
+            // must not be concentrated into the last short native section.
+            var reach=Math.Min(1200,Math.Max(500,500+500*deflection/(Math.PI/2)));
             var edge=request.Index;var forward=request.Start;var distance=0d;
             while(seen.Add(edge)&&!used.Contains(edge))
             {
                 var s=source[edge];path.Add((edge,forward));distance+=lengths[edge];
                 affected.Add(edge);Union(request.Index,edge);
                 var key=new SourceNodeKey(s.Kind,forward?s.EndNodeId:s.StartNodeId);var arms=incident[key];
-                if(directions.ContainsKey((edge,!forward))||arms.Count!=2||mandatory.Contains(key)||distance>=500||s.PairedProfileId!=0)break;
+                if(directions.ContainsKey((edge,!forward))||arms.Count!=2||mandatory.Contains(key)||distance>=reach||s.PairedProfileId!=0)break;
                 var next=arms.First(p=>p.Index!=edge);var other=source[next.Index];
                 if(other.Kind!=s.Kind||other.Roundabout||other.OneWay!=s.OneWay||other.ProtectedLink!=s.ProtectedLink||
                     other.PairedProfileId!=0||other.Tunnel!=s.Tunnel||other.Bridge!=s.Bridge||other.NativeAssetKey!=s.NativeAssetKey||s.OneWay&&next.Start!=forward)break;
@@ -68,7 +74,7 @@ public static class NetworkApproachFrames
                 math.normalizesafe((first.Forward?ca.P1-ca.P0:ca.P2-ca.P3).xz);
             var tb=directions.TryGetValue((last.Index,!last.Forward),out var bd)?-bd:
                 math.normalizesafe((last.Forward?cb.P3-cb.P2:cb.P0-cb.P1).xz);
-            var budget=source[first.Index].ProtectedLink?48:NetworkNormalizer.Tolerance(source[first.Index].Kind);
+            var budget=source[first.Index].ProtectedLink?48:path.Min(p=>source[p.Index].SourceFitToleranceMeters??NetworkNormalizer.Tolerance(source[p.Index].Kind));
             var parts=new Cubic3d[path.Count];
             bool FitRange(int begin,int end,double3 start,double3 finish,double2 incoming,double2 outgoing)
             {

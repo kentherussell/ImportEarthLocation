@@ -67,7 +67,7 @@ public static class RailCorridorConsolidator
         // canonical raw geometry before fitting curves, preserving all tails.
         // Two tracks inside ONE native corridor segment, never two generated axes.
         source=source.Select(s=>s.Kind==NetworkKind.Rail?s with{Lanes=2,PhysicalTracks=2,OneWay=false,ExplicitWallSides=NetworkSides.None,RetainingWallSides=NetworkSides.None}:s).ToArray();
-        var result=ExactPhysicalDemands(source,log,token);
+        var result=ExactPhysicalDemands(CollapseShortConnections(source,log,token),log,token);
         for(var pass=0;pass<8;pass++)
         {
             var next=PreparePass(result,log,token);
@@ -75,6 +75,65 @@ public static class RailCorridorConsolidator
             result=next;
         }
         return result;
+    }
+    public static IReadOnlyList<PreparedSegment> NativeJunctionFootprints(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
+    {
+        var widths=source.Where(s=>s.Kind==NetworkKind.Rail&&s.NativeWidth>0&&math.isfinite(s.NativeWidth)).Select(s=>s.NativeWidth).ToArray();
+        if(widths.Length==0)return source;
+        return CollapseShortConnections(source,log,token,Math.Min(12,widths.Min()));
+    }
+
+    private static IReadOnlyList<PreparedSegment> CollapseShortConnections(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token,double maximumDiameter=3)
+    {
+        var incident=new Dictionary<long,List<PreparedSegment>>();var points=new Dictionary<long,float3>();
+        var protectedNodes=new HashSet<long>(source.Where(s=>s.Kind==NetworkKind.Road).SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));
+        foreach(var s in source.Where(s=>s.Kind==NetworkKind.Rail))foreach(var start in new[]{true,false})
+        {
+            var id=start?s.StartNodeId:s.EndNodeId;
+            if(!incident.TryGetValue(id,out var arms))incident[id]=arms=new();arms.Add(s);points[id]=start?s.Start:s.End;
+            var curved=(s.Control1.HasValue||s.Control2.HasValue)&&(maximumDiameter<=3||
+                NetworkNormalizer.DistanceToSegment(s.CourseControl1,s.Start,s.End)>.05||NetworkNormalizer.DistanceToSegment(s.CourseControl2,s.Start,s.End)>.05);
+            if((start?s.StartTerminal:s.EndTerminal)||curved||s.FinalDeckCurve.HasValue||
+                math.any(s.StartCurveOffset!=0)||math.any(s.EndCurveOffset!=0))protectedNodes.Add(id);
+        }
+        foreach(var node in incident)
+            if(node.Value.Count==1||node.Value.Select(s=>(s.Layer,s.Bridge,s.Tunnel,s.Classification,s.RailService)).Distinct().Count()!=1)protectedNodes.Add(node.Key);
+        var parents=points.Keys.ToDictionary(id=>id,id=>id);
+        var low=points.ToDictionary(p=>p.Key,p=>(double2)p.Value.xz);var high=new Dictionary<long,double2>(low);
+        long Root(long id){var root=id;while(parents[root]!=root)root=parents[root];while(parents[id]!=id){var next=parents[id];parents[id]=root;id=next;}return root;}
+        var maximum=maximumDiameter;
+        foreach(var s in source.Where(s=>s.Kind==NetworkKind.Rail).OrderBy(s=>math.distancesq(s.Start.xz,s.End.xz)).ThenBy(s=>s.WayId).ThenBy(s=>s.StartNodeId))
+        {
+            token.ThrowIfCancellationRequested();if(protectedNodes.Contains(s.StartNodeId)||protectedNodes.Contains(s.EndNodeId))continue;
+            var a=Root(s.StartNodeId);var b=Root(s.EndNodeId);if(a==b)continue;
+            var min=math.min(low[a],low[b]);var max=math.max(high[a],high[b]);
+            // Bound the whole cluster, not each successive link: a long run of
+            // short edges must never collapse into one drifting junction.
+            if(math.distance(min,max)>maximum)continue;
+            if(incident[a].Count<incident[b].Count||incident[a].Count==incident[b].Count&&a>b)(a,b)=(b,a);
+            parents[b]=a;low[a]=min;high[a]=max;
+        }
+        var survivingRoots=new HashSet<long>(source.Where(s=>s.Kind==NetworkKind.Rail&&Root(s.StartNodeId)!=Root(s.EndNodeId))
+            .SelectMany(s=>new[]{Root(s.StartNodeId),Root(s.EndNodeId)}));
+        // Keep an isolated short component: without a surviving incident span
+        // there is nowhere to carry its source identities or visible geometry.
+        var isolated=points.Keys.Where(id=>!survivingRoots.Contains(Root(id))).ToArray();
+        foreach(var id in isolated)parents[id]=id;
+        var remap=points.Keys.Where(id=>Root(id)!=id).ToDictionary(id=>id,id=>Root(id));
+        if(remap.Count==0)return source;
+        var output=new List<PreparedSegment>(source.Count);var removed=0;
+        foreach(var s in source)
+        {
+            token.ThrowIfCancellationRequested();if(s.Kind!=NetworkKind.Rail){output.Add(s);continue;}
+            var a=Root(s.StartNodeId);var b=Root(s.EndNodeId);if(a==b){removed++;continue;}
+            if(a==s.StartNodeId&&b==s.EndNodeId){output.Add(s);continue;}
+            output.Add(s with{StartNodeId=a,EndNodeId=b,Start=points[a],End=points[b],
+                Control1=s.Control1.HasValue?math.lerp(points[a],points[b],1f/3):null,
+                Control2=s.Control2.HasValue?math.lerp(points[a],points[b],2f/3):null,SourceGeometry=new[]{points[a],points[b]}});
+        }
+        log.Count("Sub-footprint connected rail links consolidated",removed);
+        log.Diagnostic($"RAIL SHORT LINKS removed={removed}; aliasedSourceNodes={remap.Count}; maximumClusterDiameterMeters={maximum}; nativeFootprintPolicy={maximum>3}; connectedSourceEdgesOnly=true; modeBoundariesPreserved=true; proximityWeld=false");
+        return SourceTopologyObligations.Transfer(source,output,NetworkKind.Rail,remap);
     }
     // Exact raw evidence only. Endpoint/prefab equality cannot establish that
     // separately mapped tracks represent the same physical infrastructure.

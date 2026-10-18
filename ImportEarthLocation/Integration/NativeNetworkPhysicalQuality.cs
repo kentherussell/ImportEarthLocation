@@ -82,18 +82,25 @@ public static partial class NativeNetworkDiagnostics
             log.DiagnosticRecordChunks(name,references);sourceMaps.Add(name.Substring(0,name.Length-7)+"-chunks.json");
             yield return 0;
         }
-        log.DiagnosticCompressedRecords("native-owned-final-composition-contracts.ndjson.gz",assets.Values.Cast<object>());
+        var contractsCaptured=log.DiagnosticCompressedRecords("native-owned-final-composition-contracts.ndjson.gz",assets.Values.Cast<object>());
         // Capture the exact scalar audit models too. Canonical curves alone do
         // not retain source class, grade policy, offsets and formation metadata;
         // rebuilding those by proximity would not reproduce this calculation.
-        log.DiagnosticCompressedRecords("native-owned-final-physical-models.ndjson.gz",DiagnosticArtifacts.ExactNetworkRecords(models));
+        var modelsCaptured=log.DiagnosticCompressedRecords("native-owned-final-physical-models.ndjson.gz",DiagnosticArtifacts.ExactNetworkRecords(models));
         log.DiagnosticJson("native-owned-final-physical-manifest.json",new{sourceMaps,contracts="native-owned-final-composition-contracts.ndjson.gz",
-            modelFile="native-owned-final-physical-models.ndjson.gz",nativeRaster="native-observed-heightmap.u16",models=models.Count,unavailable,distributedAcrossFrames=true,singleInstantSnapshot=false});
+            modelFile="native-owned-final-physical-models.ndjson.gz",modelsCaptured,contractsCaptured,nativeRaster="native-observed-heightmap.u16",models=models.Count,unavailable,distributedAcrossFrames=true,singleInstantSnapshot=false});
         log.DiagnosticHeights("native-observed-heightmap.u16",raster);
         log.DiagnosticJson("native-observed-terrain.json",new{samples=raster.Length,scale,width,registered,
             heightFile="native-observed-heightmap.u16",encoding="little-endian-uint16-centred-corner-grid",distributedAcrossFrames=true,singleInstantSnapshot=false});
+        void Status(string state,string reason="")
+        {
+            log.DiagnosticJson("native-physical-audit-status.json",new{state,reason,models=models.Count,unavailable,modelsCaptured,contractsCaptured,
+                map,generation,registered,calculationCompletionIsNotReplayCompleteness=true,placementBlocked=false});
+            log.Diagnostic($"NATIVE PHYSICAL AUDIT state={state}; sections={models.Count}; modelsCaptured={modelsCaptured}; contractsCaptured={contractsCaptured}; reason={reason}; noPlacementGate=true");
+        }
         if(!registered||!(scale>0)||models.Count==0)
         {
+            Status("unavailable","terrain-registration-or-source-model-unavailable");
             log.Quality(new("native-physical","clearance-cover-ground-support","final-owned",models.Count,0,Math.Max(1,unavailable),0,0,
                 "Actual terrain registration or source/composition contract unavailable; no substituted planned terrain or guessed source layer"));yield break;
         }
@@ -106,6 +113,7 @@ public static partial class NativeNetworkDiagnostics
             return (Physical:quality,Ground:ground);
         },token);
         var clock=System.Diagnostics.Stopwatch.StartNew();var next=0d;
+        var terminal=false;Status("running");
         try
         {
             while(!task.IsCompleted)
@@ -116,7 +124,7 @@ public static partial class NativeNetworkDiagnostics
             }
             if(task.IsCanceled)yield break;
             if(task.IsFaulted)
-            {log.Quality(new("native-physical","clearance-cover-ground-support","final-owned",sections.Length,0,sections.Length,0,0,task.Exception!.GetBaseException().Message));yield break;}
+            {terminal=true;Status("failed",task.Exception!.GetBaseException().Message);log.Quality(new("native-physical","clearance-cover-ground-support","final-owned",sections.Length,0,sections.Length,0,0,task.Exception!.GetBaseException().Message));yield break;}
             if(!ImportSession.Matches(map,generation))yield break;
             var result=task.Result.Physical;if(task.Result.Ground!=null)log.Quality(task.Result.Ground);
             log.Quality(new("native-physical","full-width-clearance","final-owned",(int)Math.Min(int.MaxValue,result.ClearanceRows),
@@ -127,7 +135,12 @@ public static partial class NativeNetworkDiagnostics
                 "Actual captured native encoded terrain and roof envelopes; distributed temporal scope"));
             log.Quality(new("native-physical","same-level-overlap","final-owned",sections.Length,(int)Math.Min(int.MaxValue,result.HorizontalConflictPairs),
                 unavailable+result.UncertifiedClearance,result.HorizontalConflictPairs,0,"Actual full-width footprints outside source-qualified formations"));
+            terminal=true;Status("completed");
         }
-        finally{if(!task.IsCompleted){cancel.Cancel();_ = task.ContinueWith(t=>{var observed=t.Exception;},TaskContinuationOptions.OnlyOnFaulted);}}
+        finally
+        {
+            if(!terminal)Status("canceled","session-changed-or-readback-disposed");
+            if(!task.IsCompleted){cancel.Cancel();_ = task.ContinueWith(t=>{var observed=t.Exception;},TaskContinuationOptions.OnlyOnFaulted);}
+        }
     }
 }
