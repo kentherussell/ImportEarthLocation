@@ -1,16 +1,12 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { bindValue, trigger, useValue } from "cs2/api";
-import * as UI from "cs2/ui";
-import { Button, Dropdown, DropdownToggle, Panel, Portal, Scrollable, Tooltip, DropdownItemProps } from "cs2/ui";
+import { Button, Panel, Portal, Scrollable, Tooltip } from "cs2/ui";
 import styles from "./import-earth-location.module.scss";
 import { Location, LocationPicker } from "./location-picker";
 import importIcon from "../import-earth-icon-generated.png";
 
 const group = "ImportEarthLocation";
-// The stock declarations also use DropdownItem as a data-interface name.
-// The installed cs2/ui runtime exports the component under this same name.
-const DropdownItem = (UI as unknown as { DropdownItem: React.ComponentType<React.PropsWithChildren<DropdownItemProps<string>>> }).DropdownItem;
 const isEditor$ = bindValue<boolean>(group, "isEditor", false);
 const mapExt$ = bindValue<boolean>(group, "mapExtDetected", false);
 const mapSize$ = bindValue<string>(group, "mapSize", "vanilla");
@@ -180,7 +176,11 @@ export const ImportEarthLocationContent = () => {
   useEffect(() => { setConfirming(false); setPickerOpen(false); setShowLog(false); actionGate.current = null; setStarting(false); }, [mapSession]);
   useEffect(() => { if (!ready) setConfirming(false); }, [ready]);
   useEffect(() => {
-    try { const value = JSON.parse(locationText); if (typeof value.latitude === "number") { setLatitude(String(value.latitude)); setLongitude(String(value.longitude)); } } catch { }
+    try {
+      const value = JSON.parse(locationText);
+      setLatitude(typeof value?.latitude === "number" && isFinite(value.latitude) ? String(value.latitude) : "");
+      setLongitude(typeof value?.longitude === "number" && isFinite(value.longitude) ? String(value.longitude) : "");
+    } catch { setLatitude(""); setLongitude(""); }
   }, [locationText]);
 
   const closePanel = () => {
@@ -207,9 +207,8 @@ export const ImportEarthLocationContent = () => {
 
   if (!isEditor) return null;
 
-  const updateLatitude = (value: string) => { setLatitude(value); trigger(group, "setLatitude", value); };
-  const updateLongitude = (value: string) => { setLongitude(value); trigger(group, "setLongitude", value); };
-  const updateMapSize = (value: string) => trigger(group, "setMapSize", value);
+  const locationSummary = [mapSize === "mapext57" ? "57km" : mapSize === "mapext28" ? "28km" : "14km",
+    latitude !== "" ? `Lat ${latitude}` : "", longitude !== "" ? `Lon ${longitude}` : ""].filter(Boolean).join(" / ");
 
   return (
     <Portal>
@@ -217,62 +216,46 @@ export const ImportEarthLocationContent = () => {
         <AnchoredLauncher />
 
         {panelOpen && (
-          <Panel header="Import Earth" className={styles.panel} theme={{ header: styles.panelHeader, content: styles.panelContent }} onClose={closePanel}>
+          <Panel header={<span className={styles.brand}><img src={importIcon} alt="" />Import Earth</span>} className={styles.panel} theme={{ header: styles.panelHeader, titleBar: styles.panelTitleBar, title: styles.panelTitle, iconSpace: styles.panelIconSpace, closeButton: styles.panelCloseButton, content: styles.panelContent }} onClose={closePanel}>
             <Scrollable vertical className={styles.panelBody}>
             <div className={styles.section}>
-              <div className={styles.notice}>Editor-only full-map import. Roads and rail are independently selectable.</div>
               {!serviceUrl && <div className={styles.notice}>No personal data service configured. Public backup downloads could take hours. Set up a free NextGIS service for faster access.</div>}
-              <Button variant="flat" className={`${styles.actionButton} ${styles.utility}`} disabled={busy || starting} onSelect={() => { setServiceDraft(serviceUrl); setServiceOpen(true); }}>Configure data service…</Button>
-              <Button variant="flat" className={`${styles.actionButton} ${styles.secondary}`} disabled={busy || starting} onSelect={() => setPickerOpen(true)}>Select location on map…</Button>
-              <label className={styles.field}>
-                <span>Center latitude</span>
-                <input value={latitude} disabled={busy} placeholder="43.720000" onChange={event => updateLatitude(event.target.value)} />
-              </label>
-              <label className={styles.field}>
-                <span>Center longitude</span>
-                <input value={longitude} disabled={busy} placeholder="15.820000" onChange={event => updateLongitude(event.target.value)} />
-              </label>
-              <div className={styles.field}>
-                <span>Map size</span>
-                <Tooltip tooltip="Other map sizes are not available in the alpha version." direction="up"><div>
-                <Dropdown theme={{ dropdownToggle: styles.sizeToggle, label: styles.sizeLabel, dropdownPopup: styles.sizePopup, dropdownMenu: styles.sizeMenu, dropdownItem: styles.sizeItem }} content={<>
-                  <DropdownItem value="vanilla" disabled selected={mapSize === "vanilla"} onChange={updateMapSize}>14.336 km (Vanilla)</DropdownItem>
-                  {mapExt && <DropdownItem value="mapext28" disabled selected={mapSize === "mapext28"} onChange={updateMapSize}>28.672 km (MapExt)</DropdownItem>}
-                  {mapExt && <DropdownItem value="mapext57" disabled selected={mapSize === "mapext57"} onChange={updateMapSize}>57.344 km (MapExt)</DropdownItem>}
-                </>}>
-                  <DropdownToggle disabled>{mapSize === "mapext57" ? "57.344 km (MapExt)" : mapSize === "mapext28" ? "28.672 km (MapExt)" : "14.336 km (Vanilla)"}</DropdownToggle>
-                </Dropdown>
-                </div></Tooltip>
+              <div className={styles.locationActions}>
+                <Button variant="flat" className={`${styles.actionButton} ${styles.utility}`} disabled={busy || starting} onSelect={() => { setServiceDraft(serviceUrl); setServiceOpen(true); }}>Configure Data Source</Button>
+                <Button variant="flat" className={`${styles.actionButton} ${styles.secondary}`} disabled={busy || starting} onSelect={() => setPickerOpen(true)}>Select Location on Map</Button>
               </div>
+              <div className={styles.locationSummary}>{locationSummary}</div>
               <div className={styles.field} role="group" aria-label="Road groups">
-                <span>Road groups</span>
-                {[["highways", "Highways"], ["routes", "Main Roads"], ["streets", "Streets — experimental"]].map(([id,label]) =>
+                <span className={styles.sectionTitle}>Road Groups</span>
+                <div className={styles.options}>
+                {[["highways", "Highways"], ["routes", "Main Roads"], ["streets", "Streets"]].map(([id,label]) =>
                   <Button key={id} variant="flat" className={styles.check} focusKey={`iel-roads-${id}`} role="checkbox" aria-checked={roadGroups.includes(id)} disabled={busy || starting} onSelect={() => toggleRoadGroup(id)}>
-                    <span className={styles.checkbox}>{roadGroups.includes(id) ? "✓" : ""}</span><span>{label}</span>
+                    <span className={styles.checkbox}>{roadGroups.includes(id) ? "✓" : ""}</span><span>{label}{id === "streets" && <span className={styles.experimental}>Experimental</span>}</span>
                   </Button>)}
+                </div>
               </div>
+              <div className={styles.sectionTitle}>Options</div>
+              <div className={styles.options} role="group" aria-label="Options">
               <Button variant="flat" className={styles.check} focusKey="iel-rail" role="checkbox" aria-checked={rail} disabled={busy || starting} onSelect={() => trigger(group, "setImportRail", !rail)}>
-                <span className={styles.checkbox}>{rail ? "✓" : ""}</span><span>Import rail</span>
+                <span className={styles.checkbox}>{rail ? "✓" : ""}</span><span>Rail</span>
               </Button>
               <Button variant="flat" className={styles.check} focusKey="iel-forests" role="checkbox" aria-checked={forests} disabled={busy || starting} onSelect={() => trigger(group, "setImportForests", !forests)}>
-                <span className={styles.checkbox}>{forests ? "✓" : ""}</span><span>Import forests</span>
+                <span className={styles.checkbox}>{forests ? "✓" : ""}</span><span>Vegetation</span>
               </Button>
-              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={surfaces} disabled={busy} onSelect={() => {
-                trigger(group, "setGroundSurfaces", !surfaces);
-              }}><span className={styles.checkbox}>{surfaces ? "✓" : ""}</span><span>Apply real-world ground surfaces</span></Button>
-              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={airConnections} disabled={busy} onSelect={() => {
+              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={airConnections} disabled={busy || starting} onSelect={() => {
                 trigger(group, "setAirConnections", !airConnections);
-              }}><span className={styles.checkbox}>{airConnections ? "✓" : ""}</span><span>Create air connections</span></Button>
-              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={seaConnections} disabled={busy} onSelect={() => trigger(group, "setSeaConnections", !seaConnections)}>
-                <span className={styles.checkbox}>{seaConnections ? "✓" : ""}</span><span>Create water connections</span>
+              }}><span className={styles.checkbox}>{airConnections ? "✓" : ""}</span><span>Air Routes</span></Button>
+              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={seaConnections} disabled={busy || starting} onSelect={() => trigger(group, "setSeaConnections", !seaConnections)}>
+                <span className={styles.checkbox}>{seaConnections ? "✓" : ""}</span><span>Ship Routes</span>
               </Button>
+              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={surfaces} disabled={busy || starting} onSelect={() => trigger(group, "setGroundSurfaces", !surfaces)}><span className={styles.checkbox}>{surfaces ? "✓" : ""}</span><span>Surfaces</span></Button>
               <Button variant="flat" className={styles.check} role="checkbox" aria-checked={diagnostics} disabled={busy || starting} onSelect={() => trigger(group,"setDiagnostics",!diagnostics)}>
-                <span className={styles.checkbox}>{diagnostics ? "✓" : ""}</span><span>Enable diagnostics</span>
+                <span className={styles.checkbox}>{diagnostics ? "✓" : ""}</span><span>Diagnostics</span>
               </Button>
-              <div className={styles.helper}>Detailed generation logs and diagnostic files. Off by default; status updates and important messages remain available.</div>
+              </div>
             </div>
 
-            <div className={styles.section}>
+            <div className={styles.actionSection}>
               <div className={styles.actions}>
                 {!ready && !busy && (
                   <Button variant="flat" className={`${styles.actionButton} ${styles.primary}`} focusKey="iel-prepare" disabled={busy || starting} onSelect={() => { if(actionGate.current) return; actionGate.current = "prepare"; setStarting(true); trigger(group, "prepare"); }}>
@@ -297,11 +280,11 @@ export const ImportEarthLocationContent = () => {
               {showLog && <Scrollable className={styles.logViewport} vertical horizontal={false} trackVisibility="always">
                 <pre className={styles.log}>{log || "No log entries yet."}</pre>
               </Scrollable>}
-              <div className={styles.feedback}>
+              <Scrollable vertical horizontal={false} trackVisibility="scrollable" className={styles.feedback}>
                 <div className={styles.status} role="status">{status}</div>
-                {summary && <Scrollable vertical className={styles.summary}>{summary}</Scrollable>}
+                {summary && <div className={styles.summary}>{summary}</div>}
                 {error && <div className={styles.error} role="alert">{error}</div>}
-              </div>
+              </Scrollable>
             </div>
 
             </Scrollable>
@@ -310,9 +293,11 @@ export const ImportEarthLocationContent = () => {
       </div>
       {/* Keep viewport overlays outside Panel's native clipping/containing block. */}
       {panelOpen && serviceOpen && <div className={styles.confirmBackdrop}>
-        <div className={styles.confirmBox} role="dialog" aria-modal="true" aria-labelledby="iel-service-title">
-          <h3 id="iel-service-title">Set up your data service</h3>
-          <Scrollable vertical horizontal={false} className={styles.confirmBody}>
+        <Panel className={styles.servicePanel} role="dialog" aria-modal="true" aria-labelledby="iel-service-title"
+          header={<span id="iel-service-title">Configure Data Source</span>}
+          theme={{ header: styles.panelHeader, titleBar: styles.panelTitleBar, title: styles.panelTitle, iconSpace: styles.panelIconSpace, closeButton: styles.panelCloseButton, content: styles.panelContent }} onClose={() => setServiceOpen(false)}>
+          <div className={styles.section}>
+          <Scrollable vertical horizontal={false} trackVisibility="scrollable" className={styles.confirmBody}>
             <p>Sign up for free at nextgis.com. Go to Profile → Software and services → Services. Find Overpass API, create an API key if needed, and copy your service URL.</p>
             <p>Without a service URL, public backup downloads could take hours. You can still continue using backups.</p>
             <label className={styles.field}><span>NextGIS Overpass service URL</span><input type="password" autoComplete="off" value={serviceDraft} disabled={busy} placeholder="Paste your service URL" onChange={event => setServiceDraft(event.target.value)} /></label>
@@ -323,7 +308,8 @@ export const ImportEarthLocationContent = () => {
             <Button variant="flat" className={`${styles.actionButton} ${styles.utility}`} onSelect={() => setServiceOpen(false)}>{serviceUrl ? "Cancel" : "Continue with backups"}</Button>
             <Button variant="flat" className={`${styles.actionButton} ${styles.primary}`} disabled={busy} onSelect={() => trigger(group, "saveServiceUrl", serviceDraft)}>Save</Button>
           </div>
-        </div>
+          </div>
+        </Panel>
       </div>}
       {panelOpen && confirming && (
         <div className={styles.confirmBackdrop}>

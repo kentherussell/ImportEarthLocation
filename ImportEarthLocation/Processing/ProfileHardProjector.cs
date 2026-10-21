@@ -30,12 +30,24 @@ public sealed class ProfileStar
 }
 
 /// <summary>Disjoint exact D-metric node-star projection and fixed height boxes.</summary>
-public sealed class ProfileHardProjector
+public interface IProfileProjection
+{
+    int Variables { get; }
+    double HeightScale { get; }
+    bool Project(double[] values,double[] diagonal);
+    bool TryLinearMinimum(double[] gradient,out double lowerBound);
+    void Fallback(double[] prior,double[] target);
+}
+
+public sealed class ProfileHardProjector : IProfileProjection
 {
     private readonly ProfileStar[] _stars;
     private readonly bool[] _owned;
     public int Variables { get; }
     public double HeightScale { get; }
+    internal IReadOnlyList<ProfileStar> Stars=>_stars;
+    public void Fallback(double[] prior,double[] target)
+    {for(var j=0;j<Variables;j++)target[j]=SparseProfileRows.Finite(prior[j])?Clamp(prior[j],0,HeightScale):0;}
     public ProfileHardProjector(int variables,double heightScale,ProfileStar[] stars)
     {
         if(variables<0||!SparseProfileRows.Finite(heightScale)||heightScale<=0)throw new ArgumentException("Invalid hard-set dimensions.");

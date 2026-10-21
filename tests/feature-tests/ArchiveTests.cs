@@ -67,10 +67,16 @@ static class ArchiveTests
             if(final.Truncated||final.Records!=20)throw new Exception("Ordinary captures exhausted protected final evidence or old 16MiB limit remained");
             for(var i=0;i<3;i++)if(!budgetArchive.CaptureIntermediate($"native-batch-{i}-expected.ndjson"))throw new Exception("Initial preview examples not retained");
             if(budgetArchive.CaptureIntermediate("native-batch-99-expected.ndjson"))throw new Exception("Repeated preview graph not suppressed");
+            foreach(var family in new[]{"native-live-batch-bindings.ndjson","native-batch-01-submitted-courses.ndjson"})
+            {
+                for(var i=0;i<3;i++)if(!budgetArchive.CaptureIntermediate(family))throw new Exception("Initial lineage/course examples suppressed");
+                if(budgetArchive.CaptureIntermediate(family))throw new Exception("Repeated intermediate lineage/course capture still consumes the final evidence reserve");
+            }
+            if(!budgetArchive.CaptureIntermediate("native-owned-final-01.ndjson"))throw new Exception("Intermediate suppression disabled final native outcomes");
             if(!budgetArchive.CaptureIntermediate("native-batch-99-failed-live.ndjson"))throw new Exception("Failure evidence was sampled as routine preview");
             budgetArchive.Write(Array.Empty<string>(),metrics,"completed");
             var completeness=JObject.Parse(File.ReadAllText(Path.Combine(budgetArchive.DirectoryPath,"capture-completeness.json")));
-            if((int?)completeness["suppressedIntermediateCaptures"]!=1||!completeness["incompleteArtifacts"]!.Any()||
+            if((int?)completeness["suppressedIntermediateCaptures"]!=3||!completeness["incompleteArtifacts"]!.Any()||
                 !completeness["artifacts"]!.Any(a=>(string?)a["Budget"]=="final"))throw new Exception("Capture completeness omitted loss, suppression or protected final evidence");
             Console.WriteLine("PASS: ordinary-budget exhaustion preserves >16MiB final capture, explicit limit reasons, routine sampling and completeness manifest.");
             budgetArchive.ExpectNativeSections(new[]{"Road:1:2:3","Rail:4:5:6","Road:7:8:9"});
@@ -85,6 +91,15 @@ static class ArchiveTests
             budgetArchive.Write(Array.Empty<string>(),metrics,"completed");
             coverage=JObject.Parse(File.ReadAllText(Path.Combine(budgetArchive.DirectoryPath,"capture-completeness.json")))["nativeCoverage"]!;
             if((bool?)coverage["complete"]!=true)throw new Exception("Complete captured native coverage remained unavailable");
+            budgetArchive.ObserveNativeSections("unit",new[]{("Road:1:2:3",true)},requireGeometryOutcomes:true);
+            budgetArchive.Write(Array.Empty<string>(),metrics,"completed");
+            coverage=JObject.Parse(File.ReadAllText(Path.Combine(budgetArchive.DirectoryPath,"capture-completeness.json")))["nativeCoverage"]!;
+            if((bool?)coverage["complete"]!=false)throw new Exception("Missing required connector/junction outcomes were counted as complete");
+            budgetArchive.WriteCompressedRecords("unit-connector-endpoints.ndjson.gz",Array.Empty<object>());
+            budgetArchive.WriteCompressedRecords("unit-junction-quality.ndjson.gz",Array.Empty<object>());
+            budgetArchive.Write(Array.Empty<string>(),metrics,"completed");
+            coverage=JObject.Parse(File.ReadAllText(Path.Combine(budgetArchive.DirectoryPath,"capture-completeness.json")))["nativeCoverage"]!;
+            if((bool?)coverage["complete"]!=true)throw new Exception("Closed required geometry outcome streams remained incomplete");
             budgetArchive.ObserveNativeSections("missing-artifact",new[]{("Road:1:2:3",true)});
             budgetArchive.Write(Array.Empty<string>(),metrics,"completed");
             coverage=JObject.Parse(File.ReadAllText(Path.Combine(budgetArchive.DirectoryPath,"capture-completeness.json")))["nativeCoverage"]!;

@@ -54,6 +54,11 @@ internal static class NativeBatchTests
             "An unrelated committed identity conflict poisoned a disjoint safe batch");
         Refuses(()=>Match(s,new[]{edge},new Dictionary<string,string>{{"Road:1","a"},{"Road:100","a"}}),
             "conflicting source","A required port used an ambiguously owned committed identity");
+        var contracted=s with{SourceNodeAliases=new[]{new SourceNodeAlias(100,1,true)}};
+        Check(Match(contracted,new[]{edge},new Dictionary<string,string>{{"Road:1","a"},{"Road:100","a"}}).Edges.Count==1,
+            "An explicitly declared source contraction did not preserve verified many-source-to-one lineage");
+        Refuses(()=>Match(contracted,new[]{edge},new Dictionary<string,string>{{"Road:1","a"},{"Road:100","other"}}),
+            "conflicting source","A contraction authorized two different native entities for one canonical port");
         Refuses(()=>NativeBatchBindings.Match(new[]{new NativeBatchBindings.Expected<string>(s,"stock"),new NativeBatchBindings.Expected<string>(s,"stock")},new[]{edge},Empty),"same native edge","Duplicate edge coverage");
 
         var next=s with{WayId=11,StartNodeId=2,EndNodeId=3,Start=s.End,End=new float3(80,181,0)};
@@ -318,7 +323,7 @@ internal static class NativeBatchTests
 
     public static void Replay(string folder)
     {
-        var manifests=Directory.GetFiles(folder,"native-batch-*-expected.ndjson").OrderBy(p=>p,StringComparer.Ordinal).ToArray();
+        var manifests=CapturedRunFiles.Names(folder,"native-batch-","-expected.ndjson");
         if(manifests.Length>0){ReplayManifests(folder,manifests);return;}
         var source=File.ReadLines(Path.Combine(folder,"native-plan-network.ndjson")).Take(128).Select(ParseSection).ToArray();
         Check(source.Length==128,"Captured first batch is incomplete");
@@ -396,24 +401,28 @@ internal static class NativeBatchTests
     private static void ReplayManifests(string folder,IReadOnlyList<string> manifests)
     {
         var accepted=0;var rejected=0;var pending=0;
-        foreach(var manifest in manifests)
+        foreach(var name in manifests)
         {
-            var stem=Path.GetFileName(manifest).Replace("-expected.ndjson","");
-            var graphPath=Path.Combine(folder,stem+"-graph.ndjson");var ownersPath=Path.Combine(folder,stem+"-owners.ndjson");
-            if(!File.Exists(graphPath)||!File.Exists(ownersPath)){pending++;continue;}
-            foreach(var path in new[]{manifest,graphPath,ownersPath})
+            var stem=Path.GetFileName(name).Replace("-expected.ndjson","");
+            var manifest=CapturedRunFiles.Resolve(folder,Path.GetFileName(name));
+            var graphPath=CapturedRunFiles.Optional(folder,stem+"-graph.ndjson");var ownersPath=CapturedRunFiles.Optional(folder,stem+"-owners.ndjson");
+            if(graphPath==null||ownersPath==null){pending++;continue;}
+            var rejectionPath=CapturedRunFiles.Optional(folder,stem+"-matcher-rejection.ndjson");
+            var logicalNames=new[]{Path.GetFileName(name),stem+"-graph.ndjson",stem+"-owners.ndjson"}
+                .Concat(rejectionPath==null?Array.Empty<string>():new[]{stem+"-matcher-rejection.ndjson"});
+            foreach(var logical in logicalNames)
             {
-                var meta=path+".meta.json";
-                if(File.Exists(meta)&&((bool?)JObject.Parse(File.ReadAllText(meta))["Truncated"]??false))throw new InvalidOperationException("Incomplete batch artifact: "+path);
+                var meta=CapturedRunFiles.Optional(folder,logical+".meta.json");
+                if(meta!=null&&((bool?)JObject.Parse(File.ReadAllText(meta))["Truncated"]??false))throw new InvalidOperationException("Incomplete batch artifact: "+logical);
             }
             var expected=File.ReadLines(manifest).Select(line=>{var row=JObject.Parse(line);return new NativeBatchBindings.Expected<string>(ParseSection(row["section"]!.ToString()),(string)row["prefab"]!)
                 {StartCenterBudget=(float?)row["StartCenterBudget"]??0,EndCenterBudget=(float?)row["EndCenterBudget"]??0};}).ToArray();
             var graph=File.ReadLines(graphPath).Select(line=>{var row=JObject.Parse(line);return new NativeBatchBindings.Edge<string>((string)row["entity"]!,(string)row["startNode"]!,(string)row["endNode"]!,Point(row["start"]!),Point(row["end"]!),Enum.Parse<NetworkKind>((string)row["mode"]!),(string)row["prefab"]!)
                 {CurveStart=row["curveStart"] is JObject a?Point(a):null,CurveEnd=row["curveEnd"] is JObject b?Point(b):null};}).ToArray();
             var owners=File.ReadLines(ownersPath).Select(JObject.Parse).ToDictionary(row=>(string)row["source"]!,row=>(string)row["entity"]!,StringComparer.Ordinal);
-            var journal=Path.Combine(folder,"checkpoints.ndjson");
-            var wasRejected=File.Exists(Path.Combine(folder,stem+"-matcher-rejection.ndjson"))||
-                File.Exists(journal)&&File.ReadLines(journal).Select(JObject.Parse).Any(row=>(string?)row["phase"]=="native-batch/preview-rejected"&&(string?)row["details"]?["artifactStem"]==stem);
+            var journal=CapturedRunFiles.Optional(folder,"checkpoints.ndjson");
+            var wasRejected=rejectionPath!=null||
+                journal!=null&&File.ReadLines(journal).Select(JObject.Parse).Any(row=>(string?)row["phase"]=="native-batch/preview-rejected"&&(string?)row["details"]?["artifactStem"]==stem);
             try
             {
                 var result=NativeBatchBindings.Match(expected,graph,owners);
@@ -475,8 +484,14 @@ internal static class NativeBatchTests
             }
             Write("native-batch-000128-128-attempt-00",false);
             Write("native-batch-000128-032-attempt-01",true);
+            var longStem="native-batch-"+new string('x',180);
+            Write(longStem+"-attempt-00",false);Write(longStem+"-attempt-01",true);
+            archive.Write(Array.Empty<string>(),new Dictionary<string,double>(),null);
+            Check(CapturedRunFiles.Names(archive.DirectoryPath,"native-batch-","-expected.ndjson").Length==4&&
+                !File.Exists(Path.Combine(archive.DirectoryPath,longStem+"-attempt-00-expected.ndjson")),
+                "Long logical native batch names were not shortened or discoverable through the artifact catalog");
             Replay(archive.DirectoryPath);
-            Check(Directory.GetFiles(archive.DirectoryPath,"*-graph.ndjson").Length==2,"Successful retry overwrote failed graph evidence");
+            Check(CapturedRunFiles.Names(archive.DirectoryPath,"native-batch-","-graph.ndjson").Length==4,"Successful retry overwrote failed graph evidence");
             var path=Path.Combine(archive.DirectoryPath,"native-batch-000128-032-attempt-01-graph.ndjson");
             var preserved=archive.WriteRecords(Path.GetFileName(path),new object[]{new{oversized=true}},maximumBytes:1);
             Check(preserved.PreservedPrevious&&new FileInfo(path).Length>0,"Budget exhaustion erased valid prior graph evidence");
@@ -491,6 +506,7 @@ internal static class NativeBatchTests
             archive.WriteRecords("native-batch-000256-032-attempt-00-expected.ndjson",new object[]{new{kind="expected-course",prefab="stock",StartCenterBudget=18,EndCenterBudget=18,section=DiagnosticArtifacts.NetworkRecords(new[]{s}).First()}});
             archive.WriteRecords("native-batch-000256-032-attempt-00-owners.ndjson",new object[]{new{source="Road:1",entity="committed"}});
             archive.WriteRecords("native-batch-000256-032-attempt-00-graph.ndjson",new object[]{new{oversized=true}},maximumBytes:1);
+            archive.Write(Array.Empty<string>(),new Dictionary<string,double>(),null);
             Refuses(()=>Replay(archive.DirectoryPath),"Incomplete batch artifact","Truncated captured graph may not establish coverage");
             var filler=new{payload=new string('x',32768)};
             for(var i=0;i<6;i++)archive.WriteRecords($"budget-{i}.ndjson",Enumerable.Repeat((object)filler,300));

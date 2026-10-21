@@ -83,6 +83,7 @@ public sealed class FinalNetworkDesign
             writer.Write(s.NativeAssetKey);writer.Write(s.NativeUnitId);writer.Write(s.NativeWidth);writer.Write(s.NativeCenterlineCurvatureLimit??double.NaN);writer.Write(s.Bridge);writer.Write(s.Tunnel);writer.Write(s.Layer);
             writer.Write(s.PairedCorridorId);writer.Write(s.PairedSpanId);writer.Write(s.StartHeightFamily);writer.Write(s.EndHeightFamily);writer.Write(s.PairedReversed);writer.Write(s.ReferenceSpan);writer.Write(s.StartReferenceSpeed);writer.Write(s.EndReferenceSpeed);
             writer.Write(s.PairedProfileId);writer.Write(s.PairedReferenceBegin);writer.Write(s.PairedReferenceEnd);
+            writer.Write(s.PairedProfileOnly);writer.Write(s.RailTerminalFormationId);
             writer.Write(s.NativeLaneOffsets.Count);foreach(var lane in s.NativeLaneOffsets)writer.Write(lane);
         }
         writer.Write(Assets.Count);

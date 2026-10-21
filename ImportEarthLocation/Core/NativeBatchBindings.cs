@@ -94,10 +94,37 @@ public static class NativeBatchBindings
         var anchors = new Dictionary<string,Anchor<T>>(StringComparer.Ordinal);
         var owners = new Dictionary<T,string>();
         var ambiguousOwners=new HashSet<T>();
+        var aliases=new Dictionary<string,string>(StringComparer.Ordinal);var conflictingAliases=new HashSet<string>(StringComparer.Ordinal);
+        foreach(var item in expected)foreach(var alias in item.Section.SourceNodeAliases)
+        {
+            var sourceKey=NativeEndpointPolicy.Identity(item.Section,alias.SourceNodeId);
+            var canonicalKey=NativeEndpointPolicy.Identity(item.Section,alias.CanonicalNodeId);
+            if(aliases.TryGetValue(sourceKey,out var old)&&old!=canonicalKey)conflictingAliases.Add(sourceKey);
+            else aliases[sourceKey]=canonicalKey;
+        }
+        string Canonical(string key)
+        {
+            // Transfer publishes resolved canonical aliases. Do not infer an
+            // equivalence from coordinates, entity coincidence or alias cycles.
+            return !conflictingAliases.Contains(key)&&aliases.TryGetValue(key,out var canonical)?canonical:key;
+        }
+        var aliasCommitted=new Dictionary<string,T>(StringComparer.Ordinal);
         foreach(var old in committed)
-            if(owners.TryGetValue(old.Value,out var owner)&&owner!=old.Key)
+        {
+            var key=Canonical(old.Key);
+            if(key!=old.Key)
+            {
+                if(aliasCommitted.TryGetValue(key,out var prior)&&!EqualityComparer<T>.Default.Equals(prior,old.Value))
+                {ambiguousOwners.Add(prior);ambiguousOwners.Add(old.Value);}
+                else aliasCommitted[key]=old.Value;
+                if(committed.TryGetValue(key,out var direct)&&!EqualityComparer<T>.Default.Equals(direct,old.Value))
+                {ambiguousOwners.Add(direct);ambiguousOwners.Add(old.Value);}
+            }
+            if(owners.TryGetValue(old.Value,out var owner)&&owner!=key)
                 ambiguousOwners.Add(old.Value);
-            else owners[old.Value]=old.Key;
+            else owners[old.Value]=key;
+        }
+        bool Known(string key,out T value)=>committed.TryGetValue(key,out value!)||aliasCommitted.TryGetValue(key,out value!);
         var edges = new List<Binding<T>>(expected.Count);
         var requiredNodes=new Dictionary<T,float3>();
         var used = new HashSet<T>();
@@ -112,7 +139,7 @@ public static class NativeBatchBindings
                 if(witnesses.Count<32)witnesses.Add(new{reason,observed,limit});
             }
             var aKey=NativeEndpointPolicy.Identity(s,s.StartNodeId);var bKey=NativeEndpointPolicy.Identity(s,s.EndNodeId);
-            var knownA=committed.TryGetValue(aKey,out var priorA);var knownB=committed.TryGetValue(bKey,out var priorB);
+            var knownA=Known(aKey,out var priorA);var knownB=Known(bKey,out var priorB);
             // A conflict elsewhere in the city is not a failure of this unit.
             // Using that conflicted owner still requires explicit canonical
             // alias/station reconciliation; never guess an attachment.

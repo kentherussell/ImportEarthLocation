@@ -12,12 +12,13 @@ namespace ImportEarthLocation.Processing;
 public static class NetworkTunnelContacts
 {
     public readonly record struct Report(long Rows,int Leaves,int Uncertified,int MissingAssets,long Triangles);
+    public readonly record struct CoverEvidence(int Section,double Begin,double End,long FirstRow,long RowCount,string Classification);
     private sealed record Leaf(FootprintLeaf Foot,Cubic3d Curve,int Depth);
     private sealed class Measure { public double Area; public long BoundaryRows; }
 
     public static Report Append(IReadOnlyList<PreparedSegment> source,ushort[] terrain,float scale,double width,
         IReadOnlyDictionary<string,NativeAssetContract> assets,int[] from,int[] c1,int[] c2,int[] to,
-        SparseProfileRows rows,double epsilon,CancellationToken token,Action<string>? progress=null)
+        SparseProfileRows rows,double epsilon,CancellationToken token,Action<string>? progress=null,Action<CoverEvidence>? evidence=null)
     {
         var n=TerrainSampling.Resolution(terrain);var cell=width/(n-1);var half=width/2;
         if(!(width>0&&scale>0&&epsilon>0))throw new ArgumentException("Invalid tunnel terrain datum.");
@@ -32,9 +33,10 @@ public static class NetworkTunnelContacts
         {
             token.ThrowIfCancellationRequested();var s=source[i];if(!s.Tunnel)continue;
             var a=Root(Node(new(s.Kind,s.StartNodeId)));var b=Root(Node(new(s.Kind,s.EndNodeId)));roots[b]=a;
-            if(!assets.TryGetValue(s.NativeAssetKey,out var asset)||!asset.TryEnvelope(NativeStructureMode.Tunnel,out envelopes[i])){missing++;continue;}
+            if(!assets.TryGetValue(s.NativeAssetKey,out var asset)||!asset.TryEnvelope(NativeStructureMode.Tunnel,out envelopes[i]))
+            {missing++;evidence?.Invoke(new(i,0,1,-1,0,"missing-roof-contract"));continue;}
             var c=new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd);
-            if(!NetworkDesignChecks.Finite(c)){missing++;continue;}
+            if(!NetworkDesignChecks.Finite(c)){missing++;evidence?.Invoke(new(i,0,1,-1,0,"nonfinite-curve"));continue;}
             var initial=new List<FootprintLeaf>();NetworkFootprintMath.BuildLeaves(c,Math.Max(s.NativeWidth,envelopes[i].Width)/2,i,initial,token);
             foreach(var foot in initial)leaves.Add(new(foot,Subcurve(c,foot.Begin,foot.End),0));
         }
@@ -90,15 +92,21 @@ public static class NetworkTunnelContacts
         void Polynomial(int x,int z,double2 a,double2 b,double2 c,double[] target)
         {var origin=new double2(x*cell-half,z*cell-half);NetworkTerrainPolynomial.Quadratic(Decode(x,z),Decode(x+1,z),Decode(x,z+1),Decode(x+1,z+1),(a-origin)/cell,(b-origin)/cell,(c-origin)/cell,target);}
         (int X,int Z) Cell(double2 p)=>((int)math.clamp(Math.Floor((p.x+half)/cell),0,n-2),(int)math.clamp(Math.Floor((p.y+half)/cell),0,n-2));
-        // Streaming two-pass area normalization avoids retaining every clipped
-        // triangle on large imports. Families are connected tunnel components.
-        for(var pass=0;pass<2;pass++)for(var i=0;i<leaves.Count;i++)
+        // Optimized costs require area normalization. A fixed-vector sink only
+        // checks the identical inequalities, so it needs no normalization pass.
+        var measurementOnly=rows.MeasurementOnly;var unitMeasure=new Measure();
+        for(var pass=measurementOnly?1:0;pass<2;pass++)for(var i=0;i<leaves.Count;i++)
         {
-            token.ThrowIfCancellationRequested();if((i&63)==0)progress?.Invoke($"Building continuous tunnel cover; pass {pass+1}/2; footprint {i+1}/{leaves.Count}");
+            var classify=pass==0||measurementOnly;
+            token.ThrowIfCancellationRequested();if((i&63)==0)progress?.Invoke($"Building continuous tunnel cover; pass {(measurementOnly?1:pass+1)}/{(measurementOnly?1:2)}; footprint {i+1}/{leaves.Count}");
             var leaf=leaves[i];var foot=leaf.Foot;var edge=foot.Curve;var s=source[edge];
+            var firstRow=rows.Count;
             var da=upper[start[i]];var db=upper[end[i]];var gap=DistanceGap(leaf,da,db,lower[start[i]],lower[end[i]]);
-            if(!foot.Certified||gap>.05){if(pass==0)uncertified++;continue;}
-            var family=Root(nodes[new(s.Kind,s.StartNodeId)]);if(!measures.TryGetValue(family,out var measure))measures[family]=measure=new();
+            if(!foot.Certified||gap>.05)
+            {if(classify){uncertified++;evidence?.Invoke(new(edge,foot.Begin,foot.End,-1,0,"uncertified-footprint-or-portal"));}continue;}
+            Measure measure;
+            if(measurementOnly)measure=unitMeasure;
+            else {var family=Root(nodes[new(s.Kind,s.StartNodeId)]);if(!measures.TryGetValue(family,out measure!))measures[family]=measure=new();}
             NetworkFootprintMath.Rectangle(foot,Math.Max(s.NativeWidth,envelopes[edge].Width)/2,double2.zero,rectangle);
             var breaks=new SortedSet<double>{0,1};var speed=foot.MaximumSpeed;var rampWidth=Math.Max(8,Math.Max(s.NativeWidth,envelopes[edge].Width));
             void Break(double t){if(t>0&&t<1&&SparseProfileRows.Finite(t))breaks.Add(t);}
@@ -129,7 +137,8 @@ public static class NetworkTunnelContacts
                 double Distance(double t)=>forward?da+speed*t:db+speed*(1-t);
                 var distance=Distance(mid);var interior=distance>=160;var blended=distance<rampWidth;
                 var minimum=region[0];var maximum=region[0];for(var j=1;j<used;j++){minimum=math.min(minimum,region[j]);maximum=math.max(maximum,region[j]);}
-                if(pass==0&&(minimum.x< -half||minimum.y< -half||maximum.x>half||maximum.y>half))uncertified++;
+                if(classify&&(minimum.x< -half||minimum.y< -half||maximum.x>half||maximum.y>half))
+                {uncertified++;evidence?.Invoke(new(edge,foot.Begin,foot.End,-1,0,"outside-terrain"));}
                 var ca=Cell(minimum);var cb=Cell(maximum);var centerCell=Cell(math.lerp(foot.A,foot.B,mid));
                 var terrainGradient=blended?GradientBound(foot,terrain,n,scale,width):0;
                 for(var z=ca.Z;z<=cb.Z;z++)for(var x=ca.X;x<=cb.X;x++)
@@ -144,8 +153,9 @@ public static class NetworkTunnelContacts
                         var area=NetworkFootprintMath.TriangleArea(a,b,c);var terms=length==1?1:area==0?4:10;
                         if(area==0&&length>1)
                         {var ab=math.lengthsq(a-b);var ac=math.lengthsq(a-c);var bc=math.lengthsq(b-c);if(ac>=ab&&ac>=bc)b=c;else if(bc>ab)a=c;c=b;}
-                        if(pass==0){measure.Area+=area;if(area==0)measure.BoundaryRows+=terms;triangles++;continue;}
-                        var weight=area>0?10000*area/measure.Area/10:10000d/(100*Math.Max(1,measure.BoundaryRows));
+                        if(classify)triangles++;
+                        if(pass==0){measure.Area+=area;if(area==0)measure.BoundaryRows+=terms;continue;}
+                        var weight=measurementOnly?1:area>0?10000*area/measure.Area/10:10000d/(100*Math.Max(1,measure.BoundaryRows));
                         var ta=Parameter(a);var tb=Parameter(b);var tc=Parameter(c);
                         var pa=foot.Begin+(foot.End-foot.Begin)*ta;var pb=foot.Begin+(foot.End-foot.Begin)*tb;var pc=foot.Begin+(foot.End-foot.Begin)*tc;
                         Polynomial(x,z,a,b,c,gw);
@@ -167,7 +177,7 @@ public static class NetworkTunnelContacts
                         indices[0]=from[edge];indices[1]=c1[edge];indices[2]=c2[edge];indices[3]=to[edge];
                         for(var k=0;k<terms;k++)
                         {
-                            var coefficient=terms==4?new[]{0,1,3,6}[k]:k;
+                            var coefficient=terms==4?k switch{0=>0,1=>1,2=>3,_=>6}:k;
                             NetworkFootprintMath.TriangleBlossom(pa,pb,pc,coefficient,basis);
                             for(var j=0;j<4;j++)coefficients[j]=basis[j]/epsilon;
                             var ground=blended?NetworkTerrainPolynomial.Elevate(gc,coefficient)+NetworkTerrainPolynomial.AffineTimesQuadratic(lambda,delta,coefficient):NetworkTerrainPolynomial.Elevate(gw,coefficient);
@@ -178,6 +188,7 @@ public static class NetworkTunnelContacts
                     }
                 }
             }
+            if(pass==1)evidence?.Invoke(new(edge,foot.Begin,foot.End,firstRow,rows.Count-firstRow,"continuous-roof-cover"));
         }
         return new(countRows,leaves.Count,uncertified,missing,triangles);
     }

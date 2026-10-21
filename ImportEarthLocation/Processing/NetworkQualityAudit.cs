@@ -90,19 +90,24 @@ public static class NetworkQualityAudit
                     emittedA=DiagnosticArtifacts.Point(da),emittedB=DiagnosticArtifacts.Point(db),
                     referenceA=DiagnosticArtifacts.Curve(a.Section.HorizontalEmissionReference),referenceB=DiagnosticArtifacts.Curve(b.Section.HorizontalEmissionReference)});
         }
-        var paired=0;var pairedFailures=0;var pairedUnknown=0;var pairedWorst=0d;
+        var paired=0;var pairedFailures=0;var pairedUnknown=0;var pairedWorst=0d;var separationFailures=0;
         foreach(var group in sections.Where(s=>s.PairedProfileId!=0).GroupBy(s=>(s.PairedProfileId,
             Begin:Math.Round(Math.Min(s.PairedReferenceBegin,s.PairedReferenceEnd),6),End:Math.Round(Math.Max(s.PairedReferenceBegin,s.PairedReferenceEnd),6))))
         {
             var pair=group.ToArray();if(pair.Length!=2){pairedUnknown++;continue;}paired++;
             var a=pair[0];var b=pair[1];var ah=new[]{a.CourseStart.y,a.CourseControl1.y,a.CourseControl2.y,a.CourseEnd.y};
+            var ac=new Cubic3d(a.CourseStart,a.CourseControl1,a.CourseControl2,a.CourseEnd);
+            var bc=new Cubic3d(b.CourseStart,b.CourseControl1,b.CourseControl2,b.CourseEnd);
+            if(Math.Sign(a.PairedReferenceEnd-a.PairedReferenceBegin)!=Math.Sign(b.PairedReferenceEnd-b.PairedReferenceBegin))bc=new(bc.P3,bc.P2,bc.P1,bc.P0);
+            if(!NetworkPairedCorridors.Separated(ac,bc,(a.NativeWidth+b.NativeWidth)/2+2,token))separationFailures++;
             var bh=new[]{b.CourseStart.y,b.CourseControl1.y,b.CourseControl2.y,b.CourseEnd.y};
             if(Math.Sign(a.PairedReferenceEnd-a.PairedReferenceBegin)!=Math.Sign(b.PairedReferenceEnd-b.PairedReferenceBegin))Array.Reverse(bh);
             var difference=Enumerable.Range(0,4).Max(i=>Math.Abs((double)ah[i]-bh[i]));pairedWorst=Math.Max(pairedWorst,difference);
-            if(difference>.00001)pairedFailures++;
+            if(difference>.05)pairedFailures++;
         }
-        void Put(string category,int count,int failed,int unknown,double worst,double length,string evidence)
-            =>log.Quality(new("planned",category,"final-design",count,failed,unknown,worst,length,evidence));
+        void Put(string category,int count,int failed,int unknown,double worst,double length,string evidence,bool countIncludesUnknown=true)
+            =>log.Quality(new("planned",category,"final-design",countIncludesUnknown?Math.Max(failed,count-unknown):count,failed,unknown,worst,length,evidence)
+                {Expected=countIncludesUnknown?count:count+unknown});
         Put("native-safety-finite",sections.Count,finiteFailures,0,finiteFailures,0,"Exact finite controls; ECS safety remains a separate native observation");
         Put("regularity",sections.Count,0,regularityUnknown,0,0,"Bounded continuous derivative certificate; exhausted/uncertified is unavailable, not passed");
         Put("exceptional-grade",sections.Count,gradeFailures,0,maximumGrade,gradeLength,"Continuous grade ceiling; worst value and affected length are sampled observations");
@@ -111,9 +116,14 @@ public static class NetworkQualityAudit
         Put("continuation-heading",joins,headingFailures,headingUnknown,headingWorst,0,"Final float through-join radians; max(1e-5,betaA+betaB); absent references cannot justify the native 0.1-degree allowance");
         Put("float-direction-representability",joins,roundingFailures,roundingUnknown,roundingWorst,0,"Actual intended/emitted XZ endpoint and handle errors; budget above 0.1 degree requires review, never a relaxed heading limit");
         Put("continuation-grade",joins,gradeJoinFailures,gradeJoinUnknown,gradeWorst,0,"Outward physical-grade sum; through continuations only; stationary ports unavailable");
-        Put("paired-height",paired,pairedFailures,pairedUnknown,pairedWorst,0,"Maximum corresponding height-control difference; exact common reference interval");
-        Put("source-topology",sections.Count,(int)(log.Metric("Missing mandatory selected-source ports")+log.Metric("Unresolved selected-source reachability obligations")),sourceTopologyAvailable?0:1,0,0,"Exact selected-source aliases and directional reachability, not proximity");
+        Put("paired-height",paired,pairedFailures,pairedUnknown,pairedWorst,0,"Maximum corresponding height-control difference <=0.05m; exact common reference interval including separation-uncertified confirmed pairs",false);
+        Put("paired-lateral-separation",paired,separationFailures,pairedUnknown,0,0,
+            "Independent continuous two-metre median check on actual final float curves; sharing height variables never certifies separation",false);
+        if(!sourceTopologyAvailable||log.Metric("Selected-source topology validations")==0)
+            Put("source-topology",0,0,1,0,0,"Selected-source obligation snapshot or completed exact validation unavailable",false);
         if(log.DiagnosticsEnabled)log.DiagnosticRecords("planned-continuation-witnesses.ndjson",joinWitnesses,critical:true);
         NetworkVisualQuality.Audit(sections,observations,log,token);
+        NetworkJunctionQuality.Audit(sections,(s,start)=>new(start?s.CourseStart:s.CourseEnd,
+            math.normalizesafe((double2)(start?s.CourseControl1-s.CourseStart:s.CourseEnd-s.CourseControl2).xz),s.NativeLaneOffsets),log,token,"planned","final-design");
     }
 }

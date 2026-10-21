@@ -11,11 +11,11 @@ namespace ImportEarthLocation.Processing;
 // NetCourse curve supplies the lateral lane alignment. Do not offset node IDs.
 public static class NetworkLaneAlignment
 {
-    public static IReadOnlyList<PreparedSegment> Prepare(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token,double width=double.PositiveInfinity)
+    public static IReadOnlyList<PreparedSegment> Prepare(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token,double width=double.PositiveInfinity,bool deferLinkApproaches=false)
     {
         // Reconciliation may run this a second time with the selected native
         // palette. Recompute offsets, rather than adding another lane-width shift.
-        var result=source.Select(s=>s.Kind==NetworkKind.Road&&s.OneWay?s with{StartCurveOffset=default,EndCurveOffset=default}:s).ToArray();var nodes=new Dictionary<long,List<(int index,bool start)>>();
+        var result=source.Select(s=>s.Kind==NetworkKind.Road&&s.OneWay?s with{StartCurveOffset=default,EndCurveOffset=default,FinalDeckCurve=null}:s).ToArray();var nodes=new Dictionary<long,List<(int index,bool start)>>();
         for(var i=0;i<result.Length;i++)if(result[i].Kind==NetworkKind.Road&&result[i].OneWay)
             foreach(var start in new[]{true,false})
             {var id=start?result[i].StartNodeId:result[i].EndNodeId;if(!nodes.TryGetValue(id,out var list))nodes[id]=list=new();list.Add((i,start));}
@@ -26,7 +26,11 @@ public static class NetworkLaneAlignment
         {
             if(laneCache.TryGetValue(s,out var cached))return cached;
             var count=Math.Min(6,Math.Max(1,s.Lanes));
-            if(s.NativeLaneOffsets.Count>0)return laneCache[s]=s.NativeLaneOffsets.OrderBy(x=>x).ToArray();
+            if(s.NativeLaneOffsets.Count>0)
+            {
+                if(s.NativeLaneOffsets.Count!=s.Lanes)log.Count("Nominal road lane counts differing from native slots");
+                return laneCache[s]=s.NativeLaneOffsets.OrderBy(x=>x).ToArray();
+            }
             // Section-local readback is not a composed lane palette. Use a
             // bounded vanilla lane-spacing estimate instead of a false centre lane.
             var spacing=4f;return laneCache[s]=Enumerable.Range(0,count).Select(i=>(i-(count-1)*.5f)*spacing).ToArray();
@@ -50,12 +54,9 @@ public static class NetworkLaneAlignment
             heading=math.normalizesafe(heading+Heading(b,true));
             var normal=new float3(heading.y,0,-heading.x);var anchor=a.End;
             var attached=entries.Where(e=>result[e.index].ProtectedLink&&result[e.index].OneWay&&result[e.index].Tunnel==a.Tunnel).ToArray();
+            // Default right-hand-traffic policy: retain the travel-left lane
+            // datum. An attached ramp alone is not evidence of a left-lane drop.
             var side=1f;
-            if(attached.Length>0)
-            {
-                var r=result[attached[0].index];var far=attached[0].start?r.End:r.Start;
-                side=math.dot(far-anchor,normal)>=0?1:-1;
-            }
             var al=Lanes(a);var bl=Lanes(b);
             // Keep the opposite through-lane edge fixed when a lane is added or
             // removed on the ramp side. Never centre a wider road on a narrower one.
@@ -68,32 +69,29 @@ public static class NetworkLaneAlignment
         }
         var continuation=joins.ToDictionary(j=>j.incoming.index,j=>j);
         const float taperLength=220;
-        var referenceLengths=result.Select(s=>NetworkVerticalProfiles.ArcLength(s)).ToArray();
         var stationShifts=new List<NetworkApproachTapers.Shift>();
-        foreach(var join in joins)
+        var hasPredecessor=new HashSet<int>(joins.Select(j=>j.outgoing.index));
+        var datum=new Dictionary<int,float>();
+        foreach(var seed in continuation.Keys.OrderBy(i=>hasPredecessor.Contains(i)?1:0).ThenBy(i=>result[i].WayId).ThenBy(i=>result[i].StartNodeId))
         {
-            token.ThrowIfCancellationRequested();if(Math.Abs(join.delta)<.01f)continue;
-            transitions++;var index=join.outgoing.index;var distance=0f;var startNormal=join.normal;var visited=new HashSet<int>();
-            var path=new List<(int index,float length)>();var available=0f;
-            var requestedReach=(float)Math.Max(taperLength,1.875*Math.Abs(join.delta)/Math.Tan(Math.PI/90));
-            while(available<requestedReach&&visited.Add(index))
+            if(datum.ContainsKey(seed))continue;var index=seed;var value=0f;
+            while(!datum.ContainsKey(index))
             {
-                token.ThrowIfCancellationRequested();var length=referenceLengths[index];path.Add((index,length));available+=length;
-                if(!continuation.TryGetValue(index,out var next))break;index=next.outgoing.index;
+                token.ThrowIfCancellationRequested();datum[index]=value;
+                if(!continuation.TryGetValue(index,out var join))break;
+                if(Math.Abs(join.delta)>.01f)transitions++;
+                value+=join.delta;index=join.outgoing.index;
             }
-            var reach=Math.Max(.01f,Math.Min(requestedReach,available));
-            float Weight(float d)=>(float)NetworkDesignChecks.QuinticShift(1,d,reach).Value;
-            foreach(var step in path)
-            {
-                index=step.index;var s=result[index];var length=step.length;var endHeading=Heading(s,false);var endNormal=new float3(endHeading.y,0,-endHeading.x);
-                stationShifts.Add(new(index,distance,length,reach,join.delta,result[join.incoming.index].EndNodeId));
-                Offset((index,true),s.StartCurveOffset+startNormal*(join.delta*Weight(distance)));
-                Offset((index,false),s.EndCurveOffset+endNormal*(join.delta*Weight(distance+length)));
-                distance+=length;tapered++;
-                // A valid terminal or an ambiguous fork is a stop, not an error
-                // or a reason to search endlessly for a continuous highway.
-                startNormal=endNormal;
-            }
+        }
+        foreach(var item in datum)
+        {
+            if(Math.Abs(item.Value)<.001f)continue;var s=result[item.Key];
+            var a=Heading(s,true);var b=Heading(s,false);
+            // Zero station span is a constant lateral datum, with the curved
+            // normal derivative still supplied by the shared materializer.
+            stationShifts.Add(new(item.Key,0,0,1,item.Value));
+            Offset((item.Key,true),new float3(a.y,0,-a.x)*item.Value);
+            Offset((item.Key,false),new float3(b.y,0,-b.x)*item.Value);tapered++;
         }
         // A large correction is review evidence, not permission to independently
         // clamp adjacent ports and introduce another kink. Reach grows with shift.
@@ -114,7 +112,7 @@ public static class NetworkLaneAlignment
                 // Ramp local lane coordinates rotate with its own approach.
                 // Subtracting both offsets in the mainline frame picks the wrong
                 // receiving lane when the ramp enters at a substantial angle.
-                var addedLane=entry.start?a.Lanes>b.Lanes:b.Lanes>a.Lanes;
+                var addedLane=rampSide>0&&(entry.start?Lanes(a).Length>Lanes(b).Length:Lanes(b).Length>Lanes(a).Length);
                 // Without an added receiving lane, use a real merging junction,
                 // not almost coincident decks with crossing lane markings.
                 var approach=heading;
@@ -170,12 +168,12 @@ public static class NetworkLaneAlignment
                 if(ordered[j].Full-ordered[j-1].Full<=.001f||ordered[j].Half-ordered[j-1].Half<=.001f||ordered[j].Far-ordered[j-1].Far<=.001f)ambiguous=true;
             if(ambiguous){log.Count("Lane bundles with ambiguous immutable branch order");continue;}
             var branches=ordered.Select(p=>p.Port).ToArray();
-            var slots=Lanes(target);var total=branches.Sum(e=>Math.Max(1,result[e.index].Lanes));var cursor=0;
+            var slots=Lanes(target);var total=branches.Sum(e=>Lanes(result[e.index]).Length);var cursor=0;
             if(total!=slots.Length){log.Count("Lane bundles requiring native lane merge");continue;}
             directions.Add(new(receiver.index,receiver.start,(double2)heading*(receiver.start?1:-1)));
             foreach(var branch in branches)
             {
-                var s=result[branch.index];var count=Math.Max(1,s.Lanes);var laneCenter=slots.Skip(cursor).Take(count).Average();cursor+=count;
+                var s=result[branch.index];var count=Lanes(s).Length;var laneCenter=slots.Skip(cursor).Take(count).Average();cursor+=count;
                 var branchCenter=Lanes(s).Average();var offset=normal*(laneCenter-branchCenter)+(merging?target.StartCurveOffset:target.EndCurveOffset);
                 Offset(branch,offset);directions.Add(new(branch.index,branch.start,(double2)heading*(branch.start?1:-1)));
             }
@@ -205,6 +203,64 @@ public static class NetworkLaneAlignment
         if(boundaryNodes.Count>0)stationShifts.RemoveAll(s=>boundaryNodes.Contains(result[s.Index].StartNodeId)||boundaryNodes.Contains(result[s.Index].EndNodeId));
         log.Diagnostic($"LANE ALIGNMENT ramps={ramps}; widthTransitions={transitions}; taperedSections={tapered}; minimumTaperMeters={taperLength}; largeOffsetsRequiringReview={limited}; boundaryJoinsRolledBack={boundaryNodes.Count}; curveEndpointsOffset=true; exactSharedNodeAnchorsPreserved=true; nativeMeshRequiresVerification=true");
         directions.RemoveAll(r=>boundaryNodes.Contains(r.Start?result[r.Index].StartNodeId:result[r.Index].EndNodeId));
+        if(deferLinkApproaches)
+        {
+            // The paired owner has not selected its final native courses yet.
+            // Do not fit a ramp against a frame that that owner may replace.
+            for(var i=0;i<result.Length;i++)if(source[i].ProtectedLink)result[i]=source[i];
+            directions.RemoveAll(r=>source[r.Index].ProtectedLink);
+            stationShifts.RemoveAll(s=>source[s.Index].ProtectedLink);
+        }
         return NetworkApproachTapers.Materialize(result,stationShifts,log,token,directions,fallback:source);
+    }
+
+    // Consume the already selected mainline courses without resetting or
+    // refitting them. Only link approaches own geometry in this handoff.
+    public static IReadOnlyList<PreparedSegment> MaterializeLinkApproaches(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
+    {
+        var result=source.ToArray();var directions=new List<NetworkApproachTapers.DirectionRequest>();
+        var nodes=new Dictionary<long,List<(int Index,bool Start)>>();
+        for(var i=0;i<source.Count;i++)if(source[i].Kind==NetworkKind.Road&&source[i].OneWay)
+            foreach(var start in new[]{true,false})
+            {var id=start?source[i].StartNodeId:source[i].EndNodeId;if(!nodes.TryGetValue(id,out var ports))nodes[id]=ports=new();ports.Add((i,start));}
+        foreach(var node in nodes.OrderBy(p=>p.Key))
+        {
+            token.ThrowIfCancellationRequested();var main=node.Value.Where(p=>!source[p.Index].ProtectedLink&&source[p.Index].Classification is "motorway" or "trunk").ToArray();
+            if(main.Length!=2||main.Count(p=>p.Start)!=1)continue;
+            var a=source[main.First(p=>!p.Start).Index];var b=source[main.First(p=>p.Start).Index];
+            var da=math.normalizesafe((a.CourseEnd-a.CourseControl2).xz);var db=math.normalizesafe((b.CourseControl1-b.CourseStart).xz);
+            if(math.dot(da,db)<.9f||a.Tunnel!=b.Tunnel||a.NativeLaneOffsets.Count==0||b.NativeLaneOffsets.Count==0)continue;
+            var heading=math.normalizesafe(da+db);var normal=new float3(heading.y,0,-heading.x);
+            foreach(var port in node.Value.Where(p=>source[p.Index].ProtectedLink&&source[p.Index].Tunnel==a.Tunnel))
+            {
+                var ramp=source[port.Index];if(ramp.NativeLaneOffsets.Count==0)continue;
+                var anchor=port.Start?ramp.Start:ramp.End;var far=port.Start?ramp.End:ramp.Start;
+                var right=math.dot(far-anchor,normal)>=0;var target=port.Start?a:b;
+                var added=right&&(port.Start?a.NativeLaneOffsets.Count>b.NativeLaneOffsets.Count:b.NativeLaneOffsets.Count>a.NativeLaneOffsets.Count);
+                var direction=heading;
+                if(!added)
+                {
+                    var angle=20f*(float)Math.PI/180;var sign=(port.Start?1:-1)*(right?1:-1);
+                    direction=heading*(float)Math.Cos(angle)+normal.xz*sign*(float)Math.Sin(angle);
+                }
+                var offset=(port.Start?a.CourseEnd-a.End:b.CourseStart-b.Start);
+                if(added)
+                {
+                    var lane=right?target.NativeLaneOffsets.Max():target.NativeLaneOffsets.Min();
+                    var rampLane=right?ramp.NativeLaneOffsets.Min():ramp.NativeLaneOffsets.Max();
+                    offset+=normal*lane-new float3(direction.y,0,-direction.x)*rampLane;
+                }
+                result[port.Index]=port.Start?result[port.Index] with{StartCurveOffset=offset}:result[port.Index] with{EndCurveOffset=offset};
+                directions.Add(new(port.Index,port.Start,(double2)direction*(port.Start?1:-1)));
+            }
+        }
+        if(directions.Count==0)return source;
+        log.Count("Final mainline frame link requests",directions.Count);
+        // Selected course offsets are boundary poses, not a second displacement
+        // field to apply after fitting. One fit owns both heading and position.
+        var failed=new HashSet<int>();
+        var fitted=NetworkApproachFrames.Prepare(result,directions,log,token,failed,courseCoordinates:true).ToArray();
+        foreach(var index in failed)fitted[index]=source[index];
+        return fitted;
     }
 }

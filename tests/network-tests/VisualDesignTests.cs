@@ -33,11 +33,21 @@ static class VisualDesignTests
         var mainA=Road(250,2500,2501,new(-600,50,4),new(0,50,4));var mainB=Road(251,2501,2502,new(0,50,4),new(600,50,4));
         var oppositeA=Road(252,2503,2504,new(600,50,-4),new(0,50,-4));var oppositeB=Road(253,2504,2505,new(0,50,-4),new(-600,50,-4));
         var ramp=Road(254,2501,2506,new(0,50,4),new(100,50,150)) with{Classification="motorway_link",NativeWidth=8};
-        var junctionPair=NetworkPairedCorridors.Prepare(new[]{mainA,mainB,oppositeA,oppositeB,ramp},new ImportLog(),default);
+        var sharedRail=Road(255,2501,2507,new(0,50,4),new(0,50,150)) with{Kind=NetworkKind.Rail,Classification="rail",OneWay=false};
+        var junctionPair=NetworkPairedCorridors.Prepare(new[]{mainA,mainB,oppositeA,oppositeB,ramp,sharedRail},new ImportLog(),default);
         Check(junctionPair.Any(s=>s.PairedProfileId!=0)&&junctionPair.Any(s=>s.StartNodeId==2501)&&junctionPair.Any(s=>s.EndNodeId==2501),
             "Mainline matching across a ramp branch lost pairing or the real junction port");
-        var junctionAnchors=junctionPair.SelectMany(s=>new[]{(Id:s.StartNodeId,Point:s.Start),(Id:s.EndNodeId,Point:s.End)}).Where(p=>p.Id==2501).ToArray();
+        var junctionAnchors=junctionPair.Where(s=>s.Kind==NetworkKind.Road).SelectMany(s=>new[]{(Id:s.StartNodeId,Point:s.Start),(Id:s.EndNodeId,Point:s.End)}).Where(p=>p.Id==2501).ToArray();
         Check(junctionAnchors.All(p=>math.all(p.Point==junctionAnchors[0].Point)),"Paired formation left mismatched anchors at a ramp junction");
+        var emittedRamp=junctionPair.Single(s=>s.WayId==254);
+        var originalRampHeading=math.normalizesafe((ramp.CourseControl1-ramp.CourseStart).xz);
+        var emittedRampHeading=math.normalizesafe((emittedRamp.CourseControl1-emittedRamp.CourseStart).xz);
+        Check(math.dot(originalRampHeading,emittedRampHeading)>1-1e-6,
+            "Paired mainline tangent overwrote the attached link's independently selected junction angle");
+        var emittedRail=junctionPair.Single(s=>s.WayId==255);
+        Check(math.all(emittedRail.CourseStart==sharedRail.CourseStart)&&math.all(emittedRail.CourseEnd==sharedRail.CourseEnd)&&
+            math.all(emittedRail.CourseControl1==sharedRail.CourseControl1)&&math.all(emittedRail.CourseControl2==sharedRail.CourseControl2),
+            "Road pairing changed rail geometry through a numerically shared source node ID");
         var assets=new Dictionary<string,NativeAssetContract>{{"visual",Asset()}};
         var valley=Enumerable.Range(0,17*17).Select(i=>(ushort)Math.Round((50-25*Math.Sin(Math.PI*(i%17)/16))/100*65535)).ToArray();
         var crossing=Road(300,3000,3001,new(-200,50,0),new(200,50,0));
@@ -50,6 +60,41 @@ static class VisualDesignTests
         var ridge=Enumerable.Range(0,17*17).Select(i=>(ushort)Math.Round((50+25*Math.Sin(Math.PI*(i%17)/16))/100*65535)).ToArray();
         Check(NetworkVisualDesign.StructureIntent(new[]{crossing},ridge,100,400,assets,new ImportLog(),default)[0].Tunnel,"Crest formation did not select a coherent tunnel");
         PreparedSegment Rail(long way,long a,long b,float3 p,float3 q)=>Road(way,a,b,p,q) with{Kind=NetworkKind.Rail,Classification="rail",OneWay=false};
+        var steepTerrain=Enumerable.Range(0,17*17).Select(i=>(ushort)Math.Round((20+60*(i%17)/16d)/100*65535)).ToArray();
+        var mixedDirections=new[]{Rail(380,3800,3801,new(-200,50,0),new(-65,50,0)),
+            Rail(381,3802,3801,new(65,50,0),new(-65,50,0)),Rail(382,3802,3803,new(65,50,0),new(200,50,0))};
+        var coherentRail=NetworkVisualDesign.StructureIntent(mixedDirections,valley,100,400,assets,new ImportLog(),default);
+        Check(coherentRail.All(s=>s.Bridge)&&coherentRail.Zip(mixedDirections).All(p=>p.First.StartNodeId==p.Second.StartNodeId&&p.First.EndNodeId==p.Second.EndNodeId),
+            "Bidirectional source orientation split one structural railway into incompatible short intents or changed source direction");
+        var excludedLoop=Rail(383,3830,3830,new(0,50,0),new(0,50,0)) with{Roundabout=true,Control1=new(50,50,50),Control2=new(-50,50,50)};
+        Check(NetworkVisualDesign.StructureIntent(new[]{excludedLoop},valley,100,400,assets,new ImportLog(),default).Count==1,
+            "Undirected traversal treated a duplicated self-loop incidence as a distinct neighbouring edge");
+        var steepRail=Rail(390,3900,3901,new(-200,20,0),new(200,80,0));
+        Check(NetworkGroundFeasibility.Check(new[]{steepRail},steepTerrain,100,400,default).Conflicts==1,
+            "Steep structural-intent fixture no longer demonstrates a ground-budget contradiction");
+        var structuralRail=NetworkVisualDesign.StructureIntent(new[]{steepRail},steepTerrain,100,400,assets,new ImportLog(),default)[0];
+        Check(NetworkVisualDesign.StructureIntent(new[]{steepRail},steepTerrain,100,400,assets,new ImportLog(),default,
+            allowedSections:new HashSet<int>(),propagateChainConflicts:true)[0]==steepRail,
+            "Corrective structural selection changed a section outside its owned set");
+        Check(NetworkStructure.IsStructure(structuralRail)&&structuralRail.StartNodeId==steepRail.StartNodeId&&structuralRail.EndNodeId==steepRail.EndNodeId&&
+            math.all(structuralRail.Start.xz==steepRail.Start.xz)&&math.all(structuralRail.End.xz==steepRail.End.xz),
+            "A terrain-derived steep prior vetoed structural intent or changed horizontal/source identity");
+        var lockedRail=steepRail with{RawSourceTags=new Dictionary<string,string>{{"bridge","no"}}};
+        Check(!NetworkStructure.IsStructure(NetworkVisualDesign.StructureIntent(new[]{lockedRail},steepTerrain,100,400,assets,new ImportLog(),default)[0]),
+            "Steep inferred structure overrode an explicit ground policy");
+        var moderateTerrain=Enumerable.Range(0,17*17).Select(i=>(ushort)Math.Round((30+25*(i%17)/16d)/100*65535)).ToArray();
+        var moderateRail=Rail(391,3910,3911,new(-200,30,0),new(200,55,0));
+        Check(NetworkGroundFeasibility.Check(new[]{moderateRail},moderateTerrain,100,400,default).Conflicts==0,
+            "Desired-grade fixture unexpectedly violates the exceptional endpoint feasibility bound");
+        Check(!NetworkStructure.IsStructure(NetworkVisualDesign.StructureIntent(new[]{moderateRail},moderateTerrain,100,400,assets,new ImportLog(),default)[0]),
+            "Slope alone invented a structure on an otherwise feasible linear ground interval");
+        var neighbour=Rail(392,3920,3900,new(-250,10,0),steepRail.Start) with{Bridge=true};
+        var frozenIntent=NetworkVisualDesign.StructureIntent(new[]{steepRail,neighbour},steepTerrain,100,400,assets,new ImportLog(),default,
+            allowedSections:new HashSet<int>{0},propagateChainConflicts:true);
+        Check(frozenIntent[1]==neighbour&&frozenIntent[0].Start.y==neighbour.End.y&&NetworkStructure.IsStructure(frozenIntent[0]),
+            "Structural corrective prior averaged a committed boundary or abandoned an available native mode before physical evaluation");
+        var joinedIntent=NetworkVisualDesign.StructureIntent(new[]{steepRail,neighbour},steepTerrain,100,400,assets,new ImportLog(),default);
+        Check(math.all(joinedIntent[0].Start==joinedIntent[1].End),"Structural prior left conflicting source anchors before the joint solve");
         var fan=new[]{Rail(401,1,2,new(-100,50,0),new(0,50,0)),Rail(402,2,3,new(0,50,0),new(8,50,0)),
             Rail(403,3,4,new(8,50,0),new(100,50,0)),Rail(404,2,5,new(0,50,0),new(-100,50,100)),Rail(405,3,6,new(8,50,0),new(100,50,-100))};
         var nativeFan=RailCorridorConsolidator.NativeJunctionFootprints(fan,new ImportLog(),default);

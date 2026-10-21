@@ -14,7 +14,8 @@ public static class NetworkPhysicalReconstruction
 {
     public static IReadOnlyList<PreparedSegment> Once(IReadOnlyList<PreparedSegment> horizontal,IReadOnlyList<PreparedSegment> solved,
         ushort[] terrain,float scale,double width,IReadOnlyDictionary<string,NativeAssetContract>? assets,Func<float3,float?>? water,
-        ImportLog log,CancellationToken token,Action<string>? progress=null,NetworkTunnelProfile.PhysicalQuality? initialQuality=null)
+        ImportLog log,CancellationToken token,Action<string>? progress=null,NetworkTunnelProfile.PhysicalQuality? initialQuality=null,
+        Action<string,SparseProfileRows>? inspectProfileRows=null,Action<object>? inspectProfileSeam=null)
     {
         var failed=new HashSet<int>();
         for(var i=0;i<solved.Count;i++)
@@ -85,6 +86,12 @@ public static class NetworkPhysicalReconstruction
             var tb=path[path.Count-1].Forward?b-endSection.CourseControl2:endSection.CourseControl1-b;
             var budget=solved[seed].ProtectedLink?48:NetworkNormalizer.Tolerance(solved[seed].Kind);
             if(!NetworkSourceFit.TryFit(points,a,b,ta.xz,tb.xz,budget,token,out var fitted,out _))continue;
+            if(solved[seed].Kind==NetworkKind.Rail)
+            {
+                var limits=path.Select(p=>solved[p.Index].NativeCenterlineCurvatureLimit).ToArray();
+                if(limits.Any(limit=>!limit.HasValue)||NetworkDesignChecks.Certify(fitted,limits.Min(limit=>limit!.Value),
+                    double.PositiveInfinity,token:token,maximumLeaves:4096).Quality!=DesignQuality.Certified)continue;
+            }
             for(var j=0;j<path.Count;j++)
             {
                 var item=path[j];var s=solved[item.Index];var lo=boundaries[j]/total;var hi=boundaries[j+1]/total;
@@ -96,25 +103,40 @@ public static class NetworkPhysicalReconstruction
                 rebuilt++;
             }
         }
-        var low=new double2(double.PositiveInfinity);var high=new double2(double.NegativeInfinity);
-        foreach(var i in affected)foreach(var p in new[]{candidate[i].CourseStart,candidate[i].CourseControl1,candidate[i].CourseControl2,candidate[i].CourseEnd})
-        {low=math.min(low,p.xz);high=math.max(high,p.xz);}
+        // Preserve global portal distances, formation classification and family
+        // area weights. Exact fixed-star substitution below makes optimizer
+        // dependencies local without an unsafe spatial cut of physical evidence.
         var indices=new List<int>();var frozen=new HashSet<int>();
         for(var i=0;i<solved.Count;i++)
         {
-            var s=candidate[i];var radius=Math.Max(32,s.NativeWidth+16);var a=math.min(math.min(s.CourseStart.xz,s.CourseControl1.xz),math.min(s.CourseControl2.xz,s.CourseEnd.xz));
-            var b=math.max(math.max(s.CourseStart.xz,s.CourseControl1.xz),math.max(s.CourseControl2.xz,s.CourseEnd.xz));
-            if(!affected.Contains(i)&&(!math.all((double2)b>=low-radius)||!math.all((double2)a<=high+radius)))continue;
             if(!affected.Contains(i))frozen.Add(indices.Count);indices.Add(i);
         }
         var local=indices.Select(i=>candidate[i]).ToArray();var fixedHeights=new Dictionary<SourceNodeKey,double>();var fixedSlopes=new Dictionary<SourceNodeKey,double>();
+        // Spend the existing single corrective solve on a supported structural
+        // alternative when ground-chain budgets conflict. This is not another
+        // optimizer pass. Full surrounding portal/contact context stays present,
+        // and neither mode selection nor anchor publication may move a frozen
+        // native neighbour. The existing final physical gate still owns adoption.
+        var modeLog=new ImportLog();
+        var structural=NetworkVisualDesign.StructureIntent(local,terrain,scale,width,assets,modeLog,token,
+            allowedSections:affected,propagateChainConflicts:true);
+        var changedModes=Enumerable.Range(0,local.Length).Count(i=>NativeAssetContract.Mode(local[i])!=NativeAssetContract.Mode(structural[i]));
+        var frozenPreserved=frozen.All(i=>local[i]==structural[i]);
+        var curvatureCertified=Enumerable.Range(0,local.Length).Where(i=>local[i].Kind==NetworkKind.Rail&&
+            NativeAssetContract.Mode(local[i])!=NativeAssetContract.Mode(structural[i])).All(i=>
+                structural[i].NativeCenterlineCurvatureLimit.HasValue&&NetworkDesignChecks.Certify(
+                    new(structural[i].CourseStart,structural[i].CourseControl1,structural[i].CourseControl2,structural[i].CourseEnd),
+                    structural[i].NativeCenterlineCurvatureLimit!.Value,double.PositiveInfinity,token:token,maximumLeaves:4096).Quality==DesignQuality.Certified);
+        if(changedModes>0&&frozenPreserved&&curvatureCertified)local=structural.ToArray();
+        log.Diagnostic($"PHYSICAL STRUCTURAL CANDIDATE changedModes={changedModes}; frozenContextPreserved={frozenPreserved}; nativeCurvatureCertified={curvatureCertified}; submittedToExistingSolve={changedModes>0&&frozenPreserved&&curvatureCertified}; additionalSolves=0; finalPhysicalCertificateRequired=true");
         foreach(var i in affected)foreach(var start in new[]{true,false})
         {
             var s=solved[i];var key=Key(s,start);
             if(incident[key].Count==2&&incident[key].All(affected.Contains))continue;
             var point=start?s.CourseStart:s.CourseEnd;var delta=start?s.CourseControl1-point:point-s.CourseControl2;
             fixedHeights[key]=point.y;
-            if(incident[key].Count==1)fixedSlopes[key]=math.length(delta.xz)>1e-8?delta.y/math.length(delta.xz):0;
+            var reach=math.length((double2)delta.xz);
+            if(incident[key].Count==1)fixedSlopes[key]=reach>1e-8?delta.y/reach:0;
         }
         try
         {
@@ -122,7 +144,8 @@ public static class NetworkPhysicalReconstruction
             var baselineQuality=NetworkTunnelProfile.MeasurePhysical(indices.Select(i=>solved[i]).ToArray(),terrain,scale,width,assets,token);
             NetworkTunnelProfile.PhysicalQuality? quality=null;
             var repaired=NetworkTunnelProfile.Solve(local,scale,Array.Empty<(int,float,float)>(),log,token,fixedHeights,
-                new(terrain,width,water,assets,progress,CaptureReplay:false,EvidenceScope:"physical-reconstruction"),fixedSlopes,frozen,value=>quality=value);
+                new(terrain,width,water,assets,progress,CaptureReplay:false,EvidenceScope:"physical-reconstruction")
+                    {InspectRows=inspectProfileRows==null?null:(scope,matrix)=>inspectProfileRows("corrective/"+scope,matrix),InspectSeam=inspectProfileSeam},fixedSlopes,frozen,value=>quality=value);
             var remaining=indices.Select((id,i)=>(id,i)).Count(p=>affected.Contains(p.id)&&
                 !NetworkVerticalProfiles.WithinGradeCeiling(repaired[p.i],NetworkGeometrySafety.GradeLimit(repaired[p.i])));
             // A failed attempt is evidence, not permission to replace a better

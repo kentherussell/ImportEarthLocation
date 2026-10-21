@@ -64,7 +64,7 @@ public static class DiagnosticArtifacts
                 s.ExplicitLanes, s.SourceWidthMeters, s.SourceSpeedKph, s.ExplicitIncline, s.SignedInclinePriorAccepted, s.CorridorId, s.ConsolidatedAvenue,
                 s.NativeAssetKey, s.NativeUnitId, s.NativeCenterlineCurvatureLimit, s.NativeWidth, s.MaximumNativeWidth, s.NativeLaneOffsets, s.StartElevation, s.EndElevation,
                 s.PairedCorridorId,s.PairedSpanId,s.StartHeightFamily,s.EndHeightFamily,s.PairedReversed,s.ReferenceSpan,s.StartReferenceSpeed,s.EndReferenceSpeed,
-                s.PairedProfileId,s.PairedReferenceBegin,s.PairedReferenceEnd,
+                s.PairedProfileId,s.PairedProfileOnly,s.PairedReferenceBegin,s.PairedReferenceEnd,s.RailTerminalFormationId,
                 StartCurveOffset = Point(s.StartCurveOffset), EndCurveOffset = Point(s.EndCurveOffset),
                 s.StartMiniRoundabout, s.EndMiniRoundabout, s.StartRoundaboutRadius, s.EndRoundaboutRadius, s.Roundabout,
                 ExplicitCutSides = (int)s.ExplicitCutSides, ExplicitWallSides = (int)s.ExplicitWallSides, RetainingWallSides = (int)s.RetainingWallSides,

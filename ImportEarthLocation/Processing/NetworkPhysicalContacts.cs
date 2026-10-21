@@ -34,6 +34,8 @@ public static class NetworkPhysicalContacts
                 if(!NetworkDesignChecks.Finite(new(b.CourseStart,b.CourseControl1,b.CourseControl2,b.CourseEnd))||
                     a.Kind!=b.Kind||a.StartNodeId!=b.StartNodeId||a.EndNodeId!=b.EndNodeId||a.Layer!=b.Layer||
                     a.NativeAssetKey!=b.NativeAssetKey||a.NativeWidth!=b.NativeWidth||a.Bridge!=b.Bridge||a.Tunnel!=b.Tunnel||
+                    a.PairedProfileId!=b.PairedProfileId||a.PairedCorridorId!=b.PairedCorridorId||a.PairedReversed!=b.PairedReversed||a.PairedProfileOnly!=b.PairedProfileOnly||
+                    a.PairedReferenceBegin!=b.PairedReferenceBegin||a.PairedReferenceEnd!=b.PairedReferenceEnd||
                     NetworkGeometrySafety.GradeLimit(a)!=NetworkGeometrySafety.GradeLimit(b)||
                     !math.all(a.Start.xz==b.Start.xz)||!math.all(a.End.xz==b.End.xz)||
                     !math.all(a.CourseStart.xz==b.CourseStart.xz)||!math.all(a.CourseControl1.xz==b.CourseControl1.xz)||
@@ -78,6 +80,12 @@ public static class NetworkPhysicalContacts
             if(geometry!=null)
             {geometry.Source=new List<PreparedSegment>(source).ToArray();geometry.Assets=assets;geometry.Epsilon=epsilon;geometry.Leaves=leaves;geometry.Envelopes=envelopes;geometry.Topology=topology;geometry.Index=index;geometry.Missing=missing;geometry.Uncertified=uncertified;geometry.Builds++;}
         }
+        if(evidence!=null)foreach(var leaf in leaves)
+        {
+            token.ThrowIfCancellationRequested();
+            if(!leaf.Certified)evidence(new(leaf.Ordinal,-1,leaf.Curve,-1,leaf.Begin,leaf.End,0,0,
+                "unavailable-footprint-leaf",-1,0));
+        }
         var initialCandidateTests=index.CandidateTests;var families=new Dictionary<Family,Measure>();
         var measurementOnly=rows.MeasurementOnly;var unitMeasure=new Measure();
         var localTransitions=0L;var pairedFormations=0L;var contradictions=0L;var horizontalConflicts=0L;var coalesced=0L;
@@ -101,7 +109,12 @@ public static class NetworkPhysicalContacts
                 =>evidence?.Invoke(new(a.Ordinal,b.Ordinal,a.Curve,b.Curve,a.Begin,a.End,b.Begin,b.End,classification,firstRow,rowCount));
             if(!a.Certified||!b.Certified){if(classify)Evidence("unavailable-footprint");continue;}
             var sa=source[a.Curve];var sb=source[b.Curve];
-            if(sa.PairedProfileId!=0&&sa.PairedProfileId==sb.PairedProfileId&&sa.PairedReversed!=sb.PairedReversed)
+            // Native/reference cuts are not separate formations. Adjacent
+            // synchronized spans overlap longitudinally near their ends too.
+            var sharedFormation=sa.PairedCorridorId!=0&&sa.PairedCorridorId==sb.PairedCorridorId&&sa.PairedReversed!=sb.PairedReversed&&
+                Math.Max(Math.Min(sa.PairedReferenceBegin,sa.PairedReferenceEnd),Math.Min(sb.PairedReferenceBegin,sb.PairedReferenceEnd))<=
+                Math.Min(Math.Max(sa.PairedReferenceBegin,sa.PairedReferenceEnd),Math.Max(sb.PairedReferenceBegin,sb.PairedReferenceEnd))+Math.Max(sa.NativeWidth,sb.NativeWidth);
+            if(sharedFormation&&!sa.PairedProfileOnly&&!sb.PairedProfileOnly)
             {if(classify){pairedFormations++;Evidence("trusted-paired-formation");}continue;}
             if(topology.LocalTransition(a,b)){if(classify){localTransitions++;Evidence("local-junction-or-structure-transition");}continue;}
             var ma=NativeAssetContract.Mode(sa);var mb=NativeAssetContract.Mode(sb);
@@ -112,7 +125,7 @@ public static class NetworkPhysicalContacts
             // because one abutment/water interval selected a bridge composition.
             // Keep its footprint conflict visible; never solve it by stacking.
             var opposingMainlines=ma!=mb&&sa.Layer==sb.Layer&&NetworkContactPolicy.OpposingMainlines(sa,sb,(float2)(a.B-a.A),(float2)(b.B-b.A));
-            var sameLevel=sa.Layer==sb.Layer&&ma==mb||opposingMainlines;
+            var sameLevel=sa.Layer==sb.Layer&&ma==mb||opposingMainlines||sharedFormation;
             // Same-level overlaps only produce observations in pass zero.
             // Re-clipping their polygons cannot contribute family weights or
             // clearance rows in the second pass.
@@ -164,13 +177,14 @@ public static class NetworkPhysicalContacts
             else if(families.TryGetValue(family,out var existingMeasure))measure=existingMeasure;
             else families.Add(family,measure=new());
             var firstContactRow=rows.Count;
+            var sharedNodeFormation=SharedFormation(hs,ls,envelopes[hi.Curve],envelopes[lo.Curve]);
             // The clamped affine parameter is piecewise affine. Split both
             // parameter domains before constructing polynomial coefficients.
             for(var hc=0;hc<3;hc++)for(var lc=0;lc<3;lc++)
             {
                 Array.Copy(original,region,count);var used=count;
                 used=ClampRegion(hi,hc,used);used=ClampRegion(lo,lc,used);if(used==0)continue;
-                var formation=SharedFormation(hs,ls,envelopes[hi.Curve],envelopes[lo.Curve]);
+                var formation=sharedNodeFormation;
                 var clampedCount=used;Array.Copy(region,clamped,used);
                 // Subtract the shared native node's local formation in four
                 // disjoint strips. Sharing one node does not exempt an entire
@@ -267,8 +281,9 @@ public static class NetworkPhysicalContacts
     {
         if(a.Kind!=b.Kind&&(NetworkStructure.IsStructure(a)||NetworkStructure.IsStructure(b)||a.Layer!=b.Layer))return null;
         var radius=Math.Max(ea.NodeOffset,eb.NodeOffset)+Math.Max(ea.Width,eb.Width)/2;
-        foreach(var id in new[]{a.StartNodeId,a.EndNodeId})
+        for(var endpoint=0;endpoint<2;endpoint++)
         {
+            var id=endpoint==0?a.StartNodeId:a.EndNodeId;
             if(id!=b.StartNodeId&&id!=b.EndNodeId)continue;
             return ((double2)(id==a.StartNodeId?a.Start:a.End).xz,radius);
         }

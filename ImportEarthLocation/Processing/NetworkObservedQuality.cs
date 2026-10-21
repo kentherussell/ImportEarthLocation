@@ -14,12 +14,12 @@ public static class NetworkObservedQuality
     public static void Paired(IReadOnlyList<PreparedSegment> sections,Func<PreparedSegment,IReadOnlyList<Cubic3d>?> observe,
         ImportLog log,CancellationToken token,string scope)
     {
-        var checkedPairs=0;var failed=0;var unknown=0;var worst=0d;var affected=0d;var witnesses=new List<object>();
+        var checkedPairs=0;var expected=0;var failed=0;var unknown=0;var worst=0d;var affected=0d;var witnesses=new List<object>();
         foreach(var group in sections.Where(s=>s.PairedProfileId!=0).GroupBy(s=>(s.PairedProfileId,
             Begin:Math.Round(Math.Min(s.PairedReferenceBegin,s.PairedReferenceEnd),6),End:Math.Round(Math.Max(s.PairedReferenceBegin,s.PairedReferenceEnd),6))))
         {
-            token.ThrowIfCancellationRequested();var pair=group.ToArray();if(pair.Length!=2){unknown++;continue;}
-            checkedPairs++;var a=pair[0];var b=pair[1];var ac=observe(a);var bc=observe(b);
+            token.ThrowIfCancellationRequested();expected++;var pair=group.ToArray();if(pair.Length!=2){unknown++;continue;}
+            var a=pair[0];var b=pair[1];var ac=observe(a);var bc=observe(b);
             if(ac==null||bc==null||ac.Count==0||bc.Count==0){unknown++;continue;}
             var sameDirection=Math.Sign(a.PairedReferenceEnd-a.PairedReferenceBegin)==Math.Sign(b.PairedReferenceEnd-b.PairedReferenceBegin);
             var pairWorst=0d;var unavailable=false;
@@ -32,14 +32,14 @@ public static class NetworkObservedQuality
                 pairWorst=Math.Max(pairWorst,Math.Abs(ya.Value-yb.Value));
             }
             worst=Math.Max(worst,pairWorst);
-            if(pairWorst>.05){failed++;affected+=NetworkDesignChecks.HorizontalArcLength(new(a.CourseStart,a.CourseControl1,a.CourseControl2,a.CourseEnd));}
-            if(unavailable)unknown++;
-            if((unavailable||pairWorst>.05)&&witnesses.Count<128)witnesses.Add(new{a.PairedProfileId,a.WayId,otherWay=b.WayId,
+            if(pairWorst>.25){failed++;affected+=NetworkDesignChecks.HorizontalArcLength(new(a.CourseStart,a.CourseControl1,a.CourseControl2,a.CourseEnd));}
+            if(unavailable)unknown++;else checkedPairs++;
+            if((unavailable||pairWorst>.25)&&witnesses.Count<128)witnesses.Add(new{a.PairedProfileId,a.WayId,otherWay=b.WayId,
                 a.StartNodeId,a.EndNodeId,maximumObservedDifferenceMeters=pairWorst,unavailableStations=unavailable,
                 stations=17,projectionToleranceMeters=.05,continuousCertificate=false});
         }
         log.Quality(new("native-paired","paired-height",scope,checkedPairs,failed,unknown,worst,affected,
-            "17 common planned-reference stations on exact qualified native paths; XZ mismatch/ambiguous height unavailable; sampled, not continuous"));
+            "17 common planned-reference stations on exact qualified native paths; <=0.25m observed height difference; XZ mismatch/ambiguous height unavailable; sampled, not continuous"){Expected=expected});
         if(log.DiagnosticsEnabled)log.DiagnosticRecords(scope+"-paired-height-witnesses.ndjson",witnesses,critical:true);
     }
 

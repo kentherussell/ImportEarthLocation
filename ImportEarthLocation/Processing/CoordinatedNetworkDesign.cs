@@ -21,6 +21,8 @@ public static class CoordinatedNetworkDesign
     private static bool IsMainline(PreparedSegment s)=>s.Kind==NetworkKind.Rail||s.Classification is "motorway" or "trunk";
     private static bool Same(PreparedSegment a,PreparedSegment b)=>a.Kind==b.Kind&&a.OneWay==b.OneWay&&a.ProtectedLink==b.ProtectedLink&&
         (a.Kind==NetworkKind.Rail||a.WayId==b.WayId||a.Reference.Length>0&&a.Reference==b.Reference||a.Name.Length>0&&a.Name==b.Name||a.CorridorId!=0&&a.CorridorId==b.CorridorId);
+    private static bool ExplicitStructure(PreparedSegment s)=>s.RawSourceTags.ContainsKey("bridge")||s.RawSourceTags.ContainsKey("tunnel")||
+        s.RawSourceTags.ContainsKey("layer")||s.SourceTags.ContainsKey("bridge")||s.SourceTags.ContainsKey("tunnel")||s.SourceTags.ContainsKey("layer");
 
     public static IReadOnlyList<PreparedSegment> TunnelIntervals(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
     {
@@ -30,20 +32,25 @@ public static class CoordinatedNetworkDesign
         var filled=0;var visited=new HashSet<int>();
         for(var seed=0;seed<result.Length;seed++)
         {
-            var first=result[seed];if(first.Tunnel||first.Bridge||first.ProtectedLink||!IsMainline(first)||visited.Contains(seed))continue;
+            var first=result[seed];if(first.Tunnel||first.Bridge||first.ProtectedLink||!IsMainline(first)||ExplicitStructure(first)||visited.Contains(seed))continue;
             token.ThrowIfCancellationRequested();var run=new HashSet<int>{seed};var boundary=new List<int>();var length=NetworkVerticalProfiles.ArcLength(first);
             foreach(var end in new[]{first.StartNodeId,first.EndNodeId})
             {
                 var current=seed;var node=end;
                 while(length<=220)
                 {
+                    if(nodes[(first.Kind,node)].Count!=2)break;
                     var options=nodes[(first.Kind,node)].Where(i=>i!=current&&!result[i].ProtectedLink&&result[i].OneWay==first.OneWay&&result[i].Classification==first.Classification).ToArray();
                     if(options.Length!=1)break;var next=options[0];if(run.Contains(next))break;
+                    var a=result[current];var b=result[next];
+                    if(a.OneWay&&(a.StartNodeId==node)==(b.StartNodeId==node)||
+                        NetworkBoundaryPolicy.EndpointMarker(a,a.StartNodeId==node)||NetworkBoundaryPolicy.EndpointMarker(b,b.StartNodeId==node))break;
                     if(result[next].Tunnel){boundary.Add(next);break;}if(result[next].Bridge)break;
+                    if(ExplicitStructure(result[next]))break;
                     run.Add(next);length+=NetworkVerticalProfiles.ArcLength(result[next]);current=next;node=result[next].StartNodeId==node?result[next].EndNodeId:result[next].StartNodeId;
                 }
             }
-            visited.UnionWith(run);if(length>220||boundary.Count!=2)continue;
+            visited.UnionWith(run);if(length>220||boundary.Count!=2||result[boundary[0]].Layer!=result[boundary[1]].Layer)continue;
             foreach(var index in run){result[index]=result[index] with{Tunnel=true,Bridge=false,Layer=Math.Min(result[boundary[0]].Layer,result[boundary[1]].Layer)};filled++;}
         }
         var underground=new HashSet<long>(result.Where(s=>s.Kind==NetworkKind.Road&&s.Tunnel).SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));
@@ -71,7 +78,7 @@ public static class CoordinatedNetworkDesign
         var edges=(tunnelIntervalsResolved?source:TunnelIntervals(source,log,token)).ToArray();
         if(water!=null)for(var i=0;i<edges.Length;i++)
         {
-            var s=edges[i];if(s.Tunnel||s.Bridge)continue;
+            var s=edges[i];if(s.Tunnel||s.Bridge||ExplicitStructure(s))continue;
             for(var j=0;j<=8;j++)
             {var p=NetworkNormalizer.Evaluate(s,j/8f);var stage=water(p);if(!stage.HasValue||!math.isfinite(stage.Value)||NetworkProcessor.Sample(p.x,p.z,raster,scale,width)>stage.Value+.5f)continue;edges[i]=s with{Bridge=true};break;}
         }
@@ -81,7 +88,10 @@ public static class CoordinatedNetworkDesign
     public static IReadOnlyList<PreparedSegment> Prepare(IReadOnlyList<PreparedSegment> source,ushort[] raster,float scale,double width,
         ImportLog log,CancellationToken token,Func<float3,float?>? water=null,bool structureIntervalsResolved=false,
         IReadOnlyDictionary<string,NativeAssetContract>? assets=null,Action<string>? progress=null,
-        IReadOnlyList<float3[]>? protectedAreas=null,IReadOnlyList<float3[]>? protectedLines=null,SourceTopologyManifest? sourceTopology=null)
+        IReadOnlyList<float3[]>? protectedAreas=null,IReadOnlyList<float3[]>? protectedLines=null,SourceTopologyManifest? sourceTopology=null,
+        Action<string,IReadOnlyList<PreparedSegment>>? inspectStage=null,
+        Action<string,SparseProfileRows>? inspectProfileRows=null,Action<object>? inspectProfileSeam=null,
+        Action<string,IReadOnlyList<PreparedSegment>>? inspectWriter=null)
     {
         var invalid=source.Count(s=>!NetworkDesignChecks.Finite(new(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd))||!math.all(math.isfinite(s.Start))||!math.all(math.isfinite(s.End)));
         if(invalid>0)
@@ -89,18 +99,26 @@ public static class CoordinatedNetworkDesign
             log.Count("Nonfinite source sections excluded for native safety",invalid);
             log.Warn($"Native safety: {invalid} nonfinite source sections cannot be represented; continuing the remaining network.");
             var finite=source.Where(s=>NetworkDesignChecks.Finite(new(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd))&&math.all(math.isfinite(s.Start))&&math.all(math.isfinite(s.End))).ToArray();
-            return Prepare(finite,raster,scale,width,log,token,water,structureIntervalsResolved,assets,progress);
+            return Prepare(finite,raster,scale,width,log,token,water,structureIntervalsResolved,assets,progress,
+                protectedAreas,protectedLines,sourceTopology,inspectStage,inspectProfileRows,inspectProfileSeam,inspectWriter);
         }
         if(source.Count==0)return source;
         var stageClock=System.Diagnostics.Stopwatch.StartNew();
-        void Stage(string name,int sections)
+        void Stage(string name,IReadOnlyList<PreparedSegment> sections)
         {
             var seconds=stageClock.Elapsed.TotalSeconds;
             log.AddDuration("Coordinated "+name,seconds);
-            log.Diagnostic($"DESIGN STAGE name={name}; elapsedSeconds={seconds:F6}; sections={sections}; scope=coordinated-design; includesDiagnosticOverhead=true");
+            log.Diagnostic($"DESIGN STAGE name={name}; elapsedSeconds={seconds:F6}; sections={sections.Count}; scope=coordinated-design; includesDiagnosticOverhead=true; boundaryCensusTimedSeparately=true");
+            NetworkBoundaryPolicy.Survey(sections,sourceTopology,log,name,assets);
+            inspectWriter?.Invoke(name,sections);
+            inspectStage?.Invoke(name,sections);
             stageClock.Restart();
         }
+        inspectWriter?.Invoke("coordinated-input",source);
+        source=NetworkRailTerminalFormations.Prepare(source,log,token);
+        inspectWriter?.Invoke("rail-terminal-formations",source);
         source=RailCorridorConsolidator.NativeJunctionFootprints(source,log,token);
+        inspectWriter?.Invoke("rail-junction-footprints",source);
         var edges=(structureIntervalsResolved?source:StructureIntervals(source,raster,scale,width,log,token,water))
             .OrderBy(s=>s.Kind).ThenBy(s=>s.WayId).ThenBy(s=>s.StartNodeId).ThenBy(s=>s.EndNodeId).ToArray();
         var graph=new Dictionary<Key,List<int>>();var positions=new Dictionary<Key,float3>();
@@ -129,12 +147,15 @@ public static class CoordinatedNetworkDesign
             var best=-1;var score=.8f;
             foreach(var j in graph[node])
             {
-                var t=edges[j];if(j==index||!Same(s,t)||s.OneWay&&(A(t)==node)==start)continue;
+                var t=edges[j];if(j==index||!Continues(s,t,node)||s.OneWay&&(A(t)==node)==start)continue;
                 var departure=math.normalizesafe(A(t)==node?t.End.xz-t.Start.xz:t.Start.xz-t.End.xz);
                 var dot=math.dot(arrival,departure);if(dot>score){best=j;score=dot;}
             }
             return best;
         }
+        bool Continues(PreparedSegment a,PreparedSegment b,Key node)=>
+            !NetworkBoundaryPolicy.EndpointMarker(a,A(a)==node)&&!NetworkBoundaryPolicy.EndpointMarker(b,A(b)==node)&&
+            (Same(a,b)||graph[node].Count==2&&NativeChainCompactor.Compatible(a,b));
         var routes=new List<Route>();var seen=new HashSet<int>();
         foreach(var seed in Enumerable.Range(0,edges.Length).OrderBy(i=>edges[i].ProtectedLink?1:0).ThenBy(i=>edges[i].WayId).ThenBy(i=>i))
         {
@@ -189,7 +210,7 @@ public static class CoordinatedNetworkDesign
         }
         foreach(var node in graph.Where(p=>p.Value.Count==2))
         {
-            var x=node.Value[0];var y=node.Value[1];var a=edges[x];var b=edges[y];if(!Same(a,b)||a.Roundabout||b.Roundabout)continue;
+            var x=node.Value[0];var y=node.Value[1];var a=edges[x];var b=edges[y];if(!Continues(a,b,node.Key)||a.Roundabout||b.Roundabout)continue;
             var p=positions[node.Key];var xa=A(a)==node.Key;var yb=A(b)==node.Key;
             var awayA=(xa?a.End:a.Start)-p;var awayB=(yb?b.End:b.Start)-p;
             var da=math.normalizesafe(awayA.xz);var db=math.normalizesafe(awayB.xz);if(math.dot(da,db)>-.5f)continue;
@@ -199,6 +220,8 @@ public static class CoordinatedNetworkDesign
             edges[x]=xa?a with{Control1=ca}:a with{Control2=ca};edges[y]=yb?b with{Control1=cb}:b with{Control2=cb};
         }
         var railDirections=new List<NetworkApproachTapers.DirectionRequest>();
+        if(protectedAreas!=null&&protectedLines!=null)
+            edges=NetworkVisualDesign.FitBudgets(edges,width,protectedAreas,protectedLines,water,log,token).ToArray();
         foreach(var node in graph.Where(p=>p.Key.Kind==NetworkKind.Rail&&p.Value.Count>=3))
         {
             var p=positions[node.Key];var ports=node.Value.OrderBy(i=>edges[i].WayId).ThenBy(i=>edges[i].StartNodeId).ThenBy(i=>edges[i].EndNodeId).Select(i=>(Index:i,Start:A(edges[i])==node.Key,
@@ -225,36 +248,40 @@ public static class CoordinatedNetworkDesign
             }
         }
         progress?.Invoke($"Simplifying {edges.Length:N0} road and railway spans");
-        Stage("route-and-junction-frames",edges.Length);
+        log.Diagnostic($"DESIGN INPUT routes={routes.Count}; sections={edges.Length}; sourceReferencePoints={source.Sum(s=>s.SourceGeometry.Count)}; rawEvidenceRetained=true; compatibleUnnamedWaysContinuous=true; nativeContractCount={assets?.Count??0}; formationOwnerUnchanged=true");
+        Stage("route-and-junction-frames",edges);
         var approaches=NetworkApproachTapers.Materialize(edges,Array.Empty<NetworkApproachTapers.Shift>(),log,token,railDirections,includeLaneOffsets:false);
-        Stage("turnout-approach-fit",approaches.Count);
+        Stage("turnout-approach-fit",approaches);
         if(protectedAreas!=null&&protectedLines!=null)
             approaches=NetworkVisualDesign.FitBudgets(approaches,width,protectedAreas,protectedLines,water,log,token);
         IReadOnlyList<PreparedSegment> horizontal=NativeChainCompactor.Prepare(approaches,log,token,sourceTopology);
-        Stage("chain-compaction",horizontal.Count);
+        Stage("chain-compaction",horizontal);
         horizontal=NetworkHorizontalRegularity.Prepare(horizontal,log,token);
-        horizontal=NetworkLaneAlignment.Prepare(horizontal,log,token,width);
+        horizontal=NetworkLaneAlignment.Prepare(horizontal,log,token,width,deferLinkApproaches:true);
         horizontal=PortalSpans(horizontal,token);
-        Stage("regularity-lane-alignment-portals",horizontal.Count);
-        horizontal=NetworkPairedCorridors.Prepare(horizontal,log,token,progress);
-        Stage("paired-corridors",horizontal.Count);
+        Stage("regularity-lane-alignment-portals",horizontal);
+        horizontal=NetworkPairedCorridors.Prepare(horizontal,log,token,progress,width,protectedAreas,protectedLines,assets,
+            inspectPublication:inspectWriter);
+        horizontal=NetworkLaneAlignment.MaterializeLinkApproaches(horizontal,log,token);
+        Stage("paired-corridors",horizontal);
         horizontal=PortalSpans(NetworkVisualDesign.StructureIntent(horizontal,raster,scale,width,assets,log,token),token);
         horizontal=NetworkHorizontalRegularity.Prepare(horizontal,log,token);
         log.CaptureProfileInput(horizontal,raster,scale,width,assets);
         var cover=NetworkGeometrySafety.TunnelCoverSamples(horizontal,raster,scale,width,token,assets).ToArray();
-        Stage("profile-input-and-cover",horizontal.Count);
+        Stage("profile-input-and-cover",horizontal);
         progress?.Invoke("Building fixed slope, structure-clearance and tunnel-cover equations");
         NetworkTunnelProfile.PhysicalQuality? physicalQuality=null;
         var contactGeometry=new NetworkPhysicalContacts.GeometryCache();
-        var result=NetworkTunnelProfile.Solve(horizontal,scale,cover,log,token,design:new NetworkTunnelProfile.TerrainReference(raster,width,water,assets,progress){ContactGeometry=contactGeometry},
+        var result=NetworkTunnelProfile.Solve(horizontal,scale,cover,log,token,design:new NetworkTunnelProfile.TerrainReference(raster,width,water,assets,progress)
+            {ContactGeometry=contactGeometry,InspectRows=inspectProfileRows==null?null:(scope,matrix)=>inspectProfileRows("initial/"+scope,matrix),InspectSeam=inspectProfileSeam},
             physicalQuality:value=>physicalQuality=value);
-        Stage("profile-formulation-and-solve",result.Count);
-        result=NetworkPhysicalReconstruction.Once(horizontal,result,raster,scale,width,assets,water,log,token,progress,physicalQuality);
-        Stage("bounded-physical-reconstruction",result.Count);
+        Stage("profile-formulation-and-solve",result);
+        result=NetworkPhysicalReconstruction.Once(horizontal,result,raster,scale,width,assets,water,log,token,progress,physicalQuality,inspectProfileRows,inspectProfileSeam);
+        Stage("bounded-physical-reconstruction",result);
         progress?.Invoke("Certifying final road/rail physical outcomes against the immutable terrain");
         var finalPhysical=NetworkTunnelProfile.MeasurePhysical(result,raster,scale,width,assets,token,contactGeometry);
         log.Diagnostic($"CONTACT GEOMETRY CACHE builds={contactGeometry.Builds}; reuses={contactGeometry.Reuses}; scope=one-design; xzAndContractsChecked=true; heightResidualsAlwaysRecomputed=true");
-        Stage("final-physical-certification",result.Count);
+        Stage("final-physical-certification",result);
         log.Quality(new("planned","full-width-clearance","final-design",(int)Math.Min(int.MaxValue,finalPhysical.ClearanceRows),
             (int)Math.Min(int.MaxValue,finalPhysical.ClearanceFailures),assets==null?1:finalPhysical.UncertifiedClearance,
             finalPhysical.MaximumClearanceResidual,finalPhysical.ClearanceAffectedLength,"Correlated native full-width footprint inequalities evaluated on final float controls; affected length counts each involved section once"));

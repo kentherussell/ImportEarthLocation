@@ -149,6 +149,10 @@ public sealed record PreparedSegment(
     public long PairedCorridorId { get; init; }
     public long PairedSpanId { get; init; }
     public long PairedProfileId { get; init; }
+    // Confirmed same-level relationship may share a height function even when
+    // its lateral emission could not satisfy the full-width separation proof.
+    public bool PairedProfileOnly { get; init; }
+    public long RailTerminalFormationId { get; init; }
     public double PairedReferenceBegin { get; init; }
     public double PairedReferenceEnd { get; init; }
     public long StartHeightFamily { get; init; }

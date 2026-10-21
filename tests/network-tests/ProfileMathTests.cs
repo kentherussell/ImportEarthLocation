@@ -15,6 +15,55 @@ static class ProfileMathTests
     }
     public static void Run()
     {
+        ProfileRowCensus.Test();
+        ProfileEvaluationTests.Run();
+        var immutableRows=new SparseProfileRows(5);
+        immutableRows.Append(new[]{0,1,3},new[]{2d,-1,3},3,9,2,ProfileRowKind.EqualityCost);
+        immutableRows.Append(new[]{2,4},new[]{1d,-2},2,1,3,ProfileRowKind.UpperHingeCost);
+        immutableRows.Append(new[]{1},new[]{1d},1,0,5,ProfileRowKind.UpperHingeCost);
+        immutableRows.Append(new[]{4},new[]{1d},1,6,1,ProfileRowKind.EqualityCost);immutableRows.Freeze();
+        var immutableStars=new[]{new ProfileStar(0,new[]{1,2},new[]{-1d,2},new[]{0,0},5,new double?[]{1}),
+            new ProfileStar(3,new[]{4},new[]{1d},new[]{0})};
+        var immutableReduction=NetworkProfileParents.EliminateFixed(immutableRows,new[]{5d,4,7,2,6},immutableStars,20,new ImportEarthLocation.Core.ImportLog(),default)!;
+        try
+        {
+            NetworkProfileParents.EliminateFixed(immutableRows,new[]{5d,4,7,2,6},new[]{immutableStars[0],immutableStars[0]},20,new ImportEarthLocation.Core.ImportLog(),default);
+            throw new Exception("Overlapping immutable stars bypassed native variable ownership validation");
+        }
+        catch(ArgumentException e) when(e.Message.Contains("disjoint variable ownership")){}
+        Check(immutableReduction.Rows.Variables==2&&immutableReduction.Stars.Length==1,"Immutable star retained unnecessary optimizer variables");
+        foreach(var immutableTrial in new[]{new[]{1d,2},new[]{8d,1},new[]{3d,9}})
+        {
+            var full=immutableReduction.Expand(immutableTrial);var fullGradient=new double[5];var smallGradient=new double[2];
+            Close(immutableRows.Evaluate(full,fullGradient,default),immutableReduction.Rows.Evaluate(immutableTrial,smallGradient,default),1e-10,"Frozen substitution changed equality/hinge/constant objective");
+            Close(smallGradient[0],fullGradient[3],1e-10,"Frozen substitution changed free height gradient");
+            Close(smallGradient[1],fullGradient[4],1e-10,"Frozen substitution changed free control gradient");
+            Check(full[0]==5&&full[1]==4&&full[2]==7,"Frozen substitution moved an immutable height/control");
+        }
+        var immutableFull=NetworkProfileSolve.SolveComponents(immutableRows,new[]{5d,4,7,2,6},20,immutableStars,default);
+        var immutableSmall=NetworkProfileSolve.SolveComponents(immutableReduction.Rows,immutableReduction.Prior,20,immutableReduction.Stars,default);
+        var immutableExpanded=immutableReduction.Expand(immutableSmall.Heights);
+        for(var i=0;i<5;i++)Close(immutableExpanded[i],immutableFull.Heights[i],2e-5,"Frozen/local solve changed the independently solved full-context result");
+        var cancellationRows=new SparseProfileRows(3);
+        cancellationRows.Append(new[]{0,1,2},new[]{1d,1,-1},3,3,1,ProfileRowKind.EqualityCost);
+        cancellationRows.Append(new[]{1},new[]{1d},1,1,1,ProfileRowKind.EqualityCost);cancellationRows.Freeze();
+        var cancellationStars=new[]{new ProfileStar(0,Array.Empty<int>(),Array.Empty<double>(),Array.Empty<int>(),1e16),
+            new ProfileStar(2,Array.Empty<int>(),Array.Empty<double>(),Array.Empty<int>(),1e16)};
+        var cancellationReduction=NetworkProfileParents.EliminateFixed(cancellationRows,new[]{1e16,2.5,1e16},cancellationStars,1e17,new ImportEarthLocation.Core.ImportLog(),default)!;
+        var cancellationCertified=NetworkProfileParents.CertifyFixedResult(cancellationReduction,cancellationRows,cancellationStars,1e17,
+            new ProfileSolveResult(new[]{2.5},immutableSmall.Report with{Outcome=ProfileSolveOutcome.Converged}),default);
+        Check(cancellationCertified.Report.Outcome==ProfileSolveOutcome.NumericFallback&&cancellationCertified.Report.FailureReason.Contains("original_coordinate_certificate"),
+            "Cancellation-heavy fixed substitution falsely claimed original-problem convergence");
+        var budgetRows=new SparseProfileRows(2);
+        budgetRows.Append(new[]{0},new[]{1d},1,3,1,ProfileRowKind.EqualityCost);
+        budgetRows.Append(new[]{1},new[]{1d},1,7,1,ProfileRowKind.EqualityCost);budgetRows.Freeze();var budgetReports=0;
+        var budgetResult=NetworkProfileSolve.SolveComponents(budgetRows,new double[2],20,Array.Empty<ProfileStar>(),default,
+            (_,_,_)=>budgetReports++,partitionComponents:false);
+        Check(budgetReports==1&&budgetResult.Report.Components==1&&budgetResult.Report.AcceptedIterations<=2000,
+            "Independent corrective islands multiplied the joint repair iteration budget");
+        Close(budgetResult.Heights[0],3,1e-6,"Joint corrective solve lost first independent optimum");
+        Close(budgetResult.Heights[1],7,1e-6,"Joint corrective solve lost second independent optimum");
+        ProfileStarCoordinateTests.Run();
         ProfileReplay.SelfTest();
         var chunked=new SparseProfileRows(8);var expectedObjective=0d;var expectedGradient=new double[8];
         var chunkPoint=Enumerable.Range(0,8).Select(i=>i*.7).ToArray();
@@ -103,6 +152,8 @@ static class ProfileMathTests
         var boundedTrial=NetworkProfileSolve.SolveComponent(regular,new[]{0d,0d},fixedCommon);
         Console.WriteLine($"Projected directional trial: outcome={boundedTrial.Report.Outcome}; iterations={boundedTrial.Report.AcceptedIterations}; backtracks={boundedTrial.Report.Backtracks}; y={boundedTrial.Heights[1]:R}.");
         Check(boundedTrial.Report.Backtracks>0,"Projected direction did not exercise majorization rejection");
+        Check(boundedTrial.Report.CurvatureSweeps<boundedTrial.Report.AcceptedIterations,
+            "Accepted curvature was not reused; the solver still rescans the unconstrained direction every iteration");
         Check(boundedTrial.Report.Outcome==ProfileSolveOutcome.Converged,"Fixed-height quadratic did not converge");
         Close(boundedTrial.Heights[0],0,0,"Fixed native boundary moved");
         Close(boundedTrial.Heights[1],2/(1001+1e-8),1e-7,"Independent fixed-height optimum");

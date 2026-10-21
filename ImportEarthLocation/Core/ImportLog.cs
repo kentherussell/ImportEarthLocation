@@ -28,6 +28,7 @@ public sealed class ImportLog
             {
                 stage=g.Key.Stage,category=g.Key.Category,scopes=g.Count(),checkedObservations=g.Sum(f=>(long)f.Checked),
                 failedObservations=g.Sum(f=>(long)f.Failed),unavailableObservations=g.Sum(f=>(long)f.Unavailable),
+                expectedObservations=g.Sum(f=>(long)f.Expected),intentionallyExcluded=g.Sum(f=>(long)f.IntentionallyExcluded),notApplicable=g.Sum(f=>(long)f.NotApplicable),
                 worst=g.Max(f=>f.Worst),affectedLengthMeters=g.Sum(f=>f.AffectedLengthMeters),
                 observationScopesMayOverlap=g.Key.Stage=="native-unit",subdivisionCountIsNotAffectedLength=true
             }).ToArray(),
@@ -174,6 +175,7 @@ public sealed class ImportLog
     public void DiagnosticRecordChunks(string name,IEnumerable<object> records)
         => Artifact(name,archive=>
         {
+            if(!archive.CaptureIntermediate(name))return;
             var result=archive.WriteRecordChunks(name,records,final:true);
             Diagnostic($"ARTIFACT CHUNKS manifest={result.Manifest}; attemptManifest={result.AttemptManifest}; preservedPrevious={result.PreservedPrevious}; chunks={result.Chunks.Length}; records={result.Records}; truncated={result.Truncated}; boundedRunByteBudget=true; localOnly=true");
         });
@@ -202,8 +204,8 @@ public sealed class ImportLog
     public void CaptureReplayBoundary(string name,IEnumerable<object> records)
         =>Artifact(name,archive=>archive.WriteRecordChunks("offline-"+name+".ndjson",records,final:true,compress:true));
 
-    public void ObserveNativeCapture(string stem,IEnumerable<(string Identity,bool Resolved)> sections)
-        =>Artifact("native-coverage-observation",archive=>archive.ObserveNativeSections(stem,sections));
+    public void ObserveNativeCapture(string stem,IEnumerable<(string Identity,bool Resolved)> sections,bool requireGeometryOutcomes=false)
+        =>Artifact("native-coverage-observation",archive=>archive.ObserveNativeSections(stem,sections,requireGeometryOutcomes));
 
     public void CaptureGeometry(string stage, IReadOnlyList<PreparedSegment> sections, ushort[] heights, float scale, double width)
     {

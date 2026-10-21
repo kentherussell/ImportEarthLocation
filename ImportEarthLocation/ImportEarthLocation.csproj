@@ -4,6 +4,7 @@
     <RootNamespace>ImportEarthLocation</RootNamespace>
     <AssemblyName>ImportEarthLocation</AssemblyName>
     <Nullable>enable</Nullable>
+    
     <LangVersion>11</LangVersion>
     <PublishConfigurationPath>Properties\PublishConfiguration.xml</PublishConfigurationPath>
     <CSII_USERDATAPATH Condition="'$(CSII_USERDATAPATH)' == ''">$([System.IO.Path]::GetFullPath('$(LOCALAPPDATA)\..\LocalLow\Colossal Order\Cities Skylines II'))</CSII_USERDATAPATH>

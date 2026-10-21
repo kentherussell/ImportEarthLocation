@@ -68,6 +68,20 @@ internal static class RepairTests
         var expectedBed=NetworkRoadbed.Prepare(flat,100,1000,new[]{lateProfile},new[]{protectedRing},Array.Empty<float3[]>(),new ImportLog(),default);
         Check(refreshedBed[0]==1234&&refreshedBed.Skip(1).SequenceEqual(expectedBed.Skip(1)),"Late roadbed refresh lost water edits or accumulated a second cut/fill budget");
         Check(flat.SequenceEqual(original)&&laterWater[0]==1234,"Late roadbed refresh mutated its input raster");
+        var unsupported=ground with{Start=ground.Start+new float3(0,30,0),End=ground.End+new float3(0,30,0)};
+        var higherUnsupported=unsupported with{Start=unsupported.Start+new float3(0,15,0),End=unsupported.End+new float3(0,15,0)};
+        var unsupportedLog=new ImportLog();
+        var boundedBank=NetworkRoadbed.Prepare(flat,100,1000,new[]{unsupported},Array.Empty<float3[]>(),Array.Empty<float3[]>(),unsupportedLog,default);
+        var higherBank=NetworkRoadbed.Prepare(flat,100,1000,new[]{higherUnsupported},Array.Empty<float3[]>(),Array.Empty<float3[]>(),new ImportLog(),default);
+        Check(boundedBank.SequenceEqual(higherBank),"Unsupported road height enlarged or flattened earthworks beyond the same cut/fill budget");
+        Check(unsupportedLog.Metric("Roadbed ground formations beyond support budget")==1,"Bounded terrain edit concealed an unsupported road profile");
+        var bankRow=Enumerable.Range(64,20).Select(z=>(int)boundedBank[z*128+64]-flat[z*128+64]).ToArray();
+        Check(bankRow.Zip(bankRow.Skip(1),(a,b)=>a>=b).All(v=>v)&&bankRow.Last()==0,"Bounded earthwork feather is not monotone or has no unchanged toe");
+        var deepCut=ground with{Start=ground.Start-new float3(0,30,0),End=ground.End-new float3(0,30,0)};
+        var deeperCut=deepCut with{Start=deepCut.Start-new float3(0,15,0),End=deepCut.End-new float3(0,15,0)};
+        Check(NetworkRoadbed.Prepare(flat,100,1000,new[]{deepCut},Array.Empty<float3[]>(),Array.Empty<float3[]>(),new ImportLog(),default)
+            .SequenceEqual(NetworkRoadbed.Prepare(flat,100,1000,new[]{deeperCut},Array.Empty<float3[]>(),Array.Empty<float3[]>(),new ImportLog(),default)),
+            "Unsupported underground height enlarged cut earthworks beyond the same budget");
         var triangularWater=new[]{new float3(-200,0,-200),new float3(200,0,-200),new float3(-200,0,200)};
         var dryRoad=S(501,501,502,80,140,160,140) with{Start=new(80,53,140),End=new(160,53,140)};
         var nearWaterBed=NetworkRoadbed.Prepare(flat,100,1000,new[]{dryRoad},new[]{triangularWater},Array.Empty<float3[]>(),new ImportLog(),default);

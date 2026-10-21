@@ -15,6 +15,30 @@ static class Program
     }
     static void Run(string[] args)
     {
+        if(args.Length==1&&args[0]=="--writer-trace-only"){NetworkWriterTrace.Test();PairedPublicationTraceTests.Run();return;}
+        if(args.Length==4&&args[0] is "--corrective-writer-trace" or "--corrective-writer-trace-horizontal")
+        {
+            var ways=args[3].Split(',').Select(value=>long.Parse(value,System.Globalization.CultureInfo.InvariantCulture));
+            CorrectiveCapturedReplay.Design(args[1],args[2],horizontalOnly:args[0].EndsWith("-horizontal",StringComparison.Ordinal),
+                writerTrace:new NetworkWriterTrace(ways));return;
+        }
+        if(args.Length==1&&args[0]=="--profile-census-only"){ProfileRowCensus.Test();ProfileCouplingCensus.Test();return;}
+        if(args.Length==3&&args[0]=="--profile-coupling-census")
+        {
+            ProfileCouplingCensus.Test();
+            ProfileReplay.Inspect(args[1],(rows,prior,stars,scale)=>File.WriteAllText(args[2],
+                Newtonsoft.Json.JsonConvert.SerializeObject(ProfileCouplingCensus.Analyze(rows,prior,stars),Newtonsoft.Json.Formatting.Indented)));
+            return;
+        }
+        if(args.Length==3&&args[0]=="--profile-evaluation-kernels"){ProfileReplay.BenchmarkEvaluation(args[1],args[2]);return;}
+        if(args.Length==3&&args[0]=="--corrective-census"){CorrectiveCapturedReplay.Design(args[1],args[2],profileInspection:true);return;}
+        if(args.Length==1&&args[0]=="--corrective-plan-only"){CorrectivePlanTests.Run();return;}
+        if(args.Length==3&&args[0]=="--corrective-capture"){CorrectiveCapturedReplay.Run(args[1],args[2]);return;}
+        if(args.Length==3&&args[0]=="--corrective-design"){CorrectiveCapturedReplay.Design(args[1],args[2]);return;}
+        if(args.Length==3&&args[0]=="--corrective-horizontal"){CorrectiveCapturedReplay.Design(args[1],args[2],true);return;}
+        if(args.Length==3&&args[0]=="--corrective-benchmark"){CorrectiveCapturedReplay.Benchmark(args[1],args[2]);return;}
+        if(args.Length==3&&args[0]=="--corrective-timing"){CorrectiveCapturedReplay.Design(args[1],args[2],benchmark:true);return;}
+        if(args.Length==3&&args[0]=="--corrective-feasibility"){CorrectiveCapturedReplay.Design(args[1],args[2],feasibilityOnly:true);return;}
         if(args.Length==1&&args[0]=="--visual-design-only"){VisualDesignTests.Run();return;}
         if(args.Length==4&&args[0]=="--compare-run-quality"){NetworkQualityComparison.Run(args[1],args[2],args[3]);return;}
         if(args.Length==1&&args[0]=="--paired-corridors-only"){PairedCorridorTests.Run();return;}
@@ -28,6 +52,10 @@ static class Program
         {CapturedDesignReplay.Run(args[1],args[2],args[0]=="--captured-design");return;}
         if(args.Length==1&&args[0]=="--critical-rework-only"){CriticalReworkTests.Run();return;}
         if(args.Length==1&&args[0]=="--offline-completion-only"){OfflineCompletionTests.Run();return;}
+        ProfileCouplingCensus.Test();
+        NetworkWriterTrace.Test();
+        PairedPublicationTraceTests.Run();
+        CorrectivePlanTests.Run();
         CriticalReworkTests.Run();
         VisualDesignTests.Run();
         OfflineCompletionTests.Run();
@@ -181,8 +209,9 @@ namespace ImportEarthLocation.Core
         public readonly List<NetworkQualityFinding> Findings=new();
         private readonly Dictionary<string,double> _metrics=new();
         public bool CaptureRecords { get; init; }
+        public bool ScalarDiagnostics { get; init; }
         public readonly Dictionary<string,object[]> Records=new();
-        public bool DiagnosticsEnabled=>CaptureRecords;
+        public bool DiagnosticsEnabled=>CaptureRecords||ScalarDiagnostics;
         public void Info(string s)=>Lines.Add(s);
         public void Warn(string s)=>Lines.Add(s);
         public void Diagnostic(string s)=>Lines.Add(s);
@@ -192,13 +221,13 @@ namespace ImportEarthLocation.Core
         public void AddDuration(string s,double seconds){_metrics.TryGetValue(s+" time (s)",out var old);_metrics[s+" time (s)"]=old+seconds;}
         public void DiagnosticRecords(string s,IEnumerable<object> records,long maximumBytes=8L*1024*1024,bool critical=false){}
         public void DiagnosticCompressedRecords(string s,IEnumerable<object> records){}
-        public void DiagnosticRecordChunks(string s,IEnumerable<object> records){if(CaptureRecords)Records[s]=records.ToArray();}
+        public void DiagnosticRecordChunks(string s,IEnumerable<object> records){if(CaptureRecords||ScalarDiagnostics&&s=="paired-construction")Records[s]=records.ToArray();}
         public void CaptureProfileInput(IReadOnlyList<PreparedSegment> s,ushort[] heights,float scale,double width,IReadOnlyDictionary<string,NativeAssetContract>? assets){}
         public void Time(string s,double seconds){_metrics[s+" time (s)"]=seconds;}
         public double Metric(string s)=>_metrics.TryGetValue(s,out var value)?value:0;
     }
 }
-namespace ImportEarthLocation.Processing { public static class TerrainBuilder { public const int Resolution=128; } }
+namespace ImportEarthLocation.Processing { public static class TerrainBuilder { public const int Resolution=128; public sealed record Result(ushort[] Heightmap,float HeightScaleMeters,float SeaLevelMeters,float MinimumElevation,float MaximumElevation); } }
 namespace ImportEarthLocation.Data
 {
     public static class PublicHttpClient { public static HttpClient Instance=new(); }

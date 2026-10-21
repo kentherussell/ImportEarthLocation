@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { bindValue, trigger, useValue } from "cs2/api";
-import { Button, Panel, Scrollable, Tooltip } from "cs2/ui";
+import { Button, Panel, Scrollable } from "cs2/ui";
 import styles from "./import-earth-location.module.scss";
 
 const group = "ImportEarthLocation";
@@ -37,6 +37,10 @@ export const LocationPicker = ({ initial, mapExt, onCommit, onClose }: { initial
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
   const [searching, setSearching] = useState(false);
+  const [waitingToSearch, setWaitingToSearch] = useState(false);
+  const [resultsOpen, setResultsOpen] = useState(false);
+  const searchTimer = useRef<number | null>(null);
+  const inFlight = useRef(false);
   const [searchRevision, setSearchRevision] = useState(0);
   const [tileRevision, setTileRevision] = useState(0);
   const committed = useRef(false);
@@ -68,10 +72,14 @@ export const LocationPicker = ({ initial, mapExt, onCommit, onClose }: { initial
     return () => window.clearTimeout(timer);
   }, [keys, center.latitude]);
   useEffect(() => () => trigger(group, "cancelLocationServices"), []);
-  useEffect(() => { if (rawPlaces.revision === searchRevision) setSearching(false); }, [rawPlaces.revision, searchRevision]);
+  useEffect(() => {
+    if (rawPlaces.revision === searchRevision && inFlight.current) {
+      inFlight.current = false; setSearching(false); setResultsOpen(true);
+    }
+  }, [rawPlaces.revision, searchRevision]);
   useEffect(() => { if (!mapExt) setSize("vanilla"); }, [mapExt]);
   const recenter = (value: { latitude: number; longitude: number }) => {
-    setCenter(value); setLatitude(value.latitude.toFixed(6)); setLongitude(value.longitude.toFixed(6)); setError("");
+    setCenter(value); setLatitude(String(value.latitude)); setLongitude(String(value.longitude)); setError("");
   };
   const manual = () => {
     const lat = parseCoordinate(latitude, 90), lon = parseCoordinate(longitude, 180);
@@ -86,21 +94,44 @@ export const LocationPicker = ({ initial, mapExt, onCommit, onClose }: { initial
   const se = project(center.latitude - halfLat, center.longitude + halfLon, zoom);
   const mapUnavailable = Math.abs(center.latitude) > 85.05112878 || tiles.error;
   const search = () => {
-    if (searching || query.trim().length < 2) return;
-    const revision = nextRevision(); setSearchRevision(revision); setSearching(true);
+    if (inFlight.current || !query.trim()) return;
+    if (searchTimer.current !== null) window.clearTimeout(searchTimer.current);
+    setWaitingToSearch(false); setResultsOpen(false);
+    const revision = nextRevision(); setSearchRevision(revision); setSearching(true); inFlight.current = true;
     trigger(group, "searchPlace", JSON.stringify({ revision, query }));
   };
-  return <Panel header="Select Earth location" className={styles.picker} onClose={onClose}>
-    <div className={styles.section}>
-      <div className={styles.search}><input aria-label="City or place" placeholder="City or place" value={query} onChange={e => {
-        setQuery(e.target.value); setSearchRevision(nextRevision()); setSearching(false);
+  useEffect(() => {
+    if (!waitingToSearch || !query.trim()) return;
+    searchTimer.current = window.setTimeout(search, 3500);
+    return () => { if (searchTimer.current !== null) window.clearTimeout(searchTimer.current); searchTimer.current = null; };
+  }, [query, waitingToSearch]);
+  return <Panel header="Select Location" className={styles.picker} theme={{ header: styles.panelHeader, titleBar: styles.panelTitleBar, title: styles.panelTitle, iconSpace: styles.panelIconSpace, closeButton: styles.panelCloseButton, content: styles.panelContent }} onClose={onClose}>
+    <div className={styles.section} onClickCapture={event => {
+      // Do not dismiss when the user drags/clicks the results scrollbar.
+      const target = event.target as Element;
+      // Results must stay mounted through the button's selection event.
+      if (!target.closest('[data-location-results]') && target.closest("input, button")) setResultsOpen(false);
+    }}>
+      <div className={styles.field} role="group" aria-label="Map Size">
+        <span>Map Size</span>
+        <div className={styles.sizeChoices}>{["vanilla", "mapext28", "mapext57"].map(id =>
+          <Button key={id} variant="flat" className={styles.configChoice} disabled={id !== "vanilla" && !mapExt} selected={id === size} aria-pressed={id === size} onSelect={() => setSize(id)}>{id === "mapext57" ? "57km" : id === "mapext28" ? "28km" : "14km"}</Button>)}</div>
+        {!mapExt && <span className={styles.helper}>28km and 57km require MapExt.</span>}
+      </div>
+      <div className={styles.searchArea}>
+      <div className={styles.search}><div className={styles.searchInput}><input aria-label="City or place" placeholder="City or place" value={query} onChange={e => {
+        setQuery(e.target.value); setSearchRevision(nextRevision()); setSearching(false); inFlight.current = false;
+        setWaitingToSearch(!!e.target.value.trim()); setResultsOpen(false);
       }} onKeyDown={e => {
         if (e.key !== "Enter" || e.nativeEvent.isComposing || e.repeat) return;
         e.preventDefault(); e.stopPropagation(); search();
-      }} /><Button variant="flat" className={`${styles.actionButton} ${styles.secondary}`} disabled={searching || query.trim().length < 2} onSelect={search}>Search</Button></div>
-      {places.message && <div className={styles.notice}>{places.message}</div>}
-      {places.results?.length > 0 && <Scrollable vertical className={styles.results}>{places.results.map((p: any, i: number) =>
-        <Button key={i} variant="flat" className={`${styles.actionButton} ${styles.secondary}`} onSelect={() => recenter(p)}>{p.label}</Button>)}</Scrollable>}
+      }} />{(searching || waitingToSearch) && <span className={styles.searchSpinner} role="status" aria-label="Searching" />}</div><Button variant="flat" className={`${styles.actionButton} ${styles.secondary}`} disabled={searching || !query.trim()} onSelect={search}>Search</Button></div>
+      {resultsOpen && <div data-location-results><Scrollable vertical trackVisibility="scrollable" className={styles.results}>
+        {places.message && places.message !== "Select a result" && places.message !== "Select a result." && <div className={styles.resultMessage}>{places.message}</div>}
+        {places.results?.map((p: any, i: number) =>
+        <Button key={i} variant="flat" className={styles.resultButton} onSelect={() => { recenter(p); setResultsOpen(false); }}>{p.label}</Button>)}
+      </Scrollable></div>}
+      </div>
       <div className={styles.map} onWheel={e => { e.preventDefault(); setZoom(z => Math.max(1, Math.min(16, z + (e.deltaY < 0 ? 1 : -1)))); }}
         onMouseDown={e => { if (e.button !== 0) return; e.preventDefault(); drag.current = { x: e.clientX, y: e.clientY, worldX: world.x, worldY: world.y, moved: false }; }}
         onMouseMove={e => {
@@ -117,17 +148,18 @@ export const LocationPicker = ({ initial, mapExt, onCommit, onClose }: { initial
         {!mapUnavailable && visible.map(t => tiles.tiles?.[t.key] && <img key={t.key} draggable={false} src={tiles.tiles[t.key]} style={{ left: `${t.left}rem`, top: `${t.top}rem` }} />)}
         <div className={styles.footprint} style={{ left: `${nw.x - world.x + 200}rem`, top: `${nw.y - world.y + 130}rem`, width: `${se.x - nw.x}rem`, height: `${se.y - nw.y}rem` }} />
         <div className={styles.reticle}>+</div>
+        <div className={styles.zoomControls} onMouseDown={e => e.stopPropagation()} onMouseUp={e => e.stopPropagation()}>
+          <Button variant="flat" className={styles.zoomButton} aria-label="Zoom in" disabled={zoom === 16} onSelect={() => setZoom(z => Math.min(16, z + 1))}>+</Button>
+          <Button variant="flat" className={styles.zoomButton} aria-label="Zoom out" disabled={zoom === 1} onSelect={() => setZoom(z => Math.max(1, z - 1))}>−</Button>
+        </div>
         {mapUnavailable && <div className={styles.mapError}>Map preview unavailable. Enter coordinates manually.</div>}
         <div className={styles.attribution}>© OpenStreetMap contributors</div>
       </div>
-      <div className={styles.actions}><Button variant="flat" className={`${styles.actionButton} ${styles.secondary}`} onSelect={() => setZoom(z => Math.min(16, z + 1))}>Zoom +</Button><Button variant="flat" className={`${styles.actionButton} ${styles.secondary}`} onSelect={() => setZoom(z => Math.max(1, z - 1))}>Zoom −</Button></div>
       <div className={styles.coordinates}>
         <label className={styles.field}>Latitude<input value={latitude} onChange={e => setLatitude(e.target.value)} onBlur={manual} /></label>
         <label className={styles.field}>Longitude<input value={longitude} onChange={e => setLongitude(e.target.value)} onBlur={manual} /></label>
       </div>
-      <Tooltip tooltip="Other map sizes are not available in the alpha version." direction="up"><div className={styles.actions}>{["vanilla", ...(mapExt ? ["mapext28", "mapext57"] : [])].map(id =>
-        <Button key={id} variant="flat" className={styles.configChoice} disabled selected={id === size} onSelect={() => setSize(id)}>{mapWidth(id) / 1000} km</Button>)}</div></Tooltip>
-      <div className={styles.notice}>Search: Photon / OpenStreetMap; fallback Open-Meteo / GeoNames. Terrain import currently supports latitudes ±85° and does not cross the date line.</div>
+      <div className={styles.disclaimer}>Search: Photon / OpenStreetMap; fallback Open-Meteo / GeoNames.</div>
       {error && <div className={styles.error}>{error}</div>}
       <div className={styles.actions}><Button variant="flat" className={`${styles.actionButton} ${styles.primary}`} disabled={committing} onSelect={() => {
         if(committed.current) return;

@@ -204,7 +204,10 @@ try {
         # under the repository, never the user's installed mod directory.
         $gameOutput=Join-Path $repo 'bin/verification-game/'
         if($gameBuild) {
-            $builds.Add((New-VerificationJob 'game-reference' $dotnet @('build',(Join-Path $repo 'ImportEarthLocation/ImportEarthLocation.csproj'),'-c',$Configuration,'-v:quiet','-p:LocalVerificationOnly=true','-p:NeedBuild=false',"-p:ManagedPath=$ManagedPath","-p:OutDir=$gameOutput")))
+            # Installed Mod.targets resets NeedBuild in BuildGetFullPaths. Its
+            # Update setting suppresses toolchain post-processing; this invokes
+            # only the build target, never a publisher target.
+            $builds.Add((New-VerificationJob 'game-reference' $dotnet @('build',(Join-Path $repo 'ImportEarthLocation/ImportEarthLocation.csproj'),'-c',$Configuration,'-v:quiet','-p:LocalVerificationOnly=true','-p:NeedBuild=false','-p:ModPublisherCommand=Update',"-p:ManagedPath=$ManagedPath","-p:OutDir=$gameOutput")))
         }
         Write-Host "Verification focus=$Focus; configuration=$Configuration; parallel limit=$MaxParallel"
         Write-Host 'Build barrier: every selected harness must build successfully before any test binary runs.'

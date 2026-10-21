@@ -844,6 +844,26 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
             validationPhase = "native-network-preflight";
             _log.Diagnostic($"PREFLIGHT BEGIN phase={validationPhase}; segments={result.Segments.Count}");
             var supported = NativeNetworkPlacement.Preflight(result.Segments, World.GetOrCreateSystemManaged<PrefabSystem>(), _log,out var needsRepair);
+            IReadOnlyList<NativeAssetContract>? refreshedAssets=null;
+            if(result.NetworkDesigned)
+            {
+                refreshedAssets=CaptureNativeAssets(supported);
+                // This is the same immutable ProcessedBundle, terrain/source/
+                // water/protection snapshot and checked epoch. Only native
+                // metadata can have changed here; never cache across bundles.
+                var sectionBindingsChanged=needsRepair;
+                if(!sectionBindingsChanged&&supported.Count==result.Segments.Count&&NativeAssetContract.Fingerprint(refreshedAssets)==NativeAssetContract.Fingerprint(result.NativeAssets))
+                {
+                    needsRepair=false;
+                    _log.Diagnostic("PREFLIGHT design-reuse effectiveContractsUnchanged=true; immutableBundleUnchanged=true; epochChecked=true; liveSubmissionSafetyChecksRetained=true");
+                    _log.Count("Unchanged native design refreshes avoided");
+                }
+                else
+                {
+                    needsRepair=true;
+                    _log.Diagnostic($"PREFLIGHT design-invalidation reason={(supported.Count!=result.Segments.Count?"SupportedSource":sectionBindingsChanged?"SectionAssetBinding":"EffectiveNativeContract")}; sameEpoch=true; refreshRemainsBounded=true");
+                }
+            }
             // Preflight observes the contract. Once frozen, an unchanged
             // contract must not replace the authoritative section collection.
             if(!result.NetworkDesigned||needsRepair)result=result with{Segments=supported};
@@ -859,7 +879,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
                 // is allowed only for a real contract change, from the original
                 // graph and pre-roadbed terrain, never a previously shifted deck.
                 if(result.NetworkDesigned)_log.Warn("Native asset contract changed during preparation; refreshing the design once from its immutable reference.");
-                result=result with{NativeAssets=CaptureNativeAssets(result.Segments)};
+                result=result with{NativeAssets=refreshedAssets??CaptureNativeAssets(result.Segments)};
                 _progress.Begin("Designing roads and railways using game asset dimensions");
                 _status.Update(_progress.Snapshot());
                 _processConsumed=false;

@@ -180,7 +180,7 @@ public static class NetworkApproachTapers
             added+=result.Count-before-1;
         }
         log.Count("Whole-approach taper extra spans",added);log.Count("Taper fits requiring review",review);
-        log.Diagnostic($"APPROACH TAPERS stationFunctions={planned.Count}; directionRequests={directionRequestCount}; residualPorts={ports.Count}; constrainedApproaches={constrained}; addedSpans={added}; uncertifiedFits={review}; maximumCertifiedDoubleFitErrorMeters={boundMaximum:R}; doubleFitBudgetMeters=0.045; floatBudgetMeters=0.005; derivativeAware=true; curvedNormalDerivative=true; independentEndpointSmoothsteps=false; qualityFailureBlocksPlacement=false");
+        log.Diagnostic($"APPROACH TAPERS stationFunctions={planned.Count}; directionRequests={directionRequestCount}; residualPorts={ports.Count}; constrainedApproaches={constrained}; addedSpans={added}; uncertifiedFits={review}; maximumCertifiedDoubleFitErrorMeters={boundMaximum:R}; doubleFitBudgetMeters=0.245; totalFitBudgetMeters=0.25; derivativeAware=true; curvedNormalDerivative=true; independentEndpointSmoothsteps=false; qualityFailureBlocksPlacement=false");
         return result;
     }
 

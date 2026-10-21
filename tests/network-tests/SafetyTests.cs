@@ -101,12 +101,20 @@ static class SafetyTests
             var outgoing=result.Single(s=>s.WayId==52&&s.StartNodeId==2);
             var ramp=result.Single(s=>s.WayId==53&&s.EndNodeId==2);
             var normal=new float3(0,0,-1);var rampSide=-side;
-            var oppositeLaneBefore=rampSide>0?-3.5f:3.5f;var oppositeLaneAfter=rampSide>0?-5.25f:5.25f;
+            // COR-003: a ramp's position is not evidence for dropping or
+            // adding the travel-left through lane. Retain that datum on both sides.
+            var oppositeLaneBefore=-3.5f;var oppositeLaneAfter=-5.25f;
             Check(math.distance(incoming.CourseEnd+normal*oppositeLaneBefore,outgoing.CourseStart+normal*oppositeLaneAfter)<.001f,"Width change did not keep the through lanes aligned");
             var outerAfter=rampSide>0?5.25f:-5.25f;
-            Check(math.distance(ramp.CourseEnd,outgoing.CourseStart+normal*outerAfter)<.001f,"Ramp lane centre still joins the highway centre instead of its closest lane");
+            if(rampSide>0)Check(math.distance(ramp.CourseEnd,outgoing.CourseStart+normal*outerAfter)<.001f,"Added-lane ramp does not receive the newly created right lane");
+            else
+            {
+                var direction=math.normalizesafe(ramp.CourseEnd-ramp.CourseControl2);
+                var degrees=Math.Acos(math.clamp(direction.x,-1,1))*180/Math.PI;
+                Check(Math.Abs(degrees-20)<1,"Left-side branch invented an added receiving lane instead of a 20-degree merge");
+            }
             Check(math.all(incoming.End==outgoing.Start)&&math.all(ramp.End==outgoing.Start),"Lane offset broke exact shared native anchors");
-            Check(math.distance(ramp.CourseEnd,ramp.End)>3,"Test did not exercise an actually offset curve endpoint");
+            Check(math.distance(ramp.CourseEnd,ramp.End)>(rampSide>0?3:1),"Test did not exercise an actually offset curve endpoint");
         }
     }
 }

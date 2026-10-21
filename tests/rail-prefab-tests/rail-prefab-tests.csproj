@@ -4,5 +4,6 @@
     <Compile Include="../../ImportEarthLocation/Integration/PrefabResolver.cs" Link="PrefabResolver.cs" />
     <Compile Include="../../ImportEarthLocation/Core/RailPrefabPolicy.cs" Link="RailPrefabPolicy.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NetworkSelection.cs" Link="NetworkSelection.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/NativeAssetContracts.cs" Link="NativeAssetContracts.cs" />
   </ItemGroup>
 </Project>

@@ -65,7 +65,12 @@ public static class SourceTopologyObligations
             aliases[alias.SourceNodeId]=alias with{CanonicalNodeId=Resolve(alias.CanonicalNodeId)};
         foreach(var pair in remap)aliases[pair.Key]=new(pair.Key,Resolve(pair.Value),required.Contains(pair.Key)||aliases.TryGetValue(pair.Key,out var old)&&old.Mandatory);
         var byNode=aliases.Values.GroupBy(a=>a.CanonicalNodeId).ToDictionary(g=>g.Key,g=>g.ToArray());
-        return after.Select(s=>s.Kind!=kind?s:s with{SourceNodeAliases=s.SourceNodeAliases.Select(alias=>alias with{CanonicalNodeId=Resolve(alias.CanonicalNodeId)})
+        return after.Select(s=>s.Kind!=kind?s:s with{SourceNodeAliases=s.SourceNodeAliases.Select(alias=>alias with{
+                // A new intentional contraction of this exact source ID
+                // supersedes its old alias everywhere, including surviving
+                // exterior sections. Otherwise stale targets make one source
+                // port appear to name two different canonical nodes.
+                CanonicalNodeId=Resolve(remap.ContainsKey(alias.SourceNodeId)?alias.SourceNodeId:alias.CanonicalNodeId)})
             .Concat(byNode.TryGetValue(s.StartNodeId,out var a)?a:Array.Empty<SourceNodeAlias>())
             .Concat(byNode.TryGetValue(s.EndNodeId,out var b)?b:Array.Empty<SourceNodeAlias>())
             .GroupBy(a=>a.SourceNodeId).Select(g=>g.Last()).OrderBy(a=>a.SourceNodeId).ToArray()}).ToArray();
@@ -86,7 +91,12 @@ public static class SourceTopologyObligations
         }
         SourceNodeKey? Resolve(SourceNodeKey key)
         {
-            if(aliases.TryGetValue(key,out var targets))return targets.Count==1?new SourceNodeKey(key.Kind,targets.First()):null;
+            if(aliases.TryGetValue(key,out var targets))
+            {
+                if(targets.Count!=1)return null;
+                var canonical=new SourceNodeKey(key.Kind,targets.First());
+                return nodes.Contains(canonical)?canonical:null;
+            }
             return nodes.Contains(key)?key:null;
         }
         var missingPorts=expected.Ports.Count(p=>!Resolve(p).HasValue);var failed=0;var records=new List<object>();
@@ -109,6 +119,10 @@ public static class SourceTopologyObligations
                 identityMapping="exact-source-aliases-only",nativeLaneAcceptanceVerified=false});
         }
         log.Count("Missing mandatory selected-source ports",missingPorts);log.Count("Unresolved selected-source reachability obligations",failed);
+        log.Count("Selected-source topology validations");
+        var expectedChecks=expected.Ports.Count+expected.Connections.Count;
+        log.Quality(new("planned","source-topology","selected-source-obligations",expectedChecks,missingPorts+failed,0,0,0,
+            "Exact source port identities and directional reachability; intentional aliases are checked obligations, not discarded failures"){Expected=expectedChecks});
         if(log.DiagnosticsEnabled)log.DiagnosticRecordChunks("source-topology-obligations.ndjson",records);
         log.Diagnostic($"SOURCE OBLIGATIONS ports={expected.Ports.Count}; missingPorts={missingPorts}; directionalConnections={expected.Connections.Count}; unresolvedConnections={failed}; provenanceRestrictedSearch=true; sourceProximityMatching=false; quality=RequiresReview; placementBlocked=false");
     }

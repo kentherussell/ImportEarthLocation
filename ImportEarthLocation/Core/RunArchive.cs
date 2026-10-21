@@ -26,6 +26,7 @@ public sealed class RunArchive
     private static bool IsCensus(string name)=>name.StartsWith("native-owned-final-",StringComparison.Ordinal)||
         name.StartsWith("native-final-source-",StringComparison.Ordinal)||name.StartsWith("native-owned-census-",StringComparison.Ordinal);
     private static bool IsReplay(string name)=>name.StartsWith("offline-",StringComparison.Ordinal)||name=="profile-problem.ndjson.gz"||name=="profile-result.ndjson.gz"||
+        name=="profile-native-variable-bindings.ndjson.gz"||name.StartsWith("profile-variable-map",StringComparison.Ordinal)||
         name.StartsWith("profile-horizontal-input",StringComparison.Ordinal)||name.StartsWith("profile-native-contracts",StringComparison.Ordinal)||
         name.StartsWith("final-prepared-network",StringComparison.Ordinal)||name.StartsWith("immutable-source-network",StringComparison.Ordinal)||name.StartsWith("final-native-asset-contracts",StringComparison.Ordinal);
     private long FinalRemaining(bool census,bool replay)=>_exhaustedFinalBudgets.Contains(BudgetKey(census,replay))?0:Math.Max(0,Math.Min(512L*1024*1024-_finalRecordBytes,
@@ -37,6 +38,7 @@ public sealed class RunArchive
     private readonly HashSet<string> _nativeExpected=new(StringComparer.Ordinal);
     private readonly Dictionary<string,string> _nativeObserved=new(StringComparer.Ordinal);
     private readonly Dictionary<string,string> _nativeCaptureStems=new(StringComparer.Ordinal);
+    private readonly HashSet<string> _nativeGeometryOutcomeStems=new(StringComparer.Ordinal);
     private readonly Dictionary<string,int> _sampledFamilies=new(StringComparer.Ordinal);
     private int _suppressedCaptures;
     private readonly Dictionary<string,string> _fileNames=new(StringComparer.Ordinal);
@@ -201,8 +203,9 @@ public sealed class RunArchive
     public void ExpectNativeSections(IEnumerable<string> identities)
     { _nativeExpected.Clear();foreach(var identity in identities)_nativeExpected.Add(identity); }
 
-    public void ObserveNativeSections(string stem,IEnumerable<(string Identity,bool Resolved)> sections)
+    public void ObserveNativeSections(string stem,IEnumerable<(string Identity,bool Resolved)> sections,bool requireGeometryOutcomes=false)
     {
+        if(requireGeometryOutcomes)_nativeGeometryOutcomeStems.Add(stem);
         foreach(var section in sections)
         {_nativeCaptureStems[section.Identity]=stem;_nativeObserved[section.Identity]=section.Resolved?"lineage-observed":"unresolved";}
     }
@@ -216,19 +219,25 @@ public sealed class RunArchive
         if(!_nativeObserved.TryGetValue(identity,out var state)||!_nativeCaptureStems.TryGetValue(identity,out var stem))return null;
         // Re-evaluate the latest attempt. A later failed recapture must not
         // leave the earlier successful observation falsely marked complete.
-        return CompleteRecords(stem+".ndjson")&&CompleteRecords(stem+"-port-movements.ndjson")?state:"artifact-incomplete";
+        return CompleteRecords(stem+".ndjson")&&CompleteRecords(stem+"-port-movements.ndjson")&&
+            (!_nativeGeometryOutcomeStems.Contains(stem)||CompleteRecords(stem+"-connector-endpoints.ndjson")&&CompleteRecords(stem+"-junction-quality.ndjson"))?state:"artifact-incomplete";
     }
 
     // Detailed preview graphs are examples, not final-state coverage. Reserve disk
     // and serialization work for the post-neighbour readback of every native unit.
     public bool CaptureIntermediate(string name)
     {
+        if(name=="native-live-batch-bindings.ndjson")
+        {
+            _sampledFamilies.TryGetValue(name,out var legacy);_sampledFamilies[name]=legacy+1;
+            if(legacy<3)return true;_suppressedCaptures++;return false;
+        }
         if(!name.StartsWith("native-batch-",StringComparison.Ordinal))return true;
         var suffixes=new[]{"-expected.ndjson","-submitted-placement-evidence.ndjson","-temp.ndjson",
             "-mutation-contracts.ndjson","-owners.ndjson","-graph.ndjson","-bindings.ndjson",
             "-live.ndjson","-settled-readback.ndjson","-settled-port-movements.ndjson",
             "-rejected-placement-evidence.ndjson","-matcher-rejection.ndjson","-rejection-endpoints.ndjson",
-            "-downstream-contracts.ndjson"};
+            "-downstream-contracts.ndjson","-submitted-courses.ndjson","-live-constraint-observations.ndjson"};
         foreach(var suffix in suffixes)if(name.EndsWith(suffix,StringComparison.Ordinal))
         {
             _sampledFamilies.TryGetValue(suffix,out var count);_sampledFamilies[suffix]=count+1;

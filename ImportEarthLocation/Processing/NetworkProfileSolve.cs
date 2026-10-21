@@ -21,19 +21,29 @@ public sealed class SparseProfileRows
     private int[]? _lastIndices;
     private double[]? _lastCoefficients;
     private ProfileRow _lastObserved;
+    private Dictionary<ulong,long>? _recentRows;
+    private long _recentStart;
+    private readonly bool _coalesceInterleaved;
+    private long _variableRows;
+    private List<int[]?>? _evaluationSlots;
+    private long _evaluationIndexBytes;
+    public long CoalescedRows { get; private set; }
     public long Count { get; private set; }
     public long Terms { get; private set; }
+    public double ConstantObjective { get; private set; }
     public int Variables { get; }
     public bool MeasurementOnly=>_observe!=null;
-    public long CapacityBytes => checked((long)_rows.Count*ChunkSize*40+(long)_indices.Count*ChunkSize*12);
-    public SparseProfileRows(int variables) { if(variables<0)throw new ArgumentOutOfRangeException(nameof(variables));Variables=variables; }
+    public long CapacityBytes => checked((long)_rows.Count*ChunkSize*40+(long)_indices.Count*ChunkSize*12+_evaluationIndexBytes);
+    internal bool IndexedVariableRows=>_evaluationSlots!=null;
+    public SparseProfileRows(int variables,bool coalesceInterleaved=false)
+    { if(variables<0)throw new ArgumentOutOfRangeException(nameof(variables));Variables=variables;_coalesceInterleaved=coalesceInterleaved; }
     // Fixed-geometry certification needs the identical canonical coefficients,
     // not a second city-sized packed matrix. This mode cannot be optimized.
     // Observe distinct rows synchronously; coalesced cost weights are irrelevant
     // to a fixed geometric inequality and are deliberately not an objective API.
     public static SparseProfileRows ForMeasurement(int variables,Action<int[],double[],int,double> observe)
         =>new(variables){_observe=observe??throw new ArgumentNullException(nameof(observe)),_lastIndices=new int[8],_lastCoefficients=new double[8]};
-    public void Append(int[] indices,double[] coefficients,int count,double target,double weight,ProfileRowKind kind,bool coalescePrevious=false)
+    public void Append(int[] indices,double[] coefficients,int count,double target,double weight,ProfileRowKind kind,bool coalescePrevious=true)
     {
         if(_sealed)throw new InvalidOperationException("Profile rows are frozen.");
         if(count<0||count>8||indices.Length<count||coefficients.Length<count||!Finite(target)||!Finite(weight)||weight<=0)
@@ -52,13 +62,39 @@ public sealed class SparseProfileRows
         // At most eight elements: stable index insertion sort, not a global new solver/order policy.
         for(var i=1;i<actual;i++)
         {var index=_indexScratch[i];var coefficient=_coefficientScratch[i];var j=i;while(j>0&&_indexScratch[j-1]>index){_indexScratch[j]=_indexScratch[j-1];_coefficientScratch[j]=_coefficientScratch[j-1];j--;}_indexScratch[j]=index;_coefficientScratch[j]=coefficient;}
+        if(actual==0)
+        {
+            var residual=kind==ProfileRowKind.UpperHingeCost?Math.Max(0,-target):-target;
+            ConstantObjective+=.5*weight*residual*residual;
+        }
         if(coalescePrevious&&Count>0)
         {
             var previous=Row(Count-1);var same=previous.Count==actual&&previous.Target==target&&previous.Kind==kind;
             for(var i=0;same&&i<actual;i++)same=Index(previous.Offset+i)==_indexScratch[i]&&Coefficient(previous.Offset+i)==_coefficientScratch[i];
             var combined=previous.Weight+weight;
             if(same&&Finite(combined))
-            {if(_observe!=null)_lastObserved=previous with{Weight=combined};else _rows[checked((int)((Count-1)/ChunkSize))][(int)((Count-1)%ChunkSize)]=previous with{Weight=combined};return;}
+            {if(_observe!=null)_lastObserved=previous with{Weight=combined};else _rows[checked((int)((Count-1)/ChunkSize))][(int)((Count-1)%ChunkSize)]=previous with{Weight=combined};CoalescedRows++;return;}
+        }
+        // A bounded fingerprint index catches interleaved duplicates without a
+        // second city-sized matrix. Hash matches are always checked exactly;
+        // different targets, kinds or coefficients remain independent demands.
+        ulong fingerprint=0;
+        if(coalescePrevious&&_coalesceInterleaved&&_observe==null&&actual>0)
+        {
+            _recentRows??=new Dictionary<ulong,long>();
+            if(Count-_recentStart>=ChunkSize){_recentRows.Clear();_recentStart=Count;}
+            fingerprint=14695981039346656037UL;
+            void Mix(ulong value){unchecked{fingerprint=(fingerprint^value)*1099511628211UL;}}
+            Mix((ulong)kind);Mix(unchecked((ulong)BitConverter.DoubleToInt64Bits(target==0?0:target)));
+            for(var i=0;i<actual;i++){Mix((ulong)_indexScratch[i]);Mix(unchecked((ulong)BitConverter.DoubleToInt64Bits(_coefficientScratch[i])));}
+            if(_recentRows.TryGetValue(fingerprint,out var index))
+            {
+                var previous=Row(index);var same=previous.Count==actual&&previous.Target==target&&previous.Kind==kind;
+                for(var i=0;same&&i<actual;i++)same=Index(previous.Offset+i)==_indexScratch[i]&&Coefficient(previous.Offset+i)==_coefficientScratch[i];
+                var combined=previous.Weight+weight;
+                if(same&&Finite(combined))
+                {_rows[checked((int)(index/ChunkSize))][(int)(index%ChunkSize)]=previous with{Weight=combined};CoalescedRows++;return;}
+            }
         }
         var offset=Terms;
         if(_observe!=null)
@@ -76,39 +112,68 @@ public sealed class SparseProfileRows
         var rowChunk=checked((int)(Count/ChunkSize));var rowSlot=(int)(Count%ChunkSize);
         if(rowChunk==_rows.Count)_rows.Add(new ProfileRow[ChunkSize]);
         _rows[rowChunk][rowSlot]=new ProfileRow(offset,(byte)actual,target,weight,kind);Count=checked(Count+1);
+        if(actual>0)_variableRows++;
+        if(coalescePrevious&&_coalesceInterleaved&&actual>0)_recentRows![fingerprint]=Count-1;
     }
-    public void Freeze() => _sealed=true;
+    public void Freeze()
+    {
+        if(_sealed)return;_sealed=true;_recentRows=null;
+        // Fixed substitution retains every original demand as evidence. When
+        // constants dominate, index only variable rows for repeated sweeps.
+        // Their storage and summation order are unchanged; full-objective
+        // evaluation still visits all rows in the original order.
+        if(_observe!=null||Count<ChunkSize||_variableRows>=Count/2)return;
+        _evaluationSlots=new List<int[]?>(_rows.Count);
+        for(var chunk=0;chunk<_rows.Count;chunk++)
+        {
+            var count=(int)Math.Min(ChunkSize,Count-(long)chunk*ChunkSize);var active=0;
+            for(var r=0;r<count;r++)if(_rows[chunk][r].Count>0)active++;
+            if(active==count){_evaluationSlots.Add(null);continue;}
+            var slots=new int[active];var at=0;
+            for(var r=0;r<count;r++)if(_rows[chunk][r].Count>0)slots[at++]=r;
+            _evaluationSlots.Add(slots);_evaluationIndexBytes+=(long)active*sizeof(int);
+        }
+    }
     public ProfileRow Row(long index)=>_observe!=null?(index==Count-1?_lastObserved:throw new InvalidOperationException("Measurement rows retain only their last coefficient row")):_rows[checked((int)(index/ChunkSize))][(int)(index%ChunkSize)];
     public int Index(long index)=>_observe!=null?_lastIndices![checked((int)(index-_lastObserved.Offset))]:_indices[checked((int)(index/ChunkSize))][(int)(index%ChunkSize)];
     public double Coefficient(long index)=>_observe!=null?_lastCoefficients![checked((int)(index-_lastObserved.Offset))]:_coefficients[checked((int)(index/ChunkSize))][(int)(index%ChunkSize)];
-    public double Evaluate(double[] x,double[]? gradient,CancellationToken token,bool objective=true)
+    public double Evaluate(double[] x,double[]? gradient,CancellationToken token,bool objective=true,bool includeConstantObjective=true)
     {
         if(_observe!=null||!_sealed||x.Length!=Variables||(gradient!=null&&gradient.Length!=Variables))throw new InvalidOperationException("Profile evaluation requires stored frozen rows and matching vectors.");
+        token.ThrowIfCancellationRequested();
         if(gradient!=null)Array.Clear(gradient,0,gradient.Length);
         var sum=0d;
         for(var chunk=0;chunk<_rows.Count;chunk++)
         {
+            token.ThrowIfCancellationRequested();
             var block=_rows[chunk];var count=(int)Math.Min(ChunkSize,Count-(long)chunk*ChunkSize);
-            for(var r=0;r<count;r++)
+            // Constant rows contribute neither derivatives nor a requested
+            // variable-only objective. Keep variable-row accumulation ordered.
+            var slots=objective&&includeConstantObjective?null:_evaluationSlots?[chunk];
+            var visits=slots?.Length??count;
+            for(var visit=0;visit<visits;visit++)
             {
-                if((r&1023)==0)token.ThrowIfCancellationRequested();
+                if((visit&1023)==0)token.ThrowIfCancellationRequested();var r=slots==null?visit:slots[visit];
                 var row=block[r];var residual=-row.Target;
+                if(row.Count==0&&(!objective||!includeConstantObjective))continue;
                 var termChunk=checked((int)(row.Offset/ChunkSize));var slot=(int)(row.Offset%ChunkSize);
                 // Almost every row fits inside one primitive term chunk. Avoid
                 // repeated Int64 division/list lookup for every coefficient on
                 // every FISTA sweep; retain the identical accumulation order.
                 if(row.Count>0&&slot+row.Count<=ChunkSize)
                 {
-                    var indices=_indices[termChunk];var coefficients=_coefficients[termChunk];
-                    for(var j=0;j<row.Count;j++)residual+=coefficients[slot+j]*x[indices[slot+j]];
-                    if(row.Kind==ProfileRowKind.UpperHingeCost)residual=Math.Max(0,residual);
+                    var indices=_indices[termChunk].AsSpan(slot,row.Count);var coefficients=_coefficients[termChunk].AsSpan(slot,row.Count);
+                    for(var j=0;j<indices.Length;j++)residual+=coefficients[j]*x[indices[j]];
+                    if(row.Kind==ProfileRowKind.UpperHingeCost)
+                    {if(residual<=0)continue;residual=Math.Max(0,residual);}
                     if(objective)sum+=.5*row.Weight*residual*residual;
-                    if(gradient!=null&&residual!=0)for(var j=0;j<row.Count;j++)gradient[indices[slot+j]]+=row.Weight*residual*coefficients[slot+j];
+                    if(gradient!=null&&residual!=0)for(var j=0;j<indices.Length;j++)gradient[indices[j]]+=row.Weight*residual*coefficients[j];
                 }
                 else
                 {
                     for(var j=0;j<row.Count;j++)residual+=Coefficient(row.Offset+j)*x[Index(row.Offset+j)];
-                    if(row.Kind==ProfileRowKind.UpperHingeCost)residual=Math.Max(0,residual);
+                    if(row.Kind==ProfileRowKind.UpperHingeCost)
+                    {if(residual<=0)continue;residual=Math.Max(0,residual);}
                     if(objective)sum+=.5*row.Weight*residual*residual;
                     if(gradient!=null&&residual!=0)for(var j=0;j<row.Count;j++)gradient[Index(row.Offset+j)]+=row.Weight*residual*Coefficient(row.Offset+j);
                 }
@@ -127,13 +192,32 @@ public sealed class SparseProfileRows
         }
         var diagonal=new double[Variables];var inverseRoot=new double[Variables];var sums=new double[Variables];
         for(long r=0;r<Count;r++)
-        {if((r&1023)==0){token.ThrowIfCancellationRequested();Pulse("conditioning-diagonal",r);}var row=Row(r);for(var j=0;j<row.Count;j++){var a=Coefficient(row.Offset+j);diagonal[Index(row.Offset+j)]+=row.Weight*a*a;}}
+        {
+            if((r&1023)==0){token.ThrowIfCancellationRequested();Pulse("conditioning-diagonal",r);}var row=Row(r);
+            var chunk=checked((int)(row.Offset/ChunkSize));var slot=(int)(row.Offset%ChunkSize);
+            if(_observe==null&&row.Count>0&&slot+row.Count<=ChunkSize)
+            {
+                var indices=_indices[chunk];var coefficients=_coefficients[chunk];
+                for(var j=0;j<row.Count;j++){var a=coefficients[slot+j];diagonal[indices[slot+j]]+=row.Weight*a*a;}
+            }
+            else for(var j=0;j<row.Count;j++){var a=Coefficient(row.Offset+j);diagonal[Index(row.Offset+j)]+=row.Weight*a*a;}
+        }
         for(var j=0;j<Variables;j++){diagonal[j]=Math.Max(1e-9,diagonal[j]);inverseRoot[j]=1/Math.Sqrt(diagonal[j]);}
         for(long r=0;r<Count;r++)
         {
             if((r&1023)==0){token.ThrowIfCancellationRequested();Pulse("conditioning-bound",r);}var row=Row(r);var norm=0d;
-            for(var j=0;j<row.Count;j++)norm+=Math.Abs(Coefficient(row.Offset+j))*inverseRoot[Index(row.Offset+j)];
-            for(var j=0;j<row.Count;j++)sums[Index(row.Offset+j)]+=row.Weight*Math.Abs(Coefficient(row.Offset+j))*inverseRoot[Index(row.Offset+j)]*norm;
+            var chunk=checked((int)(row.Offset/ChunkSize));var slot=(int)(row.Offset%ChunkSize);
+            if(_observe==null&&row.Count>0&&slot+row.Count<=ChunkSize)
+            {
+                var indices=_indices[chunk];var coefficients=_coefficients[chunk];
+                for(var j=0;j<row.Count;j++)norm+=Math.Abs(coefficients[slot+j])*inverseRoot[indices[slot+j]];
+                for(var j=0;j<row.Count;j++)sums[indices[slot+j]]+=row.Weight*Math.Abs(coefficients[slot+j])*inverseRoot[indices[slot+j]]*norm;
+            }
+            else
+            {
+                for(var j=0;j<row.Count;j++)norm+=Math.Abs(Coefficient(row.Offset+j))*inverseRoot[Index(row.Offset+j)];
+                for(var j=0;j<row.Count;j++)sums[Index(row.Offset+j)]+=row.Weight*Math.Abs(Coefficient(row.Offset+j))*inverseRoot[Index(row.Offset+j)]*norm;
+            }
         }
         var lipschitz=0d;for(var j=0;j<Variables;j++)lipschitz=Math.Max(lipschitz,sums[j]);
         return(diagonal,1.01*lipschitz);
@@ -143,6 +227,7 @@ public sealed class SparseProfileRows
     {
         if(_observe!=null||!_sealed||gradient.Length!=Variables||d.Length!=Variables||direction.Length!=Variables||
             ReferenceEquals(direction,gradient)||ReferenceEquals(direction,d))throw new ArgumentException("Directional curvature requires frozen rows and a distinct matching scratch vector.");
+        token.ThrowIfCancellationRequested();
         var denominator=0d;
         // The candidate vector is free during this sweep. Compute each scaled
         // gradient once per variable, not once per sparse row incidence.
@@ -151,10 +236,12 @@ public sealed class SparseProfileRows
         var numerator=0d;
         for(var chunk=0;chunk<_rows.Count;chunk++)
         {
+            token.ThrowIfCancellationRequested();
             var block=_rows[chunk];var count=(int)Math.Min(ChunkSize,Count-(long)chunk*ChunkSize);
-            for(var r=0;r<count;r++)
+            var slots=_evaluationSlots?[chunk];var visits=slots?.Length??count;
+            for(var visit=0;visit<visits;visit++)
             {
-                if((r&1023)==0)token.ThrowIfCancellationRequested();var row=block[r];var directional=0d;
+                if((visit&1023)==0)token.ThrowIfCancellationRequested();var r=slots==null?visit:slots[visit];var row=block[r];var directional=0d;
                 var termChunk=checked((int)(row.Offset/ChunkSize));var slot=(int)(row.Offset%ChunkSize);
                 if(row.Count>0&&slot+row.Count<=ChunkSize)
                 {
@@ -172,7 +259,13 @@ public sealed class SparseProfileRows
 
 public enum ProfileSolveOutcome { Converged, IterationCap, NumericFallback, HardSetUnavailable }
 public sealed record ProfileSolveReport(ProfileSolveOutcome Outcome,int AcceptedIterations,int Trials,int Restarts,int GradientSweeps,int ObjectiveSweeps,int CheckSweeps,int Projections,double Objective,double ProjectedStep,long VectorCapacityBytes,double OptimalityGap,int OptimalityChecks,int CurvatureSweeps,int Backtracks)
-{ public int Components { get; init; } = 1; public string FailureReason { get; init; } = ""; }
+{
+    public int Components { get; init; } = 1;
+    public string FailureReason { get; init; } = "";
+    public int OriginalVariables { get; init; }
+    public int OptimizerVariables { get; init; }
+    public string CoordinateSystem { get; init; } = "native-heights";
+}
 public sealed record ProfileSolveResult(double[] Heights,ProfileSolveReport Report);
 
 /// <summary>The single amendment-selected solver. Geometric acceptance is separate.</summary>
@@ -181,8 +274,20 @@ public static class NetworkProfileSolve
     // Row/star connectivity is the exact separability criterion. Roads joined by
     // a crossing or parallel-profile row stay in the same solve component.
     public static ProfileSolveResult SolveComponents(SparseProfileRows rows,double[] prior,double scale,ProfileStar[] stars,CancellationToken token=default,Action<int,int,ProfileSolveReport>? componentReport=null,
-        Action<int,int[],SparseProfileRows,double[],ProfileStar[],ProfileSolveResult>? failureEvidence=null,Action<int,int,int,int>? progress=null,Action<string>? diagnostic=null)
+        Action<int,int[],SparseProfileRows,double[],ProfileStar[],ProfileSolveResult>? failureEvidence=null,Action<int,int,int,int>? progress=null,Action<string>? diagnostic=null,bool partitionComponents=true,
+        Action<string,SparseProfileRows>? inspectRows=null)
     {
+        if(!partitionComponents)
+        {
+            // A corrective call owns one 2000-iteration budget. Fixed-value
+            // elimination must not turn it into a full budget per small island.
+            var joint=SolveComponent(rows,prior,new ProfileHardProjector(rows.Variables,scale,stars),token,
+                progress==null?null:i=>progress(1,1,i,prior.Length),diagnostic,inspectRows);
+            componentReport?.Invoke(0,prior.Length,joint.Report);
+            if(joint.Report.Outcome!=ProfileSolveOutcome.Converged&&failureEvidence!=null)
+            {var global=new int[prior.Length];for(var i=0;i<global.Length;i++)global[i]=i;failureEvidence(0,global,rows,prior,stars,joint);}
+            return joint;
+        }
         var assemblyClock=System.Diagnostics.Stopwatch.StartNew();var nextReport=5d;
         void AssemblyProgress(string stage,long completed)
         {
@@ -203,7 +308,7 @@ public static class NetworkProfileSolve
         if(groups.Count<=1)
         {
             var single=SolveComponent(rows,prior,new ProfileHardProjector(rows.Variables,scale,stars),token,
-                progress==null?null:iteration=>progress(1,1,iteration,prior.Length),diagnostic);componentReport?.Invoke(0,prior.Length,single.Report);
+                progress==null?null:iteration=>progress(1,1,iteration,prior.Length),diagnostic,inspectRows);componentReport?.Invoke(0,prior.Length,single.Report);
             if(single.Report.Outcome!=ProfileSolveOutcome.Converged&&failureEvidence!=null)
             {var global=new int[prior.Length];for(var i=0;i<global.Length;i++)global[i]=i;failureEvidence(0,global,rows,prior,stars,single);}
             return single;
@@ -226,7 +331,8 @@ public static class NetworkProfileSolve
         {
             token.ThrowIfCancellationRequested();var seed=new double[group.Value.Count];for(var j=0;j<seed.Length;j++)seed[j]=prior[group.Value[j]];
             var current=++ordinal;var problem=builders[group.Key];problem.Freeze();var result=SolveComponent(problem,seed,new ProfileHardProjector(seed.Length,scale,blocks[group.Key].ToArray()),token,
-                progress==null?null:iteration=>progress(current,groups.Count,iteration,seed.Length),diagnostic==null?null:message=>diagnostic($"component={current}/{groups.Count}; root={group.Key}; {message}"));
+                progress==null?null:iteration=>progress(current,groups.Count,iteration,seed.Length),diagnostic==null?null:message=>diagnostic($"component={current}/{groups.Count}; root={group.Key}; {message}"),
+                inspectRows==null?null:(scope,matrix)=>inspectRows($"component-{current}/{scope}",matrix));
             componentReport?.Invoke(group.Key,seed.Length,result.Report);
             if(result.Report.Outcome!=ProfileSolveOutcome.Converged&&failureEvidence!=null)
                 failureEvidence(group.Key,group.Value.ToArray(),problem,seed,blocks[group.Key].ToArray(),result);
@@ -236,20 +342,84 @@ public static class NetworkProfileSolve
                 (ProfileSolveOutcome)Math.Max((int)total.Outcome,(int)report.Outcome),Math.Max(total.AcceptedIterations,report.AcceptedIterations),total.Trials+report.Trials,total.Restarts+report.Restarts,
                 total.GradientSweeps+report.GradientSweeps,total.ObjectiveSweeps+report.ObjectiveSweeps,total.CheckSweeps+report.CheckSweeps,total.Projections+report.Projections,
                 total.Objective+report.Objective,Math.Max(total.ProjectedStep,report.ProjectedStep),Math.Max(total.VectorCapacityBytes,report.VectorCapacityBytes),
-                total.OptimalityGap+report.OptimalityGap,total.OptimalityChecks+report.OptimalityChecks,total.CurvatureSweeps+report.CurvatureSweeps,total.Backtracks+report.Backtracks);
+                total.OptimalityGap+report.OptimalityGap,total.OptimalityChecks+report.OptimalityChecks,total.CurvatureSweeps+report.CurvatureSweeps,total.Backtracks+report.Backtracks)
+                {OriginalVariables=total.OriginalVariables+report.OriginalVariables,OptimizerVariables=total.OptimizerVariables+report.OptimizerVariables,
+                    CoordinateSystem=total.CoordinateSystem==report.CoordinateSystem?report.CoordinateSystem:"mixed-exact"};
         }
         return new(output,total! with{Components=groups.Count,Objective=total.Objective+constantObjective});
     }
 
-    public static ProfileSolveResult SolveComponent(SparseProfileRows rows,double[] immutablePrior,ProfileHardProjector projector,CancellationToken token=default,Action<int>? progress=null,Action<string>? diagnostic=null)
+    public static ProfileSolveResult SolveComponent(SparseProfileRows rows,double[] immutablePrior,ProfileHardProjector projector,CancellationToken token=default,Action<int>? progress=null,Action<string>? diagnostic=null,
+        Action<string,SparseProfileRows>? inspectRows=null)
     {
+        if(immutablePrior.Length!=rows.Variables||projector.Variables!=rows.Variables)throw new ArgumentException("Profile component dimension mismatch.");
+        progress?.Invoke(0);
+        inspectRows?.Invoke("native-coordinates",rows);
+        var coordinates=ProfileStarCoordinates.Create(rows,immutablePrior,projector,token,diagnostic);
+        if(coordinates==null)
+        {inspectRows?.Invoke("optimizer-native",rows);return SolveCore(rows,immutablePrior,projector,token,progress,diagnostic);}
+        inspectRows?.Invoke("optimizer-star",coordinates.Rows);
+        diagnostic?.Invoke($"PROFILE COORDINATES originalVariables={rows.Variables}; optimizerVariables={coordinates.Rows.Variables}; exactStarElimination=true; originalHeightBoxesPreserved=true");
+        var retained=SolveCore(coordinates.Rows,coordinates.Prior,coordinates.Projection,token,progress,diagnostic);
+        var expanded=coordinates.Expand(retained.Heights);var gradient=new double[rows.Variables];var boxFailure=false;
+        var boxRoundoff=16*2.2204460492503131e-16*Math.Max(1,projector.HeightScale);
+        for(var i=0;i<expanded.Length;i++)
+        {
+            var bounded=Math.Max(0,Math.Min(projector.HeightScale,expanded[i]));
+            // h+beta*q has at most two bounded terms. Restore a boundary lost
+            // by a few double ulps, as the native-height projector already
+            // does. Anything larger is a numerical fallback, not convergence.
+            if(Math.Abs(bounded-expanded[i])>boxRoundoff)boxFailure=true;
+            expanded[i]=bounded;
+        }
+        // Independently certify the returned vector in the ORIGINAL problem.
+        // A transformed stopping test is never permission to conceal numerical
+        // loss in cancellation-heavy source equations or alter their tolerance.
+        var cost=rows.Evaluate(expanded,gradient,token,includeConstantObjective:false);var gap=double.PositiveInfinity;
+        if(AllFinite(gradient)&&projector.TryLinearMinimum(gradient,out var support))
+        {
+            var at=0d;var magnitude=Math.Abs(support);
+            for(var i=0;i<gradient.Length;i++){var term=gradient[i]*expanded[i];at+=term;magnitude+=Math.Abs(term);}
+            gap=Math.Max(0,at-support)+64*2.2204460492503131e-16*Math.Max(1,gradient.Length)*magnitude;
+        }
+        var conditioned=rows.Conditioning(token);var originalL=conditioned.L==0?1:conditioned.L;var check=new double[expanded.Length];var step=double.PositiveInfinity;
+        for(var i=0;i<check.Length;i++)check[i]=expanded[i]-gradient[i]/(originalL*conditioned.D[i]);
+        if(AllFinite(check)&&projector.Project(check,conditioned.D))
+        {step=0;for(var i=0;i<check.Length;i++)step=Math.Max(step,Math.Abs(check[i]-expanded[i]));}
+        var report=retained.Report;var agrees=SparseProfileRows.Finite(cost)&&step<=.0005&&gap<=1e-9*Math.Max(1,Math.Abs(cost));
+        if(boxFailure)report=report with{Outcome=ProfileSolveOutcome.NumericFallback,FailureReason="original_coordinate_height_box_verification_failed"};
+        if(report.Outcome==ProfileSolveOutcome.Converged&&!agrees)
+            report=report with{Outcome=ProfileSolveOutcome.NumericFallback,FailureReason="original_coordinate_returned_vector_certificate_failed"};
+        report=report with{Objective=cost+rows.ConstantObjective,ProjectedStep=step,OptimalityGap=Math.Max(gap,report.OptimalityGap),
+            OriginalVariables=rows.Variables,OptimizerVariables=coordinates.Rows.Variables,CoordinateSystem="node-star-relative-v1",
+            CheckSweeps=report.CheckSweeps+1,ObjectiveSweeps=report.ObjectiveSweeps+1,OptimalityChecks=report.OptimalityChecks+1,Projections=report.Projections+1,
+            VectorCapacityBytes=checked(report.VectorCapacityBytes+8L*(coordinates.Prior.Length+6L*rows.Variables))};
+        diagnostic?.Invoke($"PROFILE ORIGINAL CERTIFICATE outcome={report.Outcome}; variables={rows.Variables}; optimizerVariables={coordinates.Rows.Variables}; objective={report.Objective:R}; gap={report.OptimalityGap:R}; projectedStep={step:R}");
+        return new(expanded,report);
+    }
+
+    private static ProfileSolveResult SolveCore(SparseProfileRows rows,double[] immutablePrior,IProfileProjection projector,CancellationToken token,Action<int>? progress,Action<string>? diagnostic)
+    {
+        // Constant contradictions remain in the evidence and reported cost,
+        // but cannot scale the stopping tolerance or erase meaningful objective
+        // changes through floating-point addition to a large fixed residual.
+        double VariableCost(double[] values,double[]? derivative)=>rows.Evaluate(values,derivative,token,includeConstantObjective:false);
         var workClock=System.Diagnostics.Stopwatch.StartNew();var nextDiagnostic=5d;
         diagnostic?.Invoke($"PROFILE WORK stage=conditioning-start; variables={rows.Variables}; rows={rows.Count}; terms={rows.Terms}");
         var n=rows.Variables;if(immutablePrior.Length!=n||projector.Variables!=n)throw new ArgumentException("Profile component dimension mismatch.");
         progress?.Invoke(0);
         var x=(double[])immutablePrior.Clone();var y=new double[n];var candidate=new double[n];var gradient=new double[n];var best=new double[n];
-        var conditioned=rows.Conditioning(token,diagnostic);var d=conditioned.D;var l=conditioned.L;
-        diagnostic?.Invoke($"PROFILE WORK stage=conditioning-complete; elapsedSeconds={workClock.Elapsed.TotalSeconds:R}; lipschitz={l:R}");
+        var conditioned=rows.Conditioning(token,diagnostic);var d=conditioned.D;
+        // Exact star elimination can leave a constant objective. Any positive
+        // majorizer is valid for zero curvature; projection and the unchanged
+        // first-order certificate must still run before declaring convergence.
+        var l=conditioned.L==0?1:conditioned.L;
+        if(diagnostic!=null)
+        {
+            var minimumD=double.PositiveInfinity;var maximumD=0d;
+            for(var j=0;j<n;j++){minimumD=Math.Min(minimumD,d[j]);maximumD=Math.Max(maximumD,d[j]);}
+            diagnostic($"PROFILE WORK stage=conditioning-complete; elapsedSeconds={workClock.Elapsed.TotalSeconds:R}; lipschitz={l:R}; metric=all-row-diagonal; diagonalMin={minimumD:R}; diagonalMax={maximumD:R}; globalBoundIncludesAllRows=true");
+        }
         var accepted=0;var trials=0;var restarts=0;var gradients=0;var objectives=0;var checks=0;var projections=0;var projectedStep=double.PositiveInfinity;
         var fx=double.NaN;var bestF=double.NaN;
         var optimalityGap=double.PositiveInfinity;var optimalityChecks=0;
@@ -262,27 +432,40 @@ public static class NetworkProfileSolve
         }
         ProfileSolveResult Finish(ProfileSolveOutcome outcome,string reason="")
         {
-            diagnostic?.Invoke($"PROFILE WORK stage=component-complete; outcome={outcome}; iterations={accepted}; objective={bestF:R}; optimalityGap={optimalityGap:R}; elapsedSeconds={workClock.Elapsed.TotalSeconds:R}; gradientSweeps={gradients}; objectiveSweeps={objectives}; backtracks={backtracks}; reason={reason}");
-            return new(best,new ProfileSolveReport(outcome,accepted,trials,restarts,gradients,objectives,checks,projections,bestF,projectedStep,checked((long)n*8*8),optimalityGap,optimalityChecks,curvatureSweeps,backtracks){FailureReason=reason});
+            diagnostic?.Invoke($"PROFILE WORK stage=component-complete; outcome={outcome}; iterations={accepted}; objective={bestF+rows.ConstantObjective:R}; variableObjective={bestF:R}; constantObjective={rows.ConstantObjective:R}; optimalityGap={optimalityGap:R}; elapsedSeconds={workClock.Elapsed.TotalSeconds:R}; gradientSweeps={gradients}; objectiveSweeps={objectives}; backtracks={backtracks}; reason={reason}");
+            return new(best,new ProfileSolveReport(outcome,accepted,trials,restarts,gradients,objectives,checks,projections,bestF+rows.ConstantObjective,projectedStep,checked((long)n*8*8),optimalityGap,optimalityChecks,curvatureSweeps,backtracks)
+                {FailureReason=reason,OriginalVariables=n,OptimizerVariables=n});
         }
         // Even a numerical failure must return a finite bounded diagnostic profile.
         // This fallback is not convergence or proof of a satisfied hard set.
-        for(var j=0;j<n;j++)best[j]=SparseProfileRows.Finite(x[j])?Math.Max(0,Math.Min(projector.HeightScale,x[j])):0;
+        projector.Fallback(x,best);
         if(!AllFinite(x)||!AllFinite(d)||(n>0&&(!SparseProfileRows.Finite(l)||l<=0)))return Finish(ProfileSolveOutcome.NumericFallback);
         diagnostic?.Invoke("PROFILE WORK stage=initial-projection");
         if(!projector.Project(x,d))return Finish(ProfileSolveOutcome.HardSetUnavailable);
         diagnostic?.Invoke("PROFILE WORK stage=initial-objective");
-        projections++;Array.Copy(x,best,n);Array.Copy(x,y,n);fx=bestF=rows.Evaluate(x,null,token);objectives++;
+        projections++;Array.Copy(x,best,n);Array.Copy(x,y,n);fx=bestF=VariableCost(x,null);objectives++;
         if(!SparseProfileRows.Finite(fx))return Finish(ProfileSolveOutcome.NumericFallback);
         if(n==0)return Finish(ProfileSolveOutcome.Converged);
         var history=new double[4];history[0]=fx;var t=1d;var successes=0;
         bool Trial()
         {
             WorkPhase("gradient-objective");
-            var fy=rows.Evaluate(y,gradient,token);gradients++;
+            var fy=VariableCost(y,gradient);gradients++;
             if(!SparseProfileRows.Finite(fy)||!AllFinite(gradient))return false;
             WorkPhase("directional-curvature");
-            var local=rows.DirectionalLipschitz(gradient,d,l,candidate,token);curvatureSweeps++;
+            double local;
+            if(accepted==0)
+            {local=rows.DirectionalLipschitz(gradient,d,l,candidate,token);curvatureSweeps++;}
+            else
+            {
+                // Reuse the last accepted majorizer rather than measuring the
+                // unconstrained gradient's curvature on every iteration. That
+                // direction can be dominated by modes removed by the hard-star
+                // projection. Periodically probe a larger step; the SAME
+                // projected majorization test below must still accept it.
+                local=acceptedL*(accepted%8==0?.5:1);
+                if(!(local>0)||!SparseProfileRows.Finite(local))local=l;
+            }
             // At most sixteen local probes, then the proven global bound.
             // Projection and majorization validate each probe; Rayleigh alone
             // is never treated as a bound on every feasible direction.
@@ -294,7 +477,7 @@ public static class NetworkProfileSolve
                 var finite=AllFinite(candidate);
                 if(finite&&projector.Project(candidate,d)&&AllFinite(candidate))
                 {
-                    projections++;trialObjective=rows.Evaluate(candidate,null,token);objectives++;
+                    projections++;trialObjective=VariableCost(candidate,null);objectives++;
                     var linear=0d;var quadratic=0d;
                     for(var j=0;j<n;j++){var delta=candidate[j]-y[j];linear+=gradient[j]*delta;quadratic+=d[j]*delta*delta;}
                     var rhs=fy+linear+.5*acceptedL*quadratic;

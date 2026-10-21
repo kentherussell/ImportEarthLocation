@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Game.Net;
 using Game.Prefabs;
 using ImportEarthLocation.Core;
@@ -27,7 +28,12 @@ public sealed partial class ImportEarthLocationUISystem
         var matchData=GetComponentLookup<NetVertexMatchData>(true);
         var resolver=new PrefabResolver(World.GetOrCreateSystemManaged<PrefabSystem>(),_log);
         var seen=new HashSet<string>(StringComparer.Ordinal);var output=new List<NativeAssetContract>();
-        foreach(var segment in segments)
+        // Structural intent may select either composition before freeze. Read
+        // both palette variants now; an internally selected bridge is not a
+        // late asset change requiring another city-wide optimization pass.
+        var palette=segments.GroupBy(s=>NativeAssetKeys.Sized(s with{Bridge=false})).SelectMany(g=>new[]{
+            g.First() with{Bridge=false,Tunnel=false},g.First() with{Bridge=true,Tunnel=false}});
+        foreach(var segment in palette)
         {
             var key=PrefabResolver.SizedPaletteKey(segment);if(!seen.Add(key))continue;
             var prefab=resolver.Resolve(segment);
@@ -75,7 +81,14 @@ public sealed partial class ImportEarthLocationUISystem
                 catch(InvalidOperationException error)
                 {_log.Warn($"Native train curvature metadata unavailable for {key}: {error.Message} Rail curvature remains RequiresReview; available roads and rail are not discarded.");}
             }
-            output.Add(new NativeAssetContract(key,envelopes,segment.NativeLaneOffsets,trainLimit));
+            PreparedSegment metadata;
+            try {metadata=resolver.ResolveMetadata(segment);}
+            catch(InvalidOperationException error)
+            {
+                _log.Warn($"Native composition metadata unavailable for {key}: {error.Message}. This palette remains unavailable; other palettes continue.");
+                continue;
+            }
+            output.Add(new NativeAssetContract(key,envelopes,metadata.NativeLaneOffsets,trainLimit));
             if(_log.DiagnosticsEnabled)_log.Diagnostic($"NATIVE ASSET CONTRACT palette={key}; envelopes=48; unavailable={unavailable}; guessedOffsets=false");
         }
         return output.AsReadOnly();

@@ -31,6 +31,7 @@ public static class NativeNetworkReadback
         IReadOnlyList<Entity>? scope=null,string artifactStem="native-network-readback",bool reportWarnings=true,IReadOnlyList<OsmRelation>? relationScope=null,bool finalCapture=false,bool captureRawLanes=false)
     {
         finalCapture=finalCapture&&log.DiagnosticsEnabled;
+        if(sections.Count==0&&!finalCapture)return default;
         manager.CompleteAllTrackedJobs();
         using var query=manager.CreateEntityQuery(new EntityQueryDesc{All=new[]{ComponentType.ReadOnly<Edge>(),ComponentType.ReadOnly<Curve>(),ComponentType.ReadOnly<PrefabRef>()},None=new[]{ComponentType.ReadOnly<Temp>(),ComponentType.ReadOnly<Deleted>()}});
         using var entities=scope==null?query.ToEntityArray(Allocator.Temp):new NativeArray<Entity>(scope.ToArray(),Allocator.Temp);
@@ -48,6 +49,7 @@ public static class NativeNetworkReadback
             foreach(var cell in new[]{Cell(live.Start),Cell(live.End)}.Distinct()){if(!grid.TryGetValue(cell,out var list))grid[cell]=list=new();list.Add(live);}
         }
         var owners=new Dictionary<int,HashSet<long>>();var matched=0;var missing=0;var compositionMissing=0;var exposed=0;var laneMismatch=0;var lineageSections=0;var inspected=new HashSet<Entity>();
+        var structureChecked=0;var structureMismatches=0;var qualifiedEdges=new HashSet<Entity>();
         var readbackRecords=new List<object>();var ports=new Dictionary<SourceNodeKey,List<Port>>();
         var coverage=new List<(string Identity,bool Resolved)>();
         var missingCompositionEdges=new HashSet<Entity>();
@@ -82,7 +84,7 @@ public static class NativeNetworkReadback
                     chain.Add(e);
                 }
                 valid=valid&&chain.Count>0&&cursor==b;
-                if(valid)lineageSections++;
+                if(valid){lineageSections++;foreach(var live in chain)qualifiedEdges.Add(live.Entity);}
             }
             var cell=Cell(s.Start);var candidates=new HashSet<Live>();
             if(!bound&&scope==null)for(var dx=-1;dx<=1;dx++)for(var dz=-1;dz<=1;dz++)if(grid.TryGetValue((cell.Item1+dx,cell.Item2+dz),out var list))foreach(var e in list)
@@ -109,7 +111,8 @@ public static class NativeNetworkReadback
             matched++;Anchor(s.Kind,s.StartNodeId,a);Anchor(s.Kind,s.EndNodeId,b);
             if(finalCapture)coverage.Add((DiagnosticArtifacts.SectionIdentity(s),bound));
             if(finalCapture)readbackRecords.Add(new{outcome="section-lineage",s.WayId,s.StartNodeId,s.EndNodeId,s.NativeUnitId,kind=s.Kind.ToString(),
-                s.SourceWayIds,recordedLineage=bound,edges=chain.Select(e=>e.Entity.ToString()).ToArray(),
+                s.SourceWayIds,s.SourceNodeAliases,s.PairedProfileId,s.PairedProfileOnly,s.RailTerminalFormationId,
+                expectedStructure=NativeAssetContract.Mode(s).ToString(),recordedLineage=bound,edges=chain.Select(e=>e.Entity.ToString()).ToArray(),
                 plannedA=DiagnosticArtifacts.Point(s.CourseStart),plannedB=DiagnosticArtifacts.Point(s.CourseControl1),
                 plannedC=DiagnosticArtifacts.Point(s.CourseControl2),plannedD=DiagnosticArtifacts.Point(s.CourseEnd)});
             void AddPort(long node,Entity edge,Entity via,bool incoming)
@@ -129,6 +132,13 @@ public static class NativeNetworkReadback
             }
             else if(missingCompositionEdges.Add(live.Entity))compositionMissing++;
             if(s.Tunnel&&(flags.m_General&CompositionFlags.General.Tunnel)==0)exposed++;
+            if(bound&&!missingCompositionEdges.Contains(live.Entity))
+            {
+                structureChecked++;
+                var actualMode=(flags.m_General&CompositionFlags.General.Tunnel)!=0?NativeStructureMode.Tunnel:
+                    (flags.m_General&CompositionFlags.General.Elevated)!=0?NativeStructureMode.Elevated:NativeStructureMode.Ground;
+                if(actualMode!=NativeAssetContract.Mode(s))structureMismatches++;
+            }
             var cars=0;var tracks=0;var reverse=0;var speeds=new List<float>();
             if(manager.HasBuffer<SubLane>(live.Entity))foreach(var laneRef in manager.GetBuffer<SubLane>(live.Entity,true))
             {
@@ -170,6 +180,9 @@ public static class NativeNetworkReadback
         var edgeMovements=new HashSet<(NetworkKind Kind,Entity From,Entity To,Entity Via)>();var nodeLaneCount=0;var unlocatedLanes=0;
         var slotMovements=new HashSet<(Entity From,byte FromSlot,Entity To,byte ToSlot,Entity Via)>();
         var rawLaneRecords=new List<object>();
+        var edgeLaneEnds=new Dictionary<Game.Pathfind.PathNode,List<double3>>();
+        var connectorEnds=new List<(Entity Lane,Game.Pathfind.PathNode Path,double3 Point)>();
+        var qualifiedNodes=new HashSet<Entity>(qualifiedEdges.SelectMany(e=>new[]{byEntity[e].A,byEntity[e].B}));
         var trainCurvatureChecked=0;var trainCurvatureFailed=0;var trainContractUnavailable=0;var worstTrainCurvature=0d;
         using var lanesQuery=manager.CreateEntityQuery(new EntityQueryDesc{All=new[]{ComponentType.ReadOnly<Lane>()},Any=new[]{ComponentType.ReadOnly<CarLane>(),ComponentType.ReadOnly<TrackLane>()},None=new[]{ComponentType.ReadOnly<Deleted>(),ComponentType.ReadOnly<Temp>()}});
         // A settled batch inspects the lane buffers on its actual incident
@@ -216,6 +229,20 @@ public static class NativeNetworkReadback
                         trainCurvatureChecked++;worstTrainCurvature=Math.Max(worstTrainCurvature,track.m_Curviness);
                         if(!math.isfinite(track.m_Curviness)||track.m_Curviness>contract.m_MaxCurviness)trainCurvatureFailed++;
                     }
+                }
+            }
+            if(finalCapture&&manager.HasComponent<Owner>(entity)&&manager.HasComponent<Curve>(entity))
+            {
+                var owner=manager.GetComponentData<Owner>(entity).m_Owner;
+                var curve=manager.GetComponentData<Curve>(entity).m_Bezier;
+                foreach(var endpoint in new[]{(lane.m_StartNode,(double3)curve.a),(lane.m_EndNode,(double3)curve.d)})
+                {
+                    if(qualifiedEdges.Contains(owner))
+                    {
+                        if(!edgeLaneEnds.TryGetValue(endpoint.Item1,out var values))edgeLaneEnds[endpoint.Item1]=values=new();
+                        values.Add(endpoint.Item2);
+                    }
+                    else if(qualifiedNodes.Contains(owner))connectorEnds.Add((entity,endpoint.Item1,endpoint.Item2));
                 }
             }
             var a=lane.m_StartNode.GetOwnerIndex();var b=lane.m_EndNode.GetOwnerIndex();
@@ -321,21 +348,71 @@ public static class NativeNetworkReadback
         }
         if(finalCapture)log.DiagnosticCompressedRecords(artifactStem+"-port-movements.ndjson.gz",portRecords.Concat(rawLaneRecords));
         else if(log.DiagnosticsEnabled)log.DiagnosticRecords(artifactStem+"-port-movements.ndjson",portRecords,1024L*1024);
-        if(finalCapture)log.ObserveNativeCapture(artifactStem,coverage);
+        if(finalCapture)log.ObserveNativeCapture(artifactStem,coverage,requireGeometryOutcomes:true);
         log.Diagnostic($"NATIVE ACCEPTANCE matchedSections={matched}/{sections.Count}; unresolvedSections={missing}; uniqueEdgesInspected={inspected.Count}; unavailableCompositions={compositionMissing}; tunnelFlagMismatches={exposed}; laneCountApproximations={laneMismatch}; orderedRoadAndRailNodeLanes={nodeLaneCount}; unlocatedNodeLanes={unlocatedLanes}; relationsChecked={restrictionChecks}; relationsUnverifiable={unverifiable}; prohibitedMovementsObserved={restrictionConflicts}; requiredMovementsNotObserved={connectivityMissing}; directedPortPairs={requiredPorts}; unobservedPortPairs={missingPorts}; portPairsMayIncludeSourceRestrictedTurns=true; perLaneSlotAcceptance=false; readOnly=true; definitionCountNotAcceptance=true");
         if(reportWarnings&&missing+exposed+restrictionConflicts+connectivityMissing>0)log.Warn($"Native acceptance needs review: {missing} unresolved sections, {exposed} tunnel-composition mismatches, {restrictionConflicts} prohibited and {connectivityMissing} unobserved required movements. Import remains available for iteration; no unsafe duplicate edges or transient lane edits were created.");
         log.Diagnostic($"NATIVE SLOT ACCEPTANCE required={slotPlan.Movements.Count}; disconnected={disconnectedSlots}; unavailable={unavailableSlots}; nodesWithoutCompleteSourceSlotSemantics={slotPlan.UnavailableNodes}; railRepresentationMismatches={railRepresentationMismatches}; railRepresentationsChecked={railChecked}; unavailableRailRepresentations={railUnavailable}; physicalTwoTrackOppositeDirections=true; generalTurnPoliciesNotInvented=true; missingPublicationIsNotDisconnected=true; placementBlocked=false");
         if(finalCapture)
         {
             var stage=artifactStem.StartsWith("native-owned-final-",StringComparison.Ordinal)?"native-census":"native-unit";
-            void Quality(string category,int count,int failed,int unknown,double worst,string evidence)
-                =>log.Quality(new(stage,category,artifactStem,count,failed,unknown,worst,0,evidence));
-            Quality("source-lineage",sections.Count,0,sections.Count-lineageSections,0,"Exact path/owner source qualification; unavailable is not a disconnected observation");
+            var endpointsChecked=0;var endpointsFailed=0;var endpointsUnavailable=0;var worstEndpoint=0d;
+            IEnumerable<object> EndpointRecords()
+            {
+                foreach(var endpoint in connectorEnds)
+                {
+                    // Exact full PathNode identity includes owner, lane index
+                    // and curve position. A nearby endpoint is not lineage.
+                    List<double3>? matches=null;
+                    var available=math.all(math.isfinite(endpoint.Point))&&edgeLaneEnds.TryGetValue(endpoint.Path,out matches)&&
+                        matches.All(p=>math.all(math.isfinite(p)));
+                    var error=available?matches!.Max(p=>math.distance(p,endpoint.Point)):double.NaN;
+                    if(!available)endpointsUnavailable++;
+                    else {endpointsChecked++;worstEndpoint=Math.Max(worstEndpoint,error);if(!SparseProfileRows.Finite(error)||error>.1)endpointsFailed++;}
+                    yield return new{outcome="qualified-node-lane-endpoint",lane=endpoint.Lane.ToString(),
+                        edgeOwnerIndex=endpoint.Path.GetOwnerIndex(),laneIndex=endpoint.Path.GetLaneIndex(),curvePosition=endpoint.Path.GetCurvePos(),
+                        available,gapMeters=available?(double?)error:null,toleranceMeters=.1,exactPathIdentity=true};
+                }
+            }
+            // Enumerate once: counters describe the same stream that was saved.
+            log.DiagnosticCompressedRecords(artifactStem+"-connector-endpoints.ndjson.gz",EndpointRecords());
+            var missingConnectorPublication=qualifiedNodes.Count<qualifiedEdges.Count*2&&connectorEnds.Count==0?1:0;
+            log.Quality(new(stage,"native-connector-endpoints",artifactStem,endpointsChecked,endpointsFailed,
+                endpointsUnavailable+missingConnectorPublication,worstEndpoint,0,
+                "Actual edge/node lane endpoints with identical full native PathNode; 0.1m gap; missing publication unavailable")
+                {Expected=connectorEnds.Count+missingConnectorPublication});
+            NetworkJunctionQuality.Pose? ActualPose(PreparedSegment s,bool start)
+            {
+                if(!NativeNetworkDiagnostics.VerifiedPaths.ContainsKey((s.Kind,s.WayId,s.StartNodeId,s.EndNodeId))||
+                    !ports.TryGetValue(new(s.Kind,start?s.StartNodeId:s.EndNodeId),out var candidates))return null;
+                var port=candidates.FirstOrDefault(p=>ReferenceEquals(p.Section,s)&&p.Incoming!=start);
+                if(port==null||!byEntity.TryGetValue(port.Edge,out var live)||!manager.HasComponent<Composition>(live.Entity))return null;
+                var composition=manager.GetComponentData<Composition>(live.Entity).m_Edge;
+                if(!manager.HasBuffer<NetCompositionLane>(composition))return null;
+                var offsets=new List<float>();
+                foreach(var lane in manager.GetBuffer<NetCompositionLane>(composition,true))
+                    if(manager.HasComponent<CarLaneData>(lane.m_Lane)&&math.isfinite(lane.m_Position.x)&&!offsets.Any(x=>Math.Abs(x-lane.m_Position.x)<.2f))offsets.Add(lane.m_Position.x);
+                var from=live.A==port.Via;
+                if(!from&&live.B!=port.Via)return null;
+                var point=from?live.Curve.a:live.Curve.d;var outward=from?live.Curve.b-live.Curve.a:live.Curve.c-live.Curve.d;
+                var direction=math.normalizesafe((double2)outward.xz)*(start?1:-1);
+                // Composition lane coordinates follow native edge orientation.
+                if(from!=start)for(var i=0;i<offsets.Count;i++)offsets[i]=-offsets[i];
+                return new(point,direction,offsets);
+            }
+            NetworkJunctionQuality.Audit(sections,ActualPose,log,System.Threading.CancellationToken.None,stage,artifactStem);
+            void Quality(string category,int count,int failed,int unknown,double worst,string evidence,int? expected=null)
+                =>log.Quality(new(stage,category,artifactStem,count,failed,unknown,worst,0,evidence){Expected=expected??count+unknown});
+            log.Quality(new(stage,"source-lineage",artifactStem,lineageSections,0,sections.Count-lineageSections,0,0,
+                "Exact path/owner source qualification; unavailable is not a disconnected observation"){Expected=sections.Count});
+            log.Quality(new(stage,"structure-mode",artifactStem,structureChecked,structureMismatches,inspected.Count-structureChecked,structureMismatches,0,
+                "Qualified actual Ground/Elevated/Tunnel composition versus final intent; unqualified observations do not certify structure mode"){Expected=inspected.Count});
             Quality("composition",sections.Count,exposed,compositionMissing,exposed,"Actual native tunnel/composition readback; source counts are not acceptance");
-            Quality("lane-slot-connectivity",slotPlan.Movements.Count,disconnectedSlots,unavailableSlots+slotPlan.UnavailableNodes,0,"Actual ordered lane indices and node-owned SubLane publication; closure observation scopes can overlap");
+            log.Quality(new(stage,"lane-slot-connectivity",artifactStem,slotPlan.Movements.Count-unavailableSlots,disconnectedSlots,
+                unavailableSlots+slotPlan.UnavailableNodes,0,0,"Actual ordered lane indices and node-owned SubLane publication; closure observation scopes can overlap")
+                {Expected=slotPlan.Movements.Count+slotPlan.UnavailableNodes});
             Quality("source-turn-restrictions",restrictionChecks,restrictionConflicts+connectivityMissing,unverifiable,0,"Explicit supported relation semantics; conditional/via-way/excepted relations unavailable");
             Quality("rail-representation",railChecked,railRepresentationMismatches,railUnavailable,0,"Two train lanes in opposite directions on one retained axis");
-            Quality("actual-train-curvature",trainCurvatureChecked,trainCurvatureFailed,trainContractUnavailable,worstTrainCurvature,
+            Quality("actual-train-curvature",trainCurvatureChecked,trainCurvatureFailed,trainContractUnavailable+(sections.Any(s=>s.Kind==NetworkKind.Rail)&&trainCurvatureChecked==0?1:0),worstTrainCurvature,
                 "Actual TrackLane.m_Curviness versus its actual train TrackLaneData.m_MaxCurviness; includes edge and node-owned lanes");
             var joins=0;var headingFailures=0;var joinUnknown=0;var worstHeading=0d;var gradeJoinFailures=0;var worstGradeJump=0d;
             var junctions=sections.SelectMany(s=>new[]{(Section:s,Start:true),(Section:s,Start:false)})
@@ -367,10 +444,10 @@ public static class NativeNetworkReadback
                 if(angle>Math.PI/180*.1)headingFailures++;
                 if(gradeJump>1e-5)gradeJoinFailures++;
             }
-            Quality("continuation-heading",joins,headingFailures,joinUnknown,worstHeading,
-                "Source-qualified actual edge-end tangents; native 0.1-degree allowance only with representable planned rounding budget; missing lineage/reference unavailable");
-            Quality("continuation-grade",joins,gradeJoinFailures,joinUnknown,worstGradeJump,
-                "Source-qualified actual edge-end outward physical-grade sum; through continuations only");
+            Quality("continuation-heading",joins-joinUnknown,headingFailures,joinUnknown,worstHeading,
+                "Source-qualified actual edge-end tangents; native 0.1-degree allowance only with representable planned rounding budget; missing lineage/reference unavailable",joins);
+            Quality("continuation-grade",joins-joinUnknown,gradeJoinFailures,joinUnknown,worstGradeJump,
+                "Source-qualified actual edge-end outward physical-grade sum; through continuations only",joins);
             var gradeFailures=0;var worstGrade=0d;var affectedLength=0d;
             var finiteFailures=0;var regularityUnknown=0;var maximumCurvature=0d;
             foreach(var live in byEntity.Values)
@@ -385,10 +462,10 @@ public static class NativeNetworkReadback
                 if(observation.SampledMaximumGrade>ceiling){gradeFailures++;affectedLength+=observation.SampledLengthMeters;}
             }
             log.Quality(new(stage,"observed-grade",artifactStem,byEntity.Count,gradeFailures,byEntity.Count-gradeFailures,worstGrade,affectedLength,
-                "65-point observations; exceeding the broadest policy is proven failure; a sampled nonfailure does not certify source-specific limits"));
+                "65-point observations; exceeding the broadest policy is proven failure; a sampled nonfailure does not certify source-specific limits"){Expected=byEntity.Count});
             Quality("finite-native-geometry",byEntity.Count,finiteFailures,0,finiteFailures,"Exact final native curve controls");
-            Quality("regularity",byEntity.Count,0,regularityUnknown,0,"Continuous native horizontal derivative certificate; exhausted certificate unavailable");
-            Quality("observed-curvature",byEntity.Count,0,byEntity.Count,maximumCurvature,"Sampled centreline curvature only; actual train-lane curvature has its own asset-specific acceptance category");
+            Quality("regularity",byEntity.Count-regularityUnknown,0,regularityUnknown,0,"Continuous native horizontal derivative certificate; exhausted certificate unavailable",byEntity.Count);
+            Quality("observed-curvature",byEntity.Count,0,byEntity.Count,maximumCurvature,"Sampled centreline curvature only; actual train-lane curvature has its own asset-specific acceptance category",byEntity.Count);
         }
         return new(sections.Count,lineageSections,missing,compositionMissing,exposed,requiredPorts,missingPorts,restrictionConflicts,unverifiable,slotPlan.Movements.Count,disconnectedSlots,unavailableSlots,railRepresentationMismatches,railChecked,railUnavailable);
         void Anchor(NetworkKind kind,long id,Entity entity)

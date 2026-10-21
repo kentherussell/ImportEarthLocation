@@ -36,6 +36,26 @@ static class OfflineCompletionTests
         Check(infeasible.Conflicts==1&&infeasible.MaximumDeficitMeters>100&&
             NetworkGroundFeasibility.Check(new[]{steepGround with{Bridge=true}},steepTerrain,200,200,default).Checked==0,
             "Necessary ground/grade preflight missed an independently impossible span or treated a bridge as ground earthwork");
+        var groundChain=Enumerable.Range(0,6).Select(i=>Line(901,9100+i,9101+i,new(-30+10*i,50,0),new(-20+10*i,50,0))).ToArray();
+        Check(groundChain.All(s=>NetworkGroundFeasibility.Check(new[]{s},steepTerrain,200,200,default).Conflicts==0),
+            "Chain fixture must not already fail the single-span endpoint condition");
+        var chainConflict=NetworkGroundFeasibility.Check(groundChain,steepTerrain,200,200,default);
+        var reversedConflict=NetworkGroundFeasibility.Check(groundChain.Reverse().Select(NetworkNormalizer.Reverse).ToArray(),steepTerrain,200,200,default);
+        Check(chainConflict.Conflicts==2&&chainConflict.MaximumDeficitMeters>5&&chainConflict.MaximumDeficitMeters<5.2&&reversedConflict.Conflicts==chainConflict.Conflicts&&
+            Math.Abs(reversedConflict.MaximumDeficitMeters-chainConflict.MaximumDeficitMeters)<1e-5,
+            $"Bounded chain reachability missed accumulated incompatibility or depended on direction/enumeration: {chainConflict} / {reversedConflict}");
+        var flatScreenTerrain=Enumerable.Repeat((ushort)32768,17*17).ToArray();
+        var offsetChain=new[]{groundChain[0] with{StartCurveOffset=new(0,50,0),EndCurveOffset=new(0,50,0)},
+            groundChain[1] with{StartCurveOffset=new(0,-50,0),EndCurveOffset=new(0,-50,0)}};
+        Check(offsetChain.All(s=>NetworkGroundFeasibility.Check(new[]{s},flatScreenTerrain,200,200,default).Conflicts==0)&&
+            NetworkGroundFeasibility.Check(offsetChain,flatScreenTerrain,200,200,default).Conflicts>0,
+            "Ground intervals ignored distinct course offsets on a common node anchor");
+        var cycle=new[]{Line(901,9200,9201,new(0,50,0),new(10,50,0)),Line(901,9201,9202,new(10,50,0),new(10,50,10)),
+            Line(901,9202,9200,new(10,50,10),new(0,50,0))};
+        var cycleScreen=NetworkGroundFeasibility.Check(cycle,flatScreenTerrain,200,200,default);
+        var reversedCycle=NetworkGroundFeasibility.Check(cycle.Reverse().Select(NetworkNormalizer.Reverse).ToArray(),flatScreenTerrain,200,200,default);
+        Check(cycleScreen.Conflicts==0&&cycleScreen.Unavailable==3&&cycleScreen==reversedCycle,
+            "Cycle screening used an arbitrary seam or hid unresolved coverage");
         var monotoneProfile=NetworkCurveObservations.Measure(new(new(-120,0,0),new(-40,4,0),new(40,8,0),new(120,12,0)));
         var oscillatingProfile=NetworkCurveObservations.Measure(new(new(-120,0,0),new(-40,20,0),new(40,-20,0),new(120,0,0)));
         Check(monotoneProfile.SampledGradeSignChanges==0&&monotoneProfile.SampledSignedGradeVariation<1e-12&&
@@ -107,6 +127,21 @@ static class OfflineCompletionTests
             design:new(terrain,2000),frozenSections:new HashSet<int>{0,1});
         Check(Curve(solved[0])==Curve(frozenA)&&Curve(solved[1])==Curve(frozenB)&&solved[2].Start.y<99,
             "A pre-existing wholly frozen grade disagreement prevented unrelated reconstruction or moved frozen controls");
+        var roundedA=frozenA with{Start=new(-100,495,0),End=new(0,489.89538f,0),Control2=new(-36.99385f,491.47461f,0)};
+        var roundedB=frozenB with{Start=roundedA.End,End=new(100,485,0),Control1=new(36.99385f,488.3161f,0)};
+        var freeArm=roundedB with{WayId=41,EndNodeId=22};var roundedLog=new ImportLog();
+        var rounded=NetworkTunnelProfile.Solve(new[]{roundedA,roundedB,freeArm},1000,Array.Empty<(int,float,float)>(),roundedLog,default,
+            design:new(terrain,2000),frozenSections:new HashSet<int>{0,1});
+        Check(Curve(rounded[0])==Curve(roundedA)&&Curve(rounded[1])==Curve(roundedB)&&
+            roundedLog.Metric("Frozen float-resolution grade observations retained independently")>0,
+            "Float-rounded frozen grades refused local reconstruction or immutable controls moved");
+        try
+        {
+            NetworkTunnelProfile.Solve(new[]{roundedA,roundedB with{Control1=new(36.99385f,480,0)},freeArm},1000,
+                Array.Empty<(int,float,float)>(),new ImportLog(),default,design:new(terrain,2000),frozenSections:new HashSet<int>{0,1});
+            throw new Exception("A genuine frozen grade conflict was treated as float rounding");
+        }
+        catch(InvalidOperationException e) when(e.Message.Contains("conflicts with a shared grade group")){}
 
         var a=Line(5,30,31,new(-100,55,0),new(100,55,0)) with{PairedProfileId=1,PairedReferenceBegin=0,PairedReferenceEnd=200};
         var b=Line(6,32,33,new(100,55,40),new(-100,55,40)) with{PairedProfileId=1,PairedReversed=true,PairedReferenceBegin=200,PairedReferenceEnd=0,Bridge=true};

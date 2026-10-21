@@ -98,11 +98,16 @@ public sealed class NativeNetworkPlacement
                 var actual=resolver.ResolveMetadata(s);
                 // A frozen design may intentionally reserve the widest captured
                 // side composition. A narrower base prefab is not a change.
-                var changed=!math.isfinite(s.NativeWidth)||s.NativeWidth<=0||actual.NativeWidth>s.NativeWidth+.01f||
-                    s.NativeAssetKey!=actual.NativeAssetKey||!System.Linq.Enumerable.SequenceEqual(actual.NativeLaneOffsets,s.NativeLaneOffsets);
+                var widthChanged=!math.isfinite(s.NativeWidth)||s.NativeWidth<=0||actual.NativeWidth>s.NativeWidth+.01f;
+                var keyChanged=s.NativeAssetKey!=actual.NativeAssetKey;
+                var slotsChanged=!System.Linq.Enumerable.SequenceEqual(actual.NativeLaneOffsets,s.NativeLaneOffsets);
+                var changed=widthChanged||keyChanged||slotsChanged;
                 if(changed)
                 {
                     needsRepair=true;log.Count("Native footprint sections reconciled");
+                    if(widthChanged)log.Count("Preflight change: SelectedModeEnvelope");
+                    if(keyChanged)log.Count("Preflight change: AssetKey");
+                    if(slotsChanged)log.Count("Preflight change: ComposedLaneOffsets");
                     if(log.Metric("Native footprint sections reconciled")<=25)
                         log.Warn($"Native {s.Kind} way {s.WayId}: prepared width={s.NativeWidth:0.##} m; selected width={actual.NativeWidth:0.##} m; lanes={s.Lanes}. Retained for complete-network repair/re-audit before confirmation.");
                 }
@@ -114,7 +119,8 @@ public sealed class NativeNetworkPlacement
                 if(rejected<=25)log.Warn($"Native metadata unavailable for {s.Kind} way {s.WayId}: {error.Message}");
             }
         }
-        if(rejected>0)log.Warn($"Native metadata unavailable for {rejected}/{segments.Count} sections; supported sections retained for generation.");
+        if(rejected>0)
+        {needsRepair=true;log.Count("Preflight change: SupportedSource",rejected);log.Warn($"Native metadata unavailable for {rejected}/{segments.Count} sections; supported sections retained for generation.");}
         return supported;
     }
 

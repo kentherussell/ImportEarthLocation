@@ -151,6 +151,7 @@ public static class NetworkRoadbed
             for(var i=1;i<=steps;i++){token.ThrowIfCancellationRequested();var next=NetworkNormalizer.Evaluate(tunnel,i/(float)steps);Guard(previous,next,margin);previous=next;}
         }
         var targets=new Dictionary<int,(float target,float budget,float blend,float distance)>();var protectedSamples=0;var beyondBudget=0;var clock=System.Diagnostics.Stopwatch.StartNew();var nextProgress=5d;var processed=0;
+        var unsupportedSections=0;var maximumSupportDeficit=0f;
         // A shared ground profile owns one formation, including its
         // median. Do not let two nearest-road stamps independently select the
         // elevation across that same cross-section. Mixed structural modes and
@@ -207,6 +208,7 @@ public static class NetworkRoadbed
             token.ThrowIfCancellationRequested();processed++;
             var budget=NetworkVerticalProfiles.CutFillBudget(s);
             var half=s.NativeWidth>0?s.NativeWidth*.5f:Math.Min(12,Math.Max(4,s.Lanes*1.75f));
+            var unsupported=false;
             var steps=Math.Max(1,(int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(s)/(cell*.5f)));
             for(var i=0;i<=steps;i++)
             {
@@ -216,11 +218,15 @@ public static class NetworkRoadbed
                 var t=i/(float)steps;var p=NetworkNormalizer.Evaluate(s,t);var px=Pixel(p.x);var pz=Pixel(p.z);
                 var previous=NetworkNormalizer.Evaluate(s,Math.Max(0,(i-1)/(float)steps));
                 var span=p.xz-previous.xz;var spanLengthSquared=math.lengthsq(span);
-                var originalCenter=source[math.clamp(pz,0,n-1)*n+math.clamp(px,0,n-1)]/65535f*scale;
+                var originalCenter=NetworkProcessor.Sample(p.x,p.z,source,scale,width);
+                var deficit=Math.Abs(originalCenter-p.y)-budget;
+                if(deficit>Math.Max(.05f,2*scale/65535f)){unsupported=true;maximumSupportDeficit=Math.Max(maximumSupportDeficit,deficit);}
                 // A large embankment needs proportionally more lateral room.
                 // Smoothstep's peak derivative is 1.5: six metres of shoulder
                 // per metre of fill keeps the added bank slope near 1:4.
-                var earthBlend=Math.Min(240,Math.Max(cell*3f,Math.Abs(originalCenter-p.y)*6f));
+                // An unsupported profile must not enlarge its earthworks beyond
+                // the displacement the terrain policy actually permits.
+                var earthBlend=Math.Min(240,Math.Max(cell*3f,Math.Min(budget,Math.Abs(originalCenter-p.y))*6f));
                 var radius=half+earthBlend;var reach=(int)Math.Ceiling(radius/cell);
                 var tangent=math.normalizesafe((NetworkNormalizer.Evaluate(s,Math.Min(1,t+.01f))-NetworkNormalizer.Evaluate(s,Math.Max(0,t-.01f))).xz);
                 var leftNormal=new float2(-tangent.y,tangent.x);
@@ -244,9 +250,10 @@ public static class NetworkRoadbed
                         // At DEM resolution a pixel can be outside a narrow road on
                         // steep terrain. Do not force the entire pixel to the road grade.
                         if(distance<=cell*.5f)beyondBudget++;
-                        // Do not truncate the feather: the OUTER blended edit
-                        // can be small even when full road height is far away.
+                        // Retain a bounded, smoothly feathered edit, but report
+                        // that it cannot support the requested road height.
                     }
+                    var supportedTarget=math.clamp(nearest.y,Math.Max(0,original-budget),Math.Min(scale,original+budget));
                     var blendT=math.clamp((sideRadius-distance)/Math.Max(.01f,sideRadius-half),0,1);
                     var weight=distance<=half?1:blendT*blendT*(3-2*blendT);
                     if(weight<=0)continue;
@@ -260,15 +267,16 @@ public static class NetworkRoadbed
                         // Compose the outer edit, not just its raw centre height.
                         // Switching nearest corridors must not discard a stronger
                         // compatible feather and leave a seam between earthworks.
-                        if(old.blend>0&&distance>half&&old.distance>half&&Math.Abs(old.target-nearest.y)<cell)
+                        if(old.blend>0&&distance>half&&old.distance>half&&Math.Abs(old.target-supportedTarget)<cell)
                         {
                             var combined=old.blend+weight;
-                            targets[id]=((old.target*old.blend+nearest.y*weight)/combined,Math.Min(old.budget,budget),Math.Max(old.blend,weight),distance);
+                            targets[id]=((old.target*old.blend+supportedTarget*weight)/combined,Math.Min(old.budget,budget),Math.Max(old.blend,weight),distance);
                         }
-                        else targets[id]=(nearest.y,budget,weight,distance);
+                        else targets[id]=(supportedTarget,budget,weight,distance);
                     }
                 }
             }
+            if(unsupported)unsupportedSections++;
             if(clock.Elapsed.TotalSeconds>=nextProgress){log.Diagnostic($"PROCESS roadbed sections={processed}; affectedSamples={targets.Count}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.0}");nextProgress=clock.Elapsed.TotalSeconds+5;}
         }
         var result=(ushort[])source.Clone();var changed=0;var maximum=0f;
@@ -282,7 +290,9 @@ public static class NetworkRoadbed
         }
         log.Count("Roadbed terrain samples changed",changed);log.Count("Roadbed protected samples avoided",protectedSamples);
         log.Count("Roadbed samples beyond cut/fill budget",beyondBudget);
-        log.Diagnostic($"PROCESS roadbed complete; changedSamples={changed}; maximumCutFillMeters={maximum:0.###}; target=nearest-curve-station; shoulderMetersPerFillMeter=6; maximumShoulderMeters=240; zeroWeightAtToe=true; budgetAppliedToBlendedDisplacement=true; protectedWaterCliffsQuarries=true; structuresExcluded=true; elapsedSeconds={clock.Elapsed.TotalSeconds:0.0}");
+        log.Count("Roadbed ground formations beyond support budget",unsupportedSections);
+        log.Diagnostic($"ROADBED SUPPORT sampledUnsupportedFormations={unsupportedSections}; maximumCenterlineDeficitMeters={maximumSupportDeficit:0.###}; boundedEarthworkNotSupportAcceptance=true; continuousFinalSupportAuditStillRequired=true");
+        log.Diagnostic($"PROCESS roadbed complete; changedSamples={changed}; maximumCutFillMeters={maximum:0.###}; target=nearest-curve-station; shoulderMetersPerFillMeter=6; maximumShoulderMeters=240; zeroWeightAtToe=true; targetAndShoulderBoundedBeforeFeather=true; protectedWaterCliffsQuarries=true; structuresExcluded=true; elapsedSeconds={clock.Elapsed.TotalSeconds:0.0}");
         return result;
     }
 }
