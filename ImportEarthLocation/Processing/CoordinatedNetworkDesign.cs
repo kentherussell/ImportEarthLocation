@@ -76,11 +76,31 @@ public static class CoordinatedNetworkDesign
         ImportLog log,CancellationToken token,Func<float3,float?>? water=null,bool tunnelIntervalsResolved=false)
     {
         var edges=(tunnelIntervalsResolved?source:TunnelIntervals(source,log,token)).ToArray();
+        var waterBridges=0;
         if(water!=null)for(var i=0;i<edges.Length;i++)
         {
             var s=edges[i];if(s.Tunnel||s.Bridge||ExplicitStructure(s))continue;
-            for(var j=0;j<=8;j++)
-            {var p=NetworkNormalizer.Evaluate(s,j/8f);var stage=water(p);if(!stage.HasValue||!math.isfinite(stage.Value)||NetworkProcessor.Sample(p.x,p.z,raster,scale,width)>stage.Value+.5f)continue;edges[i]=s with{Bridge=true};break;}
+            var samples=s.Kind==NetworkKind.Road?Math.Max(8,(int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(s)/10)):8;
+            for(var j=0;j<=samples;j++)
+            {
+                var t=j/(float)samples;var p=NetworkNormalizer.Evaluate(s,t);
+                var direction=NetworkNormalizer.Evaluate(s,Math.Min(1,t+.001f))-NetworkNormalizer.Evaluate(s,Math.Max(0,t-.001f));
+                var normal=math.normalizesafe(new float3(-direction.z,0,direction.x))*Math.Max(4,s.NativeWidth*.5f);
+                var crossing=false;
+                for(var side=s.Kind==NetworkKind.Road?-1:0;side<=(s.Kind==NetworkKind.Road?1:0);side++)
+                {
+                    var q=p+normal*side;var stage=water(q);if(!stage.HasValue||!math.isfinite(stage.Value))continue;
+                    var ground=NetworkProcessor.Sample(q.x,q.z,raster,scale,width);
+                    if(s.Kind==NetworkKind.Road?stage.Value-ground<WaterLevels.RoadBridgeDepthMeters:ground>stage.Value+.5f)continue;
+                    crossing=true;break;
+                }
+                if(crossing){edges[i]=s with{Bridge=true};if(s.Kind==NetworkKind.Road)waterBridges++;break;}
+            }
+        }
+        if(water!=null)
+        {
+            log.Count("Road bridges inferred from planned water depth",waterBridges);
+            log.Diagnostic($"ROAD WATER POLICY bridgeDepthMeters={WaterLevels.RoadBridgeDepthMeters}; groundFreeboardMeters={WaterLevels.RoadFreeboardMeters}; inferredBridges={waterBridges}; roadEdgesSampled=true; explicitStructuresRetained=true; nativeWaterObserved=false");
         }
         return edges;
     }
@@ -292,6 +312,155 @@ public static class CoordinatedNetworkDesign
             finalPhysical.UncertifiedClearance,finalPhysical.HorizontalConflictPairs,0,"Conservative overlap outside classified formations; never repaired by vertical stacking"));
         log.Diagnostic($"COORDINATED DESIGN routes={routes.Count}; smoothedOptionalStations={smoothed}; inputSections={source.Count}; outputSections={result.Count}; initialGlobalProfileSolves=1; exceptionalLocalReconstructionLimit=1; endpointEscalation=false; lateHorizontalWriters=false; sourceReferenceImmutable=true; railSegmentTracks=2; qualityFailureAction=RequiresReview");
         return result;
+    }
+
+    // A ground road or railway over a short culvert (WaterBodyPlanner.ShortCulverts)
+    // or an untagged crossing of an open channel (WaterBodyPlanner.OpenChannels)
+    // becomes a bridge across it. Otherwise water revalidation, which never
+    // carves beside a ground road, leaves the river dammed by the embankment.
+    // The span reaches past the channel (widened for an oblique crossing) by
+    // the road's half width plus the two raster cells revalidation protects
+    // beside a ground road, at most 50 m each side; a span ending within
+    // 10 m of a section end takes the rest of the section.
+    public static IReadOnlyList<PreparedSegment> CulvertBridges(IReadOnlyList<PreparedSegment> source,IReadOnlyList<(float3[] Line,float HalfWidth)> culverts,
+        int resolution,double width,ImportLog log,CancellationToken token)
+    {
+        if(culverts.Count==0)return source;
+        var cell=width/(resolution-1);
+        // Channel pieces indexed by the 128 m grid cells their bounds touch, so
+        // thousands of open waterways cost a lookup per section, not a scan.
+        const double GridCell=128;
+        var pieces=new List<(int Culvert,double2 A,double2 B)>();var grid=new Dictionary<(int,int),List<int>>();
+        void Cells(double2 a,double2 b,Action<(int,int)> visit)
+        {
+            for(var x=(int)Math.Floor(Math.Min(a.x,b.x)/GridCell);x<=(int)Math.Floor(Math.Max(a.x,b.x)/GridCell);x++)
+            for(var z=(int)Math.Floor(Math.Min(a.y,b.y)/GridCell);z<=(int)Math.Floor(Math.Max(a.y,b.y)/GridCell);z++)visit((x,z));
+        }
+        for(var c=0;c<culverts.Count;c++)for(var m=1;m<culverts[c].Line.Length;m++)
+        {
+            var a=(double2)culverts[c].Line[m-1].xz;var b=(double2)culverts[c].Line[m].xz;var index=pieces.Count;pieces.Add((c,a,b));
+            Cells(a,b,key=>{if(!grid.TryGetValue(key,out var list))grid[key]=list=new List<int>();list.Add(index);});
+        }
+        var occupied=new HashSet<long>(source.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));var next=long.MinValue+40000000;
+        long Id(){while(occupied.Contains(next))next++;occupied.Add(next);return next++;}
+        var result=new List<PreparedSegment>();var bridged=0;var candidates=new HashSet<int>();
+        foreach(var s in source)
+        {
+            token.ThrowIfCancellationRequested();
+            if(s.Bridge||s.Tunnel){result.Add(s);continue;}
+            var (points,at)=Polyline(s);var n=points.Length-1;
+            candidates.Clear();for(var k=1;k<=n;k++)Cells(points[k-1],points[k],key=>{if(grid.TryGetValue(key,out var list))candidates.UnionWith(list);});
+            if(candidates.Count==0){result.Add(s);continue;}
+            var spans=new List<(double From,double To)>();
+            foreach(var piece in candidates.OrderBy(i=>i))
+            {
+                var (c,c0,c1)=pieces[piece];
+                for(var k=1;k<=n;k++)
+                {
+                    if(!Cross(points[k-1],points[k],c0,c1,out var u,out _))continue;
+                    var sine=Math.Abs(NetworkDesignChecks.Cross(math.normalizesafe(points[k]-points[k-1]),math.normalizesafe(c1-c0)));
+                    var reach=Math.Min(50,culverts[c].HalfWidth/Math.Max(.5,sine)+Math.Max(4,s.NativeWidth*.5)+2*cell);
+                    var station=math.lerp(at[k-1],at[k],u);spans.Add((station-reach,station+reach));
+                }            }
+            if(spans.Count==0){result.Add(s);continue;}
+            Bridged(s,at,spans,s.Layer,Id,result);bridged++;
+        }
+        log.Count("Sections bridged over short culverts",bridged);
+        return result;
+    }
+
+    // Two ground highway-class roads (motorway, trunk or their links) crossing at
+    // more than 10° without a shared node are grade separated; the map left
+    // the upper one's bridge untagged (the I-495 express ramps over the
+    // highway). At grade the game draws one through the other. The minor road
+    // (a link before a mainline, then fewer lanes, then the higher way id)
+    // becomes a bridge one layer above the other, over the other's half width
+    // plus ClimbRoom either side, so the profile solver can lift it clear.
+    public static IReadOnlyList<PreparedSegment> UnmappedCrossingBridges(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
+    {
+        const double ClimbRoom=30,Cell=64;
+        static bool Highway(PreparedSegment s)=>s.Kind==NetworkKind.Road&&!s.Bridge&&!s.Tunnel&&(s.ProtectedLink||s.Classification is "motorway" or "trunk" or "motorway_link" or "trunk_link");
+        var candidates=Enumerable.Range(0,source.Count).Where(i=>Highway(source[i])).ToArray();if(candidates.Length<2)return source;
+        var lines=new Dictionary<int,(double2[] Points,double[] At)>();foreach(var i in candidates)lines[i]=Polyline(source[i]);
+        var grid=new Dictionary<(int,int),List<(int Section,int K)>>();
+        foreach(var i in candidates)for(var k=1;k<lines[i].Points.Length;k++)
+        {var p=lines[i].Points[k];var key=((int)Math.Floor(p.x/Cell),(int)Math.Floor(p.y/Cell));if(!grid.TryGetValue(key,out var list))grid[key]=list=new();list.Add((i,k));}
+        var spans=new Dictionary<int,List<(double From,double To)>>();var layers=new Dictionary<int,int>();var crossings=0;
+        foreach(var cell in grid)foreach(var (i,k) in cell.Value)
+        {
+            token.ThrowIfCancellationRequested();
+            for(var dz=-1;dz<=1;dz++)for(var dx=-1;dx<=1;dx++)if(grid.TryGetValue((cell.Key.Item1+dx,cell.Key.Item2+dz),out var near))foreach(var (j,m) in near)
+            {
+                // Each sample belongs to one cell, so a pair of samples is met once,
+                // from the lower section; a set of visited pairs grew to hundreds of
+                // millions in DC and Houston and ran out of memory.
+                if(j<=i)continue;var a=source[i];var b=source[j];
+                if(a.Layer!=b.Layer||a.StartNodeId==b.StartNodeId||a.StartNodeId==b.EndNodeId||a.EndNodeId==b.StartNodeId||a.EndNodeId==b.EndNodeId)continue;
+                var (pa,sa)=lines[i];var (pb,sb)=lines[j];
+                if(!Cross(pa[k-1],pa[k],pb[m-1],pb[m],out var u,out var v))continue;
+                var da=math.normalizesafe(pa[k]-pa[k-1]);var db=math.normalizesafe(pb[m]-pb[m-1]);
+                if(Math.Abs(NetworkDesignChecks.Cross(da,db))<Math.Sin(math.radians(10)))continue;
+                // A crossing within 5 m of a section end is a junction mapped with separate nodes.
+                var station=math.lerp(sa[k-1],sa[k],u);var t=math.lerp(sb[m-1],sb[m],v);
+                if(station<5||station>sa[sa.Length-1]-5||t<5||t>sb[sb.Length-1]-5)continue;
+                var minorIsA=a.ProtectedLink!=b.ProtectedLink?a.ProtectedLink:a.Lanes!=b.Lanes?a.Lanes<b.Lanes:a.WayId>b.WayId;
+                var (minor,major,at)=minorIsA?(i,b,station):(j,a,t);
+                var reach=Math.Max(4,major.NativeWidth*.5)/Math.Max(.5,Math.Abs(NetworkDesignChecks.Cross(da,db)))+ClimbRoom;
+                if(!spans.TryGetValue(minor,out var list))spans[minor]=list=new();list.Add((at-reach,at+reach));
+                layers[minor]=Math.Max(layers.TryGetValue(minor,out var l)?l:source[minor].Layer,major.Layer+1);crossings++;
+            }
+        }
+        if(crossings==0)return source;
+        var occupied=new HashSet<long>(source.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));var next=long.MinValue+42000000;
+        long Id(){while(occupied.Contains(next))next++;occupied.Add(next);return next++;}
+        var result=new List<PreparedSegment>();
+        for(var i=0;i<source.Count;i++)
+            if(spans.TryGetValue(i,out var list))Bridged(source[i],lines[i].At,list,layers[i],Id,result);else result.Add(source[i]);
+        log.Count("Unmapped highway crossings bridged",crossings);
+        return result;
+    }
+
+    // Segments ab and cd intersect at a + u(b − a) = c + v(d − c).
+    private static bool Cross(double2 a,double2 b,double2 c,double2 d,out double u,out double v)
+    {
+        var r=b-a;var q=d-c;var den=r.x*q.y-r.y*q.x;u=v=0;if(Math.Abs(den)<1e-12)return false;
+        var w=c-a;u=(w.x*q.y-w.y*q.x)/den;v=(w.x*r.y-w.y*r.x)/den;return u>=0&&u<=1&&v>=0&&v<=1;
+    }
+
+    // A section's course sampled every 2 m, with arc-length stations.
+    private static (double2[] Points,double[] At) Polyline(PreparedSegment s)
+    {
+        var curve=new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd);
+        var n=Math.Max(2,(int)Math.Ceiling(NetworkDesignChecks.HorizontalArcLength(curve)/2));
+        var points=new double2[n+1];var at=new double[n+1];
+        for(var k=0;k<=n;k++){points[k]=NetworkDesignChecks.Evaluate(curve,k/(double)n).xz;if(k>0)at[k]=at[k-1]+math.distance(points[k-1],points[k]);}
+        return (points,at);
+    }
+
+    // Splits a section (stations from Polyline) so the spans become bridge
+    // pieces at the given layer; spans are merged when within 10 m, and a span
+    // ending within 10 m of a section end takes the rest of the section.
+    private static void Bridged(PreparedSegment s,double[] at,List<(double From,double To)> spans,int layer,Func<long> id,List<PreparedSegment> result)
+    {
+        var n=at.Length-1;var total=at[n];var merged=new List<(double From,double To)>();
+        foreach(var span in spans.OrderBy(x=>x.From))
+        {
+            var from=span.From<10?0:span.From;var to=span.To>total-10?total:span.To;
+            if(merged.Count>0&&from<=merged[merged.Count-1].To+10)merged[merged.Count-1]=(merged[merged.Count-1].From,Math.Max(merged[merged.Count-1].To,to));
+            else merged.Add((from,to));
+        }
+        double T(double station){var k=Array.BinarySearch(at,station);if(k>=0)return k/(double)n;k=~k;return (k-1+(station-at[k-1])/Math.Max(1e-9,at[k]-at[k-1]))/n;}
+        var stations=new[]{0d}.Concat(merged.SelectMany(x=>new[]{x.From,x.To}).Where(x=>x>0&&x<total)).Append(total).ToArray();
+        bool Over(int piece)=>merged.Any(x=>x.From<=stations[piece]+1e-6&&x.To>=stations[piece+1]-1e-6);
+        PreparedSegment Mark(PreparedSegment p,int piece)=>Over(piece)?p with{Bridge=true,Layer=layer}:p;
+        var rest=s;var consumed=0d;
+        for(var piece=0;piece<stations.Length-2;piece++)
+        {
+            var t=T(stations[piece+1]);
+            var (left,right)=NativeDesignUnits.Split(rest,(t-consumed)/(1-consumed),id());
+            result.Add(Mark(left with{FinalDeckCurve=null},piece));rest=right with{FinalDeckCurve=null};consumed=t;
+        }
+        result.Add(Mark(rest,stations.Length-2));
     }
 
     private static IReadOnlyList<PreparedSegment> PortalSpans(IReadOnlyList<PreparedSegment> source,CancellationToken token)

@@ -80,6 +80,21 @@ public static class SurfacePlanner
         var context = new Context(Math.Min(resolution, 1024), width, terrain, token);
         context.Moisture(polygons, geography, request, token);
         var desert = context.Desert(polygons, cover, resolution, WaterLevels.Effective(terrain.SeaLevelMeters), log, token, climate);
+        var regionalDry=desert?0:DryGrassClimate(climate);
+        bool[]? dryProtected=null;
+        if(regionalDry>0)
+        {
+            dryProtected=new bool[size];
+            foreach(var polygon in polygons)
+            {
+                var tags=polygon.Tags;var natural=Tag(tags,"natural");var use=Tag(tags,"landuse");var leisure=Tag(tags,"leisure");
+                if(natural=="wood"||use=="forest"||use=="farmland"||use=="orchard"||use=="vineyard"||use=="meadow"||
+                    use=="recreation_ground"||leisure=="park"||leisure=="garden"||leisure=="golf_course"||leisure=="pitch"||
+                    Tag(tags,"landcover")=="trees"||Tag(tags,"irrigated")=="yes")
+                    Rasterize(polygon,resolution,width,(a,b)=>{for(var i=a;i<b;i++)dryProtected[i]=true;},token);
+            }
+        }
+        var climateDrySamples=0;
         var edgeDistance = BoundaryDistance(cover, resolution, cell, token);
         var material = new byte[size]; var intensity = new byte[size]; var confidence = new byte[size];
         var sea = WaterLevels.Effective(terrain.SeaLevelMeters); var underwater = 0; var inferredSand = 0;
@@ -105,7 +120,9 @@ public static class SurfacePlanner
                     // Sand's footprint is resolved first. A single terrain-aware
                     // ecotone below handles explicit and inferred sand together,
                     // rather than giving trusted polygons a narrow hard outline.
-                    strength = evidence == Cover.Sand ? .96f : edge * (evidence == Cover.Rock ? .88f : .92f); certainty = priority[i];
+                    // Rock cover (bare rock, scree, rocky surfaces) mostly sits on
+                    // peaks and ridges; at .88 it read as harsh, so it paints at half.
+                    strength = evidence == Cover.Sand ? .96f : edge * (evidence == Cover.Rock ? .44f : .92f); certainty = priority[i];
                 }
                 else if (evidence != Cover.NonSand && !submerged)
                 {
@@ -115,6 +132,16 @@ public static class SurfacePlanner
                     var wetland = evidence == Cover.Wetland ? .88f * edge * (1 - .45f * p.Steep) : 0;
                     // An intermittent drain can moderate Dry, but cannot create Lush alone.
                     var vegetation = Math.Max(moisture, wetland) - exposure - dryness + .24f * p.WeakWet;
+                    // Only low-rainfall, seasonally dry climates get this regional
+                    // bias. Freshwater and mapped managed/wooded land retain the
+                    // existing policy; no global desert/sand rule is widened.
+                    if(regionalDry>0&&!dryProtected![i]&&!urbanContext[i]&&priority[i]<240&&
+                        (evidence==Cover.Unknown||evidence==Cover.Vegetation||evidence==Cover.Scrub||evidence==Cover.Heath))
+                    {
+                        var wetRelief=Smooth((p.Wet-.05f)/.45f);
+                        var bias=.85f*regionalDry*(1-wetRelief)*(1-.35f*p.Valley)*(1-.25f*p.WeakWet);
+                        vegetation-=bias;if(bias>.05f)climateDrySamples++;
+                    }
                     if (evidence == Cover.Dry)
                     { winner = GroundMaterial.DryGrass; strength = edge * (.72f - .25f * Math.Max(p.Wet, p.WeakWet)); certainty = priority[i]; }
                     else if (vegetation > .24f)
@@ -129,9 +156,10 @@ public static class SurfacePlanner
                         certainty = 105;
                     }
                     // Dryness or slope alone is not barren ground. Only unmapped,
-                    // steep AND rough AND locally exposed terrain admits weak Dirt inference.
+                    // steep AND rough AND locally exposed terrain admits weak Dirt
+                    // inference, at half its former strength (it looked too harsh).
                     if (evidence == Cover.Unknown && p.Steep > .35f && p.Rough > .2f && p.Ridge > .15f && p.Wet < .3f)
-                    { winner = GroundMaterial.Dirt; strength = Math.Min(.32f, (p.Steep - .35f) * .35f + (p.Rough - .2f) * .2f) * (.4f + .6f * p.Ridge); certainty = 110; }
+                    { winner = GroundMaterial.Dirt; strength = .5f * Math.Min(.32f, (p.Steep - .35f) * .35f + (p.Rough - .2f) * .2f) * (.4f + .6f * p.Ridge); certainty = 110; }
                     if (desert && evidence == Cover.Unknown && Math.Max(p.Wet, p.WeakWet) < .35f)
                     {
                         // Arid rocky hills are desert too, but they are not dunes.
@@ -176,12 +204,7 @@ public static class SurfacePlanner
         var sandTransition = NaturalSandTransition(material, intensity, finalDistance, resolution, cell, width, context, sea, token);
         var outward = ExpandCompatibleSand(material, intensity, confidence, cover, urbanContext, resolution, cell, width, context, sea, token);
         if (outward > 0) finalDistance = BoundaryDistance(material, resolution, cell, token);
-        for (var i = 0; i < size; i++)
-        {
-            if ((i & 65535) == 0) token.ThrowIfCancellationRequested();
-            if (beachCoverage[i] > 0 && material[i] == (byte)GroundMaterial.Sand)
-                intensity[i] = (byte)Math.Max(1, Math.Round(intensity[i] * beachCoverage[i] / 255d));
-        }
+        var beachPaint = PaintBeaches(polygons, material, intensity, confidence, cover, beachCoverage, urbanContext, resolution, cell, width, terrain, hn, sea, token);
         log.DiagnosticRecords("surface-evidence.ndjson", provenance);
         log.Count("Surface fractional beach samples", beachCoverage.Count(v => v > 0 && v < 255));
         log.Count("Surface outward ecotone samples", outward);
@@ -201,17 +224,90 @@ public static class SurfacePlanner
             counts[material[i]]++; totalStrength[material[i]] += intensity[i];
             transitions[i] = material[i] == (byte)GroundMaterial.Dirt ? SurfaceTransition.Medium : SurfaceTransition.Soft;
         }
+        log.Diagnostic($"SURFACE DRY GRASS policy=1; regionalStrength={regionalDry:R}; biasedSamples={climateDrySamples}; annualRainfallCeilingMm=500; minimumWarmDryMonths=3; mappedWoodlandAndManagedLandProtected=true; desertPolicyUnchanged=true");
         var report = "Ground surfaces: exclusive Default/Dry/Lush/Dirt/Sand; OSM + terrain-following moisture; " +
             string.Join(", ", Enumerable.Range(0, 5).Select(m => $"{Label((GroundMaterial)m)} {100d * counts[m] / size:0.#}%")) + ".";
         log.Info(report);
         log.Diagnostic($"SURFACE DESERT DECISIONS mappedCoverProtected={desertDecisions[0]}; submergedUnknown={desertDecisions[1]}; regionalGateClosedUnknown={desertDecisions[2]}; insufficientFlatness={desertDecisions[3]}; excessiveRoughness={desertDecisions[4]}; wetOrDrainageInfluenced={desertDecisions[5]}; eligibleUnknownSandSites={desertDecisions[6]}; beforeEcotone=true; exclusivePriorityCounts=true");
         log.Diagnostic($"SURFACE ECOTONE model=terrain-aware-correlated-density; sandTransitionSamples={sandTransition.Samples}; transitionWidthMeters={sandTransition.MinWidth:0.#}..{sandTransition.MaxWidth:0.#}; sizeLimitedSandRegions={sandTransition.NarrowRegions}; mappedNonSandExpanded=false; cropEdgeFade=false; exteriorFadeAppliedOnce=true; nativeExclusiveBrushes=true; appearanceVerified=false");
-        log.Diagnostic($"SURFACE BEACH sandyPolygons={beachPolygons}; footprintSamples={beachSamples}; samplingFactor=4; maximumFootprintExpansionMeters={cell:R}; genericCoastSandInvented=false");
+        log.Diagnostic($"SURFACE BEACH sandyPolygons={beachPolygons}; footprintSamples={beachSamples}; samplingFactor=4; distancePaintedSamples={beachPaint.Samples}; widenedBeaches={beachPaint.Widened}; minimumVisibleWidthMeters={BeachVisibleWidth}; seawardReachMeters={BeachSeaward}; inlandReachMeters={BeachInland}; genericCoastSandInvented=false");
         log.Diagnostic($"SURFACE DESERT PRECEDENCE enabled={desert}; slopeAndLandCoverPaintOverridden=true; mappedWaterWetlandActualPavingProtected=true; urbanUseAloneIsNotPaving=true; mappedVegetationMayHaveSandUnderlay=true");
         log.Diagnostic($"SURFACE PLAN resolution={resolution}; contextResolution={context.N}; mappedPolygons={mapped}; permanentWaterSeeds={context.PermanentSeeds}; intermittentWaterSeeds={context.WeakSeeds}; underwaterSamples={underwater}; desertSupported={desert}; inferredSandSamples={inferredSand}; paintOrderIndependent=true; climateInputs={climate!=null}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.###}; meanIntensity=" +
             string.Join(",", Enumerable.Range(1, 4).Select(m => $"{Label((GroundMaterial)m)}:{(counts[m] == 0 ? 0 : 100d * totalStrength[m] / counts[m] / 255):0.#}%")));
         var mask = new SurfaceMask(resolution, width, material, intensity, report) { Confidence = confidence, Transitions = transitions };
         SurfacePaint.Validate(mask); return mask;
+    }
+
+    // Mapped beaches are mostly narrower than a paint cell (Marseille: median
+    // 10 m against 28 m cells), and painting whole covered cells drew them as
+    // squares. Instead each cell takes sand by the exact distance from its
+    // centre to the beach outline, fading over one cell width, so the game's
+    // filtered paint follows the outline. Beyond the outline the sand fades
+    // out by intensity: under water over BeachSeaward (the sandy shelf; sand is
+    // the one material painted under water, and an unpainted shelf showed as a
+    // brown band at the waterline), and inland over BeachInland, but only
+    // over open ground (not mapped paving or water). A beach narrower than
+    // BeachVisibleWidth (estimated as 2·area/perimeter) keeps full sand over its
+    // shortfall before the fade begins. Ground up to BeachSwash above the sea
+    // counts as the shelf: the swash strip just outside a mapped beach was
+    // neither under water nor open ground and stayed a bare band. The first
+    // BeachSeawardFull metres of the shelf keep full sand, so the waterline is
+    // sand on both sides; BeachTerrain makes that shelf shallow enough to see.
+    // Inland, sand takes over other ground paint where its strength, varied by
+    // coherent noise at dune scale, exceeds the other paint's; where it does
+    // not, the other paint is thinned by the sand's strength. The beach then
+    // dissolves into the grass in patches instead of meeting it along a line.
+    private const float BeachVisibleWidth = 25, BeachSeaward = 160, BeachSeawardFull = 30, BeachInland = 90, BeachSwash = .75f;
+    private static (int Samples, int Widened) PaintBeaches(IReadOnlyList<GeographicPolygon> polygons, byte[] material, byte[] intensity, byte[] confidence,
+        byte[] cover, byte[] beachCoverage, bool[] urbanContext, int resolution, float cell, double width, TerrainBuilder.Result terrain, int hn, float sea, CancellationToken token)
+    {
+        var samples = 0; var widened = 0;
+        // Cells painted sand only because a beach touched them start over.
+        for (var i = 0; i < beachCoverage.Length; i++) if (beachCoverage[i] > 0 && material[i] == (byte)GroundMaterial.Sand) intensity[i] = 0;
+        foreach (var beach in polygons.Where(p => Tag(p.Tags, "natural") == "beach" && Classify(p.Tags).Cover == Cover.Sand && p.Outer.Count > 0).OrderBy(p => p.Id))
+        {
+            token.ThrowIfCancellationRequested();
+            double area = 0, perimeter = 0;
+            foreach (var ring in beach.Outer.Concat(beach.Inner))
+            {
+                var signed = 0d;
+                for (var k = 0; k < ring.Length; k++)
+                {
+                    var a = ring[k]; var b = ring[(k + 1) % ring.Length];
+                    signed += (double)a.x * b.z - (double)b.x * a.z; perimeter += math.distance(a.xz, b.xz);
+                }
+                area += beach.Outer.Contains(ring) ? Math.Abs(signed) / 2 : -Math.Abs(signed) / 2;
+            }
+            var shortfall = (float)Math.Max(0, BeachVisibleWidth - 2 * Math.Max(0, area) / Math.Max(1, perimeter));
+            if (shortfall > 0) widened++;
+            // Full sand over the shortfall (seaward first), then the fade.
+            var seawardFull = Math.Max(BeachSeawardFull, Math.Min(BeachSeaward, shortfall)); var inlandFull = Math.Max(0, shortfall - Math.Min(BeachSeaward, shortfall));
+            var points = beach.Outer.SelectMany(r => r).ToArray(); var reach = Math.Max(seawardFull + BeachSeaward, inlandFull + BeachInland) + cell;
+            int Index(float v) => (int)Math.Floor((v + width * .5) / cell);
+            var lo = new int2(Index(points.Min(p => p.x) - reach), Index(points.Min(p => p.z) - reach));
+            var hi = new int2(Index(points.Max(p => p.x) + reach), Index(points.Max(p => p.z) + reach));
+            for (var z = Math.Max(0, lo.y); z <= Math.Min(resolution - 1, hi.y); z++)
+                for (var x = Math.Max(0, lo.x); x <= Math.Min(resolution - 1, hi.x); x++)
+                {
+                    var i = z * resolution + x; var worldX = (float)((x + .5) * cell - width * .5); var worldZ = (float)((z + .5) * cell - width * .5);
+                    var point = new float3(worldX, 0, worldZ); var inside = beach.Contains(point);
+                    var signed = inside ? -beach.EdgeDistance(point.xz) : beach.EdgeDistance(point.xz);
+                    var wet = !inside && Height(terrain.Heightmap, hn, terrain.HeightScaleMeters, width, worldX, worldZ) < sea + BeachSwash;
+                    var open = !inside && !wet && cover[i] != (byte)Cover.NonSand && cover[i] != (byte)Cover.Wetland;
+                    var full = wet ? seawardFull : open ? inlandFull : 0; var fade = wet ? BeachSeaward : open ? BeachInland : 0;
+                    // Inside and over the full width: the outline's one-cell edge.
+                    // Beyond it: intensity falls smoothly to nothing over fade.
+                    var edge = Smooth((full + cell * .5f - signed) / cell);
+                    var faded = fade > 0 ? 1 - Smooth((signed - full) / fade) : 0;
+                    var value = (byte)Math.Round(240 * Math.Max(edge, faded));
+                    if (value == 0 || material[i] == (byte)GroundMaterial.Sand && intensity[i] >= value) continue;
+                    if (material[i] != (byte)GroundMaterial.Sand && !inside && !wet &&
+                        value * (.6f + .8f * ValueNoise(worldX / 45, worldZ / 45, 0x2c1b3c6du)) < intensity[i])
+                    { intensity[i] = (byte)Math.Round(intensity[i] * (1 - value / 255f)); continue; }
+                    material[i] = (byte)GroundMaterial.Sand; intensity[i] = value; confidence[i] = Math.Max(confidence[i], (byte)240); samples++;
+                }
+        }
+        return (samples, widened);
     }
 
     private static Evidence Classify(IReadOnlyDictionary<string, string> tags)
@@ -227,13 +323,15 @@ public static class SurfacePlanner
         if (natural == "wetland" || tags.ContainsKey("wetland")) return new(Cover.Wetland, 255);
         if (surface == "asphalt" || surface == "concrete" || surface == "paved" || surface == "paving_stones" || surface == "cobblestone") return new(Cover.NonSand, 255);
         if (surface == "sand") return new(Cover.Sand, 255);
+        // Every unpaved mapped beach reads as beach. The game has no pebble or
+        // gravel ground, and Mediterranean pebble beaches (about a third of
+        // Marseille's) otherwise painted as rocky dirt or not at all.
+        if (natural == "beach") return new(Cover.Sand, 240);
         if (surface == "rock" || surface == "stone" || surface == "gravel" || surface == "pebblestone" || surface == "shingle") return new(Cover.Rock, 255);
         if (surface == "earth" || surface == "ground" || surface == "dirt" || surface == "mud") return new(Cover.Earth, 250);
         if (surface == "dry_grass") return new(Cover.Dry, 245);
         if (surface == "grass") return new(Cover.Vegetation, 245);
         if (natural == "sand" || natural == "dune" || Tag(tags, "landcover") == "sand") return new(Cover.Sand, 245);
-        // Preserve the existing unspecified sandy-beach fallback, not a generic coastline buffer.
-        if (natural == "beach") return surface.Length == 0 ? new(Cover.Sand, 235) : default;
         if (natural == "bare_rock" || natural == "scree" || natural == "shingle" || natural == "rock") return new(Cover.Rock, 240);
         if (natural == "mud" || natural == "bare_earth" || landuse == "quarry") return new(Cover.Earth, 240);
         if (natural == "scrub" || Tag(tags, "landcover") == "scrub") return new(Cover.Scrub, 200);
@@ -241,6 +339,18 @@ public static class SurfacePlanner
         if (Tag(tags, "landcover") == "grass" || Tag(tags, "landcover") == "trees" || natural == "grassland" || natural == "wood" || landuse == "grass" || landuse == "meadow" || landuse == "forest" ||
             landuse == "farmland" || landuse == "orchard" || landuse == "vineyard" || surface == "grass") return new(Cover.Vegetation, 170);
         return default;
+    }
+
+    // Conservative visual-style gate, not a formal climate classification.
+    // Complete normals are required. Mediterranean summer drought alone is
+    // insufficient: annual rain must also be below 500 mm. Taper to zero there.
+    private static float DryGrassClimate(ClimateNormals? climate)
+    {
+        if(climate==null||climate.Temperatures.Length!=12||climate.Temperatures.Any(t=>!math.isfinite(t)))return 0;
+        var annual=ClimateMath.AnnualPrecipitation(climate.Precipitation);
+        if(!math.isfinite(annual)||annual>=500)return 0;
+        var warmDry=0;for(var i=0;i<12;i++)if(climate.Temperatures[i]>=10&&climate.Precipitation[i]<1)warmDry++;
+        return warmDry>=3?Smooth((500-annual)/150):0;
     }
 
     // Union outer rings minus holes using scanline intervals. Cost follows covered
@@ -495,7 +605,9 @@ public static class SurfacePlanner
                 z > 0 && material[i - n] != material[i] || z + 1 < n && material[i + n] != material[i])
             { distance[i] = 0; heap.Push(i, 0); }
         }
-        var added = 0; var visits = 0; var budget = (int)Math.Min(material.Length * .01, sandy * .12);
+        // The band reaches 120–240 m into unmapped ground: at 35–80 m Cairo's
+        // desert met the green valley along a line.
+        var added = 0; var visits = 0; var budget = (int)Math.Min(material.Length * .03, sandy * .35);
         while (heap.Count > 0)
         {
             if ((visits++ & 4095) == 0) token.ThrowIfCancellationRequested();
@@ -504,7 +616,7 @@ public static class SurfacePlanner
             if (entry.Cost > 0)
             {
                 var wx = (x + .5) * cell - width * .5; var wz = (z + .5) * cell - width * .5; var p = context.At(wx, wz);
-                var band = 35 + 45 * ValueNoise(wx / 180, wz / 180, 0x1e35a7u);
+                var band = 120 + 120 * ValueNoise(wx / 180, wz / 180, 0x1e35a7u);
                 if (entry.Cost > band || p.Height <= sea || p.Wet > .35f || p.WeakWet > .35f || added >= budget) continue;
                 material[entry.Index] = (byte)GroundMaterial.Sand;
                 intensity[entry.Index] = (byte)Math.Round(120 * Smooth(1 - entry.Cost / (float)band));
@@ -517,7 +629,7 @@ public static class SurfacePlanner
                 if (cover[next] != (byte)Cover.Unknown || urban[next] || confidence[next] >= 225 ||
                     material[next] == (byte)GroundMaterial.Sand || material[next] == (byte)GroundMaterial.Dirt) continue;
                 var cost = entry.Cost + cell * (dx == 0 || dz == 0 ? 1 : 1.414214f);
-                if (cost > 80 || cost >= distance[next]) continue;
+                if (cost > 240 || cost >= distance[next]) continue;
                 distance[next] = cost; heap.Push(next, cost);
             }
         }

@@ -8,6 +8,7 @@ static class EnvironmentChecks
     static void Check(bool b,string message){if(!b)throw new Exception(message);}
     public static void Run()
     {
+        ClimateLandscapeTests.Run();
         var dry=new ClimateNormals(Enumerable.Repeat(25f,12).ToArray(),new float[12],new float[12],new float[12],0,"existing-fixture");
         Check(ClimateMath.AnnualPrecipitation(Enumerable.Repeat(2f,12).ToArray())==730,"Mean daily precipitation was mistaken for monthly totals");
         Check(float.IsNaN(ClimateMath.AnnualPrecipitation(new[]{float.NaN})),"Missing rainfall should not infer aridity");

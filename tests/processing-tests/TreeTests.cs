@@ -19,7 +19,10 @@ static class TreeTests
         var road=new PreparedSegment(10,1,2,new float3(-300,0,0),new float3(300,0,0),NetworkKind.Road,"primary",2,false,false,false,0);
         var log=new ImportLog();
         var output=ForestProcessor.Prepare(data,request,terrain,new[]{road},log,default);
-        Check(output.Count>=19&&output.Count<=21,"Mapped tree row was not continuously populated at about 12m spacing");
+        var dryOnly=ForestProcessor.Prepare(data,request,terrain,new[]{road},new ImportLog(),default,excludeWater:p=>Math.Abs(p.x)<30);
+        Check(dryOnly.Count<output.Count&&dryOnly.All(p=>Math.Abs(p.x)>=30),"Forest candidates were retained inside a supplied continuous water mask");
+        Check(output.Count>=39&&output.Count<=41,"Mapped tree row was not continuously populated at about 6m spacing");
+        for(var i=0;i<output.Count;i++)for(var j=i+1;j<output.Count;j++)Check(math.distance(output[i].xz,output[j].xz)>=ForestProcessor.MappedSpacing-.001f,"Mapped tree spacing violated");
         Check(math.distance(output[0].xz,new float2(0,200))<.001,"Mapped individual tree did not get priority/preserve its position");
         Check(output.Count(p=>math.distance(p.xz,new float2(0,200))<.001)==1,"Duplicate individual/row tree planted twice");
         Check(output.All(p=>Math.Abs(p.x)<=300&&Math.Abs(p.z)>17),"Mapped trees ignored map bounds or network clearance");
@@ -45,7 +48,17 @@ static class TreeTests
         Check(math.length(dense[dense.Count-1].xz)>5000,"Uncapped woodland did not reach the outer map area");
         Check(dense.Zip(dense.Skip(1),(a,b)=>math.lengthsq(a.xz)<=math.lengthsq(b.xz)).All(x=>x),"Lazy woodland blocks hide nearer candidates");
         var diagnostic=largeLog.Diagnostics.Single(s=>s.StartsWith("FOREST DISTRIBUTION"));
-        Check(diagnostic.Contains("woodlandCellMeters=18;")&&diagnostic.Contains("globalDensityReduction=false")&&diagnostic.Contains("woodlandFullyEnumerated=True")&&diagnostic.Contains("unexaminedDiscoveredCandidates=0;")&&diagnostic.Contains("limit=none;"),"Fixed-density/full uncapped enumeration diagnostics missing");
+        Check(diagnostic.Contains("woodlandCellMeters=15;")&&diagnostic.Contains("globalDensityReduction=false")&&diagnostic.Contains("woodlandFullyEnumerated=True")&&diagnostic.Contains("unexaminedDiscoveredCandidates=0;")&&diagnostic.Contains("limit=none;"),"Fixed-density/full uncapped enumeration diagnostics missing");
+        // Natural thinning: interior gaps and density variation remove roughly a
+        // tenth to a third, and the woodland edge is sparser than its interior.
+        int Field(string text,string key){var i=text.IndexOf(key+"=",StringComparison.Ordinal)+key.Length+1;return int.Parse(new string(text.Skip(i).TakeWhile(char.IsDigit).ToArray()));}
+        var thinnedShare=Field(diagnostic,"woodlandThinned")/(double)Field(diagnostic,"woodlandCandidates");
+        Check(thinnedShare is >.08 and <.35,$"Woodland thinning removed {thinnedShare:P0}, outside the intended natural range");
+        var square=new Dictionary<long,OsmNode>{{1,Node(1,-1000,-1000)},{2,Node(2,1000,-1000)},{3,Node(3,1000,1000)},{4,Node(4,-1000,1000)}};
+        var block=ForestProcessor.Prepare(new OsmDataset{Nodes=square,Ways=new Dictionary<long,OsmWay>{{1,wood}}},woodlandRequest,terrain,Array.Empty<PreparedSegment>(),new ImportLog(),default);
+        double Inset(float3 p)=>1000-Math.Max(Math.Abs(p.x),Math.Abs(p.z));
+        var rimDensity=block.Count(p=>Inset(p)<30)/(4*2000*30d);var coreDensity=block.Count(p=>Inset(p)>=60)/(1880*1880d);
+        Check(rimDensity<.92*coreDensity,$"Woodland edges are not feathered: rim {rimDensity*1e4:0.0} vs core {coreDensity*1e4:0.0} trees/ha");
         var overlapped=ForestProcessor.Prepare(new OsmDataset{Nodes=woodNodes,Ways=new Dictionary<long,OsmWay>{{2,wood with{Id=2}},{1,wood}}},woodlandRequest,terrain,Array.Empty<PreparedSegment>(),new ImportLog(),default);
         Check(dense.SequenceEqual(overlapped),"Overlapping polygons or polygon order change local density/output");
         using var cancel=new CancellationTokenSource(); cancel.Cancel();

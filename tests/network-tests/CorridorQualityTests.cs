@@ -31,7 +31,14 @@ internal static class CorridorQualityTests
         Check(left.Start.z==4&&right.Start.z==-4,"Corridor fit mutated its immutable reference");
         var partial=right with{End=new float3(0,100,-4),Control1=new float3(400f/3,100,-4),Control2=new float3(200f/3,100,-4)};
         var partialPair=CarriagewaySeparation.Repair(new[]{left,partial},new ImportLog(),default);
-        Check(partialPair.Where(s=>s.WayId==left.WayId).All(s=>Enumerable.Range(0,1001).All(i=>Math.Abs(NetworkNormalizer.Evaluate(s,i/1000f).z-9.05)<.02f)),"Partial parallel overlap introduced an inward hook or a new bend");
+        // Report 28 AUD-001: the unpaired part keeps its source anchor and eases
+        // outward to the paired offset, never bending in toward the partner
+        // (the defect was a 1.26 m inward hook before widening).
+        var leftPieces=partialPair.Where(s=>s.WayId==left.WayId).OrderBy(s=>s.Start.x).ToArray();
+        var leftPoints=leftPieces.SelectMany(s=>Enumerable.Range(0,201).Select(i=>NetworkNormalizer.Evaluate(s,i/200f))).OrderBy(p=>p.x).ToArray();
+        Check(Math.Abs(leftPieces[0].Start.z-4)<.001f&&leftPoints.All(p=>p.z>4-.02f&&p.z<9.05f+.02f),"Partial parallel overlap introduced an inward hook or moved the unpaired anchor");
+        Check(leftPoints.Zip(leftPoints.Skip(1)).All(p=>p.Second.z>=p.First.z-.01f),"Partial parallel overlap eased back and forth instead of once outward");
+        Check(leftPoints.Where(p=>p.x>=0).All(p=>Math.Abs(p.z-9.05)<.02f),"Partial parallel overlap lost its paired separation");
         NativePreviewSafety.RequireEdge(true,true,true,true);
         foreach(var unsafeContract in new[]{(false,true,true,true),(true,false,true,true),(true,true,false,true),(true,true,true,false)})
         {

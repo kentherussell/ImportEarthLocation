@@ -47,17 +47,18 @@ public sealed class OverpassClient
     private readonly OverpassRequestScheduler _scheduler;
     private readonly bool _geography;
     private readonly bool _forestOnly;
+    private readonly bool _rocksOnly;
     private readonly bool _includeGroundSurfaces = true;
     private readonly RoadImportLevel? _roadLevel;
     private readonly bool _importRail = true;
 
-    private string Category => _forestOnly ? "forests" : _geography ? "geography" : "networks";
+    private string Category => _forestOnly ? "forests" : _rocksOnly ? "rocks" : _geography ? "geography" : "networks";
     private double _activeSeconds;
     private double _activeBudgetSeconds = double.PositiveInfinity;
     private readonly object _budgetGate = new();
     private bool _allowPartial;
 
-    private string Query(GeoBounds bounds, bool secondary) => _forestOnly ? BuildForestQuery(bounds) : _geography ? BuildGeographyQuery(bounds, _includeGroundSurfaces) : _roadLevel.HasValue ? BuildNetworkQuery(bounds, _roadLevel.Value, _importRail) : BuildQuery(bounds, secondary);
+    private string Query(GeoBounds bounds, bool secondary) => _forestOnly ? BuildForestQuery(bounds) : _rocksOnly ? BuildRockQuery(bounds) : _geography ? BuildGeographyQuery(bounds, _includeGroundSurfaces) : _roadLevel.HasValue ? BuildNetworkQuery(bounds, _roadLevel.Value, _importRail) : BuildQuery(bounds, secondary);
     private string TileKey(string query, int index, bool secondary) => _geography ? $"overpass-v3:{index}:{secondary}:{query}" : $"overpass-v4:{Category}:{index}:{query}";
 
     public Task<IReadOnlyList<byte[]>> DownloadMapAsync(GeoBounds bounds, bool includeSecondary, CancellationToken token, double activeBudgetSeconds = double.PositiveInfinity, bool allowPartial = false)
@@ -69,7 +70,7 @@ public sealed class OverpassClient
         return Download16Async(bounds, includeSecondary, token);
     }
 
-    public OverpassClient(CacheStore cache, ImportLog log, bool geography = false, RoadImportLevel? roadLevel = null, bool importRail = true, bool forestOnly = false, bool includeGroundSurfaces = true)
+    public OverpassClient(CacheStore cache, ImportLog log, bool geography = false, RoadImportLevel? roadLevel = null, bool importRail = true, bool forestOnly = false, bool includeGroundSurfaces = true, bool rocksOnly = false)
         : this(cache, log, PublicHttpClient.Instance, Task.Delay, () => DateTimeOffset.UtcNow)
     {
         var primary = ServicePreferences.Load(log);
@@ -83,7 +84,7 @@ public sealed class OverpassClient
             }
             _scheduler = _routingScheduler;
         }
-        _geography = geography; _roadLevel = roadLevel; _importRail = importRail; _forestOnly = forestOnly; _includeGroundSurfaces = includeGroundSurfaces;
+        _geography = geography; _roadLevel = roadLevel; _importRail = importRail; _forestOnly = forestOnly; _rocksOnly = rocksOnly; _includeGroundSurfaces = includeGroundSurfaces;
         log.Diagnostic($"OSM SERVICE configured={primary.Length > 0}; providers={Endpoints.Length}; credentialLogged=false");
     }
 
@@ -102,7 +103,7 @@ public sealed class OverpassClient
     public async Task<IReadOnlyList<byte[]>> Download16Async(GeoBounds bounds, bool includeSecondary, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
-        if(!_geography&&!_forestOnly&&_roadLevel==RoadImportLevel.None&&!_importRail)
+        if(!_geography&&!_forestOnly&&!_rocksOnly&&_roadLevel==RoadImportLevel.None&&!_importRail)
         { _log.Diagnostic("OSM category=networks; skipped=true; reason=roads-and-rail-disabled; httpRequests=0"); return Array.Empty<byte[]>(); }
         var tiles = GeoMath.Split4x4(bounds);
         var results = new byte[tiles.Count][];
@@ -331,6 +332,17 @@ public sealed class OverpassClient
     {
         var bbox=string.Join(",",new[]{F(b.South),F(b.West),F(b.North),F(b.East)});
         return $"[out:xml][timeout:60];(node[\"natural\"~\"^(tree|shrub)$\"]({bbox});way[\"natural\"~\"^(tree_row|wood|scrub|heath|wetland|beach)$\"]({bbox});way[\"landuse\"~\"^(forest|orchard)$\"]({bbox});relation[\"natural\"~\"^(wood|scrub|heath|wetland|beach)$\"]({bbox});relation[\"landuse\"~\"^(forest|orchard)$\"]({bbox}););" + CompleteAreaOutput(mappedTrees: true);
+    }
+
+    // Rock evidence, cached apart from forests and geography so enabling rocks
+    // never invalidates them: outcrops and scree, single boulders (natural=stone)
+    // and mapped rocks, cliffs whose foot collects talus, and natural open cover
+    // (scrub, heath, grassland) where steep slopes may show bedrock.
+    public static string BuildRockQuery(GeoBounds b)
+    {
+        var bbox=string.Join(",",new[]{F(b.South),F(b.West),F(b.North),F(b.East)});
+        return $"[out:xml][timeout:60];(node[\"natural\"~\"^(stone|rock)$\"]({bbox});way[\"natural\"~\"^(bare_rock|scree|rock|stone|cliff|scrub|heath|grassland)$\"]({bbox});relation[\"natural\"~\"^(bare_rock|scree|rock|scrub|heath|grassland)$\"]({bbox}););" +
+            "(._;>>;)->.features;node.features[\"natural\"~\"^(stone|rock)$\"]->.stones;(way.features;relation.features;.stones;);out body qt;(node.features; - .stones;);out skel qt;";
     }
 
     private static string F(double value) => value.ToString("0.########", CultureInfo.InvariantCulture);

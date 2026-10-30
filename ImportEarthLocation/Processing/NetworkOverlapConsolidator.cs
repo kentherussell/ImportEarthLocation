@@ -13,10 +13,28 @@ public static class NetworkOverlapConsolidator
 {
     public static IReadOnlyList<PreparedSegment> Prepare(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
     {
+        // A partial duplicate leaves a unique extension. That extension was not
+        // in the retained set of its pass and may itself overlap a later road.
+        // Close those intervals before fitting widths or junction approaches.
+        var result=source;bool consolidated;var passes=0;
+        do
+        {
+            token.ThrowIfCancellationRequested();
+            result=PreparePass(result,log,token,out consolidated);
+            passes++;
+        }while(consolidated);
+        log.Diagnostic($"HIGHWAY INTERVAL CLOSURE passes={passes}; partialExtensionsRechecked=true; aliasIdentitiesReserved=true");
+        return result;
+    }
+
+    private static IReadOnlyList<PreparedSegment> PreparePass(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token,out bool consolidated)
+    {
         var removed=new HashSet<int>();var tails=new Dictionary<int,List<PreparedSegment>>();
         var knots=new Dictionary<int,List<(float t,long id,float3 point)>>();var remap=new Dictionary<long,(long id,float3 point)>();
         var absorbed=new Dictionary<int,List<(float Begin,float End,PreparedSegment Source)>>();
         var ids=new HashSet<long>(source.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));var next=long.MinValue+7000000;
+        foreach(var s in source)foreach(var alias in s.SourceNodeAliases)
+        {ids.Add(alias.SourceNodeId);ids.Add(alias.CanonicalNodeId);}
         long Id(){while(ids.Contains(next))next++;var id=next++;ids.Add(id);return id;}
         (long id,float3 point) Knot(int index,float t)
         {
@@ -91,6 +109,7 @@ public static class NetworkOverlapConsolidator
         }
         log.Count("Highway coincident intervals consolidated",overlaps);
         log.Diagnostic($"HIGHWAY INTERVALS overlappingIntervalsConsolidated={overlaps}; uniqueExtensionsRetained=true; incidentNodesTransferred={remap.Count}; oppositeCarriagewaysPreserved=true; rawCenterToleranceMeters=1.5; generationGates=false");
+        consolidated=overlaps>0;
         return SourceTopologyObligations.Transfer(source,output,NetworkKind.Road,remap.ToDictionary(p=>p.Key,p=>p.Value.id));
     }
 }

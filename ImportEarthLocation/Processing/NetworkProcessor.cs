@@ -26,8 +26,6 @@ public static class NetworkProcessor
         foreach (var way in dataset.Ways.Values.OrderBy(way => way.Id))
         {
             token.ThrowIfCancellationRequested();
-            if(way.Tags.TryGetValue("highway",out var policyClass)&&policyClass=="trunk_link"&&(request.RoadLevel&RoadImportLevel.Streets)==0)
-            {log.Count("Trunk links excluded without Streets");continue;}
             if(way.Tags.TryGetValue("highway",out var excluded)&&NetworkSelection.IsExcludedStreetLink(excluded)){log.Count("Street links explicitly excluded");continue;}
             // Support ways supply context only; they never override the selected road families.
             if (!TryClassify(way, request, out var kind, out var classification))

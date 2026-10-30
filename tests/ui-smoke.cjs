@@ -84,24 +84,50 @@ bindings.location=JSON.stringify({latitude:43.368321234567,longitude:0.528921123
 nodes=render();assert.equal(nodes.find(n=>n.props?.className==='locationSummary').props.children,'57km / Lat 43.368321234567 / Lon 0.5289211234567');
 bindings.location=JSON.stringify({longitude:0});nodes=render();assert.equal(nodes.find(n=>n.props?.className==='locationSummary').props.children,'57km / Lon 0','Absent coordinates must not leave labels; zero is valid');
 bindings.location='{}';nodes=render();assert.equal(nodes.find(n=>n.props?.className==='locationSummary').props.children,'57km');
+assert.equal(button(nodes,'iel-prepare').props.disabled,true,'Prepare must be disabled until a location is set');
+assert(nodes.some(n=>n.props?.role==='note'&&String(n.props.children).includes('Select a location')),'Missing location hint');
+{const before=events.length;button(nodes,'iel-prepare').props.onSelect();assert.equal(events.length,before,'Prepare without a location reached the backend');}
+bindings.location=JSON.stringify({latitude:43.3,longitude:5.4});nodes=render();
+assert.equal(button(nodes,'iel-prepare').props.disabled,false,'Prepare stayed disabled after a location was set');
+assert(!nodes.some(n=>n.props?.role==='note'),'Location hint shown with a location set');
 assert(!nodes.some(n=>n.type==='input'),'Main panel must not duplicate location inputs');
 assert(!nodes.some(n => n.type === 'input' && n.props.type === 'checkbox'), 'Unsupported browser checkbox must not render');
 assert.equal(nodes.filter(n=>n.props?.role==='radio').length,0);
 assert.equal(button(nodes,'iel-roads-routes').props.role,'checkbox');assert.equal(button(nodes,'iel-rail').props['aria-checked'],true);
 assert(nodes.filter(n=>n.props?.role==='checkbox').every(n=>n.props.selected===undefined),'Checkbox selection must not activate the native full-width selected background');
 assert.deepEqual(nodes.find(n=>n.type==='Panel').props.theme,{header:'panelHeader',titleBar:'panelTitleBar',title:'panelTitle',iconSpace:'panelIconSpace',closeButton:'panelCloseButton',content:'panelContent'},'Panel needs a left-aligned title without a reserved native icon slot');
-assert.deepEqual(nodes.find(n=>n.props?.['aria-label']==='Options').props.children.map(n=>n.props.children[1].props.children),['Rail','Vegetation','Air Routes','Ship Routes','Surfaces','Diagnostics']);
+const options=nodes.find(n=>n.props?.['aria-label']==='Options').props.children;
+assert(options.every(n=>n.props.className.split(' ')[0]==='tipHost'),'Every option needs hover help');
+assert.deepEqual(options.map(n=>n.props.children.props.label??n.props.children.props.children[1].props.children),['Vegetation','Rocks','Rail','HD Terrain','Air Routes','Ship Routes','Surfaces','Diagnostics']);
+assert(options.every(n=>typeof n.props['data-tip']==='string'&&n.props['data-tip'].length>0&&n.props['data-tip'].length<=100),'Hover help must be short and present');
 const roadGroup=nodes.find(n=>n.props?.['aria-label']==='Road groups');
 assert.equal(roadGroup.props.children[1].props.className,'options');
-assert.deepEqual(roadGroup.props.children[1].props.children.map(n=>n.props.focusKey),['iel-roads-highways','iel-roads-routes','iel-roads-streets']);
-assert.equal(nodes.find(n=>n.props?.className==='feedback').props.trackVisibility,'scrollable','Status track should only show for actual overflow');
+assert.deepEqual(roadGroup.props.children[1].props.children.map(n=>n.props.children.props.focusKey),['iel-roads-highways','iel-roads-routes','iel-roads-streets']);
+assert(roadGroup.props.children[1].props.children.every(n=>n.props.className==='tipHost'&&n.props['data-tip'].length>0),'Every road group needs hover help');
+// Hover help is a viewport overlay beside the panel, not a native tooltip under it.
+options[3].props.onMouseEnter({currentTarget:{getBoundingClientRect:()=>({top:240,left:700}),closest:()=>({getBoundingClientRect:()=>({left:640})})}});nodes=render();
+const bubble=nodes.find(n=>n.props?.role==='tooltip');
+assert(bubble&&bubble.props.className==='tip'&&bubble.props.style.top==='240px'&&bubble.props.style.left==='640px','Hover help must sit level with the option, at the panel edge');
+assert(nodes.find(n=>n.type==='Portal').props.children.includes(bubble),'Hover help must be a Portal sibling, outside the native Panel');
+assert.equal(bubble.props.children[0].props.children,'HD Terrain');
+nodes.find(n=>n.props?.['aria-label']==='Options').props.children[3].props.onMouseLeave();nodes=render();assert(!nodes.some(n=>n.props?.role==='tooltip'),'Hover help stayed after leaving');
+assert.equal(nodes.find(n=>n.props?.className==='feedback').type,'div','Status must scroll without a visible track');
 nodes.find(n=>n.type==='Button'&&n.props.children==='Configure Data Source').props.onSelect();
 nodes=render();
 const servicePanel=nodes.find(n=>n.props?.className==='servicePanel');
 assert(servicePanel&&servicePanel.type==='Panel'&&servicePanel.props.theme.header==='panelHeader'&&servicePanel.props.theme.titleBar==='panelTitleBar','API key dialog must reuse the native panel and shared header styling');
 servicePanel.props.onClose();nodes=render();
-assert.equal(button(nodes,'iel-forests').props['aria-checked'],true);
-button(nodes,'iel-forests').props.onSelect();nodes=render();assert.equal(button(nodes,'iel-forests').props['aria-checked'],false);assert.equal(button(nodes,'iel-rail').props['aria-checked'],true);
+// Vegetation and rock density sliders: 100% is today's plan, Off is unchecked.
+const forestSlider=button(nodes,'iel-forests');assert.equal(forestSlider.props.value,1);
+forestSlider.props.onChange(.5);assert.deepEqual(events.at(-1),['setVegetationDensity',.5]);
+assert.equal(button(nodes,'iel-rocks').props.value,0,'Rocks slider should read Off while rocks are disabled');
+const slider=output.exports.DensitySlider({label:'Rocks',value:.3,disabled:false,focusKey:'s',onChange:v=>events.push(['slider',v])});
+const sliderParts=slider.props.children;const down=sliderParts.find(n=>n.props?.focusKey==='s-down');const up=sliderParts.find(n=>n.props?.focusKey==='s-up');
+down.props.onSelect();assert.deepEqual(events.at(-1),['slider',.2]);up.props.onSelect();assert.deepEqual(events.at(-1),['slider',.4]);
+assert.equal(sliderParts.at(-1).props.children,'30%');
+const off=output.exports.DensitySlider({label:'Rocks',value:0,disabled:false,focusKey:'o',onChange:()=>{}});
+assert.equal(off.props.children.at(-1).props.children,'Off');assert(off.props.children.find(n=>n.props?.focusKey==='o-down').props.disabled,'Off cannot step lower');
+assert.equal(button(nodes,'iel-rail').props['aria-checked'],true);
 // Exercise all eight independent road combinations without relying on a mock
 // backend to implement the bitmask policy itself. Each click requests an atomic toggle.
 for(let mask=0;mask<8;mask++) {
@@ -133,7 +159,7 @@ button(nodes, 'iel-prepare').props.onSelect(); nodes = render(); assert(!nodes.s
 button(nodes, 'iel-log').props.onSelect(); nodes = render(); assert(nodes.some(isLogViewport));
 bindings.ready = true; nodes = render(); button(nodes, 'iel-replace').props.onSelect(); nodes = render();
 assert(nodes.some(n => n.props?.focusKey === 'iel-confirm-replace'));
-assert(nodes.some(n=>n.type==='p'&&typeof n.props.children==='string'&&n.props.children.includes('up to 5 minutes')), 'Confirmation missing freeze warning');
+assert(nodes.some(n=>n.type==='p'&&typeof n.props.children==='string'&&n.props.children.includes('freeze for a few seconds')), 'Confirmation missing freeze warning');
 assertViewportConfirmation(nodes);
 button(nodes, 'iel-confirm-cancel').props.onSelect(); nodes = render();
 assert(!nodes.some(n => n.props?.focusKey === 'iel-confirm-replace'), 'Cancel must release the overlay');
@@ -165,10 +191,15 @@ acknowledgeActions=true;
 bindings.busy = true; bindings.stage = 6; bindings.ready = false;
 nodes = render(); assert(!nodes.some(n => n.props?.focusKey === 'iel-cancel'));
 button(nodes,'iel-stop');assert(!nodes.some(n=>n.props?.focusKey==='iel-prepare'||n.props?.focusKey==='iel-replace'),'Generation must show stop rather than an inactive primary action');
+assert(!nodes.some(n=>n.props?.focusKey==='iel-resume'),'Resume shown while generation is not suspended');
+bindings.canResume=true;nodes=render();button(nodes,'iel-resume').props.onSelect();assert.equal(events.at(-1)[0],'resumeGeneration','Resume did not trigger resumeGeneration');bindings.canResume=false;nodes=render();
 nodes.find(n => n.type === 'Panel').props.onClose(); assert(!bindings.panelOpen);
 bindings.panelOpen=true;bindings.busy=false;bindings.ready=true;nodes=render();button(nodes,'iel-replace').props.onSelect();nodes=render();assert(nodes.some(n=>n.props?.focusKey==='iel-confirm-replace'));
 const selectedRoads=bindings.roadLevel,selectedRail=bindings.importRail;bindings.mapSession='map-B';bindings.ready=false;bindings.status='Map session reset';nodes=render();
 assert(!nodes.some(n=>n.props?.focusKey==='iel-confirm-replace'),'Map change retained stale confirmation');assert(!nodes.some(isLogViewport),'Map change retained previous map log visibility');assert.equal(bindings.roadLevel,selectedRoads);assert.equal(bindings.importRail,selectedRail);
 assert.equal(button(nodes,'iel-prepare').props.disabled,false,'Map reset left prepare disabled');
 bindings.isEditor = false; assert.equal(render().length, 0);
-console.log('PASS: launcher, compact location summary, ordered options, preparation, confirmation, Escape/close, application cancellation guard, editor-only visibility');
+bindings.isEditor = true; bindings.panelOpen = true; nodes = render();
+assert.equal(nodes.find(n=>n.type==='Panel').props.header.props.children[1].props.className,'brandText','Title must use the single-line brand text');
+bindings.isEditor = false;
+console.log('PASS: launcher, location-gated prepare, single-line title, compact location summary, ordered options, preparation, confirmation, Escape/close, application cancellation guard, editor-only visibility');

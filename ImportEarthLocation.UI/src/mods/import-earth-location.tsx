@@ -10,12 +10,13 @@ const group = "ImportEarthLocation";
 const isEditor$ = bindValue<boolean>(group, "isEditor", false);
 const mapExt$ = bindValue<boolean>(group, "mapExtDetected", false);
 const mapSize$ = bindValue<string>(group, "mapSize", "vanilla");
+const loadedMapSize$ = bindValue<string>(group, "loadedMapSize", "");
 const panelOpen$ = bindValue<boolean>(group, "panelOpen", false);
 export const ImportLauncher = ({ theme, className }: { theme?: any; className?: string }) => {
   const editor = useValue(isEditor$);
   const open = useValue(panelOpen$);
   if (!editor) return null;
-  return <Tooltip tooltip="Import Earth" direction="up"><Button variant="icon"
+  return <Tooltip tooltip={<span className={styles.brandText}>Import Earth</span>} direction="up"><Button variant="icon"
     focusKey="import-earth-location-launcher" className={className} theme={theme}
     selected={open}
     onSelect={() => trigger(group, "setPanelOpen", !open)} aria-label="Import Earth"><img className={styles.launcherIcon} src={importIcon} alt="" width={32} height={32} style={{ width: "32rem", height: "32rem", maxWidth: "32rem", maxHeight: "32rem", flexShrink: 0, objectFit: "contain" }} /></Button></Tooltip>;
@@ -85,7 +86,36 @@ const AnchoredLauncher = () => {
   }, [editor]);
   return editor && host ? createPortal(<ImportLauncher className={`${nativeButtonClass} ${styles.launcherButton}`} />, host) : null;
 };
+// A share from 0 (off) to 1 in tenths: click or drag the track, or step with the
+// buttons, which also serve keyboard and controller navigation.
+export const DensitySlider = ({ label, value, disabled, focusKey, onChange }:
+  { label: string; value: number; disabled: boolean; focusKey: string; onChange: (value: number) => void }) => {
+  const step = (v: number) => Math.round(Math.max(0, Math.min(1, v)) * 10) / 10;
+  const fromPointer = (track: HTMLElement, x: number) => {
+    const box = track.getBoundingClientRect();
+    return step(box.width > 0 ? (x - box.left) / box.width : value);
+  };
+  const begin = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    const track = event.currentTarget;
+    let last = fromPointer(track, event.clientX);
+    onChange(last);
+    const move = (e: MouseEvent) => { const next = fromPointer(track, e.clientX); if (next !== last) { last = next; onChange(next); } };
+    const end = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", end); };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", end);
+  };
+  return <div className={`${styles.slider} ${disabled ? styles.sliderDisabled : ""}`} role="slider" aria-label={label}
+    aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(value * 100)}>
+    <span className={styles.sliderLabel}>{label}</span>
+    <Button variant="flat" className={styles.sliderStep} focusKey={`${focusKey}-down`} disabled={disabled || value <= 0} onSelect={() => onChange(step(value - .1))}>−</Button>
+    <div className={styles.sliderTrack} onMouseDown={begin}><div className={styles.sliderFill} style={{ width: `${Math.round(value * 100)}%` }} /></div>
+    <Button variant="flat" className={styles.sliderStep} focusKey={`${focusKey}-up`} disabled={disabled || value >= 1} onSelect={() => onChange(step(value + .1))}>+</Button>
+    <span className={styles.sliderValue}>{value <= 0 ? "Off" : `${Math.round(value * 100)}%`}</span>
+  </div>;
+};
 const busy$ = bindValue<boolean>(group, "busy", false);
+const canResume$ = bindValue<boolean>(group, "canResume", false);
 const ready$ = bindValue<boolean>(group, "ready", false);
 const stage$ = bindValue<number>(group, "stage", 0);
 const status$ = bindValue<string>(group, "status", "");
@@ -96,6 +126,28 @@ const location$ = bindValue<string>(group, "location", "{}");
 const roads$ = bindValue<string>(group, "roadLevel", "none");
 const rail$ = bindValue<boolean>(group, "importRail", true);
 const forests$ = bindValue<boolean>(group, "importForests", true);
+const rocks$ = bindValue<boolean>(group, "importRocks", false);
+const vegetationDensity$ = bindValue<number>(group, "vegetationDensity", 1);
+const rockDensity$ = bindValue<number>(group, "rockDensity", 0);
+const hdTerrain$ = bindValue<boolean>(group, "hdTerrain", false);
+// Hover help for each option: a title and one short, plain-language line.
+const tips: Record<string, string> = {
+  "Highways": "Motorways and their on and off ramps.",
+  "Main Roads": "Major through roads between towns and districts.",
+  "Streets": "Local streets. Takes longer and is still being improved.",
+  "Rail": "Train lines and tracks.",
+  "Vegetation": "Forests, parks, trees and bushes. Lower values plant fewer; Off skips them.",
+  "Rocks": "Rock clumps below cliffs and rocky slopes. Lower values place fewer; Off skips them.",
+  "HD Terrain": "Sharper hills, valleys and coastlines. Downloads more, so preparing takes a little longer.",
+  "Air Routes": "Lets planes fly in and out of your map.",
+  "Ship Routes": "Lets ships sail in and out of your map.",
+  "Surfaces": "Paints sand, grass, dirt and rock on the ground.",
+  "Diagnostics": "Saves detailed logs for troubleshooting. Slower, so leave it off normally."
+};
+// The panel sits above the game's tooltip layer, so native tooltips drew under
+// it. The hover help is drawn by the mod instead, beside the panel, as a
+// viewport overlay in the same Portal.
+type HoverTip = { label: string; top: number; left: number };
 const airConnections$ = bindValue<boolean>(group, "createAirConnections", false);
 const seaConnections$ = bindValue<boolean>(group, "createSeaConnections", false);
 const diagnostics$ = bindValue<boolean>(group, "diagnosticsEnabled", false);
@@ -132,6 +184,7 @@ export const ImportEarthLocationContent = () => {
   const mapExt = useValue(mapExt$);
   const panelOpen = useValue(panelOpen$);
   const busy = useValue(busy$);
+  const canResume = useValue(canResume$);
   const ready = useValue(ready$);
   const applying = useValue(stage$) === 6;
   const status = useValue(status$);
@@ -141,6 +194,7 @@ export const ImportEarthLocationContent = () => {
   const [latitude, setLatitude] = useState("");
   const [longitude, setLongitude] = useState("");
   const mapSize = useValue(mapSize$);
+  const loadedMapSize = useValue(loadedMapSize$);
   const rawRoadLevel = useValue(roads$);
   const roadGroups = rawRoadLevel.split("|").filter(id => ["highways", "routes", "streets"].includes(id));
   // Toggle atomically in the backend; rapid clicks on different checkboxes
@@ -148,6 +202,10 @@ export const ImportEarthLocationContent = () => {
   const toggleRoadGroup = (id: string) => trigger(group, "toggleRoadGroup", id);
   const rail = useValue(rail$);
   const forests = useValue(forests$);
+  const rocks = useValue(rocks$);
+  const vegetationDensity = useValue(vegetationDensity$);
+  const rockDensity = useValue(rockDensity$);
+  const hdTerrain = useValue(hdTerrain$);
   const mapSession = useValue(session$);
   const actionRevision = useValue(actionRevision$);
   const actionGate = useRef<string | null>(null);
@@ -156,6 +214,15 @@ export const ImportEarthLocationContent = () => {
   const airConnections = useValue(airConnections$);
   const seaConnections = useValue(seaConnections$);
   const diagnostics = useValue(diagnostics$);
+  const [hoverTip, setHoverTip] = useState<HoverTip | null>(null);
+  const withTip = (label: string, element: JSX.Element, key?: string, wide?: boolean) =>
+    <div key={key} className={wide ? `${styles.tipHost} ${styles.wide}` : styles.tipHost} data-tip={tips[label]}
+      onMouseEnter={event => {
+        const rect = event.currentTarget.getBoundingClientRect();
+        const panel = event.currentTarget.closest(`.${styles.panel}`);
+        setHoverTip({ label, top: rect.top, left: panel ? panel.getBoundingClientRect().left : rect.left });
+      }}
+      onMouseLeave={() => setHoverTip(null)}>{element}</div>;
   const [confirming, setConfirming] = useState(false);
   const [showLog, setShowLog] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -184,6 +251,7 @@ export const ImportEarthLocationContent = () => {
   }, [locationText]);
 
   const closePanel = () => {
+    setHoverTip(null);
     setConfirming(false);
     setPickerOpen(false);
     setServiceOpen(false);
@@ -207,6 +275,7 @@ export const ImportEarthLocationContent = () => {
 
   if (!isEditor) return null;
 
+  const hasLocation = latitude !== "" && longitude !== "";
   const locationSummary = [mapSize === "mapext57" ? "57km" : mapSize === "mapext28" ? "28km" : "14km",
     latitude !== "" ? `Lat ${latitude}` : "", longitude !== "" ? `Lon ${longitude}` : ""].filter(Boolean).join(" / ");
 
@@ -216,7 +285,7 @@ export const ImportEarthLocationContent = () => {
         <AnchoredLauncher />
 
         {panelOpen && (
-          <Panel header={<span className={styles.brand}><img src={importIcon} alt="" />Import Earth</span>} className={styles.panel} theme={{ header: styles.panelHeader, titleBar: styles.panelTitleBar, title: styles.panelTitle, iconSpace: styles.panelIconSpace, closeButton: styles.panelCloseButton, content: styles.panelContent }} onClose={closePanel}>
+          <Panel header={<span className={styles.brand}><img src={importIcon} alt="" /><span className={styles.brandText}>Import Earth</span></span>} className={styles.panel} theme={{ header: styles.panelHeader, titleBar: styles.panelTitleBar, title: styles.panelTitle, iconSpace: styles.panelIconSpace, closeButton: styles.panelCloseButton, content: styles.panelContent }} onClose={closePanel}>
             <Scrollable vertical className={styles.panelBody}>
             <div className={styles.section}>
               {!serviceUrl && <div className={styles.notice}>No personal data service configured. Public backup downloads could take hours. Set up a free NextGIS service for faster access.</div>}
@@ -228,42 +297,49 @@ export const ImportEarthLocationContent = () => {
               <div className={styles.field} role="group" aria-label="Road groups">
                 <span className={styles.sectionTitle}>Road Groups</span>
                 <div className={styles.options}>
-                {[["highways", "Highways"], ["routes", "Main Roads"], ["streets", "Streets"]].map(([id,label]) =>
-                  <Button key={id} variant="flat" className={styles.check} focusKey={`iel-roads-${id}`} role="checkbox" aria-checked={roadGroups.includes(id)} disabled={busy || starting} onSelect={() => toggleRoadGroup(id)}>
+                {[["highways", "Highways"], ["routes", "Main Roads"], ["streets", "Streets"]].map(([id,label]) => withTip(label,
+                  <Button variant="flat" className={styles.check} focusKey={`iel-roads-${id}`} role="checkbox" aria-checked={roadGroups.includes(id)} disabled={busy || starting} onSelect={() => toggleRoadGroup(id)}>
                     <span className={styles.checkbox}>{roadGroups.includes(id) ? "✓" : ""}</span><span>{label}{id === "streets" && <span className={styles.experimental}>Experimental</span>}</span>
-                  </Button>)}
+                  </Button>, id))}
                 </div>
               </div>
               <div className={styles.sectionTitle}>Options</div>
               <div className={styles.options} role="group" aria-label="Options">
-              <Button variant="flat" className={styles.check} focusKey="iel-rail" role="checkbox" aria-checked={rail} disabled={busy || starting} onSelect={() => trigger(group, "setImportRail", !rail)}>
+              {withTip("Vegetation", <DensitySlider label="Vegetation" focusKey="iel-forests" value={forests ? vegetationDensity : 0} disabled={busy || starting}
+                onChange={value => trigger(group, "setVegetationDensity", value)} />, undefined, true)}
+              {withTip("Rocks", <DensitySlider label="Rocks" focusKey="iel-rocks" value={rocks ? rockDensity : 0} disabled={busy || starting}
+                onChange={value => trigger(group, "setRockDensity", value)} />, undefined, true)}
+              {withTip("Rail", <Button variant="flat" className={styles.check} focusKey="iel-rail" role="checkbox" aria-checked={rail} disabled={busy || starting} onSelect={() => trigger(group, "setImportRail", !rail)}>
                 <span className={styles.checkbox}>{rail ? "✓" : ""}</span><span>Rail</span>
-              </Button>
-              <Button variant="flat" className={styles.check} focusKey="iel-forests" role="checkbox" aria-checked={forests} disabled={busy || starting} onSelect={() => trigger(group, "setImportForests", !forests)}>
-                <span className={styles.checkbox}>{forests ? "✓" : ""}</span><span>Vegetation</span>
-              </Button>
-              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={airConnections} disabled={busy || starting} onSelect={() => {
+              </Button>)}
+              {withTip("HD Terrain", <Button variant="flat" className={styles.check} focusKey="iel-hd-terrain" role="checkbox" aria-checked={hdTerrain} disabled={busy || starting} onSelect={() => trigger(group, "setHdTerrain", !hdTerrain)}>
+                <span className={styles.checkbox}>{hdTerrain ? "✓" : ""}</span><span>HD Terrain</span>
+              </Button>)}
+              {withTip("Air Routes", <Button variant="flat" className={styles.check} role="checkbox" aria-checked={airConnections} disabled={busy || starting} onSelect={() => {
                 trigger(group, "setAirConnections", !airConnections);
-              }}><span className={styles.checkbox}>{airConnections ? "✓" : ""}</span><span>Air Routes</span></Button>
-              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={seaConnections} disabled={busy || starting} onSelect={() => trigger(group, "setSeaConnections", !seaConnections)}>
+              }}><span className={styles.checkbox}>{airConnections ? "✓" : ""}</span><span>Air Routes</span></Button>)}
+              {withTip("Ship Routes", <Button variant="flat" className={styles.check} role="checkbox" aria-checked={seaConnections} disabled={busy || starting} onSelect={() => trigger(group, "setSeaConnections", !seaConnections)}>
                 <span className={styles.checkbox}>{seaConnections ? "✓" : ""}</span><span>Ship Routes</span>
-              </Button>
-              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={surfaces} disabled={busy || starting} onSelect={() => trigger(group, "setGroundSurfaces", !surfaces)}><span className={styles.checkbox}>{surfaces ? "✓" : ""}</span><span>Surfaces</span></Button>
-              <Button variant="flat" className={styles.check} role="checkbox" aria-checked={diagnostics} disabled={busy || starting} onSelect={() => trigger(group,"setDiagnostics",!diagnostics)}>
+              </Button>)}
+              {withTip("Surfaces", <Button variant="flat" className={styles.check} role="checkbox" aria-checked={surfaces} disabled={busy || starting} onSelect={() => trigger(group, "setGroundSurfaces", !surfaces)}><span className={styles.checkbox}>{surfaces ? "✓" : ""}</span><span>Surfaces</span></Button>)}
+              {withTip("Diagnostics", <Button variant="flat" className={styles.check} role="checkbox" aria-checked={diagnostics} disabled={busy || starting} onSelect={() => trigger(group,"setDiagnostics",!diagnostics)}>
                 <span className={styles.checkbox}>{diagnostics ? "✓" : ""}</span><span>Diagnostics</span>
-              </Button>
+              </Button>)}
               </div>
             </div>
 
             <div className={styles.actionSection}>
               <div className={styles.actions}>
                 {!ready && !busy && (
-                  <Button variant="flat" className={`${styles.actionButton} ${styles.primary}`} focusKey="iel-prepare" disabled={busy || starting} onSelect={() => { if(actionGate.current) return; actionGate.current = "prepare"; setStarting(true); trigger(group, "prepare"); }}>
+                  <Button variant="flat" className={`${styles.actionButton} ${styles.primary}`} focusKey="iel-prepare" disabled={busy || starting || !hasLocation} onSelect={() => { if(actionGate.current || !hasLocation) return; actionGate.current = "prepare"; setStarting(true); trigger(group, "prepare"); }}>
                     Prepare import
                   </Button>
                 )}
                 {busy && !applying && (
                   <Button variant="flat" className={`${styles.actionButton} ${styles.utility}`} focusKey="iel-cancel" onSelect={() => trigger(group, "cancel")}>Cancel preparation</Button>
+                )}
+                {busy && applying && canResume && (
+                  <Button variant="flat" className={styles.actionButton} focusKey="iel-resume" onSelect={() => trigger(group, "resumeGeneration")}>Resume</Button>
                 )}
                 {busy && applying && (
                   <Button variant="flat" className={`${styles.actionButton} ${styles.danger}`} focusKey="iel-stop" onSelect={() => trigger(group, "stopGeneration")}>Stop generation</Button>
@@ -277,14 +353,16 @@ export const ImportEarthLocationContent = () => {
                   {showLog ? "Hide log" : "View log"}
                 </Button>
               </div>
+              {!ready && !busy && !hasLocation && <div className={styles.helper} role="note">Select a location on the map to prepare an import.</div>}
               {showLog && <Scrollable className={styles.logViewport} vertical horizontal={false} trackVisibility="always">
                 <pre className={styles.log}>{log || "No log entries yet."}</pre>
               </Scrollable>}
-              <Scrollable vertical horizontal={false} trackVisibility="scrollable" className={styles.feedback}>
+              {/* Scrolls without a visible bar: Gameface draws none for overflow. */}
+              <div className={styles.feedback}>
                 <div className={styles.status} role="status">{status}</div>
                 {summary && <div className={styles.summary}>{summary}</div>}
                 {error && <div className={styles.error} role="alert">{error}</div>}
-              </Scrollable>
+              </div>
             </div>
 
             </Scrollable>
@@ -292,9 +370,13 @@ export const ImportEarthLocationContent = () => {
         )}
       </div>
       {/* Keep viewport overlays outside Panel's native clipping/containing block. */}
+      {panelOpen && hoverTip && !confirming && !serviceOpen && !pickerOpen &&
+        <div className={styles.tip} role="tooltip" style={{ top: `${hoverTip.top}px`, left: `${hoverTip.left}px` }}>
+          <div className={styles.tipTitle}>{hoverTip.label}</div><div className={styles.tipText}>{tips[hoverTip.label]}</div>
+        </div>}
       {panelOpen && serviceOpen && <div className={styles.confirmBackdrop}>
         <Panel className={styles.servicePanel} role="dialog" aria-modal="true" aria-labelledby="iel-service-title"
-          header={<span id="iel-service-title">Configure Data Source</span>}
+          header={<span id="iel-service-title" className={styles.brandText}>Configure Data Source</span>}
           theme={{ header: styles.panelHeader, titleBar: styles.panelTitleBar, title: styles.panelTitle, iconSpace: styles.panelIconSpace, closeButton: styles.panelCloseButton, content: styles.panelContent }} onClose={() => setServiceOpen(false)}>
           <div className={styles.section}>
           <Scrollable vertical horizontal={false} trackVisibility="scrollable" className={styles.confirmBody}>
@@ -318,7 +400,7 @@ export const ImportEarthLocationContent = () => {
             <Scrollable vertical horizontal={false} className={styles.confirmBody}>
               <p>This replaces terrain and removes existing roads, rail, other networks, and water sources from the open map—even when new roads or rail are disabled. Optional forest trees are added where supported. The map file and name are not deleted.</p>
               <p><strong>Save a backup first.</strong></p>
-              <p>The game may appear to freeze for up to 5 minutes while replacing the map, depending on its complexity. Please wait for it to finish.</p>
+              <p>The game may appear to freeze for a few seconds at a time while replacing the map. Please wait for it to finish.</p>
             </Scrollable>
             <div className={`${styles.actions} ${styles.confirmFooter}`}>
               <Button variant="flat" focusKey="iel-confirm-cancel" className={`${styles.actionButton} ${styles.utility}`} onSelect={() => setConfirming(false)}>Cancel</Button>
@@ -329,7 +411,7 @@ export const ImportEarthLocationContent = () => {
           </div>
         </div>
       )}
-      {panelOpen && pickerOpen && <LocationPicker mapExt={mapExt} initial={{ latitude: Number(latitude) || 0, longitude: Number(longitude) || 0, mapSize }} onClose={() => setPickerOpen(false)} onCommit={(value: Location) => {
+      {panelOpen && pickerOpen && <LocationPicker mapExt={mapExt} loadedSize={loadedMapSize} initial={hasLocation ? { latitude: Number(latitude), longitude: Number(longitude), mapSize } : null} onClose={() => setPickerOpen(false)} onCommit={(value: Location) => {
         trigger(group, "commitLocation", JSON.stringify(value)); setPickerOpen(false);
       }} />}
     </Portal>

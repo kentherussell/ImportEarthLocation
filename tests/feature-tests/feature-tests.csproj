@@ -10,6 +10,9 @@
     <DefineConstants>$(DefineConstants);WATER_SMOKE_ONLY</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
+    <None Update="fixtures/climate-*.json" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Include="../network-tests/CapturedRunFiles.cs" Link="CapturedRunFiles.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/OsmParsedCache.cs" Link="OsmParsedCache.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/TerrainSampling.cs" Link="TerrainSampling.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/TerrainArtifactRepair.cs" Link="TerrainArtifactRepair.cs" />
     <Compile Include="../../ImportEarthLocation/Core/VegetationPlan.cs" Link="VegetationPlan.cs" />
@@ -23,6 +26,8 @@
     <Compile Include="../../ImportEarthLocation/Processing/NetworkWorkingPolyline.cs" Link="NetworkWorkingPolyline.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkDesignChecks.cs" Link="NetworkDesignChecks.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/WaterBodyPlanner.cs" Link="WaterBodyPlanner.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/WaterCutSmoothing.cs" Link="WaterCutSmoothing.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/WaterContainment.cs" Link="WaterContainment.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkVerticalProfiles.cs" Link="NetworkVerticalProfiles.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/ConnectedRoadGrades.cs" Link="ConnectedRoadGrades.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/RiverBedSurface.cs" Link="RiverBedSurface.cs" />
@@ -47,6 +52,7 @@
     <Compile Include="../../ImportEarthLocation/Processing/TerrainGeographyGuard.cs" Link="TerrainGeographyGuard.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/GeographyPolygons.cs" Link="GeographyPolygons.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/SurfacePlanner.cs" Link="SurfacePlanner.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/BeachTerrain.cs" Link="BeachTerrain.cs" />
     <Compile Include="../../ImportEarthLocation/Core/SurfacePaint.cs" Link="SurfacePaint.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkProcessor.cs" Link="NetworkProcessor.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/OsmParser.cs" Link="OsmParser.cs" />
@@ -62,6 +68,7 @@
     <Compile Remove="../../ImportEarthLocation/Processing/NetworkVerticalProfiles.cs" />
     <Compile Remove="../../ImportEarthLocation/Processing/ConnectedRoadGrades.cs" />
     <Compile Remove="../../ImportEarthLocation/Processing/WaterBodyPlanner.cs" />
+    <Compile Remove="../../ImportEarthLocation/Processing/WaterContainment.cs" />
     <Compile Remove="../../ImportEarthLocation/Processing/VegetationPlanner.cs" />
     <Compile Remove="../../ImportEarthLocation/Processing/ForestProcessor.cs" />
     <Compile Remove="../../ImportEarthLocation/Processing/NetworkNormalizer.cs" />

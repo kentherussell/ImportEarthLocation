@@ -17,7 +17,7 @@ public static class NetworkSelection
     public static bool ParseRail(string? value) => bool.TryParse(value, out var enabled) ? enabled : true;
     public static string Id(RoadImportLevel value) {var names=new List<string>();if((value&RoadImportLevel.Highways)!=0)names.Add("highways");if((value&RoadImportLevel.Routes)!=0)names.Add("routes");if((value&RoadImportLevel.Streets)!=0)names.Add("streets");return names.Count==0?"none":string.Join("|",names);}
     public static string Label(RoadImportLevel value) => Id(value).Replace("|",", ");
-    public static string Classes(RoadImportLevel value) {var names=new List<string>();if((value&RoadImportLevel.Highways)!=0)names.Add("motorway|motorway_link");if((value&RoadImportLevel.Routes)!=0)names.Add((value&RoadImportLevel.Streets)!=0?"trunk|trunk_link":"trunk");if((value&RoadImportLevel.Streets)!=0)names.Add("primary|secondary|tertiary");return string.Join("|",names);}
+    public static string Classes(RoadImportLevel value) {var names=new List<string>();if((value&RoadImportLevel.Highways)!=0)names.Add("motorway|motorway_link");if((value&RoadImportLevel.Routes)!=0)names.Add("trunk|trunk_link");if((value&RoadImportLevel.Streets)!=0)names.Add("primary|secondary|tertiary");return string.Join("|",names);}
     public static bool IsExcludedStreetLink(string classification) => classification is "primary_link" or "secondary_link" or "tertiary_link";
     public static int MatchedLanes(int requested,bool highway,bool oneWay)
     {

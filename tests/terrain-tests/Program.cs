@@ -10,7 +10,7 @@ static class Program
         var terrain = new TerrainSystem();
         var water = new WaterSystem { Loaded = true };
         var bridge = new TerrainBridge(terrain, water);
-        Check(!bridge.BeginRestamp(new(new(0),new(1)),new(),100,new()),"Unverified stand-in engine MVID allowed native restamping");
+        Check(!bridge.BeginRestamp(new(new(0),new(1)),new(),100,new()),"Missing native update hooks allowed terrain restamping");
         // Deliberately no m_Loaded field: readiness must use the real resource APIs.
         Check(bridge.CanApply(out var reason), "Loaded terrain falsely rejected: " + reason);
         terrain.heightmap = null;

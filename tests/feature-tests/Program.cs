@@ -6,17 +6,26 @@ using Unity.Mathematics;
 static class Program
 {
     static void Check(bool value, string message) { if(!value) throw new Exception(message); }
-    static int Main()
+    static int Main(string[] args)
     {
-        try { Run(); return 0; }
+        try {
+#if !SURFACE_SMOKE_ONLY
+            if(args.Length==1&&args[0]=="--climate-landscape-only"){ClimateLandscapeTests.Run();return 0;}
+            if(args.Length==5&&args[0]=="--surface-climate-capture"){SurfaceClimateReplay.Run(args[1],args[2],args[3],args[4]);return 0;}
+            if(args.Length==1&&args[0]=="--water-landscape-only"){WaterContainmentTests.Run();RiparianTests.Run();return 0;}
+#endif
+            Run(); return 0; }
         catch(Exception e) { Console.Error.WriteLine(e); return 1; }
     }
     static void Run()
     {
 #if WATER_SMOKE_ONLY
         WaterTests.Run();
+        WaterContainmentTests.Run();
+        RiparianTests.Run();
         TerrainAcquisitionChecks();
 #else
+        FlatSpikeChecks();
         var log = new ImportLog(); var request = new ImportRequest(43.72,15.82,MapSizeProfile.MapExt57,false);
 #if !SURFACE_SMOKE_ONLY
         ArchiveTests.Run();
@@ -87,6 +96,18 @@ static class Program
         SurfacePaint.Validate(mask);
         var paintSample=SurfacePaint.Sample(mask,140,140);
         Check(paintSample.material==GroundMaterial.Sand&&paintSample.intensity>0,"Exclusive paint sampling lost mapped brush");
+        // Two plan cells per metre square: a native pixel whose nearest cell is
+        // dry grass but whose bilinear share is mostly grass paints grass; each
+        // material keeps full strength at its own cell and fades to nothing
+        // where the two shares meet, so the native texel grid never shows as a
+        // step between materials. Against unpainted ground the dry grass fades too.
+        var corner=new SurfaceMask(2,2,new[]{(byte)GroundMaterial.DryGrass,(byte)GroundMaterial.Grass,(byte)GroundMaterial.Grass,(byte)GroundMaterial.Grass},new byte[]{200,200,200,200},"test");
+        var rounded=SurfacePaint.Sample(corner,-.05,-.05);var own=SurfacePaint.Sample(corner,-.5,-.5);var seam=SurfacePaint.Sample(corner,0,-.5);
+        Check(rounded.material==GroundMaterial.Grass&&rounded.intensity>0&&rounded.intensity<200&&own.material==GroundMaterial.DryGrass&&own.intensity==200&&seam.intensity==0,
+            $"Paint border followed the plan's square cells or stepped between materials: {rounded}, {own}, {seam}");
+        var edge=new SurfaceMask(2,2,new[]{(byte)GroundMaterial.DryGrass,(byte)0,(byte)0,(byte)0},new byte[]{200,0,0,0},"test");
+        var faded=SurfacePaint.Sample(edge,-.3,-.3);
+        Check(faded.material==GroundMaterial.DryGrass&&faded.intensity>0&&faded.intensity<128,$"Paint no longer fades into unpainted ground: {faded}");
         GeographicPolygon Cover(long id,params (string key,string value)[] tags)=>new(id,tags.ToDictionary(t=>t.key,t=>t.value),new(){Ring(-200,-200,200,200)},new());
         var scrub=SurfacePlanner.Prepare(new[]{Cover(3,("natural","scrub"))},small,terrain,log,default,resolution:256);
         var woods=SurfacePlanner.Prepare(new[]{Cover(3,("natural","wood"))},small,terrain,log,default,resolution:256);
@@ -94,7 +115,25 @@ static class Program
         var track=SurfacePlanner.Prepare(new[]{Cover(3,("highway","track"),("surface","sand"),("area","yes"))},small,terrain,log,default,resolution:256);
         Check(scrub.Material[128*256+128]==(byte)GroundMaterial.DryGrass&&woods.Material[128*256+128]==(byte)GroundMaterial.Grass&&woods.Intensity[128*256+128]<70,"Scrub not Dry or woodland fallback exceeded documented weak variation");
         var lowResolutionBackground=SurfacePlanner.Prepare(Array.Empty<GeographicPolygon>(),small,terrain,log,default,resolution:256);
-        Check(rocks.Material[128*256+128]==(byte)GroundMaterial.Dirt&&track.Material.SequenceEqual(lowResolutionBackground.Material)&&track.Intensity.SequenceEqual(lowResolutionBackground.Intensity),"Rocky beach lost underwater or track surface painted enclosing landscape");
+        // A pebble/gravel beach is still a beach: the game has no pebble ground.
+        Check(rocks.Material[128*256+128]==(byte)GroundMaterial.Sand&&track.Material.SequenceEqual(lowResolutionBackground.Material)&&track.Intensity.SequenceEqual(lowResolutionBackground.Intensity),"Gravel beach not painted as beach, or track surface painted enclosing landscape");
+        // Mapped beaches stand clear of the effective water, rising gently
+        // inland from just above it at the outline; the sea beside them becomes
+        // a shelf raised by at most MaximumLift that stays under water; a cliff
+        // far above the beach and every non-beach polygon leave terrain as it was.
+        var shore=terrain with{Heightmap=Enumerable.Range(0,256).Select(i=>(ushort)Math.Round((i%16<8?60.5f:i%16<12?55f:80f)/terrain.HeightScaleMeters*65535)).ToArray(),SeaLevelMeters=60};
+        var lifted=BeachTerrain.Lift(shore,small.MapSize.WidthMeters,new[]{Cover(40,("natural","beach"))},new ImportLog(),default);
+        float Metres(ushort v)=>v/65535f*terrain.HeightScaleMeters;float Grid(int k)=>(k/15f-.5f)*(float)small.MapSize.WidthMeters;
+        var beachEdge=WaterLevels.Effective(60)+BeachTerrain.EdgeHeight;
+        bool InsideBeach(int i)=>i%16<8&&Math.Abs(Grid(i%16))<200&&Math.Abs(Grid(i/16))<200;
+        var insidePixels=Enumerable.Range(0,256).Where(InsideBeach).ToArray();
+        Check(insidePixels.Length>0&&insidePixels.All(i=>Metres(lifted[i])>=beachEdge-.01f&&Metres(lifted[i])<=beachEdge+BeachTerrain.InlandRise+.01f),
+            "Beach not raised clear of the water, rising at most InlandRise inland");
+        Check(Enumerable.Range(0,256).Where(i=>i%16>=8&&i%16<12).All(i=>lifted[i]>=shore.Heightmap[i]&&Metres(lifted[i])<=55+BeachTerrain.MaximumLift+.01f),
+            "Sea beside the beach lowered, or raised more than MaximumLift");
+        // Column 12 lies inside the outline and is lowered by at most MaximumCut; beyond it the cliff stays.
+        Check(Enumerable.Range(0,256).Where(i=>i%16>=13).All(i=>lifted[i]==shore.Heightmap[i]),"Cliff far above the beach changed by the beach shaping");
+        Check(BeachTerrain.Lift(shore,small.MapSize.WidthMeters,new[]{Cover(41,("natural","scrub"))},new ImportLog(),default)==shore.Heightmap,"Non-beach polygon changed terrain");
         // Existing surface smoke: a broad, coherent sand ecotone must neither
         // invent sand outside its footprint nor erase small beaches/map edges.
         var transitionRequest=small with{MapSize=new("transition","transition",2000,false)};
@@ -114,9 +153,11 @@ static class Program
         // At 7.8125 m/cell the 20 m beach has partial edge cells. The existing
         // same-brush 1:2:1 filter gives the full core >= .8125 of solid density;
         // .96*.88*255*.8125 rounds to 175, not the old all-cells-full 220.
+        // A beach fades out over open ground inland (BeachInland, 60 m past its
+        // full width): sand 10 m past the edge, fainter than the core, none 110 m out.
         Check(narrowBeach.Material[TransitionSample(0,0)]==(byte)GroundMaterial.Sand&&narrowBeach.Intensity[TransitionSample(0,0)]>=175&&
-            (narrowBeach.Material[TransitionSample(20,0)]!=(byte)GroundMaterial.Sand||narrowBeach.Confidence[TransitionSample(20,0)]<225)&&
-            narrowBeach.Material[TransitionSample(120,0)]!=(byte)GroundMaterial.Sand,$"Narrow beach core lost or inferred outward ecotone escaped its confidence/distance policy: core={narrowBeach.Material[TransitionSample(0,0)]}/{narrowBeach.Intensity[TransitionSample(0,0)]}; near={narrowBeach.Material[TransitionSample(20,0)]}/{narrowBeach.Confidence[TransitionSample(20,0)]}; far={narrowBeach.Material[TransitionSample(120,0)]}");
+            narrowBeach.Material[TransitionSample(20,0)]==(byte)GroundMaterial.Sand&&narrowBeach.Intensity[TransitionSample(20,0)]<narrowBeach.Intensity[TransitionSample(0,0)]&&
+            narrowBeach.Material[TransitionSample(120,0)]!=(byte)GroundMaterial.Sand,$"Narrow beach core lost, or its inland fade missing or unbounded: core={narrowBeach.Material[TransitionSample(0,0)]}/{narrowBeach.Intensity[TransitionSample(0,0)]}; near={narrowBeach.Material[TransitionSample(20,0)]}/{narrowBeach.Intensity[TransitionSample(20,0)]}; far={narrowBeach.Material[TransitionSample(120,0)]}");
         // Extend this existing surface smoke: sand-backed flat desert expands,
         // but a beach or flatness alone does not establish a regional desert.
         var desertRequest=small with{MapSize=new("desert","desert",6000,false)};
@@ -155,11 +196,32 @@ static class Program
         WaterTests.Run();
         TerrainAcquisitionChecks();
         EnvironmentChecks.Run();
+        WaterContainmentTests.Run();
+        RiparianTests.Run();
         Console.WriteLine("PASS: diagnostic evidence match/mismatch/missing/skipped/null guards, offline deterministic cities, nearest-first/perimeter/corner spacing, north-up bearings, circular FROM wind, exclusive surface/native brush mapping, priority/ID ties/holes/underwater support/seasonal moisture/relative exposure/feathering, sand-backed flat desert and mapped non-sand protection, terrain-aware irregular sand ecotones, narrow beach cores and crop-edge preservation.");
 #else
         Console.WriteLine("PASS: existing surface smoke subset: native brush identities/exclusive sampling, deterministic priority/ID ties, holes/underwater/seasonal moisture/relative exposure, sand-backed desert/non-sand protection, irregular terrain-aware ecotones, narrow beach cores and crop-edge preservation. No game rendering or unrelated feature-suite acceptance claimed.");
 #endif
 #endif
+    }
+
+    // A two-cell 8 m building spike on flat 20 m DEM ground goes back on the
+    // plane; a 400 m wide 20 m hill and a long 6 m levee stay.
+    static void FlatSpikeChecks()
+    {
+        const int n=64;var raster=new float[n*n];
+        for(var y=0;y<n;y++)for(var x=0;x<n;x++)
+        {
+            var i=y*n+x;raster[i]=100+.02f*x;
+            raster[i]+=(float)(20*Math.Max(0,1-Math.Sqrt((x-48)*(x-48)+(y-48)*(y-48))/10));
+            if(x==12)raster[i]+=6;
+        }
+        raster[20*n+30]+=8;raster[20*n+31]+=7;
+        var hill=raster[48*n+48];var levee=raster[40*n+12];
+        TerrainArtifactRepair.Repair(raster,n,n,20,default,null);
+        Check(Math.Abs(raster[20*n+30]-(100+.02f*30))<.2f&&Math.Abs(raster[20*n+31]-(100+.02f*31))<.2f,$"Flat-ground spike kept: {raster[20*n+30]:F1}/{raster[20*n+31]:F1}");
+        Check(raster[48*n+48]==hill&&raster[40*n+12]==levee,"Flat-ground spike repair flattened a real hill or levee");
+        Console.WriteLine("PASS: flat-ground building spikes removed; hills and levees kept.");
     }
 
     // Exercise the real async planner up to its first cancelled download gate.
@@ -178,6 +240,31 @@ static class Program
             var diagnostic=log.Lines.Single(s=>s.StartsWith("DEM PLAN ",StringComparison.Ordinal));
             Check(diagnostic.Contains("preferredTiles=121;")&&diagnostic.Contains("selectedTiles=121;")&&diagnostic.Contains("zoomReduced=False;"),"Valid Isle of Man footprint was rejected or unnecessarily downsampled: "+diagnostic);
             Check(!Directory.Exists(root)||!Directory.EnumerateFiles(root,"*",SearchOption.AllDirectories).Any(),"Cancelled footprint check acquired or cached tile bytes");
+            // HD Terrain steps a 57 km Marseille map up to zoom 13 (about one
+            // sample per 14 m game pixel); standard detail stays at zoom 12.
+            var marseille=GeoMath.BoundsFromCenter(43.371315,5.291271,57344);
+            foreach(var hd in new[]{false,true})
+            {
+                log.Lines.Clear();
+                try { client.DownloadAsync(marseille,57344,cancelled.Token,hd).GetAwaiter().GetResult();throw new Exception("Cancelled DEM request completed"); }
+                catch(OperationCanceledException) { }
+                var plan=log.Lines.Single(s=>s.StartsWith("DEM PLAN ",StringComparison.Ordinal));
+                Check(plan.Contains(hd?"selectedZoom=13;":"selectedZoom=12;"),$"HD Terrain {hd} chose the wrong DEM level: "+plan);
+                Check(hd==log.Lines.Any(s=>s.Contains("elevation read at zoom 13 directly",StringComparison.Ordinal)),"HD Terrain step-up was not reported");
+            }
+            // Smaller maps: a whole footprint within the cap and budget, with source
+            // samples no coarser than 1.5 game pixels where the provider allows.
+            foreach(var width in new[]{14336d,28672d})foreach(var hd in new[]{false,true})
+            {
+                log.Lines.Clear();
+                try { client.DownloadAsync(GeoMath.BoundsFromCenter(43.371315,5.291271,width),width,cancelled.Token,hd).GetAwaiter().GetResult();throw new Exception("Cancelled DEM request completed"); }
+                catch(OperationCanceledException) { }
+                var plan=log.Lines.Single(s=>s.StartsWith("DEM PLAN ",StringComparison.Ordinal));
+                double Field(string name){var start=plan.IndexOf(name+"=",StringComparison.Ordinal)+name.Length+1;return double.Parse(plan.Substring(start,plan.IndexOf(';',start)-start),System.Globalization.CultureInfo.InvariantCulture);}
+                Check(!plan.Contains("zoomReduced=True;")&&Field("selectedTiles")<=Field("maximumTiles")&&Field("estimatedScratchBytes")<=Field("scratchBudgetBytes"),$"{width} m map (HD {hd}) has an unusable DEM plan: "+plan);
+                Check(Field("sourceSpacingMeters")<=Field("outputSpacingMeters")*(hd?1.5:3.1),$"{width} m map (HD {hd}) reads elevation far coarser than its game pixels: "+plan);
+                if(Environment.GetEnvironmentVariable("SHOW_DEM_PLAN")=="1")Console.WriteLine(plan);
+            }
             try { client.DownloadAsync(new GeoBounds(1,2,0,3),57344,cancelled.Token).GetAwaiter().GetResult();throw new Exception("Inverted DEM bounds accepted"); }
             catch(PreparationDataException error) { Check(error.Issue==PreparationDataIssue.ElevationUnavailable,"Bad DEM bounds lost typed data outcome"); }
             Console.WriteLine("PASS: real DEM planner retains the captured 121-tile footprint, honors cancellation before acquisition and rejects inverted bounds; no HTTP or elevation decoding exercised.");
@@ -186,6 +273,6 @@ static class Program
     }
 }
 namespace ImportEarthLocation { public static class Mod { public const string Id="FeatureSmoke";public const string Version="test"; } }
-namespace ImportEarthLocation.Core { public sealed class ImportLog { public readonly List<string> Lines=new(); private readonly Dictionary<string,double> Counts=new(); public bool DiagnosticsEnabled=>false; public double Metric(string s)=>Counts.TryGetValue(s,out var count)?count:0; public void DiagnosticRecords(string name,IEnumerable<object> records,long maximumBytes=8388608){} public void Info(string s)=>Lines.Add(s); public void Warn(string s)=>Lines.Add(s); public void Diagnostic(string s)=>Lines.Add(s); public void Count(string s,int count=1){Counts[s]=Metric(s)+count;} public void Time(string s,double seconds){} } }
+namespace ImportEarthLocation.Core { public sealed class ImportLog { public readonly List<string> Lines=new(); private readonly Dictionary<string,double> Counts=new(); public bool DiagnosticsEnabled=>false; public double Metric(string s)=>Counts.TryGetValue(s,out var count)?count:0; public void DiagnosticRecords(string name,IEnumerable<object> records,long maximumBytes=8388608){} public void Info(string s)=>Lines.Add(s); public void Warn(string s)=>Lines.Add(s); public void Diagnostic(string s)=>Lines.Add(s); public void Evidence(string s,bool warning=false)=>Lines.Add(s); public void Count(string s,int count=1){Counts[s]=Metric(s)+count;} public void Time(string s,double seconds){} } }
 namespace ImportEarthLocation.Data { public static class LocationServices { public static bool Valid(double lat,double lon)=>double.IsFinite(lat)&&double.IsFinite(lon)&&Math.Abs(lat)<=90&&Math.Abs(lon)<=180; } }
 namespace ImportEarthLocation.Processing { public static class TerrainBuilder { public const int Resolution=16; public sealed record Result(ushort[] Heightmap,float HeightScaleMeters,float SeaLevelMeters,float MinimumElevation,float MaximumElevation); } }

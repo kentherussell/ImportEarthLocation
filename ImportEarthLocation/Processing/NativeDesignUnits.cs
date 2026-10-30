@@ -11,6 +11,11 @@ namespace ImportEarthLocation.Processing;
 // junction cores union; a long connecting corridor is never an atomic city.
 public static class NativeDesignUnits
 {
+    // Shortest piece an optional unit cut may leave beside an existing node
+    // (metres): under a lane width there is no usable native edge.
+    private const double MinimumPiece=3;
+    // No unit cut within this distance (metres) of another node of its kind.
+    private const float CutClearance=3;
     private sealed class Chain
     {
         public SourceNodeKey Start, End;
@@ -20,8 +25,14 @@ public static class NativeDesignUnits
         public bool Indivisible;
     }
 
+    // minimumPiece (visual compiler only) gives each chain's shortest acceptable
+    // piece. Core boundaries first settle onto an existing node or at least that
+    // far from one (Settle); a remaining cut that would leave a sliver is skipped.
+    // A core cut is skipped only when the short side lies outside the core and
+    // the inside part is longer, so the whole span still classifies into the
+    // core's unit by its midpoint; corridor cuts carry no ownership.
     public static IReadOnlyList<PreparedSegment> Prepare(IReadOnlyList<PreparedSegment> source,
-        IReadOnlyList<NativeAssetContract> contracts,ImportLog log,CancellationToken token)
+        IReadOnlyList<NativeAssetContract> contracts,ImportLog log,CancellationToken token,Func<PreparedSegment,double>? minimumPiece=null)
     {
         if(source.Count==0)return source;
         var assets=contracts.ToDictionary(a=>a.PaletteKey,StringComparer.Ordinal);
@@ -110,10 +121,25 @@ public static class NativeDesignUnits
         {key=Root(key);if(!units.TryGetValue(key,out var value))units[key]=value=nextUnit++;return value;}
         var occupied=new HashSet<long>(source.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));var nextNode=long.MinValue+12000000;
         long Node(){while(occupied.Contains(nextNode))nextNode++;var id=nextNode++;occupied.Add(id);return id;}
-        var result=new List<PreparedSegment>(source.Count);var splits=0;var indivisible=0;
+        var result=new List<PreparedSegment>(source.Count);var splits=0;var indivisible=0;var slivers=0;var settled=0;var moved=0;var crowded=0;
+        // Node positions by kind in CutClearance cells. The game joins nodes at
+        // one position: two tracks cut where they cross (Marseille, 21 October:
+        // a surface line over a tunnel line) got four unit nodes at one point,
+        // which it wired together into dead ends.
+        var nodes=new Dictionary<(NetworkKind,int,int),List<float2>>();
+        (NetworkKind,int,int) NodeCell(NetworkKind kind,float2 p)=>(kind,(int)Math.Floor(p.x/CutClearance),(int)Math.Floor(p.y/CutClearance));
+        void AddNode(NetworkKind kind,float2 p){var key=NodeCell(kind,p);if(!nodes.TryGetValue(key,out var list))nodes[key]=list=new();list.Add(p);}
+        bool Clear(NetworkKind kind,float2 p)
+        {
+            var (_,cx,cz)=NodeCell(kind,p);
+            for(var dz=-1;dz<=1;dz++)for(var dx=-1;dx<=1;dx++)if(nodes.TryGetValue((kind,cx+dx,cz+dz),out var list)&&list.Any(q=>math.distance(q,p)<CutClearance))return false;
+            return true;
+        }
+        foreach(var s in source){AddNode(s.Kind,s.CourseStart.xz);AddNode(s.Kind,s.CourseEnd.xz);}
         foreach(var chain in chains)
         {
             token.ThrowIfCancellationRequested();var startUnit=Core(chain.Start);var endUnit=Core(chain.End);
+            var minimum=minimumPiece?.Invoke(source[chain.Spans[0].Index])??0;
             var boundaries=new SortedSet<double>();var corridorUnits=new List<int>();
             // One already-fitted span needs one safe handoff, not two cuts
             // enclosing a third, otherwise empty corridor batch. The boundary
@@ -125,6 +151,14 @@ public static class NativeDesignUnits
             {
                 var prefix=new double[chain.Spans.Count+1];
                 for(var k=0;k<chain.Spans.Count;k++)prefix[k+1]=prefix[k]+chain.Spans[k].Length;
+                if(minimum>0)
+                {
+                    var inner=prefix.Skip(1).Take(chain.Spans.Count-1).ToArray();
+                    var startCore=Settle(chain.RequiredStartCore,chain.StartCore,inner,minimum);
+                    var endCore=Settle(chain.RequiredEndCore,chain.EndCore,inner.Select(e=>chain.Length-e).ToArray(),minimum);
+                    if(startCore+endCore+2*chain.Guard<chain.Length&&(startCore!=chain.StartCore||endCore!=chain.EndCore))
+                    {chain.StartCore=startCore;chain.EndCore=endCore;settled++;}
+                }
                 boundaries.Add(chain.StartCore);boundaries.Add(chain.Length-chain.EndCore);
                 void Partition(double begin,double end)
                 {
@@ -142,7 +176,7 @@ public static class NativeDesignUnits
             var distance=0d;
             foreach(var span in chain.Spans)
             {
-                var s=source[span.Index];var cuts=new List<double>();
+                var s=source[span.Index];var cuts=new List<double>();var joined=new List<(double T,int Unit)>();
                 if(!chain.Indivisible)
                 {
                     foreach(var boundary in stations)
@@ -150,9 +184,44 @@ public static class NativeDesignUnits
                         var local=boundary-distance;
                         if(local>.01&&local<span.Length-.01)
                         {
+                            var before=local;var after=span.Length-local;
+                            var startCore=!singleHandoff&&Math.Abs(boundary-chain.StartCore)<1e-6;var endCore=!singleHandoff&&Math.Abs(boundary-(chain.Length-chain.EndCore))<1e-6;
                             var curve=new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd);
                             var t=Parameter(curve,span.Forward?local:span.Length-local);
-                            if(t>0&&t<1&&CanSplit(s,t))cuts.Add(t);
+                            if(Math.Min(before,after)<MinimumPiece)
+                            {
+                                // No sub-lane piece beside a node. A core boundary whose
+                                // short side lies inside the core takes the whole span
+                                // into that core, so the junction footprint stays whole.
+                                if(startCore&&before<after)joined.Add((t,startUnit));
+                                else if(endCore&&after<before)joined.Add((t,endUnit));
+                                slivers++;continue;
+                            }
+                            if(minimum>0)
+                            {
+                                var skip=startCore?after<minimum&&before>=after:endCore?before<minimum&&after>=before:Math.Min(before,after)<minimum;
+                                if(skip){slivers++;continue;}
+                            }
+                            // A cut on another node of its kind slides along the
+                            // span (3, 6, 9 m; a core boundary only away from its
+                            // core, which must stay whole) or is left out.
+                            var chosen=double.NaN;
+                            var shifts=startCore?new[]{0d,3,6,9}:endCore?new[]{0d,-3,-6,-9}:new[]{0d,3,-3,6,-6,9,-9};
+                            // A core boundary that would leave its core side shorter
+                            // than the class's shortest section first moves out
+                            // until it does not, when the other side stays as long.
+                            if(minimum>0&&startCore&&before<minimum&&after-(minimum-before)>=minimum)shifts=new[]{minimum-before}.Concat(shifts).ToArray();
+                            if(minimum>0&&endCore&&after<minimum&&before-(minimum-after)>=minimum)shifts=new[]{-(minimum-after)}.Concat(shifts).ToArray();
+                            if(!span.Forward&&(startCore||endCore))shifts=shifts.Select(x=>-x).ToArray();
+                            foreach(var shift in shifts)
+                            {
+                                var at=local+shift;if(at<MinimumPiece||span.Length-at<MinimumPiece)continue;
+                                var u=Parameter(curve,span.Forward?at:span.Length-at);
+                                if(u<=0||u>=1||!CanSplit(s,u)||!Clear(s.Kind,((float3)NetworkDesignChecks.Evaluate(curve,u)).xz))continue;
+                                chosen=u;if(shift!=0)moved++;break;
+                            }
+                            if(double.IsNaN(chosen)){crowded++;continue;}
+                            cuts.Add(chosen);AddNode(s.Kind,((float3)NetworkDesignChecks.Evaluate(curve,chosen)).xz);
                         }
                     }
                 }
@@ -175,6 +244,7 @@ public static class NativeDesignUnits
                         else if(station>chain.Length-chain.EndCore)unit=endUnit;
                         else if(station>=chain.StartCore)
                         {var bucket=Array.BinarySearch(stations,station);if(bucket<0)bucket=~bucket-1;unit=corridorUnits[Math.Min(bucket,corridorUnits.Count-1)];}
+                        foreach(var j in joined)if(j.T>begin&&j.T<end)unit=j.Unit;
                     }
                     result.Add(child with{NativeUnitId=unit});begin=end;
                 }
@@ -197,6 +267,11 @@ public static class NativeDesignUnits
             {
                 var local=(t-begin)/(1-begin);
                 if(!CanSplit(remaining,local)){log.Count("Unrepresentable optional unit cuts avoided");continue;}
+                // The opposite carriageway's cut can fall beside a node of this one.
+                var piece=new Cubic3d(remaining.CourseStart,remaining.CourseControl1,remaining.CourseControl2,remaining.CourseEnd);
+                if(Math.Min(Length(piece,0,local),Length(piece,local,1))<MinimumPiece){log.Count("Paired unit cuts beside a node skipped");continue;}                var cutAt=((float3)NetworkDesignChecks.Evaluate(piece,local)).xz;
+                if(!Clear(remaining.Kind,cutAt)){log.Count("Paired unit cuts on another node skipped");continue;}
+                AddNode(remaining.Kind,cutAt);
                 var pair=Split(remaining,local,Node());synchronized.Add(pair.Left);remaining=pair.Right;begin=t;splits++;
             }
             synchronized.Add(remaining);
@@ -207,6 +282,8 @@ public static class NativeDesignUnits
         {c.Start,c.End,c.Length,c.StartCore,c.EndCore,c.RequiredStartCore,c.RequiredEndCore,c.Guard,c.Indivisible,
             candidateStartCore=cores[c.Start],candidateEndCore=cores[c.End],footprint="projected-central-port-rectangles-not-taper-influence",nativePreviewLegalityUnverified=true}));
         log.Count("Native design units",sizes.Length);log.Count("Native unit exact boundary splits",splits);
+        log.Count("Native unit cuts moved off another node",moved);log.Count("Native unit cuts left out beside another node",crowded);
+        if(minimumPiece!=null){log.Count("Native unit sliver cuts skipped",slivers);log.Count("Native unit core boundaries settled",settled);}
         if(log.DiagnosticsEnabled)log.DiagnosticJson("native-segmentation-reasons.json",new
         {
             inputSections=source.Count,emittedSections=result.Count,ownershipHandoffSplits=splits,
@@ -219,6 +296,22 @@ public static class NativeDesignUnits
         });
         log.Diagnostic($"NATIVE DESIGN UNITS units={sizes.Length}; sections={result.Count}; exactBoundarySplits={splits}; indivisibleChains={indivisible}; largestUnit={sizes.Max()}; overlappingCoresOnly=true; taperInfluenceDoesNotUnion=true; heuristicAloneUnions=false; centralFootprintProjected=true; nativeAcceptance=RequiresReview");
         return result;
+    }
+
+    // Distance of a core boundary from its junction. The existing node nearest
+    // the wanted extent, between the projected native footprint (required) and
+    // one longest compiled section (400 m) beyond it, becomes the boundary, so no
+    // cut is made at all; otherwise the cut lies at least one piece beyond both
+    // the core extent and the node behind it. Replay showed unchanged unit
+    // counts and sizes (largest 32 sections) with fewer sections overall.
+    private static double Settle(double required,double core,double[] nodes,double minimum)
+    {
+        const double reach=400;
+        var wanted=Math.Max(core,minimum);var best=double.NaN;
+        foreach(var e in nodes)if(e>=required&&e<=wanted+reach&&(double.IsNaN(best)||Math.Abs(e-wanted)<Math.Abs(best-wanted)))best=e;
+        if(!double.IsNaN(best))return best;
+        var behind=0d;foreach(var e in nodes)if(e<wanted)behind=Math.Max(behind,e);
+        return Math.Max(wanted,behind+minimum);
     }
 
     private static double Length(Cubic3d c,double begin=0,double end=1)

@@ -50,7 +50,9 @@ public sealed partial class NetworkCommitSystem
             _suspensionReason = currentReason;
             _suspensionUtc = now;
             _nextSuspensionDiagnosticUtc = now.AddSeconds(10);
-            _leaseLog?.Warn($"Native placement suspended: {currentReason}; batch={_diagnosticBatchStem}; Apply issued={s_Applied}; Clear issued={s_ClearingPreview}. Ownership remains unresolved; no automatic Apply/Clear or replay.");
+            // The tool that took over is named, with the mod that defines it,
+            // even without Diagnostics: the DC suspension left no clue.
+            _leaseLog?.Warn($"Native placement suspended: {currentReason}; active tool now {ToolName(_toolSystem.activeTool)} (was {ToolName(_capturedActive)}); last tool now {ToolName(_lastToolField?.GetValue(_toolSystem) as ToolBaseSystem)} (was {ToolName(_capturedLast)}); batch={_diagnosticBatchStem}; Apply issued={s_Applied}; Clear issued={s_ClearingPreview}. Ownership remains unresolved; no automatic Apply/Clear or replay.");
             if (_leaseLog?.DiagnosticsEnabled != true) return;
             try
             {
@@ -99,6 +101,9 @@ public sealed partial class NetworkCommitSystem
         TransactionState=s_Requested?NativeTransactionState.PreviewGenerated:NativeTransactionState.DefinitionsLive;
     }
 
+    private static string ToolName(ToolBaseSystem? tool) =>
+        tool == null ? "none" : $"{tool.GetType().FullName} [{tool.GetType().Assembly.GetName().Name}]";
+
     private static object ToolEvidence(ToolBaseSystem? tool) => new
     {
         type=tool?.GetType().FullName, instance=tool == null ? 0 : RuntimeHelpers.GetHashCode(tool),
@@ -139,7 +144,7 @@ public sealed partial class NetworkCommitSystem
             var owner = s_Instance;
             if (owner?._hasLease != true) return "native batch settled; checking live entities";
             if (owner._suspensionActive)
-                return $"SUSPENDED: {owner._suspensionReason}; {(DateTime.UtcNow-owner._suspensionUtc).TotalSeconds:0}s; ownership unresolved (not building)";
+                return $"SUSPENDED: another tool took over ({owner._suspensionReason}); {(DateTime.UtcNow-owner._suspensionUtc).TotalSeconds:0}s; not building{(CanResume?" — press Resume to continue":"")}";
             if (s_ClearingPreview) return $"waiting for preview cleanup ({s_Submitted.Count} submitted entities)";
             if (s_Applied) return $"waiting for native application ({s_Submitted.Count} submitted entities)";
             return s_Requested ? "waiting for native preview and source qualification" : "generating native nodes, edges and lanes";

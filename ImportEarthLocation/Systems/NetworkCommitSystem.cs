@@ -32,6 +32,9 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
     private static int s_SettledFrames;
     private static int s_CommitSequence;
     private static bool s_DeepCapture;
+    // Set by Resume until the interrupted batch's preview has retired.
+    private static bool s_Resuming;
+    private static int s_ResumeFrames;
     public static int LastMutationTargets { get; private set; }
     public static NativeBatchDisposition LastDisposition { get; private set; }
     public static bool HasUnresolvedLease => s_Instance?._hasLease==true||MapRetirementInProgress;
@@ -69,6 +72,7 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
         // A UI reset or diagnostic deadline is not native retirement. The
         // explicit map/world retirement owner must release issued work later.
         if (s_Requested && (s_Applied || s_ClearingPreview)) return;
+        s_Resuming = false;
         s_Requested = false; s_WaitFrames = 0; s_Failure = null; s_Map = s_Generation = 0; s_Submitted.Clear(); s_Applied=false; s_SettledFrames=0; s_Log=null; s_Context=null; s_BeforeApply=null;s_Recoverable=false;s_ArtifactStem=null;s_PreviewOnly=s_ClearingPreview=false;s_PreviewFailure=null;
     }
 
@@ -188,6 +192,19 @@ public sealed partial class NetworkCommitSystem : GameSystemBase
     protected override void OnUpdate()
     {
         if(_retirementId!=0)return;
+        if(s_Resuming)
+        {
+            // Two clean frames after the discarded preview retires; a minute
+            // without that leaves the batch failed rather than resubmitted.
+            s_ResumeFrames++;
+            var clean=CanStartExclusive(EntityManager,out var waiting);
+            if(!clean&&s_ResumeFrames<1800)return;
+            if(clean&&s_ResumeFrames<3)return;
+            s_Resuming=false;s_Requested=false;s_WaitFrames=-1;s_Submitted.Clear();
+            LastDisposition=clean?NativeBatchDisposition.Interrupted:NativeBatchDisposition.Unresolved;
+            s_Failure=clean?"Interrupted by another tool and resumed; nothing of the batch was applied.":"The interrupted batch's preview did not retire after Resume: "+waiting;
+            return;
+        }
         if(_hasLease&&!s_Applied&&!s_ClearingPreview&&!ObserveExclusiveWindow(false))return;
         if (!s_Requested) return;
         if ((!ImportSession.Matches(s_Map, s_Generation) || Game.SceneFlow.GameManager.instance.isGameLoading)&&!s_Applied&&!s_ClearingPreview) { CancelPending(); return; }

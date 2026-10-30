@@ -15,12 +15,19 @@ static class Program
     }
     static void Run(string[] args)
     {
+        if(args.Length==1&&args[0]=="--avenues-only"){AvenueTests.Run();return;}
+        if(args.Length==1&&args[0]=="--connectivity-only"){ConnectivityTests.Run();return;}
+        if(args.Length==3&&args[0] is "--street-capture" or "--street-design-capture"){VisualMetricsReplay.Streets(args[1],args[2],args[0]=="--street-design-capture");return;}
+        if(args.Length==4&&args[0]=="--road-water-capture"){VisualMetricsReplay.RoadWater(args[1],args[2],args[3]);return;}
+        if(args.Length==1&&args[0]=="--water-roads-only"){WaterRoadTests.Run();return;}
+        if(args.Length==5&&args[0]=="--water-landscape-capture"){VisualMetricsReplay.WaterLandscape(args[1],args[2],args[3],args[4]);return;}
+        if(args.Length==1&&args[0]=="--rebalance-anchors-only"){RebalanceRegressionTests.Run();return;}
         if(args.Length==1&&args[0]=="--writer-trace-only"){NetworkWriterTrace.Test();PairedPublicationTraceTests.Run();return;}
         if(args.Length==4&&args[0] is "--corrective-writer-trace" or "--corrective-writer-trace-horizontal")
         {
-            var ways=args[3].Split(',').Select(value=>long.Parse(value,System.Globalization.CultureInfo.InvariantCulture));
+            var traceWays=args[3].Split(',').Select(value=>long.Parse(value,System.Globalization.CultureInfo.InvariantCulture));
             CorrectiveCapturedReplay.Design(args[1],args[2],horizontalOnly:args[0].EndsWith("-horizontal",StringComparison.Ordinal),
-                writerTrace:new NetworkWriterTrace(ways));return;
+                writerTrace:new NetworkWriterTrace(traceWays));return;
         }
         if(args.Length==1&&args[0]=="--profile-census-only"){ProfileRowCensus.Test();ProfileCouplingCensus.Test();return;}
         if(args.Length==3&&args[0]=="--profile-coupling-census")
@@ -40,6 +47,22 @@ static class Program
         if(args.Length==3&&args[0]=="--corrective-timing"){CorrectiveCapturedReplay.Design(args[1],args[2],benchmark:true);return;}
         if(args.Length==3&&args[0]=="--corrective-feasibility"){CorrectiveCapturedReplay.Design(args[1],args[2],feasibilityOnly:true);return;}
         if(args.Length==1&&args[0]=="--visual-design-only"){VisualDesignTests.Run();return;}
+        if(args.Length==3&&args[0]=="--visual-metrics"){VisualMetricsReplay.Run(args[1],args[2]);return;}
+        if(args.Length==2&&args[0]=="--visual-metrics-recluster"){VisualMetricsReplay.Recluster(args[1]);return;}
+        if(args.Length==2&&args[0]=="--live-breaks"){VisualMetricsReplay.LiveBreaks(args[1]);return;}
+        if(args.Length==6&&args[0]=="--resample-demo"){var f=System.Globalization.CultureInfo.InvariantCulture;VisualMetricsReplay.ResampleDemo(args[1],args[2],double.Parse(args[3],f),double.Parse(args[4],f),args[5]);return;}
+        if(args.Length==3&&args[0]=="--visual-compiler"){VisualMetricsReplay.Compiler(args[1],args[2]);return;}
+        if(args.Length==3&&args[0]=="--rock-plan"){VisualMetricsReplay.RockPlan(args[1],args[2]);return;}
+        if(args.Length==3&&args[0]=="--lane-runs"){VisualMetricsReplay.LaneRuns(args[1],args[2]);return;}
+        if(args.Length==2&&args[0]=="--interval-timing"){VisualMetricsReplay.IntervalTiming(args[1]);return;}
+        if(args.Length>=3&&args[0]=="--crossings"){VisualMetricsReplay.Crossings(args[1],args.Skip(2).Select(long.Parse).ToHashSet());return;}
+        if(args.Length==7&&args[0]=="--plan-png"){var f=System.Globalization.CultureInfo.InvariantCulture;VisualMetricsReplay.PlanPng(args[1],args[2],double.Parse(args[3],f),double.Parse(args[4],f),double.Parse(args[5],f),args[6]);return;}
+        if(args.Length==6&&args[0]=="--terrain-crop"){var f=System.Globalization.CultureInfo.InvariantCulture;VisualMetricsReplay.TerrainCrop(args[1],float.Parse(args[2],f),float.Parse(args[3],f),float.Parse(args[4],f),args[5]);return;}
+        if(args.Length==7&&args[0]=="--terrain-teeth"){var f=System.Globalization.CultureInfo.InvariantCulture;VisualMetricsReplay.Teeth(args[1],args[2],args[3],float.Parse(args[4],f),float.Parse(args[5],f),args[6]);return;}
+        if(args.Length==4&&args[0]=="--water-replay"){VisualMetricsReplay.WaterReplay(args[1],args[2],float.Parse(args[3],System.Globalization.CultureInfo.InvariantCulture));return;}
+        if(args.Length==2&&args[0]=="--water-banks"){VisualMetricsReplay.WaterBanks(args[1]);return;}
+        if(args.Length==4&&args[0]=="--beach-check"){VisualMetricsReplay.BeachCheck(args[1],args[2],float.Parse(args[3],System.Globalization.CultureInfo.InvariantCulture));return;}
+        if(args.Length==5&&args[0]=="--visual-plot"){VisualMetricsReplay.Plot(args[1],args[2],args[3],args[4]);return;}
         if(args.Length==4&&args[0]=="--compare-run-quality"){NetworkQualityComparison.Run(args[1],args[2],args[3]);return;}
         if(args.Length==1&&args[0]=="--paired-corridors-only"){PairedCorridorTests.Run();return;}
         if(args.Length==3&&args[0]=="--captured-problem-audit"){CapturedProblemAudit.Run(args[1],args[2]);return;}
@@ -58,6 +81,10 @@ static class Program
         CorrectivePlanTests.Run();
         CriticalReworkTests.Run();
         VisualDesignTests.Run();
+        WaterRoadTests.Run();
+        RebalanceRegressionTests.Run();
+        ConnectivityTests.Run();
+        TerrainSamplingTests.Run();
         OfflineCompletionTests.Run();
         if(args.Length==1&&args[0]=="--corridor-quality-only"){CorridorQualityTests.Run();return;}
         if(args.Length==2&&args[0]=="--corridor-quality-replay"){CorridorQualityTests.Replay(args[1]);return;}
@@ -106,7 +133,8 @@ static class Program
         foreach(var level in Enum.GetValues<RoadImportLevel>())foreach(var rail in new[]{false,true})
         {
             var selected=request with{RoadLevel=level,ImportRail=rail};var result=NetworkProcessor.BuildSegments(data,selected,log);
-            var expected=((level&RoadImportLevel.Highways)!=0?2:0)+((level&RoadImportLevel.Routes)!=0?((level&RoadImportLevel.Streets)!=0?2:1):0)+((level&RoadImportLevel.Streets)!=0?3:0);
+            // Main Roads takes trunk links with it, with or without Streets.
+            var expected=((level&RoadImportLevel.Highways)!=0?2:0)+((level&RoadImportLevel.Routes)!=0?2:0)+((level&RoadImportLevel.Streets)!=0?3:0);
             Check(result.Count(s=>s.Kind==NetworkKind.Road)==expected&&result.Count(s=>s.Kind==NetworkKind.Rail)==(rail?1:0),"Road/rail independence failed");
             var query=OverpassClient.BuildNetworkQuery(new(-1,-1,1,1),level,rail);
             Check(query.Contains("way[\"highway\"~\"^("+NetworkSelection.Classes(level))== (level!=RoadImportLevel.None)&&query.Contains("way[\"railway\"=\"rail\"]")==rail,"Disabled selected network type fetched");
@@ -115,10 +143,38 @@ static class Program
             Check(forestQuery.Contains("forest")&&forestQuery.Contains("wood")&&!forestQuery.Contains("highway")&&!forestQuery.Contains("railway"),"Forest query includes networks or loses cover");
         }
         Check(new ImportRequest(0,0,MapSizeProfile.Vanilla,true).RoadLevel==RoadImportLevel.None,"Legacy constructor enabled independent groups without an explicit selection");
+        // Lane runs: a 100 m 4-lane pocket between 3-lane stretches takes 3 lanes;
+        // a 500 m 4-lane stretch is a real change and stays.
+        PreparedSegment Way(long id,float x0,float x1,int lanes)=>new(id,id,id+1,new float3(x0,0,0),new float3(x1,0,0),NetworkKind.Road,"trunk",lanes,true,false,false,0){Name="Avenue"};
+        var pocket=NetworkLaneRuns.Smooth(new[]{Way(1,0,400,3),Way(2,400,500,4),Way(3,500,900,3),Way(4,900,1400,4),Way(5,1400,1800,3)},new ImportLog());
+        Check(pocket.Select(s=>s.Lanes).SequenceEqual(new[]{3,3,3,4,3}),"Short lane pocket not smoothed, or a long lane change removed: "+string.Join(",",pocket.Select(s=>s.Lanes)));
+        // Lane slots: two 2-lane roads merging into 3 lanes land on the left two
+        // and right two lanes (±2 m), not both on the centre.
+        PreparedSegment Lane(long id,long a,long b,float3 p0,float3 p1,float[] offsets)=>new(id,a,b,p0,p1,NetworkKind.Road,"motorway",offsets.Length,true,false,false,0){NativeLaneOffsets=offsets};
+        var merged=NetworkLaneSlots.Align(new[]{Lane(11,100,200,new float3(-6,0,-200),new float3(0,0,0),new[]{-2f,2f}),Lane(12,101,200,new float3(6,0,-200),new float3(0,0,0),new[]{-2f,2f}),
+            Lane(13,200,300,new float3(0,0,0),new float3(0,0,200),new[]{-4f,0f,4f})},new ImportLog());
+        var plan=NativeLaneObligations.Build(merged);
+        Check(plan.Movements.Count>0&&plan.Movements.All(m=>m.PlannedLateralError<.05),"Merge lanes not aligned to the receiving lanes: "+string.Join(",",plan.Movements.Select(m=>m.PlannedLateralError.ToString("F2"))));
+        // A one-way road widening from 2 to 3 lanes at a plain node keeps its left
+        // edge: the wider side starts 2 m to the right; the 40 m section moves
+        // whole and the next, long enough, bends back to its mapped line.
+        var widened=NetworkLaneSlots.Align(new[]{Lane(21,400,401,new float3(0,0,-200),new float3(0,0,0),new[]{-2f,2f}) with{NativeWidth=14},
+            Lane(22,401,402,new float3(0,0,0),new float3(0,0,40),new[]{-4f,0f,4f}) with{NativeWidth=18},Lane(23,402,403,new float3(0,0,40),new float3(0,0,300),new[]{-4f,0f,4f}) with{NativeWidth=18}},new ImportLog());
+        Check(Math.Abs(widened[1].StartCurveOffset.x-2)<1e-3&&Math.Abs(widened[1].EndCurveOffset.x-2)<1e-3&&Math.Abs(widened[2].StartCurveOffset.x-widened[1].EndCurveOffset.x)<1e-4&&
+            math.lengthsq(widened[2].EndCurveOffset)<1e-6&&math.lengthsq(widened[0].EndCurveOffset)<1e-6,
+            $"Lane gain not left-aligned: {widened[1].StartCurveOffset} {widened[1].EndCurveOffset} {widened[2].StartCurveOffset} {widened[2].EndCurveOffset}");
         Check(NetworkPreferences.Parse("{}")==NetworkPreferences.Defaults&&NetworkPreferences.Parse("broken")==NetworkPreferences.Defaults,"Corrupt/missing preferences unsafe");
         Check(NetworkPreferences.Parse("{\"includeSecondaryRoads\":true}").Roads==RoadImportLevel.None,"Legacy persisted secondary enabled independent groups without an explicit selection");
         Check(NetworkPreferences.Parse("{\"roadLevel\":\"none\",\"importRail\":false}")==new NetworkPreferences(RoadImportLevel.None,false),"Explicit none/off not persisted");
         Check(!NetworkPreferences.Parse("{\"importForests\":false}").Forests,"Independent forestry preference not preserved");
+        // Density sliders: older files migrate from their on/off value; 0 is off.
+        var legacy=NetworkPreferences.Parse("{\"importForests\":true,\"importRocks\":false}");
+        Check(legacy.VegetationDensity==1&&legacy.RockDensity==0,"Legacy on/off preferences did not migrate to full/zero density");
+        var densities=NetworkPreferences.Parse("{\"importForests\":true,\"importRocks\":true,\"vegetationDensity\":0.44,\"rockDensity\":0}");
+        Check(densities.VegetationDensity==.4f&&densities.Forests&&densities.RockDensity==0&&!densities.Rocks,"Density preferences not stepped to tenths or zero not treated as off");
+        var routes=NetworkPreferences.Parse("{\"applyGroundSurfaces\":false,\"createAirConnections\":true,\"createSeaConnections\":true}");
+        Check(!routes.Surfaces&&routes.AirRoutes&&routes.ShipRoutes&&NetworkPreferences.Defaults.Surfaces&&!NetworkPreferences.Defaults.AirRoutes&&!NetworkPreferences.Defaults.ShipRoutes,
+            "Surfaces, air and ship route choices not remembered, or their defaults changed");
         Check(NetworkPreferences.Parse("{\"roadLevel\":123,\"importRail\":\"false\"}")==NetworkPreferences.Defaults,"Corrupt typed preference did not default");
         Check(!NetworkSelection.NativeDirectionMatches(true,false,false)&&NetworkSelection.NativeDirectionMatches(true,true,false)&&!NetworkSelection.NativeDirectionMatches(true,false,true),"One-way can resolve to two-way/backward prefab");
         Check(NetworkSelection.BasicRoadName(4)=="Medium Road"&&NetworkSelection.BasicRoadName(6)=="Large Road","Standard road lane mapping inconsistent");
@@ -215,6 +271,7 @@ namespace ImportEarthLocation.Core
         public void Info(string s)=>Lines.Add(s);
         public void Warn(string s)=>Lines.Add(s);
         public void Diagnostic(string s)=>Lines.Add(s);
+        public void Evidence(string s,bool warning=false)=>Lines.Add(s);
         public void Quality(NetworkQualityFinding finding)=>Findings.Add(finding);
         public void Count(string s,int count=1){_metrics.TryGetValue(s,out var old);_metrics[s]=old+count;}
         public void AddCounter(string s,long count){_metrics.TryGetValue(s,out var old);_metrics[s]=old+count;}

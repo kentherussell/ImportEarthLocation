@@ -1,6 +1,7 @@
 using ImportEarthLocation.Core;
 using ImportEarthLocation.Processing;
 using Unity.Mathematics;
+using Newtonsoft.Json.Linq;
 
 static class AvenueTests
 {
@@ -8,14 +9,32 @@ static class AvenueTests
     static PreparedSegment S(long way,long from,long to,float x,float z,float endX,float endZ)=>new(way,from,to,new(x,0,z),new(endX,0,endZ),NetworkKind.Road,"primary",2,true,false,false,0){Name="Main"};
     public static void Run()
     {
+        FragmentedCounterparts();
+        TaperAttachmentGuard();
         var a=S(1,1,2,0,0,100,0);var b=S(2,3,4,100,10,0,10);
         IReadOnlyList<PreparedSegment> Run(params PreparedSegment[] edges)=>AvenueConsolidator.Prepare(edges,new ImportLog(),default);
         var pair=Run(a,b);
-        Check(Run(a with{Lanes=1},b with{Lanes=1}).All(e=>e.ConsolidatedAvenue&&e.Lanes==2&&e.ForwardLanes==1&&e.BackwardLanes==1&&!e.OneWay),"Specified nearest 2/4/6 stock avenue representation inflated a 1+1 corridor");
+        var longRoad=new[]{S(20,20,21,-100,0,0,0),a,S(21,2,22,100,0,200,0)};
+        var partial=Run(longRoad.Concat(new[]{b}).ToArray());
+        Check(partial.Any(s=>s.StartNodeId==20)&&partial.Any(s=>s.EndNodeId==22),"Partial avenue matching removed unchanged exterior carriageway edges");
+        var partialLog=new ImportLog();SourceTopologyObligations.Validate(SourceTopologyObligations.Capture(longRoad.Concat(new[]{b}).ToArray()),partial,partialLog,default);
+        Check(partialLog.Metric("Missing mandatory selected-source ports")==0&&partialLog.Metric("Unresolved selected-source reachability obligations")==0,
+            "Partial avenue matching lost a required exterior source connection");
+        Check(Run(a with{Lanes=1},b with{Lanes=1}).All(e=>!e.ConsolidatedAvenue&&e.Lanes==2&&e.ForwardLanes==1&&e.BackwardLanes==1&&!e.OneWay),"A 1+1 corridor did not become a regular two-way two-lane road");
+        Check(Run(a with{Name=""},b with{Name=""}).Count==2,"Anonymous parallel streets were consolidated without shared identity");
+        Check(Run(a,b with{Classification="residential"}).All(e=>e.ConsolidatedAvenue&&e.Classification=="primary"),"A street-class discrepancy prevented consolidation or lost the through-road class");
+        Check(Run(a,b with{Start=new(100,0,25),End=new(0,0,25)}).All(e=>e.ConsolidatedAvenue),"A wide same-street median prevented consolidation");
+        Check(Run(a,b with{Start=new(100,0,40),End=new(0,0,40)}).Count==2,"Distant same-name streets were consolidated");
         Check(pair.Count>0&&pair.All(e=>e.ConsolidatedAvenue&&!e.OneWay&&e.Lanes==4&&Math.Abs(e.Start.z-5)<.001&&Math.Abs(e.End.z-5)<.001),"Opposing carriageways did not become a four-lane centerline avenue");
         Check(math.distance(pair[0].Start.xz,new float2(0,5))<.001&&math.distance(pair[pair.Count-1].End.xz,new float2(100,5))<.001,"Avenue discarded corridor endpoints");
         Check(Run(b,a).Select(e=>(e.WayId,e.StartNodeId,e.EndNodeId,e.Start,e.End,e.Lanes,e.OneWay)).SequenceEqual(pair.Select(e=>(e.WayId,e.StartNodeId,e.EndNodeId,e.Start,e.End,e.Lanes,e.OneWay))),"Input ordering changes consolidation");
         Check(Run(a,b with{Name="Different"}).Count==2,"Unrelated named streets merged");
+        Check(Run(a with{Reference="R1"},b with{Name="",Reference="R1"}).All(e=>!e.OneWay),"A missing name on one carriageway hid an otherwise identified divided street");
+        Check(Run(a with{Reference="R1"},b with{Name="Different",Reference="R1"}).Count==2,"A shared route reference erased two distinct named streets");
+        var highway=S(400,400,1,0,-150,0,0) with{Classification="trunk",Name="Highway"};
+        var anchored=Run(a,b,highway);
+        Check(math.all(anchored.Single(e=>e.WayId==400).Start==highway.Start)&&math.all(anchored.Single(e=>e.WayId==400).End==highway.End),
+            "Avenue midpoint placement moved an attached trunk road away from its surveyed alignment");
         Check(Run(a,b with{Start=b.End,End=b.Start,StartNodeId=4,EndNodeId=3}).Count==2,"Same-direction carriageways merged");
         Check(Run(a with{Classification="motorway"},b with{Classification="motorway"}).Count==2,"Highways converted into avenues");
         Check(Run(a with{Classification="trunk"},b with{Classification="trunk"}).Count==2,"Trunk highways converted into avenues");
@@ -57,6 +76,7 @@ static class AvenueTests
         var medianResult=Run(first,second,alignedReverseFirst,alignedReverseSecond,median);
         Check(medianResult.Any(e=>e.ConsolidatedAvenue)&&medianResult.All(e=>e.StartNodeId!=e.EndNodeId),"Median crossing consolidation created a self-loop");
         JunctionRegressions();
+        CapturedBoiseStreet();
         var normalized=NetworkNormalizer.Normalize(connected,new ImportLog(),default,1000);
         NetworkNormalizer.Validate(normalized,1000,default);
         var terrain=Enumerable.Repeat((ushort)32768,TerrainBuilder.Resolution*TerrainBuilder.Resolution).ToArray();
@@ -65,6 +85,70 @@ static class AvenueTests
         using var cancel=new CancellationTokenSource();cancel.Cancel();
         try{AvenueConsolidator.Prepare(new[]{a,b},new ImportLog(),cancel.Token);throw new Exception("Cancellation ignored");}catch(OperationCanceledException){}
         Console.WriteLine("PASS: opposing one-ways to vanilla avenue centerlines, cross-way chains, junction/end reconnection, route reachability, unmatched/highway/ramp/structure/level guards, determinism and grading integration.");
+    }
+
+    static void FragmentedCounterparts()
+    {
+        var source=new List<PreparedSegment>{S(300,300,301,0,0,2400,0) with{Lanes=1}};
+        for(var i=0;i<12;i++)source.Add(S(301+i,400+2*i,401+2*i,150+200*i,12,20+200*i,12) with{Lanes=1});
+        var log=new ImportLog();var result=AvenueConsolidator.Prepare(source,log,default);
+        Check(Enumerable.Range(301,12).All(way=>!result.Any(s=>s.OneWay&&s.WayId==way)),
+            "A long street retained parallel opposing fragments or tiny projected tails");
+        SourceTopologyObligations.Validate(SourceTopologyObligations.Capture(source),result,log,default);
+        Check(log.Metric("Missing mandatory selected-source ports")==0&&log.Metric("Unresolved selected-source reachability obligations")==0,
+            "Consolidating fragmented opposing streets lost an exterior route or source port");
+        Check(result.Where(s=>!s.OneWay).All(s=>s.Lanes==2&&!s.ConsolidatedAvenue),"Fragmented 1+1 lanes did not become regular two-lane roads");
+    }
+
+    static void TaperAttachmentGuard()
+    {
+        var body=new[]{S(500,500,501,0,0,50,0),S(500,501,502,50,0,100,0),
+            S(501,503,504,100,12,90,6),S(501,504,505,90,6,0,10)};
+        Check(AvenueConsolidator.Prepare(body,new ImportLog(),default).Any(s=>s.ConsolidatedAvenue),
+            "An identified divided street's short end taper prevented consolidation");
+        var arm=S(502,501,506,50,0,70,11) with{Name="Side",OneWay=false};var log=new ImportLog();
+        var result=AvenueConsolidator.Prepare(body.Append(arm).ToArray(),log,default);
+        Check(!result.Any(s=>s.ConsolidatedAvenue)&&log.Metric("Avenue taper matches retained for acute attachments")>0,
+            "A relaxed end taper introduced an acute side-street attachment");
+        var trunk=S(503,502,503,100,0,100,12) with{Classification="trunk",Name="Major"};
+        var tied=AvenueConsolidator.Prepare(body.Append(trunk).ToArray(),new ImportLog(),default);
+        Check(tied.Any(s=>s.ConsolidatedAvenue)&&tied.Single(s=>s.WayId==503)==trunk,
+            "Consolidation failed to retain short turning approaches behind distinct trunk-road ports");
+        var obligations=new ImportLog();SourceTopologyObligations.Validate(SourceTopologyObligations.Capture(body.Append(trunk).ToArray()),tied,obligations,default);
+        Check(obligations.Metric("Missing mandatory selected-source ports")==0&&obligations.Metric("Unresolved selected-source reachability obligations")==0,
+            "Keeping separate trunk turning ports lost a selected-source route");
+        var ring=new[]{S(504,502,507,100,0,106,6),S(504,507,503,106,6,100,12),
+            S(504,503,508,100,12,94,6),S(504,508,502,94,6,100,0)}.Select(s=>s with{Name="",Roundabout=true}).ToArray();
+        var roundabout=AvenueConsolidator.Prepare(body.Concat(ring).ToArray(),new ImportLog(),default);
+        Check(roundabout.Where(s=>s.Roundabout).SequenceEqual(ring),
+            "Avenue consolidation distorted a roundabout's ring");
+        var competition=new[]{S(510,510,511,0,0,300,0),S(511,512,513,300,10,0,10),
+            S(512,514,515,300,8,285,2),S(512,515,516,285,2,0,2)};
+        var selected=AvenueConsolidator.Prepare(competition,new ImportLog(),default);
+        Check(selected.Any(s=>s.ConsolidatedAvenue&&s.SourceWayIds.Contains(510)&&s.SourceWayIds.Contains(511))&&
+            !selected.Any(s=>s.ConsolidatedAvenue&&s.SourceWayIds.Contains(512)),
+            "A closer end-taper candidate displaced an established fully parallel counterpart");
+    }
+
+    static void CapturedBoiseStreet()
+    {
+        // Northside Road and its incident arms, from the complete Boise source
+        // capture. Coalesced stations must still carry the short source way
+        // 1572423297 between both of its mapped junction ports.
+        var source=File.ReadLines(Path.Combine(AppContext.BaseDirectory,"fixtures","avenue-boise-northside.ndjson")).Select(line=>
+        {
+            var r=Newtonsoft.Json.Linq.JObject.Parse(line);
+            float3 P(string key){var p=r[key]!.Values<float>().ToArray();return new(p[0],p[1],p[2]);}
+            return new PreparedSegment((long)r["WayId"]!,(long)r["StartNodeId"]!,(long)r["EndNodeId"]!,P("start"),P("end"),
+                NetworkKind.Road,(string)r["Classification"]!,(int)r["Lanes"]!,(bool)r["OneWay"]!,(bool)r["Bridge"]!,(bool)r["Tunnel"]!,(int)r["Layer"]!)
+                {Name=(string)r["Name"]!,Reference=(string)r["Reference"]!,SourceWayIds=Array.AsReadOnly(r["SourceWayIds"]!.Select(value=>(long)value).ToArray()),SourceGeometry=new[]{P("start"),P("end")}};
+        }).ToArray();
+        var log=new ImportLog();var result=AvenueConsolidator.Prepare(source,log,default);
+        Check(log.Metric("Opposing road pairs consolidated into avenues")>0,"Captured Boise street did not consolidate");
+        SourceTopologyObligations.Validate(SourceTopologyObligations.Capture(source),result,log,default);
+        SourceTopologyObligations.Validate(SourceTopologyObligations.Capture(result),result,log,default);
+        Check(log.Metric("Missing mandatory selected-source ports")==0&&log.Metric("Unresolved selected-source reachability obligations")==0,
+            "Captured Boise avenue lost an attached street or a short source way's directional route");
     }
 
     static void JunctionRegressions()

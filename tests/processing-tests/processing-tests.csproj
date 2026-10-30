@@ -23,6 +23,8 @@
     <Compile Include="..\..\ImportEarthLocation\Processing\OsmParser.cs" Link="OsmParser.cs" />
     <Compile Include="..\..\ImportEarthLocation\Processing\OsmParsedCache.cs" Link="OsmParsedCache.cs" />
     <Compile Include="..\..\ImportEarthLocation\Processing\ForestProcessor.cs" Link="ForestProcessor.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\GeographyPolygons.cs" Link="GeographyPolygons.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\RockPlanner.cs" Link="RockPlanner.cs" />
     <Reference Include="Unity.Mathematics"><HintPath>$(GameManagedPath)\Unity.Mathematics.dll</HintPath></Reference>
     <Reference Include="UnityEngine.CoreModule"><HintPath>$(GameManagedPath)\UnityEngine.CoreModule.dll</HintPath></Reference>
   </ItemGroup>

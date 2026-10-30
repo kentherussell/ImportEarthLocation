@@ -13,6 +13,19 @@ public sealed record GeographicPolygon(long Id, IReadOnlyDictionary<string, stri
     public bool IsRelation { get; init; }
     public long Identity => IsRelation ? -Id : Id;
     public bool Contains(float3 point) => Outer.Any(r => GeographyPolygons.Inside(point, r)) && !Inner.Any(r => GeographyPolygons.Inside(point, r));
+    // Horizontal distance (metres) from a point to the nearest ring edge, outer or inner.
+    public float EdgeDistance(float2 point)
+    {
+        var best = float.PositiveInfinity;
+        foreach (var ring in Outer.Concat(Inner))
+            for (var i = 0; i < ring.Length; i++)
+            {
+                var a = ring[i].xz; var b = ring[(i + 1) % ring.Length].xz; var ab = b - a;
+                var t = math.saturate(math.dot(point - a, ab) / math.max(1e-6f, math.lengthsq(ab)));
+                best = math.min(best, math.distance(point, a + t * ab));
+            }
+        return best;
+    }
 }
 public static class GeographyPolygons
 {

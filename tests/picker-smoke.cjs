@@ -21,7 +21,8 @@ function fireTimers(delay){for(const [id,timer] of [...timers])if(timer.delay===
 function button(nodes,label){const n=nodes.find(n=>n.type==='Button'&&n.props.children===label);assert(n,label);return n;}
 let nodes=render();assert(!nodes.some(n=>n.type==='select'||n.type==='option'));assert.equal(button(nodes,'14km').props.disabled,false);
 assert.equal(button(nodes,'28km').props.disabled,true);assert.equal(button(nodes,'57km').props.disabled,true);
-assert.equal(nodes.find(n=>n.type==='Panel').props.header,'Select Location');
+assert.equal(nodes.find(n=>n.type==='Panel').props.header.props.children,'Select Location');
+assert.equal(nodes.find(n=>n.type==='Panel').props.header.props.className,'brandText','Picker title must not wrap');
 assert.equal(nodes.find(n=>n.props?.className==='sizeChoices').props.children.length,3);
 let inputs=nodes.filter(n=>n.type==='input');inputs[1].props.onChange({target:{value:'-'}});nodes=render();button(nodes,'Use This Location').props.onSelect();assert.equal(commits.length,0);assert.equal(nodes.filter(n=>n.type==='input')[1].props.value,'-');
 inputs=nodes.filter(n=>n.type==='input');inputs[1].props.onChange({target:{value:'44'}});inputs[2].props.onChange({target:{value:'16'}});nodes=render();button(nodes,'Use This Location').props.onSelect();assert.equal(commits.length,1);assert.deepStrictEqual(JSON.parse(JSON.stringify(commits[0])),{latitude:44,longitude:16,mapSize:'vanilla'});assert(!events.some(e=>e[0]==='prepare'||e[0]==='confirm'),'Picker must not start imports');
@@ -63,4 +64,12 @@ const coordinate=nodes.filter(n=>n.type==='input')[1];coordinate.props.onChange(
 fireTimers(300);nodes=render();const tileRevision=JSON.parse(events.filter(e=>e[0]==='previewTiles').at(-1)[1]).revision;bindings.displayTiles=JSON.stringify({revision:tileRevision,tiles:{},error:true});nodes=render();assert(nodes.some(n=>n.props?.children==='Map preview unavailable. Enter coordinates manually.'));
 button(nodes,'Cancel').props.onSelect();assert.equal(commits.length,1);for(const hook of hooks)hook?.cleanup?.();assert(events.some(e=>e[0]==='cancelLocationServices'));
 hooks=[];nodes=render();assert.equal(nodes.find(n=>n.type==='input').props.value,'');assert(!nodes.some(n=>n.props?.className==='results'||n.props?.className==='searchSpinner'),'Reopening must clear search state');nodes.find(n=>n.type==='input').props.onChange({target:{value:'Zadar'}});nodes=render();button(nodes,'Search').props.onSelect();const reopened=JSON.parse(events.filter(e=>e[0]==='searchPlace').at(-1)[1]).revision;assert(reopened>autoRevision,'Reopened picker reused stale revision');
-console.log('PASS: coordinate precision/blur, projection, MapExt size selection, draft-only commit/cancel, debounced/manual search, loading/results lifecycle, stale/reopened response protection, failed preview fallback, request cancellation.');
+// The open map's size is the only choice, whatever MapExt allows.
+hooks=[];props={...props,mapExt:true,loadedSize:'mapext28'};nodes=render();
+assert.equal(button(nodes,'28km').props.selected,true);assert.equal(button(nodes,'14km').props.disabled,true);assert.equal(button(nodes,'57km').props.disabled,true);
+assert(nodes.some(n=>n.props?.className==='helper'&&String(n.props.children).includes('open map')),'Missing open-map size hint');
+// No location yet: a world view with empty coordinates, and nothing to commit until one is picked.
+hooks=[];const commitsBefore=commits.length;props={...props,initial:null};nodes=render();
+assert.deepEqual(nodes.filter(n=>n.type==='input').slice(1).map(n=>n.props.value),['',''],'Picker without a location must not prefill 0, 0');
+button(nodes,'Use This Location').props.onSelect();nodes=render();assert.equal(commits.length,commitsBefore,'Empty location was committed');
+console.log('PASS: open-map size lock, empty start without a location, coordinate precision/blur, projection, MapExt size selection, draft-only commit/cancel, debounced/manual search, loading/results lifecycle, stale/reopened response protection, failed preview fallback, request cancellation.');

@@ -3,6 +3,13 @@ using Newtonsoft.Json.Linq;
 
 static class CapturedRunFiles
 {
+    public static float WaterCellSize(string folder,JObject input)
+    {
+        var cell=(float?)input["waterCellSize"];
+        if(!cell.HasValue||cell<=0)cell=(float?)JObject.Parse(File.ReadAllText(Resolve(folder,"offline-request.json")))["waterCellSize"];
+        if(!cell.HasValue||!float.IsFinite(cell.Value)||cell<=0)throw new InvalidDataException("Missing captured native water-cell size");
+        return cell.Value;
+    }
     public static string Resolve(string folder,string name)
         =>Optional(folder,name)??throw new InvalidDataException("Artifact unavailable: "+name);
     public static string? Optional(string folder,string name)

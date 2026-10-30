@@ -106,14 +106,21 @@ public static class NetworkRoadbed
     }
 
     // Work on a copy. Structural spans never become broad terrain embankments.
+    // waterSurface: effective sea level in the raster's frame (NaN when unknown),
+    // which a tunnel roof fill under the sea never reaches.
     public static ushort[] Prepare(ushort[] source,float scale,double width,IReadOnlyList<PreparedSegment> segments,
-        IEnumerable<float3[]> protectedAreas,IEnumerable<float3[]> protectedLines,ImportLog log,CancellationToken token,int4? dirtyRegion=null)
+        IEnumerable<float3[]> protectedAreas,IEnumerable<float3[]> protectedLines,ImportLog log,CancellationToken token,int4? dirtyRegion=null,float waterSurface=float.NaN)
     {
         var n=(int)Math.Sqrt(source.Length);if(n*n!=source.Length||n<2||width<=0||scale<=0)throw new InvalidOperationException("Invalid roadbed terrain.");
-        var cell=(float)(width/(n-1));var protectedMask=new bool[source.Length];var region=dirtyRegion??new int4(0,0,n-1,n-1);
+        var cell=(float)(width/(n-1));var protectedMask=new bool[source.Length];var lineGuard=new bool[source.Length];var region=dirtyRegion??new int4(0,0,n-1,n-1);
+        // Inside mapped water and quarry polygons only, without the guard bands
+        // around them and around cliff, waterway and coast lines: tunnel roof
+        // cover may be built there (Marseille's tunnels pass beside cliffs and
+        // under buried streams, whose bands left their bores exposed).
+        var areaMask=new bool[source.Length];
         var coordinates=new float[n];for(var i=0;i<n;i++)coordinates[i]=(i/(float)(n-1)-.5f)*(float)width;
         int Pixel(float value)=>(int)Math.Round((value/width+.5)*(n-1));
-        void Guard(float3 a,float3 b,float margin)
+        void Guard(float3 a,float3 b,float margin,bool[]? mask=null)
         {
             var lo=math.min(a.xz,b.xz)-margin;var hi=math.max(a.xz,b.xz)+margin;
             var delta=b.xz-a.xz;var denominator=Math.Max(.001f,math.lengthsq(delta));
@@ -122,7 +129,7 @@ public static class NetworkRoadbed
                 {
                     var p=new float2(coordinates[x],coordinates[z]);
                     var t=math.clamp(math.dot(p-a.xz,delta)/denominator,0,1);
-                    if(math.distance(p,math.lerp(a.xz,b.xz,t))<=margin)protectedMask[z*n+x]=true;
+                    if(math.distance(p,math.lerp(a.xz,b.xz,t))<=margin)(mask??protectedMask)[z*n+x]=true;
                 }
         }
         // Protect the actual polygon, not its rectangular envelope. A winding
@@ -136,11 +143,16 @@ public static class NetworkRoadbed
             {
                 token.ThrowIfCancellationRequested();var y=coordinates[z];crossings.Clear();
                 for(var i=0;i<ring.Length;i++){var a=ring[i];var b=ring[(i+1)%ring.Length];if((a.z>y)==(b.z>y))continue;crossings.Add(a.x+(y-a.z)*(b.x-a.x)/(b.z-a.z));}
-                crossings.Sort();for(var i=1;i<crossings.Count;i+=2)for(var x=Math.Max(region.x,Pixel(crossings[i-1]));x<=Math.Min(region.z,Pixel(crossings[i]));x++)protectedMask[z*n+x]=true;
+                crossings.Sort();for(var i=1;i<crossings.Count;i+=2)for(var x=Math.Max(region.x,Pixel(crossings[i-1]));x<=Math.Min(region.z,Pixel(crossings[i]));x++)protectedMask[z*n+x]=areaMask[z*n+x]=true;
             }
             for(var i=0;i<ring.Length;i++)Guard(ring[i],ring[(i+1)%ring.Length],cell);
         }
-        foreach(var line in protectedLines)for(var i=1;i<line.Length;i++){token.ThrowIfCancellationRequested();Guard(line[i-1],line[i],cell*2);}
+        // Bands along waterway, cliff and coast lines keep road shoulders and fills
+        // off them, but not a ground road's own core and the grid cell beside it,
+        // from which the ground under its centre is read: the road stands there in
+        // game whatever the ground does, and left unstamped it floated or sank
+        // beside bridges over streams (300 of Marseille's 1,455 mismatches).
+        foreach(var line in protectedLines)for(var i=1;i<line.Length;i++){token.ThrowIfCancellationRequested();Guard(line[i-1],line[i],cell*2,lineGuard);}
         // Surface-road cuts must not remove a tunnel's roof. Include the terrain
         // interpolation footprint, not just the narrow track/road centreline.
         foreach(var tunnel in segments.Where(s=>s.Tunnel))
@@ -200,6 +212,19 @@ public static class NetworkRoadbed
             }
         }
         formations.AddRange(segments.Where(s=>!consumed.Contains(s)&&!NetworkStructure.IsStructure(s)));
+        // Bridge abutments and tunnel portals: the approach fill or cutting stays
+        // close to the road footprint (a steep, short bank) instead of the broad
+        // 1:4 shoulders used elsewhere, widening back to normal over ApproachReach.
+        const float ApproachReach=100;var narrowedApproachSamples=0;
+        var structureEnds=new Dictionary<(int,int),List<float2>>();
+        foreach(var s in segments.Where(NetworkStructure.IsStructure))foreach(var end in new[]{s.CourseStart.xz,s.CourseEnd.xz})
+        {var key=((int)Math.Floor(end.x/ApproachReach),(int)Math.Floor(end.y/ApproachReach));if(!structureEnds.TryGetValue(key,out var list))structureEnds[key]=list=new();list.Add(end);}
+        float StructureEndDistance(float2 p)
+        {
+            var best=float.PositiveInfinity;int cx=(int)Math.Floor(p.x/ApproachReach),cz=(int)Math.Floor(p.y/ApproachReach);
+            for(var dz=-1;dz<=1;dz++)for(var dx=-1;dx<=1;dx++)if(structureEnds.TryGetValue((cx+dx,cz+dz),out var list))foreach(var end in list)best=Math.Min(best,math.distance(p,end));
+            return best;
+        }
         log.Quality(new("planned","mixed-mode-formation","roadbed",mixedFormations+incompatibleFormations,0,incompatibleFormations,0,0,
             "Trusted common profile; ground/median half-formation only; structural interpolation support protected; actual raster support checked separately"));
         log.Diagnostic($"ROADBED FORMATIONS sharedGroundProfiles={sharedFormations}; sharedMixedModeHalfFormations={mixedFormations}; incompatibleProfiles={incompatibleFormations}; structuralFootprintsProtected=true; explicitWallsRetainedSeparately=true; profileHeightsNotReoptimized=true");
@@ -227,6 +252,11 @@ public static class NetworkRoadbed
                 // An unsupported profile must not enlarge its earthworks beyond
                 // the displacement the terrain policy actually permits.
                 var earthBlend=Math.Min(240,Math.Max(cell*3f,Math.Min(budget,Math.Abs(originalCenter-p.y))*6f));
+                if(structureEnds.Count>0)
+                {
+                    var approach=StructureEndDistance(p.xz);
+                    if(approach<ApproachReach){earthBlend=math.lerp(cell*1.5f,earthBlend,approach/ApproachReach);narrowedApproachSamples++;}
+                }
                 var radius=half+earthBlend;var reach=(int)Math.Ceiling(radius/cell);
                 var tangent=math.normalizesafe((NetworkNormalizer.Evaluate(s,Math.Min(1,t+.01f))-NetworkNormalizer.Evaluate(s,Math.Max(0,t-.01f))).xz);
                 var leftNormal=new float2(-tangent.y,tangent.x);
@@ -244,7 +274,7 @@ public static class NetworkRoadbed
                     // not turn otherwise natural earthworks into vertical stamps.
                     var wall=((s.ExplicitWallSides|s.QuaySides)&side)!=0;var sideRadius=half+(wall?cell*.75f:earthBlend);
                     if(distance>sideRadius)continue;
-                    var id=z*n+x;if(protectedMask[id]){protectedSamples++;continue;}
+                    var id=z*n+x;if(protectedMask[id]||lineGuard[id]&&distance>half+cell){protectedSamples++;continue;}
                     var original=source[id]/65535f*scale;if(Math.Abs(nearest.y-original)>budget+.05f)
                     {
                         // At DEM resolution a pixel can be outside a narrow road on
@@ -279,6 +309,34 @@ public static class NetworkRoadbed
             if(unsupported)unsupportedSections++;
             if(clock.Elapsed.TotalSeconds>=nextProgress){log.Diagnostic($"PROCESS roadbed sections={processed}; affectedSamples={targets.Count}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.0}");nextProgress=clock.Elapsed.TotalSeconds+5;}
         }
+        // Under a bridge deck: city elevation data carries viaducts and their
+        // embankments (the A7 into Marseille), and a deck sat in the ground it
+        // should stand over. Away from its ends ground reaching within BridgeUnder
+        // of a deck (its structure depth) is lowered to that, by at most BridgeCut, across the
+        // deck and feathered over two cells beyond it. The clearance falls to
+        // zero over BridgeUnderRamp metres toward each end so the abutment meets
+        // the deck. Cells of a ground formation or protected feature are kept.
+        const float BridgeUnder=2.5f,BridgeCut=10,BridgeUnderRamp=40;var under=new Dictionary<int,float>();
+        static float Ramp(float x){x=math.clamp(x,0,1);return x*x*(3-2*x);}
+        foreach(var bridge in segments.Where(s=>s.Bridge&&!s.Tunnel))
+        {
+            token.ThrowIfCancellationRequested();
+            var length=NetworkVerticalProfiles.ArcLength(bridge);var steps=Math.Max(1,(int)Math.Ceiling(length/Math.Max(1,cell*.5f)));
+            var core=bridge.NativeWidth>0?bridge.NativeWidth*.5f:6;var edge=core+cell*2;var r=(int)Math.Ceiling(edge/cell);
+            for(var i=0;i<=steps;i++)
+            {
+                var t=i/(float)steps;var clearance=BridgeUnder*Math.Min(1,Math.Min(t,1-t)*length/BridgeUnderRamp);if(clearance<=0)continue;
+                var p=NetworkNormalizer.Evaluate(bridge,t);var px=Pixel(p.x);var pz=Pixel(p.z);
+                for(var z=Math.Max(region.y,pz-r);z<=Math.Min(region.w,pz+r);z++)for(var x=Math.Max(region.x,px-r);x<=Math.Min(region.z,px+r);x++)
+                {
+                    var id=z*n+x;var distance=math.distance(new float2(coordinates[x],coordinates[z]),p.xz);
+                    if(distance>edge||protectedMask[id]||lineGuard[id]||targets.ContainsKey(id))continue;
+                    var original=source[id]/65535f*scale;var target=Math.Max(p.y-clearance,original-BridgeCut);if(target>=original)continue;
+                    var blend=distance<=core?1:Ramp(1-(distance-core)/(edge-core));target=original+(target-original)*blend;
+                    under[id]=under.TryGetValue(id,out var old)?Math.Min(old,target):target;
+                }
+            }
+        }
         var result=(ushort[])source.Clone();var changed=0;var maximum=0f;
         foreach(var entry in targets)
         {
@@ -288,9 +346,53 @@ public static class NetworkRoadbed
             result[entry.Key]=(ushort)Math.Round(target/scale*65535);if(result[entry.Key]!=source[entry.Key])changed++;
             maximum=Math.Max(maximum,Math.Abs(target-original));
         }
+        foreach(var (id,target) in under)
+        {var value=(ushort)Math.Round(math.clamp(target/scale,0,1)*65535);if(value<result[id]){result[id]=value;changed++;}}
+        log.Count("Roadbed samples lowered under bridge decks",under.Count);
+        // Tunnel roofs: where the ground (or the sea floor) lies below a tunnel's
+        // roof the bore shows (the A55 by Marseille's Old Port, whose tunnels
+        // cannot dive deep enough before reaching the water). Cover is built up to
+        // the roof over the tunnel's footprint, by at most RoofFill above the
+        // original ground, never above 1 m under the sea surface, and never in
+        // mapped water, cliffs or quarries. RoofFill covers a cut-and-cover
+        // tunnel whose open trench the elevation data shows (the A507 by the A50):
+        // its deck lies above the trench floor, so 4 m left the roof exposed.
+        // The cover stands full height out to one grid cell beyond the bore's
+        // edge, so bilinear terrain across the bore never dips below its roof,
+        // then falls 1 m per 2 m over RoofShoulder cells instead of stopping in
+        // a step. Only mapped water and quarry interiors (areaMask) are kept;
+        // the guard bands around cliffs, streams and shores are not.
+        // RoofHeight matches the profile's TunnelDepth: the game draws a tunnel
+        // as an open cut unless the ground stands about 12 m above its deck, and
+        // 8 m of cover left 2.8 km of the A507's covered trenches drawn open.
+        // Cover never rises above the formation of a ground road over the
+        // tunnel, which would bury that road.
+        const float RoofHeight=13,RoofFill=10,RoofSlope=.5f;const int RoofShoulder=3;var roofSamples=0;
+        foreach(var tunnel in segments.Where(s=>s.Tunnel))
+        {
+            token.ThrowIfCancellationRequested();
+            var core=(tunnel.NativeWidth>0?tunnel.NativeWidth*.5f:6)+cell;var reach=core+RoofShoulder*cell;
+            var steps=Math.Max(1,(int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(tunnel)/Math.Max(1,cell*.5f)));
+            for(var i=0;i<=steps;i++)
+            {
+                var p=NetworkNormalizer.Evaluate(tunnel,i/(float)steps);var r=(int)Math.Ceiling(reach/cell);var px=Pixel(p.x);var pz=Pixel(p.z);
+                for(var z=Math.Max(region.y,pz-r);z<=Math.Min(region.w,pz+r);z++)for(var x=Math.Max(region.x,px-r);x<=Math.Min(region.z,px+r);x++)
+                {
+                    var id=z*n+x;var distance=math.distance(new float2(coordinates[x],coordinates[z]),p.xz);if(areaMask[id]||distance>reach)continue;
+                    var original=source[id]/65535f*scale;var current=result[id]/65535f*scale;
+                    var target=Math.Min(p.y+RoofHeight-Math.Max(0,distance-core)*RoofSlope,original+RoofFill);
+                    if(math.isfinite(waterSurface)&&original<waterSurface)target=Math.Min(target,waterSurface-1);
+                    if(targets.TryGetValue(id,out var formation)&&formation.blend>=1)target=Math.Min(target,formation.target);
+                    if(target<=current)continue;
+                    result[id]=(ushort)Math.Round(math.clamp(target/scale,0,1)*65535);roofSamples++;
+                }
+            }
+        }
+        log.Count("Roadbed tunnel roof samples filled",roofSamples);
         log.Count("Roadbed terrain samples changed",changed);log.Count("Roadbed protected samples avoided",protectedSamples);
         log.Count("Roadbed samples beyond cut/fill budget",beyondBudget);
         log.Count("Roadbed ground formations beyond support budget",unsupportedSections);
+        log.Count("Roadbed approach samples kept to the footprint",narrowedApproachSamples);
         log.Diagnostic($"ROADBED SUPPORT sampledUnsupportedFormations={unsupportedSections}; maximumCenterlineDeficitMeters={maximumSupportDeficit:0.###}; boundedEarthworkNotSupportAcceptance=true; continuousFinalSupportAuditStillRequired=true");
         log.Diagnostic($"PROCESS roadbed complete; changedSamples={changed}; maximumCutFillMeters={maximum:0.###}; target=nearest-curve-station; shoulderMetersPerFillMeter=6; maximumShoulderMeters=240; zeroWeightAtToe=true; targetAndShoulderBoundedBeforeFeather=true; protectedWaterCliffsQuarries=true; structuresExcluded=true; elapsedSeconds={clock.Elapsed.TotalSeconds:0.0}");
         return result;

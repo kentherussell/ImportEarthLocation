@@ -221,6 +221,31 @@ public sealed partial class NetworkCommitSystem
         }
         return true;
     }
+    // The Resume button. Only a batch whose Apply and Clear were never issued
+    // qualifies: nothing of it reached the map, and its definitions are still
+    // the importer's alone. They are destroyed, the tool active when the batch
+    // began is restored, and once the game has retired the batch's preview
+    // (CanStartExclusive) the batch reports Interrupted so the importer
+    // submits the same sections again. Nothing is applied or cleared here.
+    public static bool CanResume => s_Instance is { } owner&&owner._hasLease&&owner._suspensionActive&&
+        !s_Applied&&!s_ClearingPreview&&!owner._allocationUnknown&&owner._retirementId==0&&!s_Resuming;
+
+    public static bool Resume(out string message)
+    {
+        var owner=s_Instance;
+        if(owner==null||!CanResume)
+        {message="Nothing can be resumed: no unissued native batch is suspended.";return false;}
+        var manager=owner.EntityManager;var destroyed=0;
+        foreach(var id in owner._ownedDefinitions)if(manager.Exists(id)&&manager.HasComponent<CreationDefinition>(id)){manager.DestroyEntity(id);destroyed++;}
+        var restored=owner._capturedActive!=null&&!ReferenceEquals(owner._toolSystem.activeTool,owner._capturedActive);
+        if(restored)owner._toolSystem.activeTool=owner._capturedActive;
+        owner._leaseLog?.Warn($"Native placement resumed by the user after {(DateTime.UtcNow-owner._suspensionUtc).TotalSeconds:0} s: {destroyed} unapplied definitions of batch {owner._diagnosticBatchStem} discarded; {(restored?"restored "+ToolName(owner._capturedActive):"tool unchanged")}; the batch is submitted again once its preview retires.");
+        owner._hasLease=false;owner._ownedDefinitions.Clear();owner._baselineTemps.Clear();owner._claimedTemps.Clear();
+        owner._ownedEntities.DiscardBatch();owner._suspensionActive=false;owner.TransactionState=NativeTransactionState.Cleared;
+        s_Resuming=true;s_ResumeFrames=0;
+        message="Resuming: the interrupted batch will be placed again.";return true;
+    }
+
     private bool SuspendUncertain(string reason,Entity culprit,Entity related)
     { TransactionState=NativeTransactionState.AwaitingExclusiveSafety;ReportSuspension(reason,culprit,related);return false; }
 

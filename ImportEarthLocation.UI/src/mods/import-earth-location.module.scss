@@ -37,7 +37,7 @@
 }
 .launcher:hover { background: rgba(39, 79, 104, .98); }
 .panel {
-  position: fixed; top: 150rem; right: 16rem; width: 430rem; max-height: 760rem;
+  position: fixed; top: 150rem; right: 16rem; width: 430rem;
   z-index: 9998; overflow: hidden;
 }
 .panelHeader { background: transparent; border-bottom: 1rem solid rgba(165, 184, 194, .14); color: #fff; font-weight: 700; justify-content: space-between; text-align: left; }
@@ -47,15 +47,29 @@
 .panelCloseButton { margin: 0; }
 .servicePanel { position: relative; width: 460rem; max-width: 90%; max-height: 80%; overflow: hidden; color: #d1d9de; }
 .brand { display: flex; align-items: center; justify-content: flex-start; color: #fff; font-weight: 700; }
+// The title is short; Gameface otherwise wraps each word of a flex text item.
+.brandText { white-space: nowrap; flex-shrink: 0; }
 .brand img { width: 20rem; height: 20rem; object-fit: contain; margin-right: 8rem; flex-shrink: 0; }
 .panelContent { background: transparent; }
-.panelBody { height: 570rem; }
+// Gameface's Scrollable needs a fixed height. rem scales with the screen, so
+// this fits every resolution: the full option list without scrolling, ending
+// above the bottom toolbar. The log, when shown, scrolls inside it.
+.panelBody { height: 680rem; }
 .notice { color: #aebdc5; font-size: 12rem; line-height: 1.45; margin-bottom: 12rem; }
 .section { padding: 14rem 16rem; }
 .sectionTitle { color: #e4eaed; font-size: 13rem; font-weight: 700; border-bottom: 1rem solid rgba(165, 184, 194, .14); padding-bottom: 6rem; }
 .options { display: flex; flex-wrap: wrap; }
-.options > button { width: 50%; }
+.options > * { width: 50%; }
 .experimental { display: block; color: #97a5ae; font-size: 10rem; line-height: 1.3; }
+// Drawn level with the hovered option, then shifted to sit left of the panel.
+.tip {
+  position: fixed; z-index: 10001; width: 240rem; transform: translateX(-100%); margin-left: -12rem; padding: 10rem 12rem;
+  pointer-events: none; background: rgba(30, 39, 44, .97); border: 1rem solid rgba(165, 184, 194, .3); border-radius: 8rem; box-shadow: 0 6rem 18rem rgba(0, 0, 0, .35);
+}
+.tipHost { display: flex; flex-direction: column; }
+.tipHost > button { width: 100%; }
+.tipTitle { color: #f1f5f7; font-size: 13rem; font-weight: 700; margin-bottom: 3rem; }
+.tipText { color: #c3cfd5; font-size: 12rem; line-height: 1.4; }
 .locationActions { display: flex; flex-direction: column; gap: 8rem; }
 .locationSummary { height: 32rem; display: flex; align-items: center; color: #aebdc5; font-size: 11rem; white-space: nowrap; }
 .actionSection { padding: 0 16rem 14rem; }
@@ -74,6 +88,17 @@
 .radioIndicator { flex-shrink: 0; width: 18rem; height: 18rem; margin-right: 8rem; border: 1rem solid #91bed5; border-radius: 50%; background: transparent; }
 .radioSelected { background: #b7f5ff; border-color: #b7f5ff; }
 .check:disabled { opacity: .55; }
+// Density slider: a full-width row in the options grid.
+.options > .wide { width: 100%; }
+.slider { display: flex; align-items: center; min-height: 32rem; margin-top: 4rem; color: #d1d9de; font-size: 13rem; }
+.sliderLabel { width: 96rem; flex-shrink: 0; }
+.sliderStep { display: flex; align-items: center; justify-content: center; flex-shrink: 0; width: 20rem; height: 20rem; padding: 0; border-radius: 50%; border: 1rem solid #71838d; background: rgba(0, 0, 0, .16); color: #e1edf1; font-size: 13rem; line-height: 1; }
+.sliderStep:disabled { opacity: .4; }
+.sliderStep:focus { outline: 2rem solid #9ab5c3; outline-offset: 2rem; }
+.sliderTrack { position: relative; flex: 1; height: 8rem; margin: 0 10rem; border-radius: 4rem; background: rgba(0, 0, 0, .3); cursor: pointer; }
+.sliderFill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4rem; background: #8da9b6; }
+.sliderValue { width: 40rem; flex-shrink: 0; margin-left: 8rem; text-align: right; color: #e1edf1; }
+.sliderDisabled { opacity: .55; pointer-events: none; }
 .configChoice { display: flex; align-items: center; min-height: 32rem; padding: 5rem 8rem; border-radius: 4rem; color: #d1d9de; background: #303d45; font-size: 13rem; line-height: 1.4; }
 .configChoice:hover { background: #3b4c56; }
 .configChoice:disabled { opacity: .45; pointer-events: none; }
@@ -94,7 +119,7 @@
 .danger:hover { background: #795149; }
 .danger:active { background: #533934; }
 .actionButton:disabled { opacity: .4; pointer-events: none; }
-.feedback { height: 78rem; margin-top: 10rem; border-top: 1rem solid rgba(165, 184, 194, .14); padding-top: 8rem; }
+.feedback { height: 78rem; margin-top: 10rem; border-top: 1rem solid rgba(165, 184, 194, .14); padding-top: 8rem; overflow-x: hidden; overflow-y: auto; }
 .status { color: #c0ccd3; font-size: 12rem; line-height: 1.5; }
 .summary { color: #b4c8b8; font-size: 12rem; margin-top: 8rem; white-space: pre-wrap; }
 .error { color: #efb5a9; background: rgba(115, 65, 52, .24); border-left: 2rem solid #b78a70; padding: 10rem; margin-top: 8rem; border-radius: 4rem; }

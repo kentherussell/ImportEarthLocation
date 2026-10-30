@@ -73,6 +73,11 @@ const coordinates = nodes.filter(n => n.type === 'input' && !n.props['aria-label
 assert.equal(coordinates[0].props.value, String(place.latitude));
 assert.equal(coordinates[1].props.value, String(place.longitude));
 assert(!nodes.some(n => n.props?.className === 'resultButton'), 'Selected result remained open');
+// The chosen place's import footprint fills the 400×260 preview, not a speck on the world view.
+const footprint = nodes.find(n => n.props?.className === 'footprint').props.style;
+const footprintWidth = parseFloat(footprint.width), footprintHeight = parseFloat(footprint.height);
+assert(footprintWidth <= 400 * 0.85 + 1e-6 && footprintHeight <= 260 * 0.85 + 1e-6 && (footprintWidth > 400 * 0.4 || footprintHeight > 260 * 0.4),
+  `Selecting a place did not zoom to its footprint: ${footprintWidth}×${footprintHeight}`);
 nodes.find(n => n.type === 'Button' && n.props.children === 'Use This Location').props.onSelect();
 assert.equal(committed.latitude, place.latitude); assert.equal(committed.longitude, place.longitude);
 console.log('PASS: search response, capture-before-selection, populated coordinates, result dismissal and committed location. Native Gameface event dispatch/layout still needs in-game verification.');

@@ -45,6 +45,8 @@ public sealed class ImportLog
     private volatile bool _diagnosticsEnabled;
     public bool DiagnosticsEnabled { get=>_diagnosticsEnabled; set=>_diagnosticsEnabled=value; }
     private readonly int[] _legacyRepeats = new int[3];
+    private const int MaximumRepeatKinds = 256;
+    private readonly Dictionary<string,int> _repeatKinds = new();
     private int _suppressedLines;
     private long _archiveDrops;
     private long _lastArchiveFlush;
@@ -259,7 +261,7 @@ public sealed class ImportLog
                 scope="frozen-horizontal-profile-input-before-roadbed-stamp",heightEncoding="little-endian-uint16-corner-grid"});
         });
 
-    public void ResetMetrics() { lock (_gate) { _metrics.Clear();Array.Clear(_legacyRepeats,0,_legacyRepeats.Length);_suppressedLines=0;_archiveDrops=0;_lastArchiveFlush=0; } }
+    public void ResetMetrics() { lock (_gate) { _metrics.Clear();Array.Clear(_legacyRepeats,0,_legacyRepeats.Length);_repeatKinds.Clear();_suppressedLines=0;_archiveDrops=0;_lastArchiveFlush=0; } }
     public void Clear() { lock (_gate) { _lines.Clear(); _lineHead=0; _metrics.Clear(); } Changed?.Invoke(); }
     public void Count(string name, int count = 1) { lock (_gate) { _metrics.TryGetValue(name, out var value); _metrics[name] = value + count; } }
     public void Time(string name, double seconds) { lock (_gate) _metrics[name + " time (s)"] = seconds; }
@@ -272,6 +274,14 @@ public sealed class ImportLog
     public event Action? Changed;
 
     public void Info(string message) => Add("INFO", message);
+    // Bounded per-import evidence for verifying a run from logs alone: exempt from
+    // the normal-mode repeat filter and mirrored to Player.log, which can omit the
+    // Colossal logger's INFO level. Callers keep the line count small.
+    public void Evidence(string message,bool warning=false)
+    {
+        Add(warning?"WARN":"INFO",message,structured:true);
+        UnityEngine.Debug.Log("[IEL] "+message);
+    }
     public void Warn(string message) => Add("WARN", message);
     public void Error(string message) => Add("ERROR", message);
     public void Event(TelemetryEvent kind, TelemetryReason reason, string message)
@@ -315,10 +325,19 @@ public sealed class ImportLog
         // repeated per-source condition in normal mode. Full mode is unfiltered.
         if(!DiagnosticsEnabled&&!structured&&level!="ERROR")
         {
-            // Unknown legacy messages share fixed overflow buckets. Typed callers
-            // use (stage,event,reason), not a growing normalized-message dictionary.
+            // A message keeps three examples per kind, its text with digits
+            // removed (so "way 123: …" and "way 456: …" are one kind). One
+            // global count let three startup notices hide every later warning,
+            // including why vegetation stopped. Kinds are bounded; beyond the
+            // bound, messages share the fixed overflow buckets.
             var index = level == "WARN" ? 1 : 0;
-            lock(_gate){if(_legacyRepeats[index]++>=3){_suppressedLines++;return;}}
+            var kind = level + ":" + new string(message.Take(60).Where(c => !char.IsDigit(c)).ToArray());
+            lock(_gate)
+            {
+                if(_repeatKinds.TryGetValue(kind,out var seen)||_repeatKinds.Count<MaximumRepeatKinds)
+                {_repeatKinds[kind]=seen+1;if(seen>=3){_suppressedLines++;return;}}
+                else if(_legacyRepeats[index]++>=3){_suppressedLines++;return;}
+            }
         }
         var line = $"{DateTime.Now:HH:mm:ss} [{level}]"+(Telemetry==null?"":" [RunId="+Telemetry.RunId+"]")+" "+message;
         lock (_gate)

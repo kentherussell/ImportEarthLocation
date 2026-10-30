@@ -1,8 +1,8 @@
 # Target runtime snapshot
 
-Checked on 2026-10-02.
+Runtime compatibility policy updated on 2026-10-28; upstream references below were checked on 2026-10-02.
 
-- Current game line targeted: Cities: Skylines II **1.6.2f1**.
+- Game versions are unrestricted. Native composition capture and local terrain updates do not reject an engine build by version or module identity. Required APIs, resources, data validation and publication checks still apply. The installed game inspected on 2026-10-28 is **1.6.3f1**; earlier integration inspection used **1.6.2f1**.
 - Latest tracked stock code/UI template change: `CitiesSkylinesModding/StockModTemplatesDiffer` commit `1d7c741d14e61c6e2e55b720d61f39a85a56f87f`, identified by that repository as the 1.6.0f1 template update. No later stock-template structure change was present.
 - Current MapExt behavior/detection reference: `Noel-leoN/MapExt2` commit `949272f34a9276eab1fce046a4bff4022961c6fb` (2026-09-15). The MVP intentionally exposes only the non-experimental 28.672 km and 57.344 km modes in addition to vanilla; it does not expose MapExt's experimental 43 km mode or the 114 km mode.
 - Current native network-placement reference: `iRecycled/CS2_Events` commit `b196491a7f906042d5e19c075e8238fd30f67f6a`, which documents and implements the two-frame `CreationDefinition + NetCourse` path used by CS2's normal `GenerateNodes/GenerateEdges` and `ApplyNetSystem` phases.
@@ -13,4 +13,6 @@ The source deliberately probes the two unstable internal seams before confirmati
 1. `TerrainSystem.ReplaceHeightmap(Texture2D)` plus the runtime terrain scale/offset hook.
 2. The tool pipeline's native apply-mode hook after `GenerateEdgesSystem` and before `ToolOutputSystem`.
 
-If either seam changes in a later game update, preparation fails before deleting or replacing map contents. Re-check those two integration classes against the installed `Game.dll` when moving beyond 1.6.2f1.
+Composition capture requires the `NetCompositionHelpers` APIs. The installed 1.6.3f1 helpers retain the expected composition signatures and offset-calculation calls. Local terrain updates retain the bounds notification, cascade update/render methods, reader job handles and asynchronous publication trigger. `tests/native-contract-smoke.ps1` checks these installed-assembly contracts without a version allowlist; offline checks do not establish live generation or GPU publication acceptance.
+
+Future game versions can proceed without being added to an allowlist. Missing APIs or invalid native data may still prevent an operation; the local terrain-update guard retains the original unit when required hooks or resources are unavailable. Re-check these integration points when investigating a game update failure.

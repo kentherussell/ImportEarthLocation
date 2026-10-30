@@ -500,12 +500,12 @@ public static class NetworkTunnelProfile
                     for(var k=0;k<4;k++)coefficients[k]=-coefficients[k];
                     Row(4,-lower/budget,weight,ProfileRowKind.UpperHingeCost);
                     var level=design.Water?.Invoke(p);
-                    if(s.Bridge&&!s.Tunnel&&level.HasValue&&math.isfinite(level.Value))
+                    if(!s.Tunnel&&(s.Bridge||s.Kind==NetworkKind.Road)&&level.HasValue&&math.isfinite(level.Value))
                     {
                         // Clearance uses eps once, not the cut/fill budget or a
                         // second inverse-variance factor.
                         for(var k=0;k<4;k++)coefficients[k]*=budget/eps;
-                        Row(4,-(level.Value+7)/eps,10000*weight/support,ProfileRowKind.UpperHingeCost);
+                        Row(4,-(level.Value+(s.Bridge?7:WaterLevels.RoadFreeboardMeters))/eps,10000*weight/support,ProfileRowKind.UpperHingeCost);
                     }
                 }
             }

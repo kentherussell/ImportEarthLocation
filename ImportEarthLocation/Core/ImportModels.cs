@@ -50,6 +50,23 @@ public sealed record ImportRequest(
     public bool CreateAirConnections { get; init; }
     public bool CreateSeaConnections { get; init; }
     public bool DiagnosticsEnabled { get; init; }
+    // Create finished tree entities from each prefab's own archetype instead of
+    // tool definitions (research report 67). Off by default until verified in game.
+    public bool DirectVegetation { get; init; }
+    // Fast Road Design also lets native network batches grow past 32 sections
+    // while they settle cleanly (report 64 Phase 6 batch ladder).
+    public bool VisualDesign { get; init; }
+    // Vanilla rocks and boulders from OSM rock, scree, cliff and stone features
+    // plus steep natural slopes (RockPlanner). Off by default until verified in game.
+    public bool ImportRocks { get; init; }
+    // Share of the planned trees and bushes (rock clumps) kept, 0–1. One keeps
+    // the full plan; zero is the same as the option being off.
+    public float VegetationDensity { get; init; } = 1;
+    public float RockDensity { get; init; } = 1;
+    // HD Terrain: elevation is read from tiles one zoom level finer and each
+    // 2×2 block averaged into one sample, an area mean in place of the coarser
+    // tile's own resampling. Four times the tile downloads; same output grid.
+    public bool HdTerrain { get; init; }
 }
 
 public sealed record MapSizeProfile(string Id, string Label, double WidthMeters, bool RequiresMapExt)
@@ -191,6 +208,9 @@ public sealed class TerrainTile
     public byte[] PngBytes { get; init; } = Array.Empty<byte>();
     public int RecoveryPass { get; init; }
     public TerrainTile? RecoveryParent { get; init; }
+    // HD Terrain: the four tiles one zoom finer, row-major (north-west first),
+    // averaged 2×2 into this tile's grid when decoded. Null otherwise.
+    public TerrainTile[]? Children { get; init; }
 }
 
 public sealed class TerrainTilePixels
@@ -235,7 +255,9 @@ public sealed class PreparedImport
 public sealed record ClimateNormals(float[] Temperatures, float[] Precipitation, float[] WindSpeed, float[] WindFrom,
     float SourceElevation, string SourceVersion);
 
-public enum VegetationForm { Broadleaf, Conifer, Palm, Shrub }
+// Rocks share the vegetation placement path; their size classes come from each
+// vanilla prefab's footprint (NativeVegetationPlacement.ResolveCatalog).
+public enum VegetationForm { Broadleaf, Conifer, Palm, Shrub, RockSmall, RockMedium, RockLarge }
 
 public enum GroundMaterial : byte { Base, Sand, DryGrass, Grass, Dirt }
 public enum SurfaceTransition : byte { Hard, Medium, Soft }

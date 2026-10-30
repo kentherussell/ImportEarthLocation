@@ -4,6 +4,18 @@ $ErrorActionPreference = 'Stop'
 $contractAssembly = [Colossal.Mono.Cecil.AssemblyDefinition]::ReadAssembly((Join-Path $ManagedPath 'Game.dll'))
 try {
     $contractTypes = $contractAssembly.MainModule.Types
+    # Check native capabilities without restricting the installed engine build.
+    $compositionHelpers=$contractTypes | Where-Object FullName -eq 'Game.Prefabs.NetCompositionHelpers'
+    foreach($signature in @(
+        @('GetCompositionPieces','Unity.Collections.NativeList`1<Game.Prefabs.NetCompositionPiece>,Unity.Collections.NativeArray`1<Game.Prefabs.NetGeometrySection>,Game.Prefabs.CompositionFlags,Unity.Entities.BufferLookup`1<Game.Prefabs.NetSubSection>,Unity.Entities.BufferLookup`1<Game.Prefabs.NetSectionPiece>'),
+        @('CalculateCompositionData','Game.Prefabs.NetCompositionData&,Unity.Collections.NativeArray`1<Game.Prefabs.NetCompositionPiece>,Unity.Entities.ComponentLookup`1<Game.Prefabs.NetPieceData>,Unity.Entities.ComponentLookup`1<Game.Prefabs.NetVertexMatchData>')
+    )) {
+        if(!($compositionHelpers.Methods | Where-Object { $_.Name -eq $signature[0] -and $_.IsPublic -and $_.IsStatic -and $_.ReturnType.FullName -eq 'System.Void' -and ($_.Parameters.ParameterType.FullName -join ',') -eq $signature[1] })) { throw "Native composition helper changed: $($signature[0])" }
+    }
+    $calculateComposition=($compositionHelpers.Methods | Where-Object Name -eq 'CalculateCompositionData').Body.Instructions | ForEach-Object ToString
+    foreach($helper in @('CalculateCompositionPieceOffsets','CalculateSyncVertexOffsets')) {
+        if(!($calculateComposition -match "NetCompositionHelpers::$helper")){throw "Native composition calculation no longer calls $helper"}
+    }
     $pathNode=$contractTypes | Where-Object FullName -eq 'Game.Pathfind.PathNode'
     $laneIndex=$pathNode.Methods | Where-Object Name -eq 'GetLaneIndex'
     if(!(($laneIndex.Body.Instructions | ForEach-Object ToString) -match 'ldc.i4 65535')){throw 'Native lane-slot index mask changed'}
@@ -160,6 +172,18 @@ try {
     $sourceJob = $sourceSimulation.NestedTypes | Where-Object Name -eq 'SourceJob'
     if (!(($sourceJob.Methods | Where-Object Name -eq 'Execute').Body.Instructions | Where-Object { $_.Operand -and $_.Operand.ToString() -match 'Game.Objects.Transform' })) { throw 'Native water collector no longer uses Transform' }
     $terrainType=$contractTypes | Where-Object FullName -eq 'Game.Simulation.TerrainSystem'
+    foreach($signature in @(
+        @('OnAreaChanged','Colossal.Mathematics.Bounds2&'),
+        @('UpdateCascades','System.Boolean,System.Boolean'),
+        @('RenderCascades','')
+    )) {
+        if(!($terrainType.Methods | Where-Object { $_.Name -eq $signature[0] -and !($_.IsStatic) -and $_.ReturnType.FullName -eq 'System.Void' -and ($_.Parameters.ParameterType.FullName -join ',') -eq $signature[1] })) { throw "Native local terrain stage changed: $($signature[0])" }
+    }
+    foreach($fieldContract in @(@('m_HeightMapChanged','System.Boolean'),@('m_CPUHeightReaders','Unity.Jobs.JobHandle'),@('m_CPUDownSampleHeightReaders','Unity.Jobs.JobHandle'))) {
+        if(!($terrainType.Fields | Where-Object { $_.Name -eq $fieldContract[0] -and $_.FieldType.FullName -eq $fieldContract[1] })){throw "Native terrain publication field changed: $($fieldContract[0])"}
+    }
+    $renderCascades=($terrainType.Methods | Where-Object Name -eq 'RenderCascades').Body.Instructions | ForEach-Object ToString
+    if(!($renderCascades -match 'TerrainSystem::TriggerAsyncChange')){throw 'Native local terrain render no longer triggers CPU publication'}
     foreach($signature in @(
         @('SetHeightmap','UnityEngine.Texture2D'),
         @('SetWorldHeightmap','UnityEngine.Texture2D,System.Boolean'),

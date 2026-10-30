@@ -110,15 +110,16 @@ static class Program
         Check(trees.SequenceEqual(ForestProcessor.Prepare(forest,request,terrain,corridor,log,default)),"Tree generation nondeterministic");
         var smallMap=request with{MapSize=new MapSizeProfile("test","test",600,false)};
         Check(ForestProcessor.Prepare(forest,smallMap,terrain,corridor,log,default).All(p=>Math.Abs(p.x)<=300 && Math.Abs(p.z)<=300),"Trees not clipped to map bounds");
-        for(var i=0;i<trees.Count;i++) for(var j=i+1;j<trees.Count;j++) Check(math.distance(trees[i].xz,trees[j].xz)>=ForestProcessor.MinimumSpacing,"Tree spacing violated");
+        for(var i=0;i<trees.Count;i++) for(var j=i+1;j<trees.Count;j++) Check(math.distance(trees[i].xz,trees[j].xz)>=ForestProcessor.WoodlandSpacing,"Tree spacing violated");
         Check(ForestProcessor.Prepare(forest,request,terrain with{SeaLevelMeters=60},corridor,log,default).Count==0,"Underwater forest planted");
         TreeTests.Run();
+        RockTests.Run();
         Console.WriteLine("PASS: straight/gentle curves, strict deviation, protected junctions/sharp bends, parallel rail, cancellation, malformed features, complete coverage, deterministic forest masks/holes/corridors/spacing/water, exact +1m correction");
     }
 }
 namespace ImportEarthLocation.Core
 {
-    public sealed class ImportLog { public Dictionary<string,int> Counts=new(); public List<string> Diagnostics=new(); public double Metric(string x)=>Counts.TryGetValue(x,out var count)?count:0; public void Info(string x){} public void Warn(string x){} public void Diagnostic(string x){Diagnostics.Add(x);} public void Count(string x,int count=1){Counts.TryGetValue(x,out var old);Counts[x]=old+count;} public void Time(string x,double seconds){} }
+    public sealed class ImportLog { public Dictionary<string,int> Counts=new(); public List<string> Diagnostics=new(); public double Metric(string x)=>Counts.TryGetValue(x,out var count)?count:0; public void Info(string x){} public void Warn(string x){} public void Diagnostic(string x){Diagnostics.Add(x);} public void Evidence(string x,bool warning=false){Diagnostics.Add(x);} public void Count(string x,int count=1){Counts.TryGetValue(x,out var old);Counts[x]=old+count;} public void Time(string x,double seconds){} }
 }
 namespace ImportEarthLocation.Processing
 {

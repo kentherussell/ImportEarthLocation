@@ -28,12 +28,32 @@ const json = (text: string) => { try { return JSON.parse(text); } catch { return
 let requestSerial = 0;
 const nextRevision = () => ++requestSerial;
 
-export const LocationPicker = ({ initial, mapExt, onCommit, onClose }: { initial: Location; mapExt: boolean; onCommit: (value: Location) => void; onClose: () => void }) => {
-  const [center, setCenter] = useState({ latitude: initial.latitude, longitude: initial.longitude });
-  const [latitude, setLatitude] = useState(String(initial.latitude));
-  const [longitude, setLongitude] = useState(String(initial.longitude));
-  const [size, setSize] = useState(mapExt ? initial.mapSize : "vanilla");
-  const [zoom, setZoom] = useState(9);
+// Without a chosen location the picker opens on a world view with empty
+// coordinates, so nothing is committed until the user picks a place.
+const worldView = { latitude: 30, longitude: 0 };
+const viewportSize = { width: 400, height: 260 };
+// Equirectangular half extents of the import footprint, as GeoMath.BoundsFromCenter.
+function halfExtents(latitude: number, sizeId: string) {
+  const halfLat = mapWidth(sizeId) / 2 / 6378137 * 180 / Math.PI;
+  return { halfLat, halfLon: halfLat / Math.max(0.01, Math.cos(latitude * Math.PI / 180)) };
+}
+// The closest zoom at which the whole import footprint fits the preview with a margin.
+export function fitZoom(latitude: number, sizeId: string) {
+  const { halfLat, halfLon } = halfExtents(latitude, sizeId);
+  for (let z = 16; z > 1; z--) {
+    const nw = project(latitude + halfLat, -halfLon, z), se = project(latitude - halfLat, halfLon, z);
+    if (se.x - nw.x <= viewportSize.width * 0.85 && se.y - nw.y <= viewportSize.height * 0.85) return z;
+  }
+  return 1;
+}
+export const LocationPicker = ({ initial, mapExt, loadedSize, onCommit, onClose }: { initial: Location | null; mapExt: boolean; loadedSize?: string; onCommit: (value: Location) => void; onClose: () => void }) => {
+  const [center, setCenter] = useState(initial ? { latitude: initial.latitude, longitude: initial.longitude } : worldView);
+  const [latitude, setLatitude] = useState(initial ? String(initial.latitude) : "");
+  const [longitude, setLongitude] = useState(initial ? String(initial.longitude) : "");
+  // The open map's size is the only valid choice once it is known.
+  const [size, setSize] = useState(loadedSize || (mapExt && initial ? initial.mapSize : "vanilla"));
+  // A chosen location opens fitted to its import footprint; none opens on the world.
+  const [zoom, setZoom] = useState(initial ? fitZoom(initial.latitude, loadedSize || (mapExt ? initial.mapSize : "vanilla")) : 3);
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
   const [searching, setSearching] = useState(false);
@@ -77,7 +97,7 @@ export const LocationPicker = ({ initial, mapExt, onCommit, onClose }: { initial
       inFlight.current = false; setSearching(false); setResultsOpen(true);
     }
   }, [rawPlaces.revision, searchRevision]);
-  useEffect(() => { if (!mapExt) setSize("vanilla"); }, [mapExt]);
+  useEffect(() => { if (loadedSize) setSize(loadedSize); else if (!mapExt) setSize("vanilla"); }, [mapExt, loadedSize]);
   const recenter = (value: { latitude: number; longitude: number }) => {
     setCenter(value); setLatitude(String(value.latitude)); setLongitude(String(value.longitude)); setError("");
   };
@@ -85,11 +105,20 @@ export const LocationPicker = ({ initial, mapExt, onCommit, onClose }: { initial
     const lat = parseCoordinate(latitude, 90), lon = parseCoordinate(longitude, 180);
     if (lat === null || lon === null) { setError("Enter valid latitude (−90 to 90) and longitude (−180 to 180)."); return null; }
     const value = { latitude: lat, longitude: lon };
+    // Typed coordinates for a new place zoom to its footprint; re-entering the
+    // current centre keeps the user's own zoom.
+    if (lat !== center.latitude || lon !== center.longitude) setZoom(fitZoom(lat, size));
     setCenter(value); setError(""); return value;
   };
+  // A different map size changes the footprint: fit it again around the same centre.
+  const fittedSize = useRef(size);
+  useEffect(() => {
+    if (fittedSize.current === size) return;
+    fittedSize.current = size;
+    if (latitude.trim() && longitude.trim()) setZoom(fitZoom(center.latitude, size));
+  }, [size]);
   // Identical equirectangular footprint calculation to GeoMath.BoundsFromCenter.
-  const halfLat = mapWidth(size) / 2 / 6378137 * 180 / Math.PI;
-  const halfLon = halfLat / Math.max(0.01, Math.cos(center.latitude * Math.PI / 180));
+  const { halfLat, halfLon } = halfExtents(center.latitude, size);
   const nw = project(center.latitude + halfLat, center.longitude - halfLon, zoom);
   const se = project(center.latitude - halfLat, center.longitude + halfLon, zoom);
   const mapUnavailable = Math.abs(center.latitude) > 85.05112878 || tiles.error;
@@ -105,7 +134,7 @@ export const LocationPicker = ({ initial, mapExt, onCommit, onClose }: { initial
     searchTimer.current = window.setTimeout(search, 3500);
     return () => { if (searchTimer.current !== null) window.clearTimeout(searchTimer.current); searchTimer.current = null; };
   }, [query, waitingToSearch]);
-  return <Panel header="Select Location" className={styles.picker} theme={{ header: styles.panelHeader, titleBar: styles.panelTitleBar, title: styles.panelTitle, iconSpace: styles.panelIconSpace, closeButton: styles.panelCloseButton, content: styles.panelContent }} onClose={onClose}>
+  return <Panel header={<span className={styles.brandText}>Select Location</span>} className={styles.picker} theme={{ header: styles.panelHeader, titleBar: styles.panelTitleBar, title: styles.panelTitle, iconSpace: styles.panelIconSpace, closeButton: styles.panelCloseButton, content: styles.panelContent }} onClose={onClose}>
     <div className={styles.section} onClickCapture={event => {
       // Do not dismiss when the user drags/clicks the results scrollbar.
       const target = event.target as Element;
@@ -115,8 +144,9 @@ export const LocationPicker = ({ initial, mapExt, onCommit, onClose }: { initial
       <div className={styles.field} role="group" aria-label="Map Size">
         <span>Map Size</span>
         <div className={styles.sizeChoices}>{["vanilla", "mapext28", "mapext57"].map(id =>
-          <Button key={id} variant="flat" className={styles.configChoice} disabled={id !== "vanilla" && !mapExt} selected={id === size} aria-pressed={id === size} onSelect={() => setSize(id)}>{id === "mapext57" ? "57km" : id === "mapext28" ? "28km" : "14km"}</Button>)}</div>
-        {!mapExt && <span className={styles.helper}>28km and 57km require MapExt.</span>}
+          <Button key={id} variant="flat" className={styles.configChoice} disabled={loadedSize ? id !== loadedSize : id !== "vanilla" && !mapExt} selected={id === size} aria-pressed={id === size} onSelect={() => setSize(id)}>{id === "mapext57" ? "57km" : id === "mapext28" ? "28km" : "14km"}</Button>)}</div>
+        {loadedSize ? <span className={styles.helper}>Matches the open map. To import a different size, open a map of that size.</span>
+          : !mapExt && <span className={styles.helper}>28km and 57km require MapExt.</span>}
       </div>
       <div className={styles.searchArea}>
       <div className={styles.search}><div className={styles.searchInput}><input aria-label="City or place" placeholder="City or place" value={query} onChange={e => {
@@ -129,7 +159,7 @@ export const LocationPicker = ({ initial, mapExt, onCommit, onClose }: { initial
       {resultsOpen && <div data-location-results><Scrollable vertical trackVisibility="scrollable" className={styles.results}>
         {places.message && places.message !== "Select a result" && places.message !== "Select a result." && <div className={styles.resultMessage}>{places.message}</div>}
         {places.results?.map((p: any, i: number) =>
-        <Button key={i} variant="flat" className={styles.resultButton} onSelect={() => { recenter(p); setResultsOpen(false); }}>{p.label}</Button>)}
+        <Button key={i} variant="flat" className={styles.resultButton} onSelect={() => { recenter(p); setZoom(fitZoom(p.latitude, size)); setResultsOpen(false); }}>{p.label}</Button>)}
       </Scrollable></div>}
       </div>
       <div className={styles.map} onWheel={e => { e.preventDefault(); setZoom(z => Math.max(1, Math.min(16, z + (e.deltaY < 0 ? 1 : -1)))); }}

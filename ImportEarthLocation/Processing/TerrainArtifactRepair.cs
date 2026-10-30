@@ -140,7 +140,54 @@ public static class TerrainArtifactRepair
                 if (details++ < 25) report?.Invoke($"DEM ARTIFACT kind={(residual > 0 ? "spike" : "pit")}; sourceCell={x},{y}; sourceHeight={value:R}; surroundingPlaneHeight={median:R}; ringResidualSpread={spread:R}; correctedClusterCells={component.Count}; maximumComponentJumpMeters={maximumJump:R}; method=constrained-local-plane; localExtremumAndEnclosingSupport=true; suppliedProtectionRespected=true");
             }
         }
-        report?.Invoke($"DEM ARTIFACT REPAIR invalidSamples={repaired}; isolatedSpikes={spikes}; isolatedPits={pits}; supportRadiusCells={radius}; ridgesRequireSurroundingSupport=true; noGlobalBiasRollback=true");
+        var flatSpikes = FlatSpikes(raster, baseline, changed, width, height, spacing, token, protectedSample);
+        report?.Invoke($"DEM ARTIFACT REPAIR invalidSamples={repaired}; isolatedSpikes={spikes}; isolatedPits={pits}; flatGroundSpikeCells={flatSpikes}; supportRadiusCells={radius}; ridgesRequireSurroundingSupport=true; noGlobalBiasRollback=true");
+    }
+
+    // Flat-ground spikes: on flat land, city elevation data reads a block of
+    // tall buildings or a minaret as a sudden hill a cell or two wide (Cairo).
+    // Where the ring FlatRing metres out lies within FlatSpread of a plane, a
+    // local maximum standing FlatSpike above that plane, whose raised cells all
+    // lie inside the ring, is put back on the plane. Real hills, ridges and
+    // slopes either break the ring's flatness or reach the ring.
+    private const float FlatRing = 60, FlatSpread = 2.5f, FlatSpike = 3;
+    private static int FlatSpikes(float[] raster, float[] baseline, bool[] changed, int width, int height, float spacing, CancellationToken token, Func<int, bool>? protectedSample)
+    {
+        var r = Math.Max(2, (int)Math.Ceiling(FlatRing / spacing)); var cells = 0;
+        var rim = new List<(int X, int Y, float H)>(8 * r); var component = new List<int>(); var members = new HashSet<int>();
+        for (var y = r; y < height - r; y++)
+        {
+            token.ThrowIfCancellationRequested();
+            for (var x = r; x < width - r; x++)
+            {
+                var i = y * width + x; var value = baseline[i];
+                if (changed[i] || protectedSample?.Invoke(i) == true) continue;
+                var peak = true;
+                for (var dy = -1; dy <= 1 && peak; dy++) for (var dx = -1; dx <= 1; dx++) if ((dx != 0 || dy != 0) && baseline[i + dy * width + dx] > value) { peak = false; break; }
+                if (!peak) continue;
+                rim.Clear();
+                for (var k = -r; k <= r; k++)
+                {
+                    rim.Add((x + k, y - r, baseline[(y - r) * width + x + k])); rim.Add((x + k, y + r, baseline[(y + r) * width + x + k]));
+                    if (k > -r && k < r) { rim.Add((x - r, y + k, baseline[(y + k) * width + x - r])); rim.Add((x + r, y + k, baseline[(y + k) * width + x + r])); }
+                }
+                var plane = FitPlane(rim); float low = float.PositiveInfinity, high = float.NegativeInfinity;
+                foreach (var p in rim) { var residual = (float)(p.H - PlaneHeight(plane, p.X, p.Y)); low = Math.Min(low, residual); high = Math.Max(high, residual); }
+                var spread = high - low; if (spread > FlatSpread || value - PlaneHeight(plane, x, y) < Math.Max(FlatSpike, spread * 3)) continue;
+                // The raised cells around the peak: more than the ring's own spread above the plane.
+                component.Clear(); members.Clear(); component.Add(i); members.Add(i); var supported = true;
+                for (var p = 0; p < component.Count && supported; p++)
+                {
+                    var current = component[p]; var cx = current % width; var cy = current / width;
+                    if (Math.Abs(cx - x) >= r || Math.Abs(cy - y) >= r || protectedSample?.Invoke(current) == true) { supported = false; break; }
+                    foreach (var next in new[] { current - 1, current + 1, current - width, current + width })
+                        if (baseline[next] - PlaneHeight(plane, next % width, next / width) > Math.Max(1, high) && members.Add(next)) component.Add(next);
+                }
+                if (!supported) continue;
+                foreach (var index in component) { raster[index] = (float)PlaneHeight(plane, index % width, index / width); changed[index] = true; cells++; }
+            }
+        }
+        return cells;
     }
     private static (double X,double Y,double H,double Dx,double Dy) FitPlane(List<(int X,int Y,float H)> points)
     {

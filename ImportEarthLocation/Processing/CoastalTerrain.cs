@@ -260,7 +260,8 @@ public static class CoastalTerrain
                 heights[i] = -.5f; coastalRimRepairs++;
             }
         }
-        report?.Invoke($"DEM COAST model=oriented-coastline-offshore-profile; edges={coastEdges}; oceanComponents={accepted}; conflictingComponentsSkipped={ambiguous}; unseededComponents={unseeded}; acceptedOceanCells={oceanCells}; conflictingCells={ambiguousCells}; unseededCells={unseededCells}; provenLandCells={landCells}; discardedBarrierSeeds={barrierSeeds}; totalCells={heights.Length}; modeledSamples={changed}; coastalRimSamples={coastalRimRepairs}; maximumModeledDepthMeters=180; depthSlope=.015; distance=8-neighbor-chamfer; seedPolicy=nearest-shore-segment; mappedInlandWaterEnvelopesProtected=true; inlandWaterRelations={protectedRelations}; nonOceanLandPreserved=true; incompleteCoastCoverageMayLimitRepair=true; realBathymetryClaimed=false");
+        var shoreShaped = ShoreProfile(heights, width, height, spacing, oriented, ocean, provenLand, excluded, token);
+        report?.Invoke($"DEM COAST model=oriented-coastline-offshore-profile; edges={coastEdges}; oceanComponents={accepted}; conflictingComponentsSkipped={ambiguous}; unseededComponents={unseeded}; acceptedOceanCells={oceanCells}; conflictingCells={ambiguousCells}; unseededCells={unseededCells}; provenLandCells={landCells}; discardedBarrierSeeds={barrierSeeds}; totalCells={heights.Length}; modeledSamples={changed}; coastalRimSamples={coastalRimRepairs}; shoreProfileSamples={shoreShaped}; maximumModeledDepthMeters=180; depthSlope=.015; distance=8-neighbor-chamfer; seedPolicy=nearest-shore-segment; mappedInlandWaterEnvelopesProtected=true; inlandWaterRelations={protectedRelations}; nonOceanLandPreserved=true; incompleteCoastCoverageMayLimitRepair=true; realBathymetryClaimed=false");
         capture?.Invoke(new CoastCoverage(width,height,zoom,originX,originY,ocean,ambiguousMask,unseededMask,distance,accepted,ambiguous));
         void Mark(double x, double y, byte label, double ax, double ay, double bx, double by)
         {
@@ -275,5 +276,65 @@ public static class CoastalTerrain
             if (squared + 1e-6 < seedDistance[i]) { seedDistance[i] = squared; seeds[i] = label; }
             else if (Math.Abs(squared - seedDistance[i]) <= 1e-6) seeds[i] |= label;
         }
+    }
+
+    // Grid points (heights in source metres, sea level 0) within ShoreBand
+    // spacings of the mapped coastline, shaped by their exact distance to it
+    // rather than by which side of a pixel boundary they fall on. The waterline
+    // lands on the coastline itself: the game's water surface sits at
+    // WaterLevels.CorrectionMeters, so both sides meet that height at distance 0.
+    //   Sea:  depth below the surface grows along a smoothstep to the offshore
+    //         profile (1.5 m + 1.5% of distance) at the band's edge.
+    //   Land: rises along a smoothstep from the surface to the original ground,
+    //         lowered by at most 3 m (a quay or cliff keeps its height beyond
+    //         that), and land the source puts under water is raised to just
+    //         above the surface (up to 0.5 m at the band's edge), by at most
+    //         3 m, so the mapped coast is not flooded.
+    // Mapped inland water is excluded. Returns the number of points changed.
+    // Near the coastline both sides follow at least the straight slope
+    // EdgeSlope from the water surface, so the ground is a plane through the
+    // waterline along a straight coast, which interpolation reproduces exactly
+    // and the waterline follows the coastline whatever its angle to the grid.
+    // Smoothstep alone left the ground flat at the waterline, where the water
+    // simulation wets whole cells and a slanted coast showed as teeth.
+    private const float ShoreBand = 2, BankCut = 3, EdgeSlope = .06f;
+    private static int ShoreProfile(float[] heights, int width, int height, float spacing,
+        System.Collections.Generic.List<(double ax, double ay, double bx, double by)> edges, bool[] ocean, bool[] land, bool[] excluded, CancellationToken token)
+    {
+        var surface = WaterLevels.CorrectionMeters;
+        var exact = new float[heights.Length]; var seaSide = new bool[heights.Length];
+        for (var i = 0; i < exact.Length; i++) exact[i] = float.PositiveInfinity;
+        foreach (var (ax, ay, bx, by) in edges)
+        {
+            token.ThrowIfCancellationRequested();
+            var dx = bx - ax; var dy = by - ay; var squared = dx * dx + dy * dy;
+            for (var y = Math.Max(0, (int)Math.Floor(Math.Min(ay, by) - ShoreBand)); y <= Math.Min(height - 1, (int)Math.Ceiling(Math.Max(ay, by) + ShoreBand)); y++)
+                for (var x = Math.Max(0, (int)Math.Floor(Math.Min(ax, bx) - ShoreBand)); x <= Math.Min(width - 1, (int)Math.Ceiling(Math.Max(ax, bx) + ShoreBand)); x++)
+                {
+                    var t = Math.Max(0, Math.Min(1, ((x - ax) * dx + (y - ay) * dy) / squared));
+                    var ex = x - ax - t * dx; var ey = y - ay - t * dy; var d = (float)Math.Sqrt(ex * ex + ey * ey);
+                    var i = y * width + x; if (d >= exact[i]) continue;
+                    // Sea lies to the right of the way, (-dy, dx) in image coordinates.
+                    exact[i] = d; seaSide[i] = -ex * dy + ey * dx > 0;
+                }
+        }
+        static float Ramp(float t) { t = Math.Max(0, Math.Min(1, t)); return t * t * (3 - 2 * t); }
+        var changed = 0;
+        for (var i = 0; i < heights.Length; i++)
+        {
+            if ((i & 16383) == 0) token.ThrowIfCancellationRequested();
+            if (excluded[i] || exact[i] > ShoreBand) continue;
+            // A classified point keeps its side; the barrier strip uses the nearest edge.
+            var sea = ocean[i] || !land[i] && seaSide[i];
+            var distance = exact[i] * spacing; var band = ShoreBand * spacing; var h = heights[i];
+            float target;
+            var depth = 1.5f + .015f * distance;
+            if (sea) target = surface - Math.Max(Math.Min(EdgeSlope * distance, depth), depth * Ramp(distance / band));
+            else if (h >= surface) target = Math.Max(Math.Max(Math.Min(surface + EdgeSlope * distance, h), surface + (h - surface) * Ramp(distance / band)), h - BankCut);
+            else target = h < surface - BankCut ? h : surface + Math.Min(EdgeSlope * distance, .5f);
+            if (Math.Abs(target - h) < .001f) continue;
+            heights[i] = target; changed++;
+        }
+        return changed;
     }
 }

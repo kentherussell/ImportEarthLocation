@@ -46,6 +46,8 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
     private Entity[] _oldNetworks = Array.Empty<Entity>();
     private int _retirementFrames;
     private int _vegetationRetirementFrames;
+    // First candidate of the vegetation batch awaiting commit, for a Resume.
+    private int _vegetationBatchStart;
     private int _readbackFrames;
     private int _readbackStartFrame;
     private int _recoveryAttempts;
@@ -59,11 +61,29 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
     private int _preferredBatchSize=NetworkBatchSize;
     // Limit command-buffer pressure, not map coverage. Every section is submitted.
     private const int NetworkBatchSize = 32;
+    // Fast Road Design batch ladder: each batch costs a fixed number of frames
+    // (commit, four barrier frames, readback), so larger healthy batches place
+    // the same sections in fewer frames. Any rejected batch or a frame over
+    // 250 ms halves the preferred size again, never below 32.
+    private const int LargeNetworkBatchSize = 128;
+    private int _networkBatchCeiling=NetworkBatchSize;
+    private int _networkBatches,_networkBatchHalvings,_largestNetworkBatch;
+    private readonly Stopwatch _networkPlacementClock=new();
     private readonly Stopwatch _vegetationClock = new();
     private readonly Stopwatch _vegetationBatchClock=new();
     private int _vegetationBatchSize=8192;
+    private float _vegetationFrameFloor=float.MaxValue;
     private int _vegetationCooldown;
     private double _vegetationCommitStartedSeconds;
+    // Fast Tree Planting (report 67): fallback state and always-on evidence, so a
+    // single in-game run explains itself without the diagnostics archive.
+    private bool _directVegetationFailed;
+    private int _directBatches;
+    private Entity[]? _healthSample;
+    private int _vegetationFrames,_vegetationSlowFrames;
+    private double _vegetationFrameSum,_vegetationFrameMax;
+    private int _directGrows,_directShrinks,_directAfterFrames;
+    private double _directCreateMax,_directAfterFrameSum,_directAfterFrameMax;
     private bool _seaAttempted;
     private string _seaReport="Sea connections were not submitted.";
     private int _seaDefinitions;
@@ -123,6 +143,11 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
         if (prepared == null) return;
         if (!ImportSession.Matches(prepared.Request.MapSessionId, prepared.Request.Generation) || GameManager.instance.isGameLoading || GameManager.instance.gameMode != GameMode.Editor)
         { s_Log?.Warn("Stale previous-map placement rejected."); AbortMapWork(); return; }
+        if(_vegetationClock.IsRunning)
+        {
+            var frame=UnityEngine.Time.unscaledDeltaTime;_vegetationFrames++;_vegetationFrameSum+=frame;
+            _vegetationFrameMax=Math.Max(_vegetationFrameMax,frame);if(frame>.25f)_vegetationSlowFrames++;
+        }
 
         try
         {
@@ -185,6 +210,7 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                 // A risk preview against the OLD map cannot prove the replacement
                 // graph. Do not reject the import for that unrelated interaction.
                 _preflightBatches.Clear();_preflightIndex=0;
+                _networkBatchCeiling=prepared.Request.VisualDesign?LargeNetworkBatchSize:NetworkBatchSize;
                 _networkBatch=_submissionPlan.Batch(0,NetworkBatchSize);
                 s_Log?.Diagnostic("NATIVE POLICY sourceQualification=advisory; mutationGuard=disabled; oldMapRiskGate=disabled; slopeTargetsUnchanged=true");
                 _created = prepared.Segments.Count;
@@ -209,6 +235,8 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
 
                 s_Log?.Info($"Prepared {_created} native network sections; packing whole design units around a {NetworkBatchSize}-section target, with source-node attachment between batches.");
                 if (_created == 0) { _phase = 3; return; }
+                _networkPlacementClock.Restart();
+                s_Log?.Evidence($"Road placement: {_created:N0} sections; batch target {NetworkBatchSize}, growing to at most {_networkBatchCeiling} while batches settle cleanly.");
                 _phase = 6;
                 return;
             }
@@ -268,11 +296,32 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                 if(disposition==NativeBatchDisposition.AppliedAndSettled)_settledNetworkDefinitions+=_currentBatchDefinitions;
                 if (failure != null)
                 {
+                    if(disposition==NativeBatchDisposition.Interrupted)
+                    {
+                        // Resumed after another tool took over: the same sections
+                        // again, whole, once the readback phase finds the map clear.
+                        _networkIndex-=_networkBatch.Count;s_Log?.Count("Network batches resubmitted after Resume");
+                        s_Log?.Evidence($"Road placement resumed: the interrupted {_networkBatch.Count}-section batch is placed again.");
+                        _readbackFrames=0;_readbackStartFrame=UnityEngine.Time.frameCount;_phase=19;return;
+                    }
                     if(PrepareRecovery(prepared,failure,recoverable,preflight:false))return;
+                    // Nothing reached the map: resubmit the same sections as quarter
+                    // batches, so one refused section no longer drops up to 127
+                    // neighbours (DC lost 382 this way). Repeated refusals keep
+                    // splitting down to single sections, which are then skipped.
+                    if((disposition==NativeBatchDisposition.ClearedWithoutApply||disposition==NativeBatchDisposition.NoPreview)&&_networkBatch.Count>1)
+                    {
+                        var start=_networkIndex-_networkBatch.Count;
+                        _networkIndex=start;_batchSizeLimit=Math.Max(1,_networkBatch.Count/4);_recoveryUntilIndex=Math.Max(_recoveryUntilIndex,start+_networkBatch.Count);
+                        s_Log?.Count("Network batches split after refusal");
+                        s_Log?.Evidence($"Road placement: a {_networkBatch.Count}-section batch was refused ({disposition}); retrying it as {_batchSizeLimit}-section batches. {failure}",warning:true);
+                        _readbackFrames=0;_readbackStartFrame=UnityEngine.Time.frameCount;_phase=19;return;
+                    }
                     if(disposition!=NativeBatchDisposition.AppliedAndSettled)
                     {
                         _skipped+=_currentBatchDefinitions;
                         s_Log?.Count("Network definitions not applied",_currentBatchDefinitions);
+                        if(_networkPlacement!=null){var key=$"whole batch not applied ({disposition})";_networkPlacement.SkipReasons[key]=_networkPlacement.SkipReasons.TryGetValue(key,out var n)?n+_currentBatchDefinitions:_currentBatchDefinitions;}
                         s_Log?.Warn($"Native batch was not applied: {disposition}; definitions={_currentBatchDefinitions}. {failure} Continuing after verified cleanup; this is not a committed road batch.");
                         _readbackFrames=0;_readbackStartFrame=UnityEngine.Time.frameCount;_phase=19;
                     }
@@ -397,7 +446,20 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                 var workload=NetworkCommitSystem.LastMutationTargets;
                 // Mutation count is diagnostic, not a proxy for elapsed cost.
                 // The former target of 48 forced healthy batches to ~18 sections.
-                _preferredBatchSize=Math.Min(NetworkBatchSize,_preferredBatchSize+4);
+                _networkBatches++;_largestNetworkBatch=Math.Max(_largestNetworkBatch,_networkBatch.Count);
+                var frameSeconds=UnityEngine.Time.unscaledDeltaTime;
+                if(_networkBatchCeiling>NetworkBatchSize&&frameSeconds>.25f&&_preferredBatchSize>NetworkBatchSize)
+                {
+                    _preferredBatchSize=Math.Max(NetworkBatchSize,_preferredBatchSize/2);_networkBatchHalvings++;
+                    s_Log?.Evidence($"Road placement batch {_networkBatches}: frame took {frameSeconds*1000:0} ms; preferred batch halved to {_preferredBatchSize} sections.");
+                }
+                else
+                {
+                    var grown=Math.Min(_networkBatchCeiling,_preferredBatchSize+(_networkBatchCeiling>NetworkBatchSize?8:4));
+                    if(grown==_networkBatchCeiling&&grown!=_preferredBatchSize&&_networkBatchCeiling>NetworkBatchSize)
+                        s_Log?.Evidence($"Road placement batch {_networkBatches}: preferred batch reached {grown} sections; last frame {frameSeconds*1000:0} ms; {_networkPlacementClock.Elapsed.TotalSeconds:0} s so far.");
+                    _preferredBatchSize=grown;
+                }
                 s_Log?.Diagnostic($"NATIVE ADAPTIVE BATCH submittedSections={_networkBatch.Count}; sourceVerified={placement.LastBatchSourceVerified}; distinctMutations={workload}; mutationCountControlsBatchSize=false; nextPreferredSections={_preferredBatchSize}; hardMutationGuard=disabled");
                 if(_networkIndex>=_recoveryUntilIndex){_batchSizeLimit=_preferredBatchSize;_recoveryUntilIndex=0;}
                 if (_networkIndex < prepared.Segments.Count)
@@ -412,6 +474,10 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                     _phase=1;return;
                 }
                 _roadSections=placement.RoadSections;_railSections=placement.RailSections;
+                s_Log?.Evidence($"Road placement summary: {_networkIndex:N0} sections in {_networkBatches:N0} batches over {_networkPlacementClock.Elapsed.TotalSeconds:0.0} s; "+
+                    $"average {_networkIndex/(double)Math.Max(1,_networkBatches):0.0} sections per batch, largest {_largestNetworkBatch}, ceiling {_networkBatchCeiling}; halvings {_networkBatchHalvings}; settled definitions {_settledNetworkDefinitions:N0}; skipped {_skipped:N0}"+
+                    (_networkPlacement==null||_networkPlacement.SkipReasons.Count==0?".":"; skipped by reason: "+string.Join("; ",_networkPlacement.SkipReasons.OrderByDescending(p=>p.Value).Take(8).Select(p=>$"{p.Value:N0} × {p.Key}"))+"."),warning:_networkBatchHalvings>0||_skipped>0);
+                _networkPlacementClock.Stop();
                 s_Log?.Checkpoint("network/roundabout-upgrades",new { _roadSections, _railSections, mapChanged=_mapChanged });
                 NativeNetworkDiagnostics.ApplySmallRoundabouts(EntityManager,_prefabSystem,prepared.Segments,s_Log!);
                 if (prepared.Request.RoadLevel != RoadImportLevel.None) s_Log?.Count("Road sections committed", _roadSections);
@@ -427,16 +493,24 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                 // units and their boundary closure, distributed across updates.
                 if(_submissionPlan!=null&&_nativeAuditIndex<_submissionPlan.Sections.Count)
                 {
-                    var audit=_submissionPlan.Batch(_nativeAuditIndex,NetworkBatchSize);
-                    Progress?.Invoke($"Inspecting generated roads and railways… sections {_nativeAuditIndex+1}–{_nativeAuditIndex+audit.Count}/{_submissionPlan.Sections.Count}; checking native connections and tunnel compositions.");
-                    try{NativeNetworkDiagnostics.CheckUnits(EntityManager,audit,s_Log!,_nativeAuditIndex);}
-                    catch(Exception error) when(error is not OutOfMemoryException)
+                    // Read-only inspection: as many 32-section units as fit in about
+                    // 8 ms per frame, instead of one per frame (~1,400 frames in DC).
+                    var budget=Stopwatch.StartNew();var first=_nativeAuditIndex;
+                    do
                     {
-                        s_Log?.Count("Final native unit readback failures");s_Log?.Diagnostic("NATIVE UNIT AUDIT unavailable; quality=RequiresReview; no placement replay: "+error);
-                        s_Log?.DiagnosticRecords("native-unit-final-"+_nativeAuditIndex+"-unavailable.ndjson",
-                            new object[]{new{startIndex=_nativeAuditIndex,sections=audit.Count,error=error.ToString(),nativeObservationComplete=false}},final:true);
+                        var audit=_submissionPlan.Batch(_nativeAuditIndex,NetworkBatchSize);
+                        try{NativeNetworkDiagnostics.CheckUnits(EntityManager,audit,s_Log!,_nativeAuditIndex);}
+                        catch(Exception error) when(error is not OutOfMemoryException)
+                        {
+                            s_Log?.Count("Final native unit readback failures");s_Log?.Diagnostic("NATIVE UNIT AUDIT unavailable; quality=RequiresReview; no placement replay: "+error);
+                            s_Log?.DiagnosticRecords("native-unit-final-"+_nativeAuditIndex+"-unavailable.ndjson",
+                                new object[]{new{startIndex=_nativeAuditIndex,sections=audit.Count,error=error.ToString(),nativeObservationComplete=false}},final:true);
+                        }
+                        _nativeAuditIndex+=audit.Count;
                     }
-                    _nativeAuditIndex+=audit.Count;return;
+                    while(_nativeAuditIndex<_submissionPlan.Sections.Count&&budget.Elapsed.TotalMilliseconds<8);
+                    Progress?.Invoke($"Inspecting generated roads and railways… sections {first+1}–{_nativeAuditIndex}/{_submissionPlan.Sections.Count}; checking native connections and tunnel compositions.");
+                    return;
                 }
                 s_Log?.Info("Native network inspection finished. Geometry remains available for visual review; exact per-lane movement acceptance and rendered playability are not certified.");
                 s_Log?.DiagnosticRecords("native-final-audit-status.ndjson",new object[]{new{
@@ -494,7 +568,7 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                     _vegetationPlacement = new NativeVegetationPlacement(EntityManager,_treePrefabs,s_Log!,_localVegetationExclusions.Contains);
                     if (_treePrefabs.Length == 0) { s_Log?.Warn("Optional vegetation skipped: no verified stock trees or bushes are available."); s_Log?.Count("Vegetation skipped", vegetation.Count); Finish(); return; }
                 }
-                Progress?.Invoke($"Planting trees and bushes… {100L * _treeIndex / Math.Max(1, vegetation.Count)}% of locations processed.");
+                Progress?.Invoke($"Placing rocks, trees and bushes… {100L * _treeIndex / Math.Max(1, vegetation.Count)}% of locations processed.");
                 var batchBudget=_vegetationBatchSize;
                 var count = Math.Min(batchBudget, vegetation.Count - _treeIndex);
                 var failuresBefore=s_Log!.Metric("Vegetation definition failures");
@@ -507,10 +581,50 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
                 }
                 _vegetationRetirementFrames=0;
                 _vegetationBatchClock.Restart();
+                if(prepared.Request.DirectVegetation&&!_directVegetationFailed)
+                {
+                    // Finished entities, no commit round trip (report 67). The game
+                    // takes new trees in over following frames, so the batch shrinks
+                    // when creation or the previous frame ran long, and grows otherwise.
+                    if(_healthSample!=null){CheckTreeHealth(_healthSample);_healthSample=null;}
+                    int created;
+                    try{created=_vegetationPlacement!.CreateDirect(vegetation,_treeIndex,count);}
+                    catch(Exception error) when(error is not OutOfMemoryException)
+                    {
+                        // Fall back to the tool path for the rest of the import. The
+                        // failed batch keeps its fully written entities and removes its
+                        // unfinished ones; its uncreated remainder is skipped, not
+                        // retried, since prefab grouping reordered it.
+                        _directVegetationFailed=true;var done=_vegetationPlacement!.DirectCreated;var removed=_vegetationPlacement.DirectRemoved;
+                        s_Log.Evidence($"Fast Tree Planting failed in batch {_directBatches+1} at candidate {_treeIndex} after creating {done:N0} of {count:N0} ({removed:N0} unfinished removed); switching to standard planting for the remaining {vegetation.Count-_treeIndex-count:N0}. {error.GetType().Name}: {error.Message}",warning:true);
+                        s_Log.Diagnostic("VEGETATION DIRECT FAILURE "+error);s_Log.Count("Vegetation entities created directly",done);
+                        if(removed>0)s_Log.Count("Vegetation unfinished entities removed",removed);
+                        s_Log.Count("Vegetation skipped",count-done);_treeIndex+=count;return;
+                    }
+                    var milliseconds=_vegetationBatchClock.Elapsed.TotalMilliseconds;var previous=UnityEngine.Time.unscaledDeltaTime;
+                    _treeIndex+=count;_directBatches++;
+                    s_Log.Count("Vegetation entities created directly",created);
+                    s_Log.AddDuration("Vegetation direct creation",milliseconds/1000);
+                    // A heavy map renders slowly whatever this does (DC: ~180 ms
+                    // frames with 1 ms batches), so compare against the map's own
+                    // steady frame, a floor that rises 2% per batch, and shrink only
+                    // when the batch adds 100 ms beyond it or creation itself is slow.
+                    _vegetationFrameFloor=Math.Min(_vegetationFrameFloor*1.02f,previous);
+                    var shrink=milliseconds>40||previous>_vegetationFrameFloor+.1f;
+                    _vegetationBatchSize=shrink?Math.Max(2048,_vegetationBatchSize/2):Math.Min(65536,_vegetationBatchSize*2);
+                    // Pacing evidence for the summary: the frame before each batch
+                    // after the first carries the game's intake of the previous one.
+                    if(shrink)_directShrinks++;else _directGrows++;_directCreateMax=Math.Max(_directCreateMax,milliseconds);
+                    if(_directBatches>1){_directAfterFrames++;_directAfterFrameSum+=previous;_directAfterFrameMax=Math.Max(_directAfterFrameMax,previous);}
+                    s_Log.Evidence($"Fast Tree Planting batch {_directBatches}: {created:N0} created of {count:N0} candidates in {milliseconds:0} ms; previous frame {previous*1000:0} ms; next batch {_vegetationBatchSize:N0}; {_treeIndex:N0}/{vegetation.Count:N0} processed.");
+                    if(_directBatches==1||_directBatches%10==0)_healthSample=_vegetationPlacement.DirectSample.ToArray();
+                    _vegetationCooldown=1;
+                    return;
+                }
                 s_Log.Checkpoint("vegetation/definitions",new { startIndex=_treeIndex, count, total=vegetation.Count, mapChanged=_mapChanged, batchBudget });
                 _definitions = _vegetationPlacement!.CreateBatch(vegetation, _treeIndex, count);
                 s_Log.AddDuration("Vegetation definition construction",_vegetationBatchClock.Elapsed.TotalSeconds);
-                _treeIndex += count;
+                _vegetationBatchStart=_treeIndex;_treeIndex += count;
                 if (count >= 32 && s_Log.Metric("Vegetation definition failures")-failuresBefore > count / 2)
                 {
                     foreach (var definition in _definitions) EntityManager.DestroyEntity(definition);
@@ -549,6 +663,11 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
             {
                 if(NetworkCommitSystem.LastDisposition==NativeBatchDisposition.AppliedAndSettled)
                     s_Log?.Count("Tree definitions applied and settled", _definitions!.Count);
+                else if(NetworkCommitSystem.LastDisposition==NativeBatchDisposition.Interrupted)
+                {
+                    // Resumed after another tool took over: plant the same candidates again.
+                    _treeIndex=_vegetationBatchStart;s_Log?.Count("Vegetation batches resubmitted after Resume");
+                }
                 else
                 {
                     s_Log?.Count("Vegetation skipped",_definitions!.Count);
@@ -603,7 +722,7 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
             }
             if (_phase >= 3 && _phase <= 5)
             {
-                s_Log?.Warn($"Optional vegetation application stopped: {message}. Terrain and networks remain imported.");
+                s_Log?.Evidence($"Optional vegetation application stopped at candidate {_treeIndex:N0} of {prepared.Vegetation.Count:N0}: {exception.GetType().Name}: {message}. Terrain and networks remain imported.",warning:true);
                 s_Log?.Count("Vegetation skipped", Math.Max(0, prepared.Vegetation.Count - _treeIndex));
                 s_Log?.Count("Unconfirmed tree definitions", _definitions?.Count ?? 0);
                 CleanupOwnedPreview(prepared);
@@ -658,6 +777,11 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
         if(retryCount==0)return false;
         _recoveryUntilIndex=Math.Max(_recoveryUntilIndex,start+_networkBatch.Count);
         _batchSizeLimit=retryCount;
+        if(_networkBatchCeiling>NetworkBatchSize&&_preferredBatchSize>NetworkBatchSize)
+        {
+            _preferredBatchSize=Math.Max(NetworkBatchSize,_preferredBatchSize/2);_networkBatchHalvings++;
+            s_Log?.Evidence($"Road placement: a {originalBatch.Count}-section batch was rejected; preferred batch halved to {_preferredBatchSize} sections.",warning:true);
+        }
         if(!preflight)_networkIndex-=_networkBatch.Count;
         if(preflight)
         {
@@ -785,7 +909,16 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
             foreach(var report in reports)s_Log?.Diagnostic("FEATURE RESULT " + report);
             NativeDiagnostics.Queue("after-apply",s_Log!);
         }
-        if (_vegetationClock.IsRunning) { _vegetationClock.Stop(); s_Log?.Time("Vegetation apply", _vegetationClock.Elapsed.TotalSeconds); }
+        if (_vegetationClock.IsRunning)
+        {
+            _vegetationClock.Stop(); s_Log?.Time("Vegetation apply", _vegetationClock.Elapsed.TotalSeconds);
+            var mode=prepared?.Request.DirectVegetation!=true?"standard":_directVegetationFailed?"fast, fell back to standard":"fast";
+            int trees=-1,plants=-1;try{trees=CountTrees();plants=CountPlants();}catch(Exception error){s_Log?.Warn("Tree census unavailable: "+error.Message);}
+            s_Log?.Evidence($"Vegetation summary: mode {mode}; {_vegetationClock.Elapsed.TotalSeconds:0.0} s; {_treeIndex:N0}/{prepared?.Vegetation.Count??0:N0} candidates processed; {s_Log.Metric("Vegetation entities created directly"):N0} created directly, {s_Log.Metric("Tree definitions applied and settled"):N0} by standard batches; "+
+                $"rocks placed {s_Log.Metric("Vegetation definitions RockSmall")+s_Log.Metric("Vegetation definitions RockMedium")+s_Log.Metric("Vegetation definitions RockLarge"):N0} (unavailable rock stock {s_Log.Metric("Vegetation unavailable stock palette RockSmall")+s_Log.Metric("Vegetation unavailable stock palette RockMedium")+s_Log.Metric("Vegetation unavailable stock palette RockLarge"):N0}); "+
+                $"world now has {trees:N0} trees and {plants:N0} plants; frames {_vegetationFrames:N0}, mean {(_vegetationFrames==0?0:_vegetationFrameSum/_vegetationFrames*1000):0} ms, worst {_vegetationFrameMax*1000:0} ms, over 250 ms {_vegetationSlowFrames:N0}"+
+                (_directBatches==0?".":$"; fast batches {_directBatches:N0} (grew {_directGrows:N0}, shrank {_directShrinks:N0}), slowest creation {_directCreateMax:0} ms, frame after a batch mean {(_directAfterFrames==0?0:_directAfterFrameSum/_directAfterFrames*1000):0} ms, worst {_directAfterFrameMax*1000:0} ms."));
+        }
         var unsubmitted=Math.Max(0,(prepared?.Segments.Count??0)-_networkIndex);
         if(unsubmitted>0)s_Log?.Count("Network sections unsubmitted",unsubmitted);
         s_Log?.Info($"Import workflow finished. Requested network sections: {_created}; native definition attempts: {_networkDefinitionsQueued}; omissions: {_skipped}; unsubmitted: {unsubmitted}. Native visual/topology outcomes require inspection.");
@@ -814,11 +947,14 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
         _preflightBatches.Clear();_preflightIndex=0;_attemptedInputs.Clear();
         _batchSizeLimit=NetworkBatchSize;_recoveryUntilIndex=0;
         _preferredBatchSize=NetworkBatchSize;
+        _networkBatchCeiling=NetworkBatchSize;_networkBatches=0;_networkBatchHalvings=0;_largestNetworkBatch=0;_networkPlacementClock.Reset();
         _phase = 0;
         _created = 0;
         _skipped = 0;
         _treeIndex = 0; _vegetationRetirementFrames=0; _treePrefabs = Array.Empty<NativeVegetationPlacement.StockPrefab>(); _vegetationClock.Reset();
-        _vegetationBatchSize=8192;_vegetationCooldown=0;_vegetationBatchClock.Reset();
+        _vegetationBatchSize=8192;_vegetationFrameFloor=float.MaxValue;_vegetationCooldown=0;_vegetationBatchClock.Reset();
+        _directVegetationFailed=false;_directBatches=0;_healthSample=null;_vegetationFrames=0;_vegetationSlowFrames=0;_vegetationFrameSum=0;_vegetationFrameMax=0;
+        _directGrows=0;_directShrinks=0;_directCreateMax=0;_directAfterFrames=0;_directAfterFrameSum=0;_directAfterFrameMax=0;
         _seaAttempted=false;_seaReport="Sea connections were not submitted.";_seaDefinitions=0;
         _networkDefinitionsQueued=0;
         _roadSections = _railSections = 0;
@@ -837,6 +973,50 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
     protected override void OnGamePreload(Colossal.Serialization.Entities.Purpose purpose, GameMode mode)
     { base.OnGamePreload(purpose, mode); NetworkCommitSystem.BeginMapRetirement(); AbortMapWork(); }
 
+    // Always-on tree counts at load and save make a save/reload comparison possible
+    // from Player.log alone, with or without the diagnostics archive.
+    protected override void OnGameLoadingComplete(Colossal.Serialization.Entities.Purpose purpose,GameMode mode)
+    {
+        base.OnGameLoadingComplete(purpose,mode);
+        try{Census($"Tree census after loading ({purpose}, {mode}): {CountTrees():N0} trees, {CountPlants():N0} plants including bushes.");}
+        catch(Exception error){Mod.Log.Warn("Tree census after loading unavailable: "+error.Message);}
+    }
+
+    private static void Census(string line){Mod.Log.Info(line);UnityEngine.Debug.Log("[IEL] "+line);}
+    private int CountTrees()
+    {
+        using var query=EntityManager.CreateEntityQuery(ComponentType.ReadOnly<Game.Objects.Tree>(),ComponentType.Exclude<Game.Tools.Temp>(),ComponentType.Exclude<Game.Common.Deleted>());
+        return query.CalculateEntityCount();
+    }
+    private int CountPlants()
+    {
+        using var query=EntityManager.CreateEntityQuery(ComponentType.ReadOnly<Game.Objects.Plant>(),ComponentType.Exclude<Game.Tools.Temp>(),ComponentType.Exclude<Game.Common.Deleted>());
+        return query.CalculateEntityCount();
+    }
+
+    // One update after a direct batch, its sample should be ordinary settled
+    // vegetation: alive, valid prefab and position, the prefab's Tree/culling
+    // components, and no lingering Created tag (the game clears it once systems
+    // have taken the entity in).
+    private void CheckTreeHealth(Entity[] sample)
+    {
+        int missing=0,badPrefab=0,badTransform=0,noTree=0,noCulling=0,stillCreated=0;
+        foreach(var entity in sample)
+        {
+            if(!EntityManager.Exists(entity)){missing++;continue;}
+            var prefab=EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
+            if(prefab==Entity.Null||!EntityManager.Exists(prefab)){badPrefab++;continue;}
+            var transform=EntityManager.GetComponentData<Game.Objects.Transform>(entity);
+            if(!Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(transform.m_Position))||!Unity.Mathematics.math.all(Unity.Mathematics.math.isfinite(transform.m_Rotation.value)))badTransform++;
+            if(EntityManager.HasComponent<TreeData>(prefab)&&!EntityManager.HasComponent<Game.Objects.Tree>(entity))noTree++;
+            if(!EntityManager.HasComponent<Game.Rendering.CullingInfo>(entity))noCulling++;
+            if(EntityManager.HasComponent<Game.Common.Created>(entity))stillCreated++;
+        }
+        var problems=missing+badPrefab+badTransform+noTree+noCulling;
+        var message=$"Fast Tree Planting health check after batch {_directBatches}: {sample.Length} sampled; missing {missing}, invalid prefab {badPrefab}, invalid transform {badTransform}, missing Tree {noTree}, missing culling {noCulling}, still tagged Created {stillCreated}.";
+        s_Log?.Evidence(message,warning:problems>0);
+    }
+
     protected override void OnDestroy()
     { if(_saveManager!=null)_saveManager.onGameSaveLoad-=OnSaveDiagnostic; AbortMapWork(); if(s_Instance==this)s_Instance=null; base.OnDestroy(); }
 
@@ -845,6 +1025,8 @@ public sealed partial class ImportApplySystem : Game.GameSystemBase
         if(GameManager.instance.gameMode!=GameMode.Editor)return;
         (s_Log??new ImportLog()).Diagnostic($"SAVE name={saveName}; start={start}; success={success}; mapSession={ImportSession.Map}; persistenceStillRequiresReloadComparison=true");
         if(!start&&success)NativeDiagnostics.QueueAfterSave();
+        if(!start&&success)
+        {try{Census($"Tree census at save '{saveName}': {CountTrees():N0} trees, {CountPlants():N0} plants including bushes.");}catch(Exception error){Mod.Log.Warn("Tree census at save unavailable: "+error.Message);}}
     }
 
     public static void AbortPending() { if(s_Instance!=null)s_Instance.AbortMapWork(); else { lock(Gate){s_Pending=null;s_Log=null;} NetworkCommitSystem.CancelPending(); } }

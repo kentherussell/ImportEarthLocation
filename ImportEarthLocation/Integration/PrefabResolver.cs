@@ -290,7 +290,7 @@ public sealed class PrefabResolver
         {
             candidates.Add(NetworkSelection.BasicRoadName(segment.Lanes));
         }
-        if(segment.ConsolidatedAvenue) { candidates.Add("Medium Road"); candidates.Add("Large Road"); }
+        if(segment.ConsolidatedAvenue&&segment.Lanes>2) { candidates.Add("Medium Road"); candidates.Add("Large Road"); }
         else if(!segment.OneWay&&!highway)candidates.Add("Small Road");
         // The requested basic size wins over a smaller palette entry. A narrow
         // OSM corridor is not evidence for reducing the requested lane count.

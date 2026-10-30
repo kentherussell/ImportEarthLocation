@@ -62,6 +62,10 @@ internal static class RepairTests
         Check(bed.Zip(flat,(a,b)=>Math.Abs((int)a-b)*100/65535f).Max()<=6.001f,"Roadbed exceeded bounded cut/fill");
         var structural=NetworkRoadbed.Prepare(flat,100,1000,new[]{lifted with{Bridge=true}},Array.Empty<float3[]>(),Array.Empty<float3[]>(),log,default);
         Check(structural.SequenceEqual(flat),"Bridge raised terrain into a long embankment");
+        // A deck sunk in the ground (city elevation data carrying the viaduct)
+        // gets the ground lowered beneath it, never raised.
+        var sunk=NetworkRoadbed.Prepare(flat,100,1000,new[]{ground with{Start=ground.Start-new float3(0,1,0),End=ground.End-new float3(0,1,0),Bridge=true}},Array.Empty<float3[]>(),Array.Empty<float3[]>(),log,default);
+        Check(sunk.Zip(flat,(a,b)=>a<b).Any(x=>x)&&sunk.Zip(flat,(a,b)=>a<=b).All(x=>x),"Ground under a sunk bridge deck was not lowered, or was raised");
         var laterWater=(ushort[])bed.Clone();laterWater[0]=1234;
         var lateProfile=lifted with{Start=lifted.Start-new float3(0,2,0),End=lifted.End-new float3(0,2,0)};
         var refreshedBed=NetworkRoadbed.Refresh(flat,bed,laterWater,100,1000,new[]{lifted},new[]{lateProfile},new[]{protectedRing},Array.Empty<float3[]>(),log,default);

@@ -1,6 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
     <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
   <ItemGroup>
+    <None Update="fixtures/avenue-boise-northside.ndjson" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="fixtures/ramp-dc-loop.json" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Include="../../ImportEarthLocation/Processing/NativeJunctionSimplifier.cs" Link="NativeJunctionSimplifier.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/ProfileStarCoordinates.cs" Link="ProfileStarCoordinates.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkProfileParents.cs" Link="NetworkProfileParents.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkBoundaryPolicy.cs" Link="NetworkBoundaryPolicy.cs" />
@@ -8,8 +11,17 @@
     <Compile Include="../../ImportEarthLocation/Processing/ProfileIntentQuadrature.cs" Link="ProfileIntentQuadrature.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/PairedEmissionCompaction.cs" Link="PairedEmissionCompaction.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/WaterBodyPlanner.cs" Link="WaterBodyPlanner.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/WaterCutSmoothing.cs" Link="WaterCutSmoothing.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/WaterContainment.cs" Link="WaterContainment.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/WaterPlanner.cs" Link="WaterPlanner.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/GeographyPolygons.cs" Link="GeographyPolygons.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/ForestProcessor.cs" Link="ForestProcessor.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/VegetationPlanner.cs" Link="VegetationPlanner.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/ClimateMath.cs" Link="ClimateMath.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/RockPlanner.cs" Link="RockPlanner.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkStubs.cs" Link="NetworkStubs.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkLaneRuns.cs" Link="NetworkLaneRuns.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/BeachTerrain.cs" Link="BeachTerrain.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/RiverBedSurface.cs" Link="RiverBedSurface.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/TerrainArtifactRepair.cs" Link="TerrainArtifactRepair.cs" />
     <Compile Include="../../ImportEarthLocation/Core/WaterLevels.cs" Link="WaterLevels.cs" />
@@ -28,6 +40,12 @@
     <Compile Include="../../ImportEarthLocation/Processing/NetworkGroundFeasibility.cs" Link="NetworkGroundFeasibility.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NetworkQualityFinding.cs" Link="NetworkQualityFinding.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkCurveObservations.cs" Link="NetworkCurveObservations.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/VisualCompilerMetrics.cs" Link="VisualCompilerMetrics.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/VisualCompilerTable.cs" Link="VisualCompilerTable.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/VisualNetworkCompiler.cs" Link="VisualNetworkCompiler.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/StreetGridAlignment.cs" Link="StreetGridAlignment.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkLaneSlots.cs" Link="NetworkLaneSlots.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/VisualCompilerProfile.cs" Link="VisualCompilerProfile.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NativeDesignUnits.cs" Link="NativeDesignUnits.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/StarterNetworkPolicy.cs" Link="StarterNetworkPolicy.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NativeJunctionReconciliation.cs" Link="NativeJunctionReconciliation.cs" />

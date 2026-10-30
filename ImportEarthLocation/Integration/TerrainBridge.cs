@@ -51,10 +51,9 @@ public sealed class TerrainBridge
 
     public bool BeginRestamp(Processing.NetworkRoadbed.Patch patch,ImportRequest request,float scale,ImportLog log)
     {
-        // These private stages were inspected in the installed Game.dll. A new
-        // engine build must be inspected again, not invoked by matching names.
-        if(typeof(TerrainSystem).Module.ModuleVersionId!=new Guid("e15551e9-3dea-4855-8dde-1da3cea7d7ef")||
-            _areaChanged==null||_updateCascades==null||_heightChanged==null||_heightReaders==null||_downsampleReaders==null||
+        // Require the native update hooks and resources without restricting
+        // engine build IDs. Publication still requires sampled CPU readback.
+        if(_areaChanged==null||_updateCascades==null||_heightChanged==null||_heightReaders==null||_downsampleReaders==null||
             _terrainSystem.freezeCascadeUpdates||_restamp!=null||_terrainSystem.heightmap is not RenderTexture target)
         {log.Diagnostic("LOCAL TERRAIN unavailable native dirty-region contract; original unit retained");return false;}
         if(!ImportSession.Matches(request.MapSessionId,request.Generation))return false;

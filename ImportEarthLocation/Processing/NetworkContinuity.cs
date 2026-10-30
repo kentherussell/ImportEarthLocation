@@ -30,10 +30,25 @@ public static class NetworkContinuity
             if(components.ContainsKey(key))continue;index++;var queue=new List<(NetworkKind,long)>{key};components[key]=index;
             for(var cursor=0;cursor<queue.Count;cursor++){token.ThrowIfCancellationRequested();var node=queue[cursor];foreach(var id in graph[node]){var next=(node.Item1,id);if(components.ContainsKey(next))continue;components[next]=index;queue.Add(next);}}
         }
+        // A source node may survive as a declared alias, or be absorbed into a
+        // longer section that still carries its way; only a way with no
+        // surviving section, or two surviving ends in different pieces, is lost.
+        var aliases=new Dictionary<(NetworkKind,long),long>();var ways=new HashSet<(NetworkKind,long)>();
+        foreach(var s in after)
+        {
+            foreach(var alias in s.SourceNodeAliases)aliases[(s.Kind,alias.SourceNodeId)]=alias.CanonicalNodeId;
+            ways.Add((s.Kind,s.WayId));foreach(var way in s.SourceWayIds)ways.Add((s.Kind,way));
+        }
+        int? Component(NetworkKind kind,long id)
+        {
+            if(components.TryGetValue((kind,id),out var c))return c;
+            return aliases.TryGetValue((kind,id),out var canonical)&&components.TryGetValue((kind,canonical),out c)?c:null;
+        }
         foreach(var s in before)
         {
             token.ThrowIfCancellationRequested();
-            if(!components.TryGetValue((s.Kind,s.StartNodeId),out var a)||!components.TryGetValue((s.Kind,s.EndNodeId),out var b)||a!=b)
+            var a=Component(s.Kind,s.StartNodeId);var b=Component(s.Kind,s.EndNodeId);
+            if(a.HasValue&&b.HasValue?a!=b:!ways.Contains((s.Kind,s.WayId)))
             {lost++;if(lost<=25)log.Warn($"Network continuity not verified for {s.Kind} way {s.WayId}; {(allowQualityWarnings?"RequiresReview; safe placement continues":"strict validation fails")}.");}
         }
         var samples=new Dictionary<(int,int),List<(int edge,float3 point,float2 heading)>>();var rails=after.Where(s=>s.Kind==NetworkKind.Rail).ToArray();

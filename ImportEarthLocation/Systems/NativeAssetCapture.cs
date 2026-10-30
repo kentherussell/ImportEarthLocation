@@ -17,10 +17,8 @@ public sealed partial class ImportEarthLocationUISystem
     {
         if(segments.Count==0)return Array.Empty<NativeAssetContract>();
         _log.BeginStage(TelemetryStage.AssetCapture);
-        // This method executes on the UI system's main thread. The verified
-        // helper contract cannot be silently substituted after an engine update.
-        if(typeof(NetCompositionData).Assembly.ManifestModule.ModuleVersionId!=new Guid("e15551e9-3dea-4855-8dde-1da3cea7d7ef"))
-            throw new InvalidOperationException("Native composition helper contract differs from the verified engine; asset capture is unavailable.");
+        // Capture native data on the UI system's main thread. Compatibility
+        // depends on available helpers and valid data, not the engine build ID.
         EntityManager.CompleteAllTrackedJobs();
         var subSections=GetBufferLookup<NetSubSection>(true);
         var sectionPieces=GetBufferLookup<NetSectionPiece>(true);

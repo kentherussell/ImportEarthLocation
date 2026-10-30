@@ -124,6 +124,9 @@ public sealed class NativeNetworkPlacement
         return supported;
     }
 
+    // Sections omitted before submission, by reason (digits removed), for the placement summary.
+    public Dictionary<string,int> SkipReasons { get; } = new();
+
     public IReadOnlyList<Entity> CreateDefinitions(IReadOnlyList<PreparedSegment> segments, out int skipped,Processing.OsmDataset? evidence=null)
     {
         NetworkCommitSystem.BeginDefinitionBatch(_entityManager,_log,ArtifactStem);
@@ -156,6 +159,10 @@ public sealed class NativeNetworkPlacement
                 catch(Exception error) when(error is not OutOfMemoryException && error is not OperationCanceledException)
                 {
                     skipped++;
+                    var message=error.GetBaseException().Message;var kind=new System.Text.StringBuilder();
+                    for(var c=0;c<message.Length&&c<70;c++)if(!char.IsDigit(message[c]))kind.Append(message[c]);
+                    var reason=kind.ToString();
+                    SkipReasons[reason]=SkipReasons.TryGetValue(reason,out var seen)?seen+1:1;
                     _log.Warn($"Network definition unavailable: {segment.Kind} way {segment.WayId} {segment.StartNodeId}->{segment.EndNodeId}; continuing other sections. {error.GetBaseException().Message}");
                     if(_log.DiagnosticsEnabled)
                     {

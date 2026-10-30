@@ -8,7 +8,7 @@ using Unity.Mathematics;
 static class CorrectiveCapturedReplay
 {
     private sealed class HorizontalComplete : Exception { }
-    private static T[] ReadManifest<T>(string folder,string logical)
+    internal static T[] ReadManifest<T>(string folder,string logical)
     {
         var manifest=JObject.Parse(File.ReadAllText(CapturedRunFiles.Resolve(folder,logical)));
         if((bool?)manifest["Truncated"]!=false)throw new InvalidDataException("Incomplete captured manifest: "+logical);
@@ -54,12 +54,13 @@ static class CorrectiveCapturedReplay
         if(benchmark&&writerTrace!=null)throw new ArgumentException("Writer inspection cannot qualify performance measurements");
         var input=JObject.Parse(File.ReadAllText(CapturedRunFiles.Resolve(folder,"offline-design-pass-01-input.json")));
         if((int?)input["schemaVersion"]!=2||(string?)input["geometryEncoding"]!="prepared-segment-exact-v1"||
-            (string?)input["waterSampler"]!="WaterBodyPlanner.SurfaceSampler")throw new InvalidDataException("Unknown full-context replay contract");
+            (string?)input["waterSampler"] is not ("WaterBodyPlanner.SurfaceSampler" or "WaterBodyPlanner.ConstructedSurfaceSampler"))throw new InvalidDataException("Unknown full-context replay contract");
         T[] Read<T>(string name)=>ReadManifest<T>(folder,(string)input[name]!);
         var source=Read<PreparedSegment>("networkManifest");if(source.Length!=(int)input["sections"]!)throw new InvalidDataException("Source count mismatch");
         var assets=Read<NativeAssetContract>("nativeContractsManifest").ToDictionary(a=>a.PaletteKey);
         var polygons=Read<GeographicPolygon>("waterPolygonsManifest");
         var water=new WaterPlan(false,0,0,0,"captured"){
+            WaterCellSize=CapturedRunFiles.WaterCellSize(folder,input),
             AreaStages=Read<WaterAreaStage>("waterAreasManifest"),ReachStages=Read<WaterReachStage>("waterReachesManifest")};
         var areas=Read<float3[]>("protectedAreasManifest");var lines=Read<float3[]>("protectedLinesManifest");
         var bytes=File.ReadAllBytes(CapturedRunFiles.Resolve(folder,(string)input["terrainFile"]!));
@@ -98,7 +99,7 @@ static class CorrectiveCapturedReplay
         var obligations=SourceTopologyObligations.Capture(source);
         var baselineLog=new ImportLog{CaptureRecords=true};SourceTopologyObligations.Validate(obligations,source,baselineLog,default);
         var baselineConnections=baselineLog.Records["source-topology-obligations.ndjson"].Select(JObject.FromObject).ToArray();
-        var sampler=WaterBodyPlanner.SurfaceSampler(water,polygons);
+        var sampler=WaterBodyPlanner.ConstructedSurfaceSampler(water,polygons);
         IReadOnlyList<PreparedSegment> result=source;IReadOnlyList<PreparedSegment>? horizontal=null;
         try {result=CoordinatedNetworkDesign.Prepare(source,terrain,scale,width,log,default,sampler,true,assets,
             progress:message=>{if(watch.Elapsed.TotalSeconds>=nextProgress){Console.WriteLine(message);nextProgress=watch.Elapsed.TotalSeconds+10;}},

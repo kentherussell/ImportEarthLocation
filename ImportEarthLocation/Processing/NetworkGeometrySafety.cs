@@ -18,7 +18,12 @@ public static class NetworkGeometrySafety
     private readonly record struct Key(NetworkKind Kind, long Id);
     private sealed record Contact(int A, float T, int B, float U,NetworkContactKind Kind=NetworkContactKind.IndependentLevels);
     private readonly record struct Span(int Index, float T, float U, float3 A, float3 B);
-    public static float GradeLimit(PreparedSegment s) => s.Kind == NetworkKind.Rail ? (s.Tunnel ? .08f : .05f) : NetworkVerticalProfiles.GradeLimit(s);
+    // A bore is out of sight, so tunnels may descend more steeply than open
+    // track or road to reach cover quickly; a portal's grade change is still
+    // checked against the open approach.
+    public const float RoadTunnelGrade = .12f;
+    public static float GradeLimit(PreparedSegment s) => s.Kind == NetworkKind.Rail ? (s.Tunnel ? .08f : .05f) :
+        s.Tunnel ? Math.Max(RoadTunnelGrade, NetworkVerticalProfiles.GradeLimit(s)) : NetworkVerticalProfiles.GradeLimit(s);
     private static float Radius(PreparedSegment s) => s.NativeWidth > 0 ? s.NativeWidth * .5f : s.Kind == NetworkKind.Rail ? 6 : Math.Max(4, s.Lanes * 1.8f + 2);
 
     public static IReadOnlyList<PreparedSegment> Repair(IReadOnlyList<PreparedSegment> source, ushort[] raster,

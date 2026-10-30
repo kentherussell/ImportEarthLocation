@@ -12,8 +12,113 @@ static class VisualDesignTests
         new NativeCompositionEnvelope(NativeStructureMode.Ground,0,12,0,0,-1,1,8,true),
         new NativeCompositionEnvelope(NativeStructureMode.Elevated,0,12,0,0,-1,1,8,true),
         new NativeCompositionEnvelope(NativeStructureMode.Tunnel,0,12,0,0,-1,1,8,true)},new[]{-2f,2f},.03f);
+
+    // A motorway over a crest with a ramp leaving it 60 m before a bridge over a
+    // crossing road. Levelling the through carriageway at the diverge, and a node
+    // height the lifted deck could not reach, left the ramp 1–2 m off the node
+    // (Marseille and DC motorway junctions); arms must meet the node they share.
+    static void JunctionBesideBridge()
+    {
+        const int size=513;const double width=4000;const float scale=1000;
+        var worst=0d;
+        foreach(var kink in new[]{-60f,-30f,15f,40f,70f})
+        {
+            double Ground(double x)=>x<kink?200+.08*x:200+.08*kink-.06*(x-kink);
+            var terrain=new ushort[size*size];
+            for(var z=0;z<size;z++)for(var x=0;x<size;x++)
+                terrain[z*size+x]=(ushort)Math.Round(Ground((x/(double)(size-1)-.5)*width)/scale*ushort.MaxValue);
+            float3 P(float x,float z)=>new(x,(float)Ground(x),z);
+            var roads=new[]{Road(1,1,2,P(-800,0),P(0,0)),Road(2,2,8,P(0,0),P(40,0)),Road(6,8,9,P(40,0),P(80,0)) with{Bridge=true,Layer=1},Road(7,9,3,P(80,0),P(800,0)),
+                Road(8,20,21,P(60,-300),P(60,300)) with{Classification="primary",OneWay=false}};
+            var ramp=Road(3,2,4,P(0,0),P(400,-90)) with{Classification="motorway_link"};
+            var log=new ImportLog{ScalarDiagnostics=true};
+            VisualNetworkCompiler.Prepare(roads.Append(ramp).ToArray(),terrain,scale,width,log,default);
+            var line=log.Lines.LastOrDefault(l=>l.Contains("junction height mismatch",StringComparison.Ordinal));
+            Check(line!=null,"The compiler did not report junction height mismatch");
+            var max=double.Parse(line!.Split("max=")[1].Split(';')[0],System.Globalization.CultureInfo.InvariantCulture);
+            worst=Math.Max(worst,max);
+        }
+        Check(worst<.3,$"A ramp leaving a motorway beside a bridge met its node {worst:F2} m off");
+    }
+
+    // A ramp drawn hugging the motorway for 300 m before it diverges. It must
+    // turn out at the merge angle and run parallel at its clearance until its
+    // own line is wider: the old approach line swung it about 35 m out and back
+    // (an S, A55 Marseille). The motorway keeps its line whether the branch is a
+    // link or another motorway (A7 bowing toward a diverge).
+    static void RampLeavesWithoutSwingingOut()
+    {
+        const int size=257;const double width=4000;const float scale=1000;
+        var terrain=new ushort[size*size];Array.Fill(terrain,(ushort)(ushort.MaxValue/10));
+        float3 P(float x,float z)=>new(x,100,z);
+        var drawn=new[]{P(0,0),P(150,-6),P(300,-8),P(450,-30),P(700,-150)};
+        foreach(var branch in new[]{"motorway_link","motorway"})
+        {
+            var roads=new[]{Road(1,1,2,P(-800,0),P(0,0)),Road(2,2,3,P(0,0),P(1200,0))};
+            var ramp=Enumerable.Range(0,drawn.Length-1).Select(k=>Road(3,k==0?2:40+k,41+k,drawn[k],drawn[k+1]) with{Classification=branch,Reference=branch=="motorway"?"V2":""});
+            var output=VisualNetworkCompiler.Prepare(roads.Concat(ramp).ToArray(),terrain,scale,width,new ImportLog(),default);
+            IEnumerable<double3> Samples(long way)=>output.Where(s=>s.WayId==way||s.SourceWayIds.Contains(way)).SelectMany(s=>Enumerable.Range(0,33).Select(k=>
+                NetworkDesignChecks.Evaluate(new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd),k/32d)));
+            var mainline=Samples(1).Concat(Samples(2)).Max(p=>Math.Abs(p.z));
+            Check(mainline<.3,$"The motorway bowed {mainline:F2} m toward a {branch} leaving it");
+            var rampLine=Samples(3).Where(p=>p.x>0&&p.x<350).OrderBy(p=>p.x).ToArray();
+            var widest=rampLine.Max(p=>-p.z);
+            Check(widest<22,$"A {branch} hugging the motorway swung {widest:F1} m out before following its line");
+            var back=rampLine.Zip(rampLine.Skip(1),(a,b)=>b.z-a.z).Max();
+            Check(back<.5,$"A {branch} leaving the motorway turned back toward it by {back:F2} m between samples");
+        }
+    }
+
+    static void RampOutsideLoopFootprint()
+    {
+        float3 P(float x,float z)=>new(x,100,z);
+        // Translated plan samples of the DC ramp whose neighbouring through
+        // road loops back. Its far side is outside the road's actual footprint.
+        var fixture=Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(Path.Combine(AppContext.BaseDirectory,"fixtures","ramp-dc-loop.json")));
+        float3[] Points(string key)=>fixture[key]!.Select(row=>P((float)row[0]!, (float)row[1]!)).ToArray();
+        var partner=Points("through");var branch=Points("branch");
+        var through=new[]{P(-200*(partner[1].x/12),-200*(partner[1].z/12))}.Concat(partner).ToArray();
+        var source=Enumerable.Range(1,through.Length-1).Select(k=>Road(600,6000+k-1,6000+k,through[k-1],through[k]))
+            .Concat(Enumerable.Range(1,branch.Length-1).Select(k=>Road(601,k==1?6001:6100+k-1,6100+k,branch[k-1],branch[k]) with{Classification="motorway_link",Reference=""})).ToArray();
+        var terrain=Enumerable.Repeat((ushort)(65535/10),33*33).ToArray();
+        var log=new ImportLog();var result=VisualNetworkCompiler.Prepare(source,terrain,1000,4000,log,default);
+        double Distance(double2 p)
+        {
+            var best=double.PositiveInfinity;
+            for(var k=1;k<branch.Length;k++)
+            {
+                var a=(double2)branch[k-1].xz;var d=(double2)branch[k].xz-a;
+                best=Math.Min(best,math.distance(p,a+d*math.clamp(math.dot(p-a,d)/math.lengthsq(d),0,1)));
+            }
+            return best;
+        }
+        var deviation=result.Where(s=>s.WayId==601||s.SourceWayIds.Contains(601)).SelectMany(s=>Enumerable.Range(0,33)
+            .Select(k=>NetworkDesignChecks.Evaluate(new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd),k/32d).xz))
+            .Where(p=>math.length(p)>100).Max(Distance);
+        Check(deviation<40,$"A ramp outside the loop's footprint was pushed {deviation:0.##} m across empty space");
+        SourceTopologyObligations.Validate(SourceTopologyObligations.Capture(source),result,log,default);
+        Check(log.Metric("Missing mandatory selected-source ports")==0&&log.Metric("Unresolved selected-source reachability obligations")==0,"Loop approach shaping lost a ramp's directed route");
+    }
+
     public static void Run()
     {
+        StreetGridTests.Run();
+        RampOutsideLoopFootprint();
+        HighwayPriorityAndAvenueJunction();
+        var bridgeRoad=new[]{Road(801,810,811,new(-250,50,0),new(-50,50,0)) with{Bridge=true,Layer=1},
+            Road(802,811,812,new(-50,50,0),new(50,50,0)),
+            Road(803,812,813,new(50,50,0),new(250,50,0)) with{Bridge=true,Layer=1}};
+        var bridgeLog=new ImportLog();
+        var continuousBridge=VisualNetworkCompiler.Prepare(bridgeRoad,Enumerable.Repeat((ushort)32768,33*33).ToArray(),100,2000,bridgeLog,default);
+        SourceTopologyObligations.Validate(SourceTopologyObligations.Capture(bridgeRoad),continuousBridge,bridgeLog,default);
+        Check(bridgeLog.Metric("Missing mandatory selected-source ports")==0&&bridgeLog.Metric("Unresolved selected-source reachability obligations")==0,
+            "Filling a bridge gap lost its former boundary ports or directed source connections");
+        Check(continuousBridge.All(s=>s.Bridge)&&continuousBridge.Count<bridgeRoad.Length,
+            "Retaining bridge-boundary identity reintroduced the ground gap or extra short sections");
+        Check(continuousBridge.SelectMany(s=>s.SourceNodeAliases).Where(a=>a.SourceNodeId is 811 or 812).Select(a=>a.SourceNodeId).Distinct().Count()==2,
+            "Former bridge boundaries lack explicit source aliases");
+        JunctionBesideBridge();
+        RampLeavesWithoutSwingingOut();
         var route=Enumerable.Range(0,24).Select(i=>Road(100+i,i+1,i+2,new(i*10,50,(float)Math.Sin(i*.25)),new((i+1)*10,50,(float)Math.Sin((i+1)*.25)))).ToArray();
         var compact=NativeChainCompactor.Prepare(route,new ImportLog(),default);
         var shuffled=NativeChainCompactor.Prepare(route.Reverse().ToArray(),new ImportLog(),default);
@@ -128,5 +233,33 @@ static class VisualDesignTests
         Check(svg.Contains("<polyline")&&svg.Contains("sampled, not rendered")&&System.Text.Encoding.UTF8.GetByteCount(svg)<1024*1024,"Visual evidence diagram missing, misleading, or unbounded");
         var document=new System.Xml.XmlDocument();document.LoadXml(svg);
         Console.WriteLine($"PASS: whole-route fit {route.Length}->{compact.Count}; guarded budgets; bridge/tunnel intent; footprint cache invalidation; visual ledger and SVG.");
+    }
+
+    static void HighwayPriorityAndAvenueJunction()
+    {
+        var terrain=Enumerable.Repeat((ushort)32768,129*129).ToArray();
+        foreach(var classification in new[]{"motorway","trunk"})
+        {
+            var highway=Road(60001,60001,60002,new(-500,50,0),new(500,50,0)) with{Classification=classification};
+            var street=Road(60002,60003,60004,new(-500,50,10),new(500,50,10)) with{Classification="primary",Reference="Street"};
+            var result=VisualNetworkCompiler.Prepare(new[]{highway,street},terrain,100,2000,new ImportLog(),default);
+            Check(result.Where(s=>s.WayId==highway.WayId).SelectMany(s=>Enumerable.Range(0,41).Select(k=>NetworkNormalizer.Evaluate(s,k/40f)))
+                .All(p=>Math.Abs(p.z)<.001),"A street moved the motorway/trunk alignment to share its clearance correction");
+            Check(result.Where(s=>s.WayId==street.WayId).Any(s=>Enumerable.Range(0,41).Any(k=>NetworkNormalizer.Evaluate(s,k/40f).z>11)),
+                "Highway priority left the overlapping street without a clearance correction");
+        }
+        var a=Road(60010,60010,60011,new(-500,50,0),new(0,50,0)) with{Classification="primary",OneWay=false};
+        var b=Road(60011,60011,60012,new(0,50,0),new(500,50,0)) with{Classification="primary",OneWay=false};
+        var branch=Road(60012,60011,60013,new(0,50,0),new(350,50,18)) with{Classification="secondary",OneWay=false,Reference="Branch"};
+        var output=VisualNetworkCompiler.Prepare(new[]{a,b,branch},terrain,100,2000,new ImportLog(),default);
+        var arm=output.Single(s=>s.WayId==branch.WayId&&s.StartNodeId==60011);
+        var heading=math.normalizesafe((arm.CourseControl1-arm.CourseStart).xz);
+        var angle=math.degrees(Math.Acos(math.clamp(heading.x,-1,1)));
+        Check(angle>=25,$"An ordinary two-way avenue retained its acute side-street junction ({angle:F2} degrees)");
+        Check(output.Where(s=>s.WayId!=branch.WayId).All(s=>Math.Abs(s.CourseControl1.z)<.001&&Math.Abs(s.CourseControl2.z)<.001),
+            "Correcting an acute avenue branch moved the through street");
+        var audit=new ImportLog();SourceTopologyObligations.Validate(SourceTopologyObligations.Capture(new[]{a,b,branch}),output,audit,default);
+        Check(audit.Metric("Missing mandatory selected-source ports")==0&&audit.Metric("Unresolved selected-source reachability obligations")==0,
+            "Avenue approach correction lost the side street's source route");
     }
 }

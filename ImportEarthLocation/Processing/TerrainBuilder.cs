@@ -43,6 +43,7 @@ public static class TerrainBuilder
                     var raw=new float[65536];for(var y=0;y<256;y++)for(var x=0;x<256;x++)raw[y*256+x]=Decode(pixels[(255-y)*256+x]);
                     if(TryRepairSmallHoles(raw,256,256,token)>0)recovered=raw;
                 }
+                else if(usable&&tile.Children!=null)recovered=AverageChildren(tile.Children,pixels,token);
                 decoded.Add(new TerrainTilePixels { Zoom=tile.Zoom, X=tile.X, Y=tile.Y, Pixels=pixels, RecoveredElevations=recovered, RecoveryPass=tile.RecoveryPass });
             }
             finally
@@ -51,6 +52,30 @@ public static class TerrainBuilder
             }
         }
         return decoded;
+    }
+
+    // HD Terrain: sample (x, y) of a tile is the mean of the 2×2 samples of its
+    // child at zoom+1 that it covers. Terrarium samples are pixel centres, so
+    // child samples 2x and 2x+1 centre on parent sample x exactly. Children are
+    // decoded one at a time; a sample keeps the tile's own value unless all four
+    // finer samples are valid.
+    private static float[] AverageChildren(TerrainTile[] children,Color32[] own,CancellationToken token)
+    {
+        var sum=new float[65536];var count=new byte[65536];
+        for(var k=0;k<4;k++)
+        {
+            token.ThrowIfCancellationRequested();
+            var child=DecodeOnMainThread(new[]{children[k]},token)[0].Pixels;
+            var ox=k%2*128;var oy=k/2*128;
+            for(var v=0;v<256;v++)for(var u=0;u<256;u++)
+            {
+                var h=Decode(child[(255-v)*256+u]);if(!ValidEarthElevation(h))continue;
+                var i=(oy+v/2)*256+ox+u/2;sum[i]+=h;count[i]++;
+            }
+        }
+        var result=new float[65536];
+        for(var y=0;y<256;y++)for(var x=0;x<256;x++){var i=y*256+x;result[i]=count[i]==4?sum[i]/4:Decode(own[(255-y)*256+x]);}
+        return result;
     }
 
     public static bool ValidEarthElevation(float value) => TerrainConditioner.ValidEarthElevation(value);
@@ -242,18 +267,17 @@ public static class TerrainBuilder
             var px = GeoMath.LongitudeToTileX(longitude, zoom) * 256;
             columns[column] = ((int)Math.Floor(px), (float)(px - Math.Floor(px)));
         }
+        // Continuous-slope bicubic (TerrainSampling.ClampedCubic), not bilinear:
+        // the output grid is finer than the DEM, and bilinear facets show in game.
+        var columnWeights = columns.Select(c => TerrainSampling.CubicWeights(c.fraction)).ToArray();
+        Func<int, int, float> read = ReadRaster;
         System.Threading.Tasks.Parallel.For(0, Resolution, options, row =>
         {
             var latitude = bounds.South + (bounds.North - bounds.South) * row / (Resolution - 1d);
             var tileY = GeoMath.LatitudeToTileY(latitude, zoom);
-            var py = tileY * 256; var y = (int)Math.Floor(py); var fy = (float)(py - y);
+            var py = tileY * 256; var y = (int)Math.Floor(py); var rowWeights = TerrainSampling.CubicWeights((float)(py - y));
             for (var column = 0; column < Resolution; column++)
-            {
-                var x = columns[column].x; var fx = columns[column].fraction;
-                var a = ReadRaster(x, y); var b = ReadRaster(x + 1, y); var c = ReadRaster(x, y + 1); var d = ReadRaster(x + 1, y + 1);
-                // Convex bilinear interpolation cannot overshoot its source neighborhood.
-                elevations[row * Resolution + column] = (a + (b - a) * fx) * (1 - fy) + (c + (d - c) * fx) * fy;
-            }
+                elevations[row * Resolution + column] = TerrainSampling.ClampedCubic(read, columns[column].x, y, columnWeights[column], rowWeights);
         });
 
         var minimum = elevations.Min();

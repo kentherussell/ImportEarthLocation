@@ -31,7 +31,7 @@ public sealed class TerrainTileClient
         _log = log;
     }
 
-    public async Task<IReadOnlyList<TerrainTile>> DownloadAsync(GeoBounds bounds, double widthMeters, CancellationToken token)
+    public async Task<IReadOnlyList<TerrainTile>> DownloadAsync(GeoBounds bounds, double widthMeters, CancellationToken token, bool hd = false)
     {
         var timer = Stopwatch.StartNew();
         var zoom = GeoMath.SelectTerrainZoom(widthMeters);
@@ -53,7 +53,11 @@ public sealed class TerrainTileClient
         // Match useful output detail when the SAME provider can fit the entire
         // footprint. Budget includes coast masks, repair clones, decoded tiles and
         // fixed output buffers; finer pixels are not a claim of finer source survey.
-        const long scratchBudgetBytes=768L*1024*1024;
+        // HD Terrain may step up to the next level for real detail: a 57 km map
+        // then has about one DEM sample per 14 m game pixel. Its larger tile set
+        // and transient processing memory are part of opting in.
+        var tileCap=hd?4*MaximumTiles:MaximumTiles;
+        var scratchBudgetBytes=(hd?1536L:768L)*1024*1024;var raised=false;
         var latitude=(bounds.North+bounds.South)*.5;
         var outputSpacing=widthMeters/4095d;
         double Spacing(int level)=>40075016.68557849*Math.Cos(latitude*Math.PI/180)/(256d*(1<<level));
@@ -63,31 +67,56 @@ public sealed class TerrainTileClient
         {
             var finer=Footprint(zoom+1);
             var finerCount=Math.Max(0L,finer.maxX-finer.minX+1L)*Math.Max(0L,finer.maxY-finer.minY+1L);
-            if(finerCount>MaximumTiles || EstimatedBytes(finer)>scratchBudgetBytes) break;
+            if(finerCount>tileCap || EstimatedBytes(finer)>scratchBudgetBytes) break;
+            raised|=finerCount>MaximumTiles||EstimatedBytes(finer)>768L*1024*1024;
             footprint=finer; zoom++;
         }
         // Mercator ground resolution changes with latitude. Width-only zoom
         // selection must not turn a valid map into an arbitrary 100-tile error.
         // Retain the real boundary halo and choose the next same-provider level.
-        while(Count()>MaximumTiles&&zoom>0){token.ThrowIfCancellationRequested();footprint=Footprint(--zoom);}
-        _log.Diagnostic($"DEM PLAN preferredZoom={preferredZoom}; preferredTiles={preferredCount}; selectedZoom={zoom}; selectedTiles={Count()}; maximumTiles={MaximumTiles}; zoomReduced={zoom<preferredZoom}; zoomIncreased={zoom>preferredZoom}; sourceSpacingMeters={Spacing(zoom):R}; outputSpacingMeters={outputSpacing:R}; estimatedScratchBytes={EstimatedBytes(footprint)}; scratchBudgetBytes={scratchBudgetBytes}; memoryEstimateNotMeasurement=true; sourceSurveyResolutionUnknown=true; boundaryHaloPixels=6; wholeBoundsRetained=true; newEndpoint=false");
+        while(Count()>tileCap&&zoom>0){token.ThrowIfCancellationRequested();footprint=Footprint(--zoom);}
+        _log.Diagnostic($"DEM PLAN preferredZoom={preferredZoom}; preferredTiles={preferredCount}; selectedZoom={zoom}; selectedTiles={Count()}; maximumTiles={tileCap}; zoomReduced={zoom<preferredZoom}; zoomIncreased={zoom>preferredZoom}; sourceSpacingMeters={Spacing(zoom):R}; outputSpacingMeters={outputSpacing:R}; estimatedScratchBytes={EstimatedBytes(footprint)}; scratchBudgetBytes={scratchBudgetBytes}; memoryEstimateNotMeasurement=true; sourceSurveyResolutionUnknown=true; boundaryHaloPixels=6; wholeBoundsRetained=true; newEndpoint=false");
         var (minX,maxX,minY,maxY)=footprint;
         var coordinates = new List<(int x, int y)>();
         for (var y = minY; y <= maxY; y++)
         for (var x = minX; x <= maxX; x++)
             coordinates.Add((x, y));
 
-        if (coordinates.Count==0||coordinates.Count>MaximumTiles)
+        if (coordinates.Count==0||coordinates.Count>tileCap)
             throw new PreparationDataException(PreparationDataIssue.ElevationUnavailable,$"DEM bounds have no recoverable bounded tile footprint ({coordinates.Count} tiles at zoom {zoom}).");
 
-        _log.Info($"Terrain plan: zoom {zoom}, {coordinates.Count} independently cached tiles.");
-        using var gate = new SemaphoreSlim(4);
+        // Where HD Terrain could not step up, it reads the next zoom level too,
+        // averaged into this grid at decode time. Stepped up, the grid is already
+        // that level and nothing is averaged.
+        if(raised)_log.Evidence($"HD Terrain: elevation read at zoom {zoom} directly ({Spacing(zoom):0.0} m between samples, {coordinates.Count:N0} tiles) instead of averaged into zoom {zoom-1}.");
+        hd &= zoom < 15 && !raised;
+        _log.Info(hd ? $"Terrain plan: zoom {zoom}, {coordinates.Count} independently cached tiles, each averaged from 4 zoom {zoom + 1} tiles (HD Terrain)."
+            : $"Terrain plan: zoom {zoom}, {coordinates.Count} independently cached tiles.");
+        using var gate = new SemaphoreSlim(hd ? 8 : 4);
+        var detailed = 0;
         var tasks = coordinates.Select(async coordinate =>
         {
             await gate.WaitAsync(token).ConfigureAwait(false);
             try
             {
-                try { return await DownloadOneAsync(zoom, coordinate.x, coordinate.y, token).ConfigureAwait(false); }
+                try
+                {
+                    var tile = await DownloadOneAsync(zoom, coordinate.x, coordinate.y, token).ConfigureAwait(false);
+                    if (!hd) return tile;
+                    try
+                    {
+                        var children = new TerrainTile[4];
+                        for (var k = 0; k < 4; k++) children[k] = await DownloadOneAsync(zoom + 1, coordinate.x * 2 + k % 2, coordinate.y * 2 + k / 2, token).ConfigureAwait(false);
+                        Interlocked.Increment(ref detailed);
+                        return new TerrainTile { Zoom = tile.Zoom, X = tile.X, Y = tile.Y, PngBytes = tile.PngBytes, Children = children };
+                    }
+                    catch (Exception error) when (error is HttpRequestException || error is InvalidDataException)
+                    {
+                        // The standard tile is already valid; HD detail is optional per tile.
+                        _log.Diagnostic($"DEM HD tile={zoom}/{coordinate.x}/{coordinate.y}; finerTilesUnavailable=true; standardTileKept=true; reason={error.GetType().Name}");
+                        return tile;
+                    }
+                }
                 catch(Exception error) when(error is HttpRequestException||error is InvalidDataException)
                 {
                     if(zoom==0)throw new PreparationDataException(PreparationDataIssue.ElevationUnavailable,$"DEM tile {zoom}/{coordinate.x}/{coordinate.y}: retries exhausted and no parent exists.",error);
@@ -104,6 +133,7 @@ public sealed class TerrainTileClient
             finally { gate.Release(); }
         });
         var result = await Task.WhenAll(tasks).ConfigureAwait(false);
+        if (hd) _log.Evidence($"HD Terrain: {detailed:N0} of {result.Length:N0} elevation tiles averaged from zoom {zoom + 1} ({4 * detailed:N0} finer tiles); the rest use standard detail.", warning: detailed < result.Length);
         _log.Time("Terrain download", timer.Elapsed.TotalSeconds);
         return result;
     }
