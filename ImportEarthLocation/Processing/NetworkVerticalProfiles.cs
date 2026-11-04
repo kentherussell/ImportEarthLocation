@@ -19,7 +19,10 @@ public static class NetworkVerticalProfiles
     public static float DesiredGrade(PreparedSegment s)=>s.Kind==NetworkKind.Rail?.02f:s.ProtectedLink?.06f:
         s.Classification=="motorway"||s.Classification=="trunk"||s.SourceSpeedKph>=80?.035f:
         s.Classification=="primary"||s.Classification=="secondary"?.06f:.08f;
-    public static float CutFillBudget(PreparedSegment segment) => segment.Kind==NetworkKind.Rail?6f:
+    // Track follows the ground only at long wavelengths, so it runs in deeper
+    // cuttings and on higher banks than a street: at 6 m Marseille's smoothed
+    // lines missed the stamped ground by up to 12 m where the budget ran out.
+    public static float CutFillBudget(PreparedSegment segment) => segment.Kind==NetworkKind.Rail?12f:
         segment.Classification=="motorway"||segment.Classification=="trunk"||segment.ProtectedLink?20f:10f;
     public static float MaximumGrade(PreparedSegment segment)
     {

@@ -132,9 +132,8 @@ const rockDensity$ = bindValue<number>(group, "rockDensity", 0);
 const hdTerrain$ = bindValue<boolean>(group, "hdTerrain", false);
 // Hover help for each option: a title and one short, plain-language line.
 const tips: Record<string, string> = {
-  "Highways": "Motorways and their on and off ramps.",
-  "Main Roads": "Major through roads between towns and districts.",
-  "Streets": "Local streets. Takes longer and is still being improved.",
+  "Highways": "Motorways, trunk roads and their on and off ramps.",
+  "Main Roads": "Primary, secondary and tertiary roads. Takes longer and is still being improved.",
   "Rail": "Train lines and tracks.",
   "Vegetation": "Forests, parks, trees and bushes. Lower values plant fewer; Off skips them.",
   "Rocks": "Rock clumps below cliffs and rocky slopes. Lower values place fewer; Off skips them.",
@@ -297,9 +296,9 @@ export const ImportEarthLocationContent = () => {
               <div className={styles.field} role="group" aria-label="Road groups">
                 <span className={styles.sectionTitle}>Road Groups</span>
                 <div className={styles.options}>
-                {[["highways", "Highways"], ["routes", "Main Roads"], ["streets", "Streets"]].map(([id,label]) => withTip(label,
-                  <Button variant="flat" className={styles.check} focusKey={`iel-roads-${id}`} role="checkbox" aria-checked={roadGroups.includes(id)} disabled={busy || starting} onSelect={() => toggleRoadGroup(id)}>
-                    <span className={styles.checkbox}>{roadGroups.includes(id) ? "✓" : ""}</span><span>{label}{id === "streets" && <span className={styles.experimental}>Experimental</span>}</span>
+                {[["highways", "Highways"], ["streets", "Main Roads"]].map(([id,label]) => withTip(label,
+                  <Button variant="flat" className={styles.check} focusKey={`iel-roads-${id}`} role="checkbox" aria-checked={(id === "highways" ? roadGroups.includes("highways") || roadGroups.includes("routes") : roadGroups.includes(id))} disabled={busy || starting} onSelect={() => toggleRoadGroup(id)}>
+                    <span className={styles.checkbox}>{(id === "highways" ? roadGroups.includes("highways") || roadGroups.includes("routes") : roadGroups.includes(id)) ? "✓" : ""}</span><span>{label}{id === "streets" && <span className={styles.experimental}>Experimental</span>}</span>
                   </Button>, id))}
                 </div>
               </div>

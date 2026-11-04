@@ -16,14 +16,21 @@ namespace ImportEarthLocation.Processing;
 //     crossings, tag-directed bounds. Exact monotone closures: lower (tunnel
 //     cover), then raise (bridge clearance). No penalty weights, no iterations
 //     to convergence; a relaxation budget overrun is a reported conflict.
+//     Road coupled points then move, least squares, until a vertical curve within
+//     the class K can pass through each consecutive three.
 //  3. Every stroke is then smoothed alone: Σ(y−τ)² + α Σ(Δ²y)² with
 //     α = (Λ/2π)⁴/h⁴, a low-pass filter with cutoff wavelength Λ per class,
 //     pinned at its coupled points, with grade and junction-plateau penalties.
-public static class VisualCompilerProfile
+public static partial class VisualCompilerProfile
 {
     public const double Spacing=10;
     // Leave interpolation headroom below the emitted curve's hard grade limit.
     private const double GradeShare=.85;
+    // Likewise for the vertical-curve rate between coupled points; the most a
+    // curve row may cost per metre it is missed by; and the ascent's sweep limit.
+    private const double BendShare=.9,CurveCap=5;
+    private const int CurveSweeps=2000;
+
     public sealed class Stroke
     {
         public NetworkKind Kind;public VisualCompilerClass Class;public bool OneWay;public string Classification="";
@@ -42,6 +49,8 @@ public static class VisualCompilerProfile
         // get a hard bound, so other tunnels and bridges still smooth freely.
         internal bool[] Constrained=Array.Empty<bool>();
         public List<(double Station,SourceNodeKey Node,bool Junction)> Pins=new();
+        internal List<(double Station,double Reach)> LevelCrossings=new();
+        internal HashSet<long> LevelCrossingNodes=new();
         public double[] Height=Array.Empty<double>();
         public double HeightAt(double s)
         {
@@ -54,6 +63,23 @@ public static class VisualCompilerProfile
         {
             var end=Station[Station.Length-1];var a=Math.Max(0,s-Spacing/2);var b=Math.Min(end,s+Spacing/2);
             return b-a<1e-6?0:(HeightAt(b)-HeightAt(a))/(b-a);
+        }
+        // Steepest change of grade per metre between the samples spanning s0..s1.
+        public double GradeChangeRate(double s0,double s1)
+        {
+            var worst=0d;
+            for(var k=1;k<Station.Length-1;k++)
+            {
+                if(Station[k+1]<s0||Station[k-1]>s1)continue;
+                var g0=(Height[k]-Height[k-1])/Math.Max(1e-9,Station[k]-Station[k-1]);var g1=(Height[k+1]-Height[k])/Math.Max(1e-9,Station[k+1]-Station[k]);
+                worst=Math.Max(worst,Math.Abs(g1-g0)/Math.Max(1e-9,(Station[k+1]-Station[k-1])/2));
+            }
+            return worst;
+        }
+        public bool AllTunnel(double s0,double s1)
+        {
+            for(var k=0;k<Station.Length;k++)if(Station[k]>=s0-Spacing&&Station[k]<=s1+Spacing&&Mode[k]>=0)return false;
+            return true;
         }
     }
 
@@ -97,6 +123,28 @@ public static class VisualCompilerProfile
             return bounds;
         }
         int Sample(Stroke s,double station){var k=Array.BinarySearch(s.Station,station);if(k<0)k=Math.Min(s.Station.Length-1,~k);return k;}
+        var levelVars=new HashSet<int>();
+        foreach(var s in strokes)s.LevelCrossings.Clear();
+        var ports=strokes.SelectMany((s,i)=>s.Pins.Select(p=>(Stroke:i,Pin:p,Sample:Sample(s,p.Station))));
+        foreach(var group in ports.GroupBy(p=>p.Pin.Node.Id))
+        {
+            var at=group.ToArray();
+            if(!at.Any(p=>strokes[p.Stroke].Kind==NetworkKind.Road)||!at.Any(p=>strokes[p.Stroke].Kind==NetworkKind.Rail))continue;
+            var rail=at.First(p=>strokes[p.Stroke].Kind==NetworkKind.Rail);var r=strokes[rail.Stroke];
+            if(at.Any(p=>!strokes[p.Stroke].LevelCrossingNodes.Contains(group.Key)||strokes[p.Stroke].Mode[p.Sample]!=0||
+                strokes[p.Stroke].Layer[p.Sample]!=r.Layer[rail.Sample]))continue;
+            var v=vars.Count;var t=tau[rail.Stroke][rail.Sample];var (lo,hi)=Bounds(r,rail.Sample,t);vars.Add((t,lo,hi));levelVars.Add(v);
+            foreach(var p in at)
+            {
+                nodeVar[p.Pin.Node]=v;var s=strokes[p.Stroke];
+                // Keep the complete opposing pavement/track footprint nearly
+                // level. At oblique crossings the footprint length is width/sinθ.
+                var reach=at.Where(q=>strokes[q.Stroke].Kind!=s.Kind).Select(q=>
+                    (strokes[q.Stroke].HalfWidth[q.Sample]+2)/Math.Max(.2,Math.Abs(NetworkDesignChecks.Cross(s.Direction[p.Sample],strokes[q.Stroke].Direction[q.Sample])))).Max();
+                s.LevelCrossings.Add((p.Pin.Station,reach));
+            }
+        }
+        log.Count("Visual compiler shared road rail crossing heights",levelVars.Count);
         for(var i=0;i<strokes.Count;i++)foreach(var pin in strokes[i].Pins)
         {
             var s=strokes[i];var k=Sample(s,pin.Station);
@@ -107,10 +155,13 @@ public static class VisualCompilerProfile
         }
         var clearances=Crossings(strokes,token).ToList();var crossingBase=vars.Count;
         var crossingConstraints=new List<(int Over,int Under,double Clearance)>();
+        // Under a tunnel, the lower bore goes deeper; the upper keeps its cover.
+        var stacked=new HashSet<int>();
         foreach(var c in clearances)
         {
             int Add(int stroke,int k){var s=strokes[stroke];var (lo,hi)=Bounds(s,k,tau[stroke][k]);var v=vars.Count;vars.Add((tau[stroke][k],lo,hi));strokeVars[stroke].Add((s.Station[k],v));return v;}
-            crossingConstraints.Add((Add(c.Over,c.OverSample),Add(c.Under,c.UnderSample),c.Clearance));
+            var constraint=(Add(c.Over,c.OverSample),Add(c.Under,c.UnderSample),c.Clearance);crossingConstraints.Add(constraint);
+            if(strokes[c.Over].Mode[c.OverSample]<0)stacked.Add(constraint.Item2);
         }
         var crossingEnd=vars.Count;
         var edges=new List<(int From,int To,double Bound)>();// h[To] ≤ h[From] + Bound
@@ -192,6 +243,76 @@ public static class VisualCompilerProfile
             }
             if(!met)conflicts++;
         }
+        var (curveMoved,curveBefore,curveAfter,curveSweeps)=CurveFeasibleHeights();
+        log.Count("Visual compiler coupled points moved for vertical curves",curveMoved);
+        log.Diagnostic($"VISUAL COMPILER profile coupled curvature moved={curveMoved}; violationsBefore={curveBefore}; violationsAfter={curveAfter}; sweeps={curveSweeps}");
+        // Grade edges bound how far coupled points may differ, not how sharply the
+        // profile must bend between them: a DC motorway junction 200 m before a
+        // deck that must clear a road 8.6 m higher (way 124891268) left the
+        // smoothing a vertical curve over three times its K. Along a
+        // stroke, a curve of at most the class rate κ passes three consecutive
+        // coupled points only if the middle one lies within κ·d₁·d₂/2 of the
+        // chord through the other two. The coupled heights move as little as
+        // possible (least squares) to meet those rows, keeping every grade edge,
+        // accepted crossing and bound: Hildreth's dual coordinate ascent, one row
+        // at a time, with each curve row's multiplier capped at CurveCap so a row
+        // that cannot be met costs CurveCap per metre instead of moving its points
+        // without limit. A crossing floor only bounds a hump and a ceiling only a
+        // sag. Moving points one at a time instead cascaded: raising a road under
+        // a deck raised the deck, and that deck ended 5 m higher.
+        (int Moved,int Before,int After,int Sweeps) CurveFeasibleHeights()
+        {
+            var rows=new List<(int A,int B,int C,double Ca,double Cb,double Cc,double Bound,double Cap)>();
+            foreach(var e in edges)rows.Add((e.To,e.From,-1,1,-1,0,e.Bound,double.PositiveInfinity));
+            foreach(var c in accepted)rows.Add((c.Under,c.Over,-1,1,-1,0,-c.Clearance,double.PositiveInfinity));
+            for(var v=0;v<h.Length;v++)
+            {
+                rows.Add((v,-1,-1,1,0,0,Math.Max(upper[v],h[v]),double.PositiveInfinity));
+                rows.Add((v,-1,-1,-1,0,0,-Math.Min(lowerBound[v],h[v]),double.PositiveInfinity));
+            }
+            var curveRows=rows.Count;
+            for(var i=0;i<strokes.Count;i++)
+            {
+                // Track keeps the grade-only heights: its rows raised Marseille's
+                // rail crossing-clearance failures from 4 to 11.
+                if(strokes[i].Kind!=NetworkKind.Road)continue;
+                var list=strokeVars[i].Where(p=>!Crossing(p.Var)||floors.Contains(p.Var)||ceilings.Contains(p.Var)).OrderBy(p=>p.Station).ToArray();
+                var kappa=BendShare*.01/strokes[i].Class.K;
+                for(var j=1;j<list.Length-1;j++)
+                {
+                    var (sa,a)=list[j-1];var (sb,b)=list[j];var (sc,c)=list[j+1];
+                    var d1=sb-sa;var d2=sc-sb;if(d1<1||d2<1||a==b||b==c||a==c)continue;
+                    var wa=d2/(d1+d2);var wc=d1/(d1+d2);var reach=kappa*d1*d2/2;
+                    if(!ceilings.Contains(b))rows.Add((b,a,c,1,-wa,-wc,reach,CurveCap));
+                    if(!floors.Contains(b))rows.Add((b,a,c,-1,wa,wc,reach,CurveCap));
+                }
+            }
+            // A shared road–rail crossing height barely moves.
+            var inverse=new double[h.Length];for(var v=0;v<h.Length;v++)inverse[v]=levelVars.Contains(v)?1e-3:1;
+            double Value(int r,double[] x){var row=rows[r];return row.Ca*x[row.A]+(row.B>=0?row.Cb*x[row.B]:0)+(row.C>=0?row.Cc*x[row.C]:0);}
+            int Bent(double[] x){var n=0;for(var r=curveRows;r<rows.Count;r++)if(Value(r,x)>rows[r].Bound/BendShare+.05)n++;return n;}
+            var y=(double[])h.Clone();var before=Bent(y);if(before==0)return (0,0,0,0);
+            var norm=rows.Select(row=>row.Ca*row.Ca*inverse[row.A]+(row.B>=0?row.Cb*row.Cb*inverse[row.B]:0)+(row.C>=0?row.Cc*row.Cc*inverse[row.C]:0)).ToArray();
+            var lambda=new double[rows.Count];var sweeps=0;
+            for(;sweeps<CurveSweeps;sweeps++)
+            {
+                token.ThrowIfCancellationRequested();var largest=0d;
+                for(var r=0;r<rows.Count;r++)
+                {
+                    var row=rows[r];var next=Math.Min(row.Cap,Math.Max(0,lambda[r]+(Value(r,y)-row.Bound)/norm[r]));var delta=next-lambda[r];
+                    if(delta==0)continue;lambda[r]=next;
+                    y[row.A]-=delta*row.Ca*inverse[row.A];if(row.B>=0)y[row.B]-=delta*row.Cb*inverse[row.B];if(row.C>=0)y[row.C]-=delta*row.Cc*inverse[row.C];
+                    largest=Math.Max(largest,Math.Abs(delta)*Math.Sqrt(norm[r]));
+                }
+                if(largest<1e-4)break;
+            }
+            // The hard rows hold to within the ascent's tolerance; an accepted
+            // crossing or a bound that does not leaves the coupled heights as they were.
+            for(var r=0;r<curveRows;r++)if(Value(r,y)>rows[r].Bound+.02)return (0,before,before,sweeps);
+            var moved=0;for(var v=0;v<h.Length;v++)if(Math.Abs(y[v]-h[v])>.01)moved++;
+            Array.Copy(y,h,h.Length);
+            return (moved,before,Bent(h),sweeps);
+        }
         // One backup buffer serves every attempt; it holds the heights before the
         // current one until the next begins.
         int Overshoot(){var n=0;for(var i=0;i<h.Length;i++)if(h[i]>upper[i]+.5&&snapshot[i]<=upper[i]+.5)n++;return n;}
@@ -199,7 +320,7 @@ public static class VisualCompilerProfile
         {
             // Only the new constraint can be violated, so relaxation starts from
             // its endpoints alone; the snapshot restores a rejected attempt.
-            Array.Copy(h,snapshot,h.Length);var tunnel=vars[c.Under].Hi<vars[c.Under].Tau;
+            Array.Copy(h,snapshot,h.Length);var tunnel=vars[c.Under].Hi<vars[c.Under].Tau||stacked.Contains(c.Under);
             if(tunnel)down[c.Over].Add((c.Under,-c.Clearance));up[c.Under].Add((c.Over,-c.Clearance));
             var failed=(tunnel?Close(h,down,upper,lower:true,new[]{c.Over}):0)+Close(h,up,lowerBound,lower:false,new[]{c.Under});
             failedBudget=failed>0;
@@ -306,7 +427,7 @@ public static class VisualCompilerProfile
                 var s=strokes[i];var end=s.Station[s.Station.Length-1];var rank=Rank(s);
                 foreach(var (station,v) in strokeVars[i])
                 {
-                    if(!junctionVars.Contains(v)||station<1||station>end-1)continue;
+                    if(!junctionVars.Contains(v)||levelVars.Contains(v)||station<1||station>end-1)continue;
                     if(!owner.TryGetValue(v,out var o)||rank<o.Rank)owner[v]=(i,station,rank);
                 }
             }
@@ -430,6 +551,17 @@ public static class VisualCompilerProfile
         log.Count("Visual compiler junction pins reconciled",reconciled);
         log.Count("Visual compiler junction reconciliation constraint conflicts",reconciliationConflicts);
         log.Diagnostic($"VISUAL COMPILER junction reconciliation revisedPins={reconciled}; correctionsWithheld={reconciliationConflicts}; protectedWetVariables={wetVariables.Count}; perJunctionConstraintClosure=true; failedCorrectionsRolledBack=true; highwayPriorityAtDryJunctions=true");
+        // 5. Interchanges: what is still bent or split is solved jointly
+        // (VisualCompilerInterchanges.cs). A second pass seeds from the first
+        // pass's result. Shared road–rail heights and water floors stay fixed.
+        for(var pass=0;pass<InterchangePasses;pass++)
+        {
+            var interchangeClock=System.Diagnostics.Stopwatch.StartNew();
+            var interchanges=Interchanges(strokes,tau,partner,strokeVars,h,v=>!Crossing(v)&&!levelVars.Contains(v)&&!waterFloors.ContainsKey(v),
+                Crossing,twinPairs,bounds,plateaus,stiffness,lowerBound,upper,token);
+            log.Count("Visual compiler interchange windows solved jointly",interchanges.Accepted);
+            log.Diagnostic($"VISUAL COMPILER profile interchanges pass={pass}; clusters={interchanges.Clusters}; accepted={interchanges.Accepted}; skipped={interchanges.Skipped}; unknowns={interchanges.Unknowns}; scoreBefore={interchanges.Before}; scoreAfter={interchanges.After}; ms={interchangeClock.ElapsedMilliseconds}");
+        }
         if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_PINS")=="1")
         {
             var worst=new List<(double Residual,string Line)>();
@@ -465,7 +597,7 @@ public static class VisualCompilerProfile
         double Quantile(double q)=>gaps.Length==0?0:gaps[(int)(q*(gaps.Length-1))];
         log.Diagnostic($"VISUAL COMPILER vertical strokes={strokes.Count}; coupledPoints={vars.Count}; junctionPoints={nodeVar.Count}; crossings={crossingConstraints.Count}; pairTwins={twins}; sharedPairSamples={shared}; conflicts={conflicts}; pairGapP50={Quantile(.5):F2}; pairGapP90={Quantile(.9):F2}; pairGapP99={Quantile(.99):F2}; pairGapOver03={gaps.Count(g=>g>.3)}");
         log.Count("Visual compiler vertical conflicts",conflicts);
-        log.Diagnostic($"VISUAL COMPILER crossing conflicts budget={budgetConflicts}; bound={boundConflicts}; overshootBeforeCrossings={preexisting}; repairedByDippingRoadBeneath={recipes}; loweringRejectedToKeepAcceptedFloors={loweringRejected}; metAtReducedClearance={partial}");
+        log.Diagnostic($"VISUAL COMPILER crossing conflicts budget={budgetConflicts}; bound={boundConflicts}; overshootBeforeCrossings={preexisting}; repairedByDippingRoadBeneath={recipes}; loweringRejectedToKeepAcceptedFloors={loweringRejected}; metAtReducedClearance={partial}; stackedTunnels={stacked.Count}; stackedTunnelsAccepted={accepted.Count(a=>stacked.Contains(a.Under))}");
         log.Count("Visual compiler crossings repaired",recipes);
     }
 
@@ -547,16 +679,21 @@ public static class VisualCompilerProfile
 
     // Half width (metres) of the moving average under rail targets.
     private const double RailSmoothing=150;
-    // A centred moving average by station, in linear time.
+    // A centred moving average by station over ground samples, in linear time.
+    // Bridge and tunnel samples take their targets from Chord and Structures and
+    // are left out: averaged in, the river under DC's Long Bridge pulled its bank
+    // targets 7 m down and the deck sank with them, 6 m below the switches at
+    // its west end. A structure sample keeps its own value.
     private static double[] Average(Stroke s,double[] values,double half)
     {
-        var n=values.Length;var result=new double[n];var prefix=new double[n+1];
-        for(var k=0;k<n;k++)prefix[k+1]=prefix[k]+values[k];
+        var n=values.Length;var result=new double[n];var prefix=new double[n+1];var count=new int[n+1];
+        for(var k=0;k<n;k++){var ground=s.Mode[k]==0;prefix[k+1]=prefix[k]+(ground?values[k]:0);count[k+1]=count[k]+(ground?1:0);}
         for(int k=0,a=0,b=0;k<n;k++)
         {
             while(s.Station[k]-s.Station[a]>half)a++;
             while(b+1<n&&s.Station[b+1]-s.Station[k]<=half)b++;
-            result[k]=(prefix[b+1]-prefix[a])/(b-a+1);
+            var samples=count[b+1]-count[a];
+            result[k]=s.Mode[k]!=0||samples==0?values[k]:(prefix[b+1]-prefix[a])/samples;
         }
         return result;
     }
@@ -579,6 +716,11 @@ public static class VisualCompilerProfile
     private const double WaterClearance=WaterLevels.RoadBridgeClearanceMeters;
     // Grade of the land ramp that carries a deck's water lift back to the ground.
     private const double ApproachGrade=.04;
+    // Track ramps off a lifted deck at 1.5%: at 4% the change from level track
+    // to the ramp was itself 2.4 times the rail grade-change limit, against a 5%
+    // hard grade.
+    private const double RailApproachGrade=.015;
+    private static double Approach(Stroke s)=>s.Kind==NetworkKind.Rail?RailApproachGrade:ApproachGrade;
 
     private static double WaterFloor(Stroke s,int k)
     {
@@ -636,8 +778,11 @@ public static class VisualCompilerProfile
     // curves at the portals, three times the rail limit).
     private const double RailTunnelDescent=.035;
     // Metres inside a portal left to the game's open-cut portal, and the most a
-    // portal is lowered so its bore reaches TunnelDepth beyond them.
-    private const double PortalOpen=40,PortalCut=8;
+    // portal is lowered so its bore reaches TunnelDepth beyond them. Track may
+    // cut as deep as its cut/fill budget: a 75 m Marseille rail tunnel whose
+    // portals stood on the ground (its targets no longer averaged with the low
+    // ground over the bore) showed 1 m of roof over 65 m at 8 m.
+    private const double PortalOpen=40,PortalCut=8,RailPortalCut=12;
 
     // Bridges: a deck is level at its higher end when both ends are within 2 m,
     // otherwise the straight chord, and it rises as one piece to clear the
@@ -671,7 +816,7 @@ public static class VisualCompilerProfile
                         var end=side<0?a:b;
                         for(var k=end+side;k>=0&&k<s.Mode.Length&&s.Mode[k]==0;k+=side)
                         {
-                            var raised=tau[end]-ApproachGrade*Math.Abs(s.Station[k]-s.Station[end]);
+                            var raised=tau[end]-Approach(s)*Math.Abs(s.Station[k]-s.Station[end]);
                             if(raised<=tau[k])break;tau[k]=raised;
                         }
                     }
@@ -707,7 +852,7 @@ public static class VisualCompilerProfile
                         if(from>=PortalOpen)need=Math.Min(need,desired[k-a]+descent[k-a]*from);
                     }
                     if(!(need<tau[portal]))continue;
-                    var target=Math.Max(need,tau[portal]-PortalCut);
+                    var target=Math.Max(need,tau[portal]-(s.Kind==NetworkKind.Rail?RailPortalCut:PortalCut));
                     for(var j=portal;j>=0&&j<s.Mode.Length&&s.Mode[j]==0;j+=step)
                     {
                         var v=target+.8*s.Grade[j]*Math.Abs(s.Station[portal]-s.Station[j]);
@@ -760,7 +905,7 @@ public static class VisualCompilerProfile
                     for(var side=-1;side<=1;side+=2)
                         for(var m=k;m>=0&&m<s.Mode.Length&&s.Mode[m]>=0;m+=side)
                         {
-                            var raised=height-ApproachGrade*Math.Abs(s.Station[m]-s.Station[k]);
+                            var raised=height-Approach(s)*Math.Abs(s.Station[m]-s.Station[k]);
                             if(raised<=tau[m])break;tau[m]=raised;
                         }
                 }
@@ -851,7 +996,7 @@ public static class VisualCompilerProfile
             var end=side<0?lo:hi;
             for(var k=end+side;k>=0&&k<s.Mode.Length&&s.Mode[k]==0;k+=side)
             {
-                var raised=tau[end]-ApproachGrade*Math.Abs(s.Station[k]-s.Station[end]);
+                var raised=tau[end]-Approach(s)*Math.Abs(s.Station[k]-s.Station[end]);
                 if(raised<=tau[k])break;tau[k]=raised;
             }
         }
@@ -882,6 +1027,9 @@ public static class VisualCompilerProfile
 
     // A structure sample over a lower-layer (or tunnel) sample of another stroke
     // whose footprints overlap: one crossing per stroke pair, at the closest pair.
+    // A tunnel is over another only when both are tunnels on different layers
+    // (stacked or braided bores); the lower one is then pushed down.
+    private const double LongOverlap=40;
     private static IEnumerable<(int Over,int OverSample,int Under,int UnderSample,double Clearance)> Crossings(IReadOnlyList<Stroke> strokes,CancellationToken token)
     {
         var grid=new Dictionary<(int,int),List<(int S,int K)>>();
@@ -893,12 +1041,12 @@ public static class VisualCompilerProfile
             token.ThrowIfCancellationRequested();var s=strokes[i];
             for(var k=0;k<s.Point.Length;k++)
             {
-                if(s.Mode[k]<0)continue;var c=Cell(s.Point[k]);
+                var c=Cell(s.Point[k]);
                 for(var x=c.Item1-1;x<=c.Item1+1;x++)for(var z=c.Item2-1;z<=c.Item2+1;z++)if(grid.TryGetValue((x,z),out var list))
                     foreach(var (j,q) in list)
                     {
                         var o=strokes[j];if(j==i)continue;
-                        var above=s.Layer[k]>o.Layer[q]||o.Mode[q]<0&&s.Mode[k]>=0&&s.Layer[k]>=o.Layer[q];if(!above)continue;
+                        var above=s.Mode[k]<0?o.Mode[q]<0&&s.Layer[k]>o.Layer[q]:s.Layer[k]>o.Layer[q]||o.Mode[q]<0&&s.Layer[k]>=o.Layer[q];if(!above)continue;
                         var d=math.distance(s.Point[k],o.Point[q]);if(d>s.HalfWidth[k]+o.HalfWidth[q])continue;
                         // Arms of one junction overlap near their shared node; not a crossing.
                         if(s.Pins.Any(p=>Math.Abs(p.Station-s.Station[k])<80&&o.Pins.Any(r=>r.Node==p.Node)))continue;
@@ -908,12 +1056,15 @@ public static class VisualCompilerProfile
         }
         // Overlaps of one stroke pair more than 60 m apart along the upper stroke
         // are separate crossings; each is constrained at its closest sample pair.
+        // A long overlap (one road running over the other, stacked bores) is
+        // constrained every LongOverlap metres, not only at one point.
         foreach(var pair in hits.OrderBy(p=>p.Key.Item1).ThenBy(p=>p.Key.Item2))
         {
             var over=strokes[pair.Key.Item1];var group=new List<(double Distance,int A,int B)>();
             foreach(var hit in pair.Value.OrderBy(h=>h.A).Append((0,int.MaxValue,0)))
             {
-                if(group.Count>0&&(hit.A==int.MaxValue||over.Station[hit.A]-over.Station[group[group.Count-1].A]>60))
+                if(group.Count>0&&(hit.A==int.MaxValue||over.Station[hit.A]-over.Station[group[group.Count-1].A]>60||
+                    over.Station[hit.A]-over.Station[group[0].A]>LongOverlap))
                 {
                     var best=group.OrderBy(h=>h.Distance).First();
                     // Deck to deck: 5 m vehicle clearance (6 m over rail) plus about 1.5 m of structure.
@@ -928,8 +1079,17 @@ public static class VisualCompilerProfile
     // weights 1 on the target, α on squared second differences, a stiff weight on
     // pinned samples, and up to five rounds of first-difference penalties for
     // samples exceeding the hard grade or a junction-plateau grade.
-    // Local stiffness stops rising once it passes this (fourfold steps: 1, 4, 16, 64, 256).
-    private const double StiffnessCap=1e2;
+    // Local stiffness stops rising once it passes this (fourfold steps: 1, 4,
+    // …, 4096, 16384 on roads; track stops at 256: 1024 added grade changes at
+    // Marseille and DC). The pair pull's weight follows the stiffness only up
+    // to PullStiffnessCap: tied to it, each stiffening also tightened the pull
+    // to the mean of two bent first passes, which carried their bends across (a
+    // third of DC's sharpest samples), and stiffness past 256 gained nothing.
+    // Decoupled, 16384 cut grade-change issues 6–8% on all three maps for 1–4%
+    // more paired-height and terrain issues; a pull cap of 1600 undid the gain.
+    private const double StiffnessCap=6.4e3,RailStiffnessCap=1e2,PullStiffnessCap=4e2,PinStiffnessCap=4e2;
+    private const int PinReach=3;
+
     // A pin missed by more than this (metres) moves to the height its stroke reached.
     private const double ReconcileTolerance=.3;
     // A second round settles arms the first round moved (DC: 130 → 89 arms over 0.3 m).
@@ -981,24 +1141,19 @@ public static class VisualCompilerProfile
         // a bound on each sample.
         var bandWeight=new double[n];var bandTarget=new double[n];
         var h=Spacing;var alpha=Math.Pow(s.Class.Wavelength/(2*Math.PI),4)/Math.Pow(h,4);
-        var limit=new double[n-1];
-        // Water approaches retain their full existing grade allowance so the
-        // smoothing target can reach the accepted deck/shore clearance.
-        var waterApproach=s.Kind==NetworkKind.Road&&s.Water.Any(v=>!float.IsNaN(v));
-        for(var k=0;k<n-1;k++)
-        {
-            // Match the coupled grade's 15% headroom: cubic emission
-            // interpolates between samples and can be steeper than their chord.
-            var mid=(s.Station[k]+s.Station[k+1])/2;limit[k]=s.Grade[k]*(waterApproach?1:GradeShare);
-            if(plateau.Any(p=>Math.Abs(p-mid)<=s.Class.PlateauLength))limit[k]=Math.Min(limit[k],s.Class.PlateauGrade);
-        }
+        var limit=GradeLimits(s,plateau);
         var penalty=new double[n-1];var target=new double[n-1];double[] y=tau;
         // Where a vertical curve is sharper than the class K allows, the local
-        // stiffness rises fourfold per round, to at most 256×, so a forced hump
-        // widens only where it must; a 10⁴ cap pulled roads off terrain. A grade change of 1% per K metres is a second difference of
+        // stiffness rises fourfold per round, up to StiffnessCap, so a forced hump
+        // widens only where it must. A grade change of 1% per K metres is a second difference of
         // 0.01·h²/K over samples h apart. The caller's stiffness array is updated
         // in place.
-        var bend=.01*h*h/s.Class.K;
+        var bend=.01*h*h/s.Class.K;var cap=s.Kind==NetworkKind.Rail?RailStiffnessCap:StiffnessCap;
+        // Beside a pin the stiffness stops at PinStiffnessCap: stiffer, it
+        // outweighed the pin, and a ramp met its node 1.6 m off (JunctionBesideBridge);
+        // pins made heavy enough to hold instead forced the bends back (DC +45%).
+        var localCap=Enumerable.Repeat(cap,n).ToArray();
+        foreach(var (station,_) in pins){var (i,_)=Bracket(s,station);for(var k=Math.Max(0,i-PinReach);k<=Math.Min(n-1,i+1+PinReach);k++)localCap[k]=Math.Min(localCap[k],PinStiffnessCap);}
         for(var round=0;round<8;round++)
         {
             var d0=new double[n];var d1=new double[n];var d2=new double[n];var r=new double[n];
@@ -1007,8 +1162,8 @@ public static class VisualCompilerProfile
             // Weight 1000 cut paired-height failing length 10–14% against 500 with
             // neutral totals; 2000 cut it further but added grade-change issues.
             // A straight water deck's own stiffness (DeckStiffness) would make the
-            // pull outweigh its pins, so the pull stops at StiffnessCap.
-            for(var k=0;k<n;k++){var weight=s.Mode[k]!=0?StructureWeight:1;d0[k]+=weight;r[k]+=weight*tau[k];if(pull!=null&&!double.IsNaN(pull[k])){var w=1000*Math.Min(stiff[k],StiffnessCap);d0[k]+=w;r[k]+=w*pull[k];}}
+            // pull outweigh its pins, so the pull stops at PullStiffnessCap.
+            for(var k=0;k<n;k++){var weight=s.Mode[k]!=0?StructureWeight:1;d0[k]+=weight;r[k]+=weight*tau[k];if(pull!=null&&!double.IsNaN(pull[k])){var w=1000*Math.Min(stiff[k],PullStiffnessCap);d0[k]+=w;r[k]+=w*pull[k];}}
             // A pin holds the profile at its own station, where HeightAt reads the
             // emitted node: w(a·y[i] + b·y[i+1] − H)², a = 1 − t, b = t, couples only
             // neighbouring samples, so the system stays pentadiagonal. Rounded to the
@@ -1056,11 +1211,29 @@ public static class VisualCompilerProfile
             }
             var raised=(double[])stiff.Clone();
             for(var k=1;k<n-1;k++)
-                if(Math.Abs(y[k-1]-2*y[k]+y[k+1])>(s.Mode[k-1]<0&&s.Mode[k]<0&&s.Mode[k+1]<0?bend/VisualCompilerTable.TunnelKShare:bend)&&stiff[k]<StiffnessCap){for(var j=Math.Max(1,k-2);j<=Math.Min(n-2,k+2);j++)raised[j]=Math.Max(raised[j],stiff[k]*4);violated=true;}
+                if(Math.Abs(y[k-1]-2*y[k]+y[k+1])>(s.Mode[k-1]<0&&s.Mode[k]<0&&s.Mode[k+1]<0?bend/VisualCompilerTable.TunnelKShare:bend)&&stiff[k]<localCap[k]){for(var j=Math.Max(1,k-2);j<=Math.Min(n-2,k+2);j++)raised[j]=Math.Max(raised[j],stiff[k]*4);violated=true;}
             Array.Copy(raised,stiff,n);
             if(!violated)break;
         }
         return y;
+    }
+
+    // Largest grade allowed over each sample interval.
+    private static double[] GradeLimits(Stroke s,double[] plateau)
+    {
+        var n=s.Station.Length;var limit=new double[Math.Max(0,n-1)];
+        // Water approaches retain their full existing grade allowance so the
+        // smoothing target can reach the accepted deck/shore clearance.
+        var waterApproach=s.Kind==NetworkKind.Road&&s.Water.Any(v=>!float.IsNaN(v));
+        for(var k=0;k<n-1;k++)
+        {
+            // Match the coupled grade's 15% headroom: cubic emission
+            // interpolates between samples and can be steeper than their chord.
+            var mid=(s.Station[k]+s.Station[k+1])/2;limit[k]=s.Grade[k]*(waterApproach?1:GradeShare);
+            if(plateau.Any(p=>Math.Abs(p-mid)<=s.Class.PlateauLength))limit[k]=Math.Min(limit[k],s.Class.PlateauGrade);
+            if(s.LevelCrossings.Any(p=>Math.Abs(p.Station-mid)<=p.Reach))limit[k]=Math.Min(limit[k],.001);
+        }
+        return limit;
     }
 
     // Solves A·x = r for symmetric positive-definite pentadiagonal A with main

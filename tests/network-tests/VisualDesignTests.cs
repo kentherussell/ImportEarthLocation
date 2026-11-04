@@ -69,6 +69,72 @@ static class VisualDesignTests
         }
     }
 
+    // A 30 m motorway or track piece that differs from its neighbours only by
+    // its OSM layer, on the ground and on a continuous bridge (a short source bridge
+    // whose approaches were raised). Both layer changes are source ports, so
+    // each bounded its own 30 m run, under the 60 m motorway minimum. The piece
+    // joins a neighbour and the ports stay as mandatory aliases of a kept node.
+    static void ShortLayerPieceJoined()
+    {
+        var terrain=Enumerable.Repeat((ushort)32768,33*33).ToArray();
+        foreach(var (bridge,rail) in new[]{(false,false),(true,false),(false,true)})
+        {
+            var source=new[]{Road(901,910,911,new(-300,50,0),new(-15,50,0)),Road(902,911,912,new(-15,50,0),new(15,50,0)) with{Layer=1},
+                Road(903,912,913,new(15,50,0),new(300,50,0))}.Select(s=>s with{Bridge=bridge,Layer=s.Layer+(bridge?1:0)})
+                .Select(s=>rail?s with{Kind=NetworkKind.Rail,Classification="rail",OneWay=false,NativeAssetKey="rail",PhysicalTracks=2}:s).ToArray();
+            var log=new ImportLog();var output=VisualNetworkCompiler.Prepare(source,terrain,100,2000,log,default);
+            SourceTopologyObligations.Validate(SourceTopologyObligations.Capture(source),output,log,default);
+            Check(log.Metric("Missing mandatory selected-source ports")==0&&log.Metric("Unresolved selected-source reachability obligations")==0,
+                $"Joining a short layer piece (bridge={bridge}, rail={rail}) lost a source port or directed connection");
+            var shortest=output.Min(s=>NetworkDesignChecks.HorizontalArcLength(new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd)));
+            Check(shortest>=60,$"A layer-only boundary (bridge={bridge}, rail={rail}) left a {shortest:F1} m piece");
+            var nodes=output.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}).ToHashSet();
+            Check(output.SelectMany(s=>s.SourceNodeAliases).Where(a=>a.SourceNodeId is 911 or 912&&!nodes.Contains(a.SourceNodeId)).All(a=>a.Mandatory&&nodes.Contains(a.CanonicalNodeId)),
+                $"A joined layer port (bridge={bridge}, rail={rail}) is not a mandatory alias of an emitted node");
+            Check(!bridge||output.All(s=>s.Bridge&&s.Layer>=1),"A joined bridge piece lost its structure or its higher layer");
+        }
+    }
+
+    // Track on flat ground at 200 m crossing a 40 m deep, 300 m wide valley on a
+    // bridge. Rail targets are a 150 m moving average of the ground; with the
+    // valley floor under the deck averaged in, the bank targets sank and the
+    // deck with them (DC's Long Bridge: 7 m below the switches at its end).
+    static void RailBridgeOverValley()
+    {
+        const int size=513;const double width=4000;const float scale=1000;
+        static double Ground(double x)=>Math.Abs(x)<150?160:200;
+        var terrain=new ushort[size*size];
+        for(var z=0;z<size;z++)for(var x=0;x<size;x++)terrain[z*size+x]=(ushort)Math.Round(Ground((x/(double)(size-1)-.5)*width)/scale*ushort.MaxValue);
+        static PreparedSegment Track(long way,long a,long b,float x0,float x1,bool bridge)=>
+            new(way,a,b,new(x0,(float)(bridge?200:Ground(x0)),0),new(x1,(float)(bridge?200:Ground(x1)),0),NetworkKind.Rail,"rail",2,false,bridge,false,bridge?1:0)
+            {NativeWidth=12,NativeAssetKey="rail",PhysicalTracks=2,SourceGeometry=new[]{new float3(x0,200,0),new float3(x1,200,0)},OriginalGeometry=new[]{new float3(x0,200,0),new float3(x1,200,0)}};
+        var line=new[]{Track(1,1,2,-1200,-150,false),Track(2,2,3,-150,150,true),Track(3,3,4,150,1200,false)};
+        var output=VisualNetworkCompiler.Prepare(line,terrain,scale,width,new ImportLog(),default);
+        var deck=output.Where(s=>s.Bridge).SelectMany(s=>Enumerable.Range(0,17).Select(k=>NetworkDesignChecks.Evaluate(new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd),k/16d).y)).ToArray();
+        Check(deck.Length>0&&deck.All(y=>Math.Abs(y-200)<2),$"A rail bridge over a valley sank to {deck.DefaultIfEmpty(0).Min():F1} m between banks at 200 m");
+    }
+
+    // A motorway on flat ground with ramps leaving it 100 m before and 100 m after
+    // a bridge over a crossing road. Grade edges alone let the
+    // coupled solve hold both junctions near the ground, so the deck had to
+    // climb its 6.5 m clearance and come down again between them, a vertical
+    // curve several times sharper than the motorway K. Both junctions must rise.
+    static void BridgeBetweenJunctions()
+    {
+        const int size=257;const double width=4000;const float scale=1000;
+        var terrain=new ushort[size*size];Array.Fill(terrain,(ushort)Math.Round(100/scale*ushort.MaxValue));
+        float3 P(float x,float z)=>new(x,100,z);
+        var source=new[]{Road(1,1,2,P(-1500,0),P(0,0)),Road(2,2,3,P(0,0),P(50,0)),Road(3,3,4,P(50,0),P(150,0)) with{Bridge=true,Layer=1},
+            Road(4,4,5,P(150,0),P(200,0)),Road(7,5,8,P(200,0),P(1500,0)),
+            Road(5,2,6,P(0,0),P(400,-150)) with{Classification="motorway_link"},
+            Road(6,5,9,P(200,0),P(700,-150)) with{Classification="motorway_link"},
+            Road(8,20,21,P(100,-400),P(100,400)) with{Classification="primary",OneWay=false}};
+        var output=VisualNetworkCompiler.Prepare(source,terrain,scale,width,new ImportLog(),default);
+        var motorway=output.Where(s=>s.Classification=="motorway").ToArray();
+        var bends=VisualCompilerMetrics.Measure(motorway,terrain,scale,width,default).Failures.Where(f=>f.Category=="grade-change").ToArray();
+        Check(bends.Length==0,$"A motorway bridge between two junctions 200 m apart bent {bends.Select(f=>f.Severity).DefaultIfEmpty(0).Max():F2}× its K");
+    }
+
     static void RampOutsideLoopFootprint()
     {
         float3 P(float x,float z)=>new(x,100,z);
@@ -103,6 +169,9 @@ static class VisualDesignTests
     public static void Run()
     {
         StreetGridTests.Run();
+        ShortLayerPieceJoined();
+        RailBridgeOverValley();
+        BridgeBetweenJunctions();
         RampOutsideLoopFootprint();
         HighwayPriorityAndAvenueJunction();
         var bridgeRoad=new[]{Road(801,810,811,new(-250,50,0),new(-50,50,0)) with{Bridge=true,Layer=1},

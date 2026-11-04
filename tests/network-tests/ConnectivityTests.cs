@@ -100,10 +100,30 @@ static class ConnectivityTests
         Check(spurs.All(s=>s.WayId!=202)&&spurs.Any(s=>s.WayId==204)&&spurs.Count==4,"A 15 m rail stub was kept, or a 60 m spur was removed");
         Check(spurs.SelectMany(s=>s.SourceNodeAliases).Any(a=>a.SourceNodeId==204&&a.CanonicalNodeId==202)&&spurs.Any(s=>s.SourceWayIds.Contains(202)),"The removed stub's dead end or way was not carried to its junction");
 
+        // A switch N meets a 32 m track to switch S and two short connectors,
+        // each lying inside a curved line from S. The connectors go one after
+        // the other; the second used to leave N a dead end of the 32 m track
+        // (Marseille Saint-Charles, DC Union Station). That track is now a spur
+        // of S and goes with it; S keeps its other lines.
+        var throat=new[]
+        {
+            Narrow(Rail(300,310,311,new(0,50,0),new(-32,50,0))),Narrow(Rail(301,311,312,new(-32,50,0),new(-200,50,0))),
+            Narrow(Rail(302,310,313,new(0,50,0),new(15,50,1))),Narrow(Rail(303,310,314,new(0,50,0),new(23,50,-1))),
+            Narrow(Rail(304,311,315,new(-32,50,0),new(-16,50,10))),Narrow(Rail(305,315,316,new(-16,50,10),new(0,50,3))),Narrow(Rail(306,316,313,new(0,50,3),new(15,50,1))),
+            Narrow(Rail(307,311,317,new(-32,50,0),new(-16,50,-10))),Narrow(Rail(308,317,318,new(-16,50,-10),new(0,50,-3))),Narrow(Rail(309,318,314,new(0,50,-3),new(23,50,-1))),
+            Narrow(Rail(310,313,319,new(15,50,1),new(150,50,1))),Narrow(Rail(311,314,320,new(23,50,-1),new(150,50,-30)))
+        };
+        int Degree(IEnumerable<PreparedSegment> list,long id)=>list.Count(s=>s.StartNodeId==id||s.EndNodeId==id);
+        var switches=throat.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}).Distinct().Where(id=>Degree(throat,id)>=3).ToArray();
+        var thinned=RailCorridorConsolidator.RedundantOverlappingRoutes(throat,new ImportLog(),default,35);
+        var stranded=switches.Where(id=>Degree(thinned,id)==1).ToArray();
+        Check(thinned.All(s=>s.WayId is not (302 or 303))&&stranded.Length==0,$"Overlapping route removal kept a connector or left former switches {string.Join(",",stranded)} as dead ends");
+        Check(Degree(thinned,311)>=3&&thinned.SelectMany(s=>s.SourceNodeAliases).Any(a=>a.SourceNodeId==310&&a.CanonicalNodeId==311),"The stranded track's switch was not carried to the switch it led to");
+
         // A road over a short culvert becomes a bridge across it, split out of
         // the section; a road beside it is untouched.
         var culvert=new[]{(new[]{new float3(100,0,-10),new float3(100,0,10)},3f)};
-        var over=Road(100,101,102,new(0,20,0),new(300,20,0));var beside=Road(101,103,104,new(0,20,40),new(300,20,40));
+        var over=Road(100,101,102,new(0,20,0),new(300,20,0));var beside=Road(101,103,104,new(0,20,60),new(300,20,60));
         var bridged=CoordinatedNetworkDesign.CulvertBridges(new[]{over,beside},culvert,4097,57344,new ImportLog(),default);
         var deck=bridged.Where(s=>s.WayId==100&&s.Bridge).ToArray();
         Check(bridged.Count(s=>s.WayId==100)==3&&deck.Length==1&&bridged.Single(s=>s.WayId==101)==beside,"A road over a culvert was not split around one bridge, or a road beside it changed");
@@ -114,7 +134,41 @@ static class ConnectivityTests
         var stream=new[]{(new[]{new float3(100,0,-1000),new float3(100,0,1000),new float3(900,0,1000)},3f)};
         var spanned=CoordinatedNetworkDesign.CulvertBridges(new[]{over,beside},stream,4097,57344,new ImportLog(),default);
         Check(spanned.Count(s=>s.WayId==100&&s.Bridge)==1&&spanned.Count(s=>s.WayId==101&&s.Bridge)==1,"A road crossing a long open stream was not bridged once");
+        OpenChannelSpans();
         Console.WriteLine("PASS: one rail course per node pair, overlapping rail connectors and lenses removed with provenance, no sub-lane unit pieces beside nodes, alias-aware continuity, and roads bridged over short culverts.");
+    }
+
+    static void OpenChannelSpans()
+    {
+        const float extent=28/.6f;
+        var channel=new[]{(new[]{new float3(-2000,0,0),new float3(2000,0,0)},extent)};
+        var across=Road(301,301,302,new(0,100,-300),new(0,100,300));
+        var along=Road(302,303,304,new(-1000,100,20),new(1000,100,20));
+        // These bounds occupy different raw index cells; padded indexing must
+        // still find the road whose support overlaps the channel near z=128.
+        var edgeChannel=new[]{(new[]{new float3(-1000,0,120),new float3(1000,0,120)},extent)};
+        var edgeRoad=Road(303,305,306,new(-500,100,150),new(500,100,150));
+        var dry=Road(304,307,308,new(-500,100,240),new(500,100,240));
+        var rail=Rail(305,309,310,new(200,100,-300),new(200,100,300));
+        var diagonal=Road(306,311,312,new(-500,100,-100),new(500,100,100));
+        var input=new[]{across,along,rail,diagonal};
+        var output=CoordinatedNetworkDesign.CulvertBridges(input,channel,4097,57344,new ImportLog(),default);
+        var crossing=output.Single(s=>s.WayId==301&&s.Bridge);
+        var margin=extent+6+28;
+        Check(crossing.CourseStart.z<=-margin+.01&&crossing.CourseEnd.z>=margin-.01,"A wide constructed channel retained the old 50 m bridge cap");
+        Check(output.Where(s=>s.WayId==302).All(s=>s.Bridge),"A road following an opened river was left on a damming embankment");
+        Check(output.Any(s=>s.WayId==305&&s.Bridge)&&output.Any(s=>s.WayId==306&&s.Bridge),"Rail or an oblique crossing did not span the opened channel");
+        foreach(var s in output.Where(s=>!s.Bridge))
+            Check(Enumerable.Range(0,21).All(k=>Math.Abs(NetworkNormalizer.Evaluate(s,k/20f).z)>=extent+Math.Max(4,s.NativeWidth*.5f)+28-.1f),
+                "An oblique bridge ended inside the channel's protected ground footprint");
+        var edge=CoordinatedNetworkDesign.CulvertBridges(new[]{edgeRoad,dry},edgeChannel,4097,57344,new ImportLog(),default);
+        Check(edge.Where(s=>s.WayId==303).All(s=>s.Bridge)&&edge.Single(s=>s.WayId==304)==dry,"Padded indexing missed an adjacent-cell overlap or changed a dry road");
+        var audit=new ImportLog();SourceTopologyObligations.Validate(SourceTopologyObligations.Capture(input),output,audit,default);
+        Check(audit.Metric("Missing mandatory selected-source ports")==0&&audit.Metric("Unresolved selected-source reachability obligations")==0,
+            "Opened-channel bridge splits lost a selected-source endpoint or route");
+        using var cancellation=new CancellationTokenSource();cancellation.Cancel();
+        try{CoordinatedNetworkDesign.CulvertBridges(input,channel,4097,57344,new ImportLog(),cancellation.Token);throw new Exception("Channel indexing ignored cancellation");}
+        catch(OperationCanceledException){}
     }
 
     static void OverlappingHighwayExtensions()

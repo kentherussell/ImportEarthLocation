@@ -24,6 +24,9 @@ static class Program
         await CacheSmoke();
         var forestQuery=OverpassClient.BuildForestQuery(new GeoBounds{South=0,West=0,North=1,East=1});
         Check(forestQuery.Contains("^(tree|shrub)$")&&forestQuery.Contains("tree_row|wood|scrub|heath|wetland|beach")&&forestQuery.Contains("forest|orchard")&&forestQuery.Contains("(._;>>;)->.features;"),"Forest query omits mapped trees/rows, woodland or recursive member geometry");
+        Check(forestQuery.Contains("way[\"leisure\"~\"^(park|garden|golf_course|")&&forestQuery.Contains("relation[\"landuse\"~\"^(forest|orchard|cemetery|residential|")&&
+            forestQuery.Contains("way[\"wetland\"~\"^(swamp|mangrove)$\"]")&&forestQuery.Contains("way[\"landcover\"=\"trees\"]")&&forestQuery.Contains("amenity\"~\"^(grave_yard|school|college|university|kindergarten|parking)$"),
+            "Forest query omits the land uses trees are inferred from or the open areas kept clear");
         Check(forestQuery.Contains("node.features[\"natural\"~\"^(tree|shrub)$\"]->.trees;")&&forestQuery.Contains("(way.features;relation.features;.trees;);out body qt;")&&forestQuery.Contains("(node.features; - .trees;);out skel qt;"),"Forest output loses tree/shrub tags or strips member way/relation tags instead of supporting node tags");
         var networkQuery=OverpassClient.BuildNetworkQuery(default,RoadImportLevel.Primary,true);
         Check(networkQuery.Contains("(.ways;.movements;);out body qt;")&&networkQuery.EndsWith(".tagged out body qt;(.nodes; - .tagged;);out skel qt;")&&!networkQuery.Contains("out geom")&&!networkQuery.Contains(";-."),"Network output loses tagged nodes/movement geometry or emits invalid Overpass subtraction syntax");

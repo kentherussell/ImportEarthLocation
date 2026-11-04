@@ -9,6 +9,7 @@ static class WaterRoadTests
     {
         RoundaboutClearance();
         DryShoreJunction();
+        OpenedRiverDeck();
         var terrain=Enumerable.Repeat((ushort)Math.Round(100d/200*65535),129*129).ToArray();
         var road=new PreparedSegment(1,1,2,new(-600,100,0),new(600,100,0),NetworkKind.Road,"primary",2,false,false,false,0)
             {NativeWidth=12,SourceGeometry=new[]{new float3(-600,100,0),new float3(600,100,0)}};
@@ -45,6 +46,28 @@ static class WaterRoadTests
             .SequenceEqual(absent.Select(s=>(s.StartNodeId,s.EndNodeId,s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd,s.Bridge,s.Tunnel,s.Lanes))),
             "Unavailable water evidence changed a dry road");
         Console.WriteLine("PASS: shallow-water ground-road freeboard, deep-water bridge selection, finite curves, tunnel preservation and dry-road equivalence.");
+    }
+
+    static void OpenedRiverDeck()
+    {
+        var terrain=Enumerable.Repeat((ushort)Math.Round(100d/200*65535),129*129).ToArray();
+        var line=new[]{new float3(-700,0,0),new float3(700,0,0)};
+        var water=new WaterPlan(false,1,0,0,"opened river fixture"){WaterCellSize=28,
+            ReachStages=new[]{new WaterReachStage(10,10,line[0],line[1],106,106,6,null)}};
+        var surface=WaterBodyPlanner.ConstructedSurfaceSampler(water,Array.Empty<GeographicPolygon>());
+        Check(surface(new(0,0,35))==106&&!surface(new(0,0,60)).HasValue,"The feathered wet cut does not match the road-clearance sampler");
+        var road=new PreparedSegment(10,11,12,new(-600,100,35),new(600,100,35),NetworkKind.Road,"primary",6,false,false,false,0)
+            {NativeWidth=32,SourceGeometry=new[]{new float3(-600,100,35),new float3(600,100,35)}};
+        var selected=CoordinatedNetworkDesign.CulvertBridges(new[]{road},new[]{(line,28/.6f)},129,1600,new ImportLog(),default);
+        Check(selected.All(s=>s.Bridge&&s.Lanes==6&&!s.OneWay),"A boulevard following an opened river was not retained as a two-way bridge");
+        var result=VisualNetworkCompiler.Prepare(selected,terrain,200,1600,new ImportLog(),default,surface);
+        Check(result.SelectMany(s=>Enumerable.Range(0,81).Select(k=>NetworkNormalizer.Evaluate(s,k/80f)))
+            .All(p=>p.y>=106+WaterLevels.RoadBridgeClearanceMeters-.01f),"A bridge alongside the river's feathered bank remained underwater");
+        var rail=new PreparedSegment(20,21,22,new(-600,100,49),new(600,100,49),NetworkKind.Rail,"rail",2,false,true,false,0)
+            {NativeWidth=11,PhysicalTracks=2,NativeAssetKey="rail",SourceGeometry=new[]{new float3(-600,100,49),new float3(600,100,49)}};
+        var railResult=VisualNetworkCompiler.Prepare(new[]{rail},terrain,200,1600,new ImportLog(),default,surface);
+        Check(railResult.SelectMany(s=>Enumerable.Range(0,81).Select(k=>NetworkNormalizer.Evaluate(s,k/80f)))
+            .All(p=>p.y>=106+WaterLevels.RoadBridgeClearanceMeters-.01f),"A railway bridge missed water beneath its outer track");
     }
 
     static void DryShoreJunction()

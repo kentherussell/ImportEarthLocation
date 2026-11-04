@@ -215,6 +215,34 @@ public static class VisualCompilerMetrics
         // Same-level overlap: road footprints of unconnected sections on one layer
         // overlapping by more than 0.5 m within 3 m of height, e.g. carriageways
         // drawn on top of each other. Rail is excluded: parallel tracks touch.
+        // Each sample is a disc of half the road width, except that a section ends
+        // flat where it continues within 30° into exactly one other road: there
+        // the disc is clipped at the end line. Junction, dead-end and sharp-bend
+        // discs stay whole, standing in for node pavement, end caps and mitres.
+        var along=new double[samples.Count];
+        for(var i=0;i<sections.Count;i++)for(var k=first[i]+1;k<first[i+1];k++)along[k]=along[k-1]+samples[k].Step;
+        double2 Outward(int section,long id)=>sections[section].StartNodeId==id?-samples[first[section]].Direction:samples[first[section+1]-1].Direction;
+        bool Plain(int section,long id)
+        {
+            var arms=incident[new(sections[section].Kind,id)];if(arms.Count!=2||arms[0]==arms[1]||first[arms[0]]==first[arms[0]+1]||first[arms[1]]==first[arms[1]+1])return false;
+            var other=arms[0]==section?arms[1]:arms[0];
+            return math.dot(Outward(section,id),-Outward(other,id))>Math.Cos(Math.PI/6);
+        }
+        var plainStart=new bool[sections.Count];var plainEnd=new bool[sections.Count];
+        for(var i=0;i<sections.Count;i++)if(sections[i].Kind==NetworkKind.Road&&first[i]<first[i+1])
+        {plainStart[i]=Plain(i,sections[i].StartNodeId);plainEnd[i]=Plain(i,sections[i].EndNodeId);}
+        double Reach(int k,double2 u)
+        {
+            var a=samples[k];var s=sections[a.Section];var h=Half(s);var reach=h;
+            void Clip(double e,double2 outward)
+            {
+                var c=math.dot(u,outward);
+                if(e<h&&h*c>e)reach=Math.Min(reach,e*c+Math.Sqrt(h*h-e*e)*Math.Sqrt(Math.Max(0,1-c*c)));
+            }
+            if(plainStart[a.Section])Clip(along[k],Outward(a.Section,s.StartNodeId));
+            if(plainEnd[a.Section])Clip(along[first[a.Section+1]-1]-along[k],Outward(a.Section,s.EndNodeId));
+            return reach;
+        }
         for(var i=0;i<sections.Count;i++)
         {
             var s=sections[i];if(s.Kind!=NetworkKind.Road)continue;token.ThrowIfCancellationRequested();
@@ -225,7 +253,10 @@ public static class VisualCompilerMetrics
                 foreach(var j in near(a.Position,Half(s)+15))
                 {
                     var b=samples[j];var o=sections[b.Section];if(b.Section<=i||o.Kind!=NetworkKind.Road||o.Layer!=s.Layer||adjacent.Contains(b.Section))continue;
-                    var overlap=Half(s)+Half(o)-math.distance(a.Position.xz,b.Position.xz);
+                    var distance=math.distance(a.Position.xz,b.Position.xz);
+                    if(Half(s)+Half(o)-distance<=.5)continue;
+                    var u=distance>1e-6?(b.Position.xz-a.Position.xz)/distance:default;
+                    var overlap=distance>1e-6?Reach(k,u)+Reach(j,-u)-distance:Half(s)+Half(o);
                     if(overlap>.5&&Math.Abs(a.Position.y-heightAt(b,a.Position))<3&&overlap>worst){worst=overlap;worstAt=a.Position;}
                 }
             }

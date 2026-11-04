@@ -61,8 +61,58 @@ static class TreeTests
         Check(rimDensity<.92*coreDensity,$"Woodland edges are not feathered: rim {rimDensity*1e4:0.0} vs core {coreDensity*1e4:0.0} trees/ha");
         var overlapped=ForestProcessor.Prepare(new OsmDataset{Nodes=woodNodes,Ways=new Dictionary<long,OsmWay>{{2,wood with{Id=2}},{1,wood}}},woodlandRequest,terrain,Array.Empty<PreparedSegment>(),new ImportLog(),default);
         Check(dense.SequenceEqual(overlapped),"Overlapping polygons or polygon order change local density/output");
+        if(ForestProcessor.PlantInferredTrees)Inferred(Node,request,terrain);
         using var cancel=new CancellationTokenSource(); cancel.Cancel();
         try { ForestProcessor.Prepare(data,request,terrain,Array.Empty<PreparedSegment>(),new ImportLog(),cancel.Token); throw new Exception("Forest cancellation ignored"); } catch(OperationCanceledException){}
         Console.WriteLine("PASS: tagged-node XML/cache preservation, uncapped center-out mapped/woodland trees, mapped-tree priority, rows across vertices, overlap deduplication, standalone trees, bounds/network/water guards and determinism.");
+    }
+
+    // Trees inferred from land use: orchard rows, parks with open pitches,
+    // swamps as woodland, residential gardens and street trees, and gaps
+    // filled between mapped street trees.
+    static void Inferred(Func<long,float,float,OsmNode> node,ImportRequest request,TerrainBuilder.Result terrain)
+    {
+        var nodes=new Dictionary<long,OsmNode>();var ways=new Dictionary<long,OsmWay>();long next=1;
+        void Area(long id,float x0,float z0,float x1,float z1,params (string,string)[] tags)
+        {
+            var ids=new long[5];foreach(var (i,x,z) in new[]{(0,x0,z0),(1,x1,z0),(2,x1,z1),(3,x0,z1)}){ids[i]=next;nodes[next]=node(next,x,z);next++;}
+            ids[4]=ids[0];ways[id]=new OsmWay(id,ids,tags.ToDictionary(t=>t.Item1,t=>t.Item2));
+        }
+        IReadOnlyList<float3> Plant(IReadOnlyList<PreparedSegment>? roads=null,Dictionary<long,IReadOnlyDictionary<string,string>>? trees=null)=>
+            ForestProcessor.Prepare(new OsmDataset{Nodes=nodes,Ways=ways,NodeTags=trees??new()},request,terrain,roads??Array.Empty<PreparedSegment>(),new ImportLog(),default);
+        bool Spaced(IReadOnlyList<float3> trees)
+        {
+            for(var i=0;i<trees.Count;i++)for(var j=i+1;j<trees.Count;j++)if(math.distance(trees[i].xz,trees[j].xz)<ForestProcessor.MappedSpacing-.001f)return false;
+            return true;
+        }
+
+        Area(1,-50,-35,50,35,("landuse","orchard"));
+        var orchard=Plant();
+        Check(orchard.Count is >=140 and <=180&&orchard.All(p=>Math.Abs(p.x)<=50&&Math.Abs(p.z)<=35)&&Spaced(orchard),$"Orchard was not planted in 6 × 7 m rows ({orchard.Count} trees)");
+        Check(orchard.Select(p=>Math.Round(p.z,1)).Distinct().Count()==10,"Orchard rows do not follow the orchard's longest edge");
+
+        ways.Clear();Area(1,-200,-200,200,200,("leisure","park"));Area(2,-40,-30,40,30,("leisure","pitch"));
+        var park=Plant();var hectares=16-.48;
+        Check(park.Count/hectares is >4 and <30,$"Park density {park.Count/hectares:0.0} trees/ha is outside the open parkland range");
+        Check(!park.Any(p=>Math.Abs(p.x)<40&&Math.Abs(p.z)<30),"Trees planted on a mapped pitch");
+
+        ways.Clear();Area(1,-200,-200,200,200,("natural","wetland"),("wetland","swamp"));
+        var swamp=Plant();ways.Clear();Area(1,-200,-200,200,200,("natural","wood"));
+        Check(swamp.SequenceEqual(Plant()),"A swamp is not planted as woodland");
+
+        ways.Clear();Area(1,-280,-280,280,280,("landuse","residential"));
+        var street=new PreparedSegment(10,1,2,new float3(-280,0,0),new float3(280,0,0),NetworkKind.Road,"residential",2,false,false,false,0){NativeWidth=12};
+        var homes=Plant(new[]{street});
+        Check(homes.Count(p=>Math.Abs(Math.Abs(p.z)-10)<.5f)>=60,"Residential street is missing its street trees");
+        Check(homes.All(p=>Math.Abs(p.z)>9),"Street trees were planted inside the road's verge clearance");
+        Check(homes.Count(p=>Math.Abs(p.z)>=14)/(56*56*.01)>4,"Residential land got no garden trees");
+        Check(homes.SequenceEqual(Plant(new[]{street})),"Inferred trees are nondeterministic");
+
+        ways.Clear();
+        var mapped=new Dictionary<long,IReadOnlyDictionary<string,string>>();IReadOnlyDictionary<string,string> tree=new Dictionary<string,string>{{"natural","tree"}};
+        foreach(var x in new[]{-100f,-90,-80,0}){nodes[next]=node(next,x,8);mapped[next++]=tree;}
+        var avenue=Plant(new[]{street with{Classification="tertiary",NativeWidth=8}},mapped);
+        Check(avenue.Count(p=>p.x>-80&&p.x<0&&Math.Abs(p.z-8)<.5f)==7,$"Gap between mapped street trees was not filled at their 10 m interval ({avenue.Count} trees)");
+        Check(avenue.Count==11,"Gap filling or street trees added trees outside mapped gaps or residential land");
     }
 }

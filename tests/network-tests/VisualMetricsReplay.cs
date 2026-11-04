@@ -384,9 +384,19 @@ static partial class VisualMetricsReplay
     // 7 m, a sample is dammed when the bed on its line stands over 0.1 m above
     // the lowest planned water stage upstream on that way (water from upstream
     // cannot pass), and cut depth is the restored ground minus the bed.
-    public static void WaterReplay(string folder,string osm,float seaLevel)
+    public static void WaterReplay(string folder,string osm,float seaLevel,string? reportPath=null)
     {
-        var c=Load(folder);var n=(int)Math.Sqrt(c.Terrain.Length);var width=(float)c.Width;var half=width/2;var spacing=width/(n-1);
+        // Water replay does not use native contracts or the historical water
+        // sampler. Read its terrain directly instead of building that unrelated
+        // index; the optional crossing audit reads the exact source separately.
+        var input=JObject.Parse(File.ReadAllText(CapturedRunFiles.Resolve(folder,"offline-design-pass-01-input.json")));
+        if((int?)input["schemaVersion"]!=2)throw new InvalidDataException("Unknown water replay capture");
+        var terrainBytes=File.ReadAllBytes(CapturedRunFiles.Resolve(folder,(string)input["terrainFile"]!));
+        if(terrainBytes.Length%2!=0||!BitConverter.IsLittleEndian)throw new InvalidDataException("Unsupported terrain encoding");
+        var heights=new ushort[terrainBytes.Length/2];Buffer.BlockCopy(terrainBytes,0,heights,0,terrainBytes.Length);
+        var c=(Input:input,Terrain:heights,Scale:(float)input["HeightScaleMeters"]!,Width:(double)input["widthMeters"]!);
+        var n=TerrainSampling.Resolution(c.Terrain);var width=(float)c.Width;var half=width/2;var spacing=width/(n-1);
+        var cell=CapturedRunFiles.WaterCellSize(folder,input);
         var request=c.Input["request"]!;
         var importRequest=new ImportRequest((double)request["Latitude"]!,(double)request["Longitude"]!,new MapSizeProfile("replay","replay",c.Width,false),false);
         var data=OsmParsedCache.LoadSnapshot(osm,default);
@@ -397,7 +407,7 @@ static partial class VisualMetricsReplay
         var restore=new bool[n*n];
         foreach(var w in lines)
         {
-            var reach=(NetworkEvidence.Measure(w.Tags,"width")??(w.Tags["waterway"]=="river"?32:12))*.5f;var radius=Math.Max(reach,28)/.6f+spacing;
+            var reach=(NetworkEvidence.Measure(w.Tags,"width")??(w.Tags["waterway"]=="river"?32:12))*.5f;var radius=Math.Max(reach,cell)/.6f+spacing;
             for(var i=1;i<w.NodeIds.Length;i++)
             {
                 var a=Local(w.NodeIds[i-1]);var b=Local(w.NodeIds[i]);
@@ -425,13 +435,22 @@ static partial class VisualMetricsReplay
         Console.WriteLine($"  restored {cells.Count:N0} cells near {lines.Length:N0} waterways");
         var terrain=new TerrainBuilder.Result(original,c.Scale,seaLevel,0,c.Scale);
         var log=new ImportLog();var watch=System.Diagnostics.Stopwatch.StartNew();
-        var plan=WaterBodyPlanner.Prepare(data,polygons,importRequest,terrain,log,default,28);
+        var plan=WaterBodyPlanner.Prepare(data,polygons,importRequest,terrain,log,default,cell);
         var traceDams=int.TryParse(Environment.GetEnvironmentVariable("WATER_DAMS"),out var shown)?shown:0;
         float Bed(ushort[] map,float3 p)=>NetworkProcessor.Sample(p.x,p.z,map,c.Scale,c.Width);
         Console.WriteLine($"  planned in {watch.Elapsed.TotalSeconds:0.0} s");
         foreach(var line in log.Lines.Where(l=>l.StartsWith("Rivers:")||l.StartsWith("Water:")))Console.WriteLine("  "+line);
         var planned=plan.ConditionedHeightmap??original;
-        var revalidated=WaterBodyPlanner.Revalidate(plan,terrain with{Heightmap=planned},c.Width,log,default);
+        IReadOnlyList<PreparedSegment>? networks=null;object? crossingReport=null;
+        if(reportPath!=null)
+        {
+            var captured=CorrectiveCapturedReplay.ReadManifest<PreparedSegment>(folder,(string)input["networkManifest"]!);
+            if(captured.Length!=(int)input["sections"]!)throw new InvalidDataException("Captured source count mismatch");
+            var channels=WaterBodyPlanner.BuriedChannels(data,importRequest,cell).Concat(WaterBodyPlanner.OpenChannels(data,importRequest,cell)).ToArray();
+            networks=CoordinatedNetworkDesign.CulvertBridges(captured,channels,n,width,log,default);
+            crossingReport=WaterCrossings(captured,networks,channels,n,width);
+        }
+        var revalidated=WaterBodyPlanner.Revalidate(plan,terrain with{Heightmap=planned},c.Width,log,default,networks);
         Console.WriteLine($"  sources {plan.Sources.Count:N0}, kept by Revalidate {revalidated.Sources.Count:N0} (rivers {plan.Sources.Count(s=>s.BodyKind=="river"):N0} → {revalidated.Sources.Count(s=>s.BodyKind=="river"):N0})");
         var keptIds=revalidated.Sources.Select(s=>(s.BodyId,s.Position.x,s.Position.z)).ToHashSet();
         foreach(var s in plan.Sources.Where(s=>!keptIds.Contains((s.BodyId,s.Position.x,s.Position.z))).Take(traceDams))
@@ -441,12 +460,13 @@ static partial class VisualMetricsReplay
         }
         foreach(var kind in new[]{"lake","river"})
             Console.WriteLine($"    {kind} bodies with a source {plan.Sources.Where(s=>s.BodyKind==kind).Select(s=>s.BodyId).Distinct().Count():N0}, still with one after Revalidate {revalidated.Sources.Where(s=>s.BodyKind==kind).Select(s=>s.BodyId).Distinct().Count():N0}");
-        foreach(var name in new[]{"Water stage bank conflicts","Water source footprint policy rejected","Water locally infeasible reaches","Water final bank conflicts","River raster components reseeded","Water stage uphill residual edges"})
+        foreach(var name in new[]{"Water stage bank conflicts","Water source footprint policy rejected","Water locally infeasible reaches","Water final bank conflicts","River raster components reseeded","Water stage uphill residual edges",
+            "Water endpoint gaps connected","Water buried waterways opened","Water buried channel metres","Lake containment bodies checked","Lake containment levels lowered","Lake containment bodies omitted"})
             Console.WriteLine($"    {name}: {log.Metric(name)}");
         long samples=0,dammed=0,dams=0;var cuts=new List<float>();var byType=new Dictionary<string,(long Samples,long Dammed)>();
         var stagesByWay=plan.ReachStages.GroupBy(r=>r.WayId).ToDictionary(g=>g.Key,g=>g.ToArray());
         foreach(var w in lines.Where(w=>!(w.Tags.TryGetValue("tunnel",out var t)&&t!="no")&&!(w.Tags.TryGetValue("intermittent",out var i)&&i=="yes")&&
-            w.Tags["waterway"] is "river" or "stream" or "canal"&&!w.Tags.ContainsKey("abandoned")&&!w.Tags.ContainsKey("disused")))
+            w.Tags["waterway"] is "river" or "stream"&&!w.Tags.ContainsKey("abandoned")&&!w.Tags.ContainsKey("disused")))
         {
             var lowest=float.PositiveInfinity;var blocked=false;var reaches=stagesByWay.TryGetValue(w.Id,out var list)?list:Array.Empty<WaterReachStage>();
             for(var i=1;i<w.NodeIds.Length;i++)
@@ -483,6 +503,39 @@ static partial class VisualMetricsReplay
         Console.WriteLine("  deepest cuts by waterway: "+string.Join(", ",lines.Where(w=>w.Tags["waterway"] is "river" or "stream" or "canal").GroupBy(w=>w.Tags["waterway"]).Select(g=>
             {var ids=g.Select(w=>w.Id).ToHashSet();return $"{g.Key} {plan.ReachStages.Count(r=>ids.Contains(r.WayId)&&Bed(original,r.Start)-r.StartLevel>15):N0} reaches over 15 m under ground";})));
         Console.WriteLine("  river sources by waterway: "+string.Join(", ",plan.Sources.Where(s=>s.BodyKind=="river").GroupBy(s=>wayType.TryGetValue(s.WayId,out var t)?t:"?").OrderByDescending(g=>g.Count()).Select(g=>$"{g.Key} {g.Count():N0}")));
+        if(reportPath!=null)
+        {
+            var buriedIds=lines.Where(w=>w.Tags.TryGetValue("tunnel",out var tag)&&tag!="no").Select(w=>w.Id).ToHashSet();
+            long buriedSamples=0,buriedObstructions=0;
+            foreach(var r in plan.ReachStages.Where(r=>buriedIds.Contains(r.WayId)))
+            {
+                var count=Math.Max(1,(int)Math.Ceiling(math.distance(r.Start.xz,r.End.xz)/7));
+                for(var k=0;k<count;k++)
+                {
+                    var t=k/(float)count;var p=math.lerp(r.Start,r.End,t);buriedSamples++;
+                    if(Bed(planned,p)>math.lerp(r.StartLevel,r.EndLevel,t)-.1f)buriedObstructions++;
+                }
+            }
+            var report=new{capture=Path.GetFileName(folder),sourceCache=osm,waterCellSize=cell,terrainReconstructed=true,nativeFlowVerified=false,
+                sources=revalidated.Sources.Count,riverControls=revalidated.Sources.Count(s=>s.BodyKind=="river"),
+                streamControls=revalidated.Sources.Count(s=>wayType.GetValueOrDefault(s.WayId)=="stream"),
+                streamReaches=revalidated.ReachStages.Count(s=>wayType.GetValueOrDefault(s.WayId)=="stream"),
+                containment=log.Lines.Where(s=>s.Contains("WATER CONTAINMENT")||s.Contains("Lake ")).ToArray(),
+                lakes=polygons.Where(p=>p.Outer.Any(r=>r.Length>0)&&!p.Tags.ContainsKey("waterway")).Select(p=>
+                {
+                    var vertices=p.Outer.SelectMany(r=>r).ToArray();var center=vertices.Aggregate(float3.zero,(a,b)=>a+b)/vertices.Length;
+                    return new{p.Id,p.Identity,p.Tags,latitude=importRequest.Latitude+math.degrees(center.z/Earth),
+                        longitude=importRequest.Longitude+math.degrees(center.x/(Earth*Math.Cos(math.radians(importRequest.Latitude)))),
+                        controls=revalidated.Sources.Count(s=>s.BodyId==p.Identity&&s.BodyKind=="lake"),
+                        stages=revalidated.AreaStages.Where(s=>s.BodyId==p.Identity).Select(s=>s.Level).ToArray()};
+                }).ToArray(),
+                lakeBodies=revalidated.Sources.Where(s=>s.BodyKind=="lake").Select(s=>s.BodyId).Distinct().Count(),
+                riverBodies=revalidated.Sources.Where(s=>s.BodyKind=="river").Select(s=>s.BodyId).Distinct().Count(),
+                openedBuriedWays=log.Metric("Water buried waterways opened"),buriedSamples,buriedObstructions,
+                naturalOpenSamples=samples,naturalOpenObstructions=dammed,uphillStageTransitions=uphill,crossings=crossingReport};
+            File.WriteAllText(reportPath,JsonConvert.SerializeObject(report,Formatting.Indented));
+            Console.WriteLine("  crossing report: "+JsonConvert.SerializeObject(crossingReport));
+        }
         if(Environment.GetEnvironmentVariable("WATER_REPLAY_OUT") is string output&&output.Length>0)
         {
             var bytes=new byte[planned.Length*2];Buffer.BlockCopy(planned,0,bytes,0,bytes.Length);File.WriteAllBytes(output,bytes);
@@ -592,8 +645,22 @@ static partial class VisualMetricsReplay
             var original=NetworkProcessor.Sample((float)p.x,(float)p.z,c.Terrain,c.Scale,c.Width);
             var stamped=NetworkProcessor.Sample((float)p.x,(float)p.z,roadbed,c.Scale,c.Width);
             string cause;
-            if(Math.Abs(p.y-original)>NetworkVerticalProfiles.CutFillBudget(s)-.1)cause="clamp";
-            else if(ends.Any(e=>math.distance(e.xz,p.xz)<60))cause="structure-end";
+            bool NearTunnel()
+            {
+                var (tx,tz)=Cell(p);
+                for(var x=tx-1;x<=tx+1;x++)for(var z=tz-1;z<=tz+1;z++)if(points.TryGetValue((x,z),out var list))
+                    foreach(var (j,q) in list)if(sections[j].Tunnel&&math.distance(q.xz,p.xz)<sections[j].NativeWidth/2+30)return true;
+                return false;
+            }
+            if(stamped-original>1&&p.y<stamped-.3&&NearTunnel())
+                cause="roof-cover"+(sections.Any(o=>o.Tunnel&&o.Kind==s.Kind&&(o.StartNodeId==s.StartNodeId||o.StartNodeId==s.EndNodeId||o.EndNodeId==s.StartNodeId||o.EndNodeId==s.EndNodeId))?" portal":" beside");
+            else if(Math.Abs(p.y-original)>NetworkVerticalProfiles.CutFillBudget(s)-.1)cause="clamp";
+            else if(ends.Any(e=>math.distance(e.xz,p.xz)<60))
+                // Approach: this road leads onto the structure (a structure end
+                // node on it within 60 m); otherwise it only passes near one.
+                cause="structure-end"+(Environment.GetEnvironmentVariable("VISUAL_DEBUG_TERRAIN")!="2"?"":
+                    sections.Any(o=>NetworkStructure.IsStructure(o)&&o.Kind==s.Kind&&new[]{(o.StartNodeId,o.CourseStart),(o.EndNodeId,o.CourseEnd)}
+                        .Any(e=>(e.Item1==s.StartNodeId||e.Item1==s.EndNodeId)&&math.distance(((double3)e.Item2).xz,p.xz)<60))?" approach":" beside");
             else
             {
                 var (cx,cz)=Cell(p);var shared=false;
@@ -605,9 +672,9 @@ static partial class VisualMetricsReplay
                     }
                 cause=shared?"shared-cells":"resolution";
             }
-            cause+=(p.y>stamped?"/above":"/below");
+            cause=(s.Kind==NetworkKind.Rail?"rail ":"")+cause+(p.y>stamped?"/above":"/below");
             // VISUAL_DEBUG_TERRAIN=2 lists the first structure-end failures.
-            if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_TERRAIN")=="2"&&cause.StartsWith("structure-end")&&(counts.TryGetValue(cause,out var seen)?seen:0)<8)
+            if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_TERRAIN")=="2"&&cause.StartsWith("structure-end")&&(counts.TryGetValue(cause,out var seen)?seen:0)<5)
             {
                 var nearest=sections.Where(NetworkStructure.IsStructure).Select(o=>(o,d:Math.Min(math.distance(((double3)o.CourseStart).xz,p.xz),math.distance(((double3)o.CourseEnd).xz,p.xz)))).OrderBy(x=>x.d).First();
                 Console.WriteLine($"    {cause} way {s.WayId} {s.Classification} w{s.NativeWidth:F0} at ({p.x:F0},{p.z:F0}): road {p.y:F1} stamped {stamped:F1} original {original:F1}; {(nearest.o.Tunnel?"tunnel":"bridge")} end {nearest.d:F0} m (way {nearest.o.WayId}); section length {NetworkDesignChecks.HorizontalArcLength(new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd)):F0}");
@@ -660,8 +727,85 @@ static partial class VisualMetricsReplay
             // VISUAL_DEBUG_OVERLAP=2 also lists each parallel overlap with both roads' ways and end nodes.
             if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_OVERLAP")=="2"&&relation=="parallel")
                 Console.WriteLine($"    {Class(s)} way {s.WayId} {s.StartNodeId}->{s.EndNodeId} L{s.Lanes} w{s.NativeWidth:F0} / {Class(o)} way {o.WayId} {o.StartNodeId}->{o.EndNodeId} L{o.Lanes} w{o.NativeWidth:F0} at ({f.Position.x:F0},{f.Position.z:F0}) gap {best.Distance:F1} m");
+            // VISUAL_DEBUG_OVERLAP=3 lists every overlap with the graph distance between the two sections.
+            if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_OVERLAP")=="3")
+            {
+                var hops=new Dictionary<int,int>{[f.Section]=0};var parent=new Dictionary<int,int>();var front=new List<int>{f.Section};
+                for(var h=1;h<=8&&!hops.ContainsKey(best.Section);h++){var next=new List<int>();foreach(var a in front)foreach(var b in Touching(a))if(hops.TryAdd(b,h)){parent[b]=a;next.Add(b);}front=next;}
+                double Length(PreparedSegment x)=>NetworkDesignChecks.HorizontalArcLength(new(x.CourseStart,x.CourseControl1,x.CourseControl2,x.CourseEnd));
+                var path=new List<int>();if(hops.ContainsKey(best.Section))for(var at=parent.GetValueOrDefault(best.Section,-1);at>=0&&at!=f.Section;at=parent.GetValueOrDefault(at,-1))path.Add(at);
+                string Degree(long id)=>incident[id].Count.ToString();
+                var via=string.Join(" ",path.Select(k=>{var x=sections[k];return $"[{Class(x)}{(x.OneWay?"":"2")} w{x.NativeWidth:F0} {Length(x):F0}m d{Degree(x.StartNodeId)}/{Degree(x.EndNodeId)}]";}));
+                Console.WriteLine($"    overlap3{(s.Roundabout||o.Roundabout||path.Any(k=>sections[k].Roundabout)?" ring":"")} {relation} hops={(hops.TryGetValue(best.Section,out var hop)?hop:99)} depth={f.Value:F1} {Class(s)}{(s.OneWay?"":"2")} way {s.WayId} L{s.Lanes} w{s.NativeWidth:F0} len {Length(s):F0} {s.StartNodeId}->{s.EndNodeId} / {Class(o)}{(o.OneWay?"":"2")} way {o.WayId} L{o.Lanes} w{o.NativeWidth:F0} len {Length(o):F0} {o.StartNodeId}->{o.EndNodeId} at ({f.Position.x:F0},{f.Position.z:F0}) via {via}");
+            }
         }
+        // VISUAL_DEBUG_CLEARANCE=1 lists each low crossing with the bridge and the
+        // lower road or rail it passes over, and both heights.
+        if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_CLEARANCE")=="1")
+        {
+            var all=new Dictionary<(int,int),List<(int Section,double3 P)>>();
+            for(var i=0;i<sections.Count;i++)
+            {
+                var s=sections[i];var curve=new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd);var n=Math.Max(2,(int)(NetworkDesignChecks.HorizontalArcLength(curve)/2)+1);
+                for(var k=0;k<n;k++){var p=NetworkDesignChecks.Evaluate(curve,k/(n-1d));if(!all.TryGetValue(Cell(p),out var l))all[Cell(p)]=l=new();l.Add((i,p));}
+            }
+            double Arc(PreparedSegment x)=>NetworkDesignChecks.HorizontalArcLength(new(x.CourseStart,x.CourseControl1,x.CourseControl2,x.CourseEnd));
+            foreach(var f in measured.Failures.Where(f=>f.Category=="crossing-clearance").OrderBy(f=>f.Value))
+            {
+                var s=sections[f.Section];var (cx,cz)=Cell(f.Position);var best=(Section:-1,Distance:double.PositiveInfinity,Y:0d);
+                for(var x=cx-1;x<=cx+1;x++)for(var z=cz-1;z<=cz+1;z++)if(all.TryGetValue((x,z),out var list))foreach(var q in list)
+                {
+                    var o=sections[q.Section];if(q.Section==f.Section||!(o.Layer<s.Layer||o.Tunnel))continue;
+                    var d=math.distance(q.P.xz,f.Position.xz);if(d<best.Distance)best=(q.Section,d,q.P.y);
+                }
+                if(best.Section<0)continue;var b=sections[best.Section];
+                string Describe(PreparedSegment x)=>$"{x.Kind} {x.Classification} L{x.Layer}{(x.Bridge?" B":"")}{(x.Tunnel?" T":"")} way {x.WayId} len {Arc(x):F0} ends {x.CourseStart.y:F1}/{x.CourseEnd.y:F1}";
+                Console.WriteLine($"    clearance gap={f.Value:F1} deck {f.Position.y:F1} over {best.Y:F1} at ({f.Position.x:F0},{f.Position.z:F0}): {Describe(s)} / {Describe(b)}");
+            }
+        }
+        if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_CROSSINGS")=="1")Crossings(sections,"final",true);
         foreach(var p in counts.OrderByDescending(p=>p.Value).Take(24))Console.WriteLine($"  cause {p.Key} = {p.Value}");
+        JunctionDistances(sections,measured);
+    }
+
+    // VISUAL_DEBUG_CROSSINGS=1: road centrelines that cross without a junction
+    // (no shared node within two steps) less than 4 m apart in height, on any
+    // layers: roads that visibly pass through each other.
+    private static void Crossings(IReadOnlyList<PreparedSegment> sections,string label,bool print)
+    {
+        (int,int) Cell(double3 p)=>((int)Math.Floor(p.x/32),(int)Math.Floor(p.z/32));
+        string Class(PreparedSegment s)=>s.ProtectedLink?"link":s.Classification;
+        var incident=new Dictionary<long,List<int>>();
+        for(var i=0;i<sections.Count;i++)if(sections[i].Kind==NetworkKind.Road)foreach(var id in new[]{sections[i].StartNodeId,sections[i].EndNodeId})
+        {if(!incident.TryGetValue(id,out var list))incident[id]=list=new();list.Add(i);}
+        IEnumerable<int> Touching(int i)=>new[]{sections[i].StartNodeId,sections[i].EndNodeId}.SelectMany(id=>incident[id]);
+        {
+            var pieces=new Dictionary<(int,int),List<(int Section,double3 A,double3 B)>>();
+            for(var i=0;i<sections.Count;i++)
+            {
+                var s=sections[i];if(s.Kind!=NetworkKind.Road)continue;var curve=new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd);
+                var n=Math.Max(2,(int)(NetworkDesignChecks.HorizontalArcLength(curve)/2)+1);var prev=NetworkDesignChecks.Evaluate(curve,0);
+                for(var k=1;k<n;k++){var p=NetworkDesignChecks.Evaluate(curve,k/(n-1d));foreach(var c in new[]{Cell(prev),Cell(p)}.Distinct()){if(!pieces.TryGetValue(c,out var l))pieces[c]=l=new();l.Add((i,prev,p));}prev=p;}
+            }
+            var seen=new HashSet<(int,int)>();var byKind=new Dictionary<string,int>();
+            foreach(var cell in pieces.Values)for(var x=0;x<cell.Count;x++)for(var y=x+1;y<cell.Count;y++)
+            {
+                var (i,a,b)=cell[x];var (j,c,d)=cell[y];if(i==j)continue;var key=(Math.Min(i,j),Math.Max(i,j));if(seen.Contains(key))continue;
+                var r=b.xz-a.xz;var q=d.xz-c.xz;var den=r.x*q.y-r.y*q.x;if(Math.Abs(den)<1e-9)continue;
+                var t=((c.x-a.x)*q.y-(c.z-a.z)*q.x)/den;var u=((c.x-a.x)*r.y-(c.z-a.z)*r.x)/den;if(t<0||t>1||u<0||u>1)continue;
+                var hi=math.lerp(a.y,b.y,t);var lo=math.lerp(c.y,d.y,u);if(Math.Abs(hi-lo)>=4)continue;
+                var near=new HashSet<int>(Touching(i).SelectMany(Touching));if(near.Contains(j))continue;
+                seen.Add(key);var s=sections[i];var o=sections[j];var p=math.lerp(a,b,t);
+                string Tag(PreparedSegment z)=>$"{Class(z)}{(z.Bridge?"B":z.Tunnel?"T":"")}L{z.Layer}";
+                var kind=string.Join("+",new[]{Tag(s),Tag(o)}.OrderBy(v=>v));byKind[kind]=byKind.GetValueOrDefault(kind)+1;
+                if(print)Console.WriteLine($"    crossing dy={hi-lo:F1} at ({p.x:F0},{p.z:F0}) {Tag(s)} way {s.WayId} {s.StartNodeId}->{s.EndNodeId} / {Tag(o)} way {o.WayId} {o.StartNodeId}->{o.EndNodeId}");
+            }
+            Console.WriteLine($"  {label} crossings without junction: {seen.Count}; "+string.Join(", ",byKind.OrderByDescending(p=>p.Value).Take(12).Select(p=>$"{p.Key}={p.Value}")));
+        }
+    }
+
+    private static void JunctionDistances(IReadOnlyList<PreparedSegment> sections,VisualCompilerMetrics.Measurement measured)
+    {
         // Distance from each overlap to the nearest road junction (degree three or more).
         var junctions=sections.Where(s=>s.Kind==NetworkKind.Road).SelectMany(s=>new[]{(s.StartNodeId,(double3)s.CourseStart),(s.EndNodeId,(double3)s.CourseEnd)})
             .GroupBy(e=>e.Item1).Where(g=>g.Count()>=3).Select(g=>g.First().Item2.xz).ToArray();
@@ -687,6 +831,10 @@ static partial class VisualMetricsReplay
             var a=source[arms[0]];var b=source[arms[1]];
             if(a.Bridge!=b.Bridge||a.Tunnel!=b.Tunnel)return "structure";if(a.Layer!=b.Layer)return "layer";
             if(a.OneWay!=b.OneWay)return "oneway";if(a.Lanes!=b.Lanes)return "lanes";if(a.Classification!=b.Classification)return "class";
+            if(a.NativeWidth!=b.NativeWidth||a.NativeAssetKey!=b.NativeAssetKey)return "asset";
+            if(a.Reference!=b.Reference)return "ref";if(a.ForwardLanes!=b.ForwardLanes||a.BackwardLanes!=b.BackwardLanes)return "dir-lanes";
+            float2 Away(PreparedSegment s)=>math.normalizesafe((s.StartNodeId==key.Id?s.CourseControl1-s.CourseStart:s.CourseControl2-s.CourseEnd).xz);
+            if(math.dot(Away(a),Away(b))>-.707f)return "bend";if(a.WayId!=b.WayId)return "way";
             return "plain";
         }
         var counts=new Dictionary<string,int>();
@@ -696,6 +844,13 @@ static partial class VisualMetricsReplay
             if(length>=VisualCompilerTable.For(s).MinimumSegment)continue;
             var pair=string.Join("+",new[]{Reason(new(s.Kind,s.StartNodeId)),Reason(new(s.Kind,s.EndNodeId))}.OrderBy(r=>r));
             var key=$"{(s.ProtectedLink?"link":s.Classification)}:{pair}";counts[key]=counts.TryGetValue(key,out var n)?n+1:1;
+            // Between two junctions: is it the gap between a divided cross street's carriageways?
+            if(pair.StartsWith("junction")&&pair.Contains("+junction"))
+            {
+                IEnumerable<(string,string)> OneWayNames(long id)=>incident[new(s.Kind,id)].Select(k=>source[k]).Where(o=>o!=s&&o.OneWay&&o.Name.Length>0).Select(o=>(o.Name,o.Classification));
+                var divided=OneWayNames(s.StartNodeId).Intersect(OneWayNames(s.EndNodeId)).Select(p=>p.Item2).FirstOrDefault();
+                var detail=$"{(s.ProtectedLink?"link":s.Classification)}:junctions {(divided!=null?"across divided "+divided:"other")}";counts[detail]=counts.TryGetValue(detail,out var m)?m+1:1;
+            }
         }
         foreach(var p in counts.OrderByDescending(p=>p.Value).Take(18))Console.WriteLine($"  short source {p.Key} = {p.Value}");
     }
@@ -704,7 +859,7 @@ static partial class VisualMetricsReplay
     {
         var log=new ImportLog{ScalarDiagnostics=Environment.GetEnvironmentVariable("VISUAL_DIAGNOSTICS")=="1"};var watch=System.Diagnostics.Stopwatch.StartNew();
         var designed=design(c,log);
-        if(log.DiagnosticsEnabled)foreach(var line in log.Lines.Where(l=>l.Contains("RAIL OVERLAPPING ROUTE",StringComparison.Ordinal)||l.Contains("RAIL PARALLEL ROUTES",StringComparison.Ordinal)||l.Contains("VISUAL DEBUG",StringComparison.Ordinal)))Console.WriteLine("  diag "+line);var designSeconds=watch.Elapsed.TotalSeconds;
+        if(log.DiagnosticsEnabled)foreach(var line in log.Lines.Where(l=>l.Contains("RAIL OVERLAPPING ROUTE",StringComparison.Ordinal)||l.Contains("RAIL PARALLEL ROUTES",StringComparison.Ordinal)||l.Contains("VISUAL DEBUG",StringComparison.Ordinal)||l.Contains("LANE SLOTS",StringComparison.Ordinal)||l.Contains("VISUAL COMPILER crossing",StringComparison.Ordinal)||l.Contains("VISUAL COMPILER vertical",StringComparison.Ordinal)||l.Contains("VISUAL COMPILER profile",StringComparison.Ordinal)||l.Contains("VISUAL COMPILER horizontal",StringComparison.Ordinal)||l.Contains("junction height mismatch",StringComparison.Ordinal)))Console.WriteLine("  diag "+line);var designSeconds=watch.Elapsed.TotalSeconds;
         var stage=System.Diagnostics.Stopwatch.StartNew();
         var sections=NativeDesignUnits.Prepare(StarterNetworkPolicy.WithoutSideStructures(designed),c.Contracts,log,default,pipeline.Contains("visual-compiler",StringComparison.Ordinal)?s=>VisualCompilerTable.For(s).MinimumSegment:null);
         var unitSeconds=stage.Elapsed.TotalSeconds;stage.Restart();
@@ -910,7 +1065,9 @@ static partial class VisualMetricsReplay
         }
         watch.Restart();var measured=VisualCompilerMetrics.Measure(sections,roadbed,c.Scale,c.Width,default);var metricSeconds=watch.Elapsed.TotalSeconds;
         if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_TERRAIN") is "1" or "2")TerrainCauses(c,sections,roadbed,measured);
-        if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_OVERLAP") is "1" or "2")OverlapCauses(sections,measured);
+        if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_OVERLAP") is "1" or "2" or "3")OverlapCauses(sections,measured);
+        // VISUAL_DEBUG_SHORT=2 classifies the finished sections instead of the source.
+        if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_SHORT")=="2")ShortSources(sections);
         var raw=VisualCompilerMetrics.Measure(designed,roadbed,c.Scale,c.Width,default);
         Console.WriteLine($"  before native units: sections={designed.Count}; paired failing={raw.Paired.FailedMeters/1000:F1} km of {raw.Paired.MatchedMeters/1000:F1}; grade-change={raw.Failures.Count(f=>f.Category=="grade-change")}; short-segment={raw.Failures.Count(f=>f.Category=="short-segment")}");
         Directory.CreateDirectory(output);
@@ -930,11 +1087,13 @@ static partial class VisualMetricsReplay
         }).ToArray();
         var designedNodes=new HashSet<SourceNodeKey>(designed.SelectMany(s=>new[]{new SourceNodeKey(s.Kind,s.StartNodeId),new SourceNodeKey(s.Kind,s.EndNodeId)}));
         foreach(var m in missing)Console.WriteLine("  missing port "+m+" inDesignOutput="+designedNodes.Contains(new(Enum.Parse<NetworkKind>(m.Split(':')[0]),long.Parse(m.Split(':')[1].Split(' ')[0]))));
+        if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_CROSSINGS")=="1")Crossings(c.Source,"source",false);
         if(long.TryParse(Environment.GetEnvironmentVariable("VISUAL_DEBUG_WAY"),out var debugWay))
             foreach(var (label,list) in new[]{("source",(IReadOnlyList<PreparedSegment>)c.Source),("designed",designed)})
                 foreach(var s in list.Where(s=>s.WayId==debugWay||s.SourceWayIds.Contains(debugWay)))
                     Console.WriteLine($"  {label} way={s.WayId} ways=[{string.Join(",",s.SourceWayIds)}] {s.StartNodeId}->{s.EndNodeId} oneway={s.OneWay} class={s.Classification} start=({s.Start.x:F1},{s.Start.z:F1}) end=({s.End.x:F1},{s.End.z:F1}) aliases=[{string.Join(",",s.SourceNodeAliases.Select(a=>a.SourceNodeId+">"+a.CanonicalNodeId))}] "+
-                        $"course=[{string.Join(" ",new[]{s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd}.Select(p=>$"({p.x:F0},{p.z:F0})"))}] geometry=[{string.Join(" ",s.SourceGeometry.Take(16).Select(p=>$"({p.x:F0},{p.z:F0})"))}]");
+                        $"course=[{string.Join(" ",new[]{s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd}.Select(p=>$"({p.x:F0},{p.z:F0})"))}] geometry=[{string.Join(" ",s.SourceGeometry.Take(16).Select(p=>$"({p.x:F0},{p.z:F0})"))}] "+
+                        $"original=[{string.Join(" ",s.OriginalGeometry.Take(24).Select(p=>$"({p.x:F0},{p.z:F0})"))}] bridge={s.Bridge} layer={s.Layer} tags={string.Join(",",s.RawSourceTags.Where(t=>t.Key is "bridge" or "layer" or "tunnel" or "railway" or "service" or "tracks").Select(t=>t.Key+"="+t.Value))}");
         foreach(var g in sections.SelectMany(s=>new[]{(s.Kind,Id:s.StartNodeId,P:s.Start,s.WayId),(s.Kind,Id:s.EndNodeId,P:s.End,s.WayId)}).GroupBy(e=>(e.Kind,e.Id))
             .Where(g=>g.Any(e=>math.distance(e.P,g.First().P)>.02f)).Take(5))
             Console.WriteLine($"  conflicting node {g.Key.Kind}:{g.Key.Id} "+string.Join(" ",g.Select(e=>$"way {e.WayId}@({e.P.x:F2},{e.P.y:F2},{e.P.z:F2})")));
@@ -983,7 +1142,7 @@ static partial class VisualMetricsReplay
         // VISUAL_DEBUG_PROFILE=x,z,r: emitted road heights against the original
         // ground at quarter points, for every section within r of a local point.
         if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_PROFILE") is {} profileAt&&profileAt.Split(',').Select(v=>double.Parse(v,CultureInfo.InvariantCulture)).ToArray() is [var px,var pz,var pr])
-            foreach(var s in sections.Where(s=>s.Kind==NetworkKind.Road&&math.distance(((double3)s.CourseStart).xz,new double2(px,pz))<pr).OrderBy(s=>s.WayId).ThenBy(s=>s.CourseStart.x))
+            foreach(var s in sections.Where(s=>(s.Kind==NetworkKind.Road||Environment.GetEnvironmentVariable("VISUAL_DEBUG_PROFILE_RAIL")=="1")&&math.distance(((double3)s.CourseStart).xz,new double2(px,pz))<pr).OrderBy(s=>s.WayId).ThenBy(s=>s.CourseStart.x))
             {
                 var curve=new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd);
                 Console.WriteLine($"  profile way={s.WayId} {s.StartNodeId}->{s.EndNodeId} {s.Classification} w={s.NativeWidth} oneway={s.OneWay} bridge={s.Bridge} tunnel={s.Tunnel} ({s.CourseStart.x:F1},{s.CourseStart.z:F1})->({s.CourseEnd.x:F1},{s.CourseEnd.z:F1}) offsets=({s.StartCurveOffset.x:F2},{s.StartCurveOffset.z:F2})/({s.EndCurveOffset.x:F2},{s.EndCurveOffset.z:F2}) "+
@@ -1015,6 +1174,94 @@ static partial class VisualMetricsReplay
             return id<=long.MinValue+9000000?"generated-compiler":id<0?"generated-earlier":"source-node";
         }
         foreach(var g in breaks.GroupBy(NodeClass))Console.WriteLine($"  tangent-break at {g.Key}: {g.Count()} (median {g.Select(f=>f.Value).OrderBy(v=>v).ElementAt(g.Count()/2):F1}°)");
+        // VISUAL_DEBUG_GRADES=1: road grade-change failures by where they sit: the
+        // worst sample at a section end (mostly a cubic's own curvature, which is
+        // largest at an end; a kink between sections is rare) or inside it, near a structure end, a
+        // junction or neither, and by class.
+        if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_GRADES")=="1")
+        {
+            var roadDegree=sections.Where(s=>s.Kind==NetworkKind.Road).SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}).GroupBy(id=>id).ToDictionary(g=>g.Key,g=>g.Count());
+            var structureEnds=sections.Where(s=>s.Kind==NetworkKind.Road&&NetworkStructure.IsStructure(s)).SelectMany(s=>new[]{((double3)s.CourseStart).xz,((double3)s.CourseEnd).xz}).ToArray();
+            var junctions=sections.Where(s=>s.Kind==NetworkKind.Road).SelectMany(s=>new[]{(s.StartNodeId,((double3)s.CourseStart).xz),(s.EndNodeId,((double3)s.CourseEnd).xz)}).Where(e=>roadDegree[e.Item1]>=3).Select(e=>e.Item2).ToArray();
+            string Where(VisualCompilerMetrics.Failure f)
+            {
+                var s=sections[f.Section];var atNode=math.distance(f.Position,(double3)s.CourseStart)<.05||math.distance(f.Position,(double3)s.CourseEnd)<.05;
+                var near=structureEnds.Any(p=>math.distance(p,f.Position.xz)<60)?"structure-end":junctions.Any(p=>math.distance(p,f.Position.xz)<60)?"junction":"open";
+                return $"{(atNode?"end":"inside")} {near} {(s.ProtectedLink?"link":s.Classification)}{(s.Tunnel?" tunnel":s.Bridge?" bridge":"")}";
+            }
+            foreach(var g in measured.Failures.Where(f=>f.Category=="grade-change"&&sections[f.Section].Kind==NetworkKind.Road).GroupBy(Where).OrderByDescending(g=>g.Count()).Take(16))
+                Console.WriteLine($"  grade-change {g.Key}: {g.Count()} (median {g.Select(f=>f.Value/f.Limit).OrderBy(v=>v).ElementAt(g.Count()/2):F1}x)");
+        }
+        // Rail on its own: failures by category, then (VISUAL_DEBUG_RAIL=n) the
+        // n worst of each with location and the section's attributes.
+        {
+            double lat0=(double)c.Input["request"]!["Latitude"]!,lon0=(double)c.Input["request"]!["Longitude"]!;
+            var railKm=sections.Where(s=>s.Kind==NetworkKind.Rail).Sum(s=>NetworkDesignChecks.HorizontalArcLength(new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd)))/1000;
+            var rail=measured.Failures.Where(f=>sections[f.Section].Kind==NetworkKind.Rail).ToArray();
+            Console.WriteLine($"  RAIL sections={sections.Count(s=>s.Kind==NetworkKind.Rail)}; km={railKm:F1}; failures={rail.Length}");
+            int.TryParse(Environment.GetEnvironmentVariable("VISUAL_DEBUG_RAIL"),out var shownRail);
+            if(shownRail>0)
+            {
+                foreach(var g in rail.GroupBy(f=>$"{f.Category} {(sections[f.Section].RailService is ""?"main":sections[f.Section].RailService)}").OrderByDescending(g=>g.Count()).Take(20))
+                    Console.WriteLine($"  rail by service {g.Key}: {g.Count()}");
+                // What the failing section's two ends are: a switch (three or more
+                // arms), a structure or layer change, a source port, a plain alias
+                // target, or a plain joint, and whether the end node came from the
+                // source, the compiler or an earlier stage.
+                var railDegree=sections.Where(s=>s.Kind==NetworkKind.Rail).SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}).GroupBy(id=>id).ToDictionary(g=>g.Key,g=>g.Count());
+                var railPorts=SourceTopologyObligations.Capture(c.Source).Ports.Where(p=>p.Kind==NetworkKind.Rail).Select(p=>p.Id).ToHashSet();
+                var railAliasTargets=c.Source.Where(s=>s.Kind==NetworkKind.Rail).SelectMany(s=>s.SourceNodeAliases.Select(a=>a.CanonicalNodeId)).ToHashSet();
+                string RailEnd(PreparedSegment s,long id)
+                {
+                    var d=railDegree[id];if(d>=3)return "switch";if(d==1)return "end";
+                    var o=sections.First(x=>x!=s&&x.Kind==NetworkKind.Rail&&(x.StartNodeId==id||x.EndNodeId==id));
+                    if(o.Bridge!=s.Bridge||o.Tunnel!=s.Tunnel)return "structure";if(o.Layer!=s.Layer)return "layer";
+                    return railPorts.Contains(id)?"port":railAliasTargets.Contains(id)?"alias":id>=0?"source-plain":id<=long.MinValue+9000000?"compiler":"other";
+                }
+                foreach(var g in rail.GroupBy(f=>{var s=sections[f.Section];return f.Category+" "+string.Join("+",new[]{RailEnd(s,s.StartNodeId),RailEnd(s,s.EndNodeId)}.OrderBy(x=>x));})
+                    .OrderByDescending(g=>g.Count()).Take(30))
+                    Console.WriteLine($"  rail ends {g.Key}: {g.Count()}");
+                string Bucket(VisualCompilerMetrics.Failure f)=>f.Category switch
+                {
+                    "tight-radius"=>f.Value<25?"<25 m":f.Value<75?"25-75 m":f.Value<150?"75-150 m":"150-300 m",
+                    "tangent-break"=>f.Value<5?"2-5°":f.Value<15?"5-15°":f.Value<45?"15-45°":"45°+",
+                    "short-segment"=>f.Value<8?"<8 m":f.Value<20?"8-20 m":f.Value<40?"20-40 m":"40-60 m",
+                    "grade-change" or "steep-grade"=>f.Value/f.Limit<2?"<2x":f.Value/f.Limit<5?"2-5x":"5x+",
+                    _=>f.Value<1?"<1 m":f.Value<3?"1-3 m":"3 m+"
+                };
+                foreach(var g in rail.GroupBy(f=>f.Category).OrderBy(g=>g.Key))
+                    Console.WriteLine($"  rail size {g.Key}: "+string.Join(", ",g.GroupBy(Bucket).OrderBy(x=>x.Key).Select(x=>$"{x.Key} {x.Count()}")));
+                // The severe geometry: kinks over 45° and radii under 25 m, with
+                // what meets at the node and the source way's own shape there.
+                foreach(var f in rail.Where(f=>f.Category=="tangent-break"&&f.Value>=45||f.Category=="tight-radius"&&f.Value<25).OrderByDescending(f=>f.Severity).Take(shownRail*3))
+                {
+                    var s=sections[f.Section];var node=math.distance((double3)s.CourseStart,f.Position)<math.distance((double3)s.CourseEnd,f.Position)?s.StartNodeId:s.EndNodeId;
+                    var arms=sections.Where(o=>o.Kind==NetworkKind.Rail&&(o.StartNodeId==node||o.EndNodeId==node)).ToArray();
+                    var src=c.Source.Where(o=>o.Kind==NetworkKind.Rail&&(o.WayId==s.WayId||s.SourceWayIds.Contains(o.WayId))).ToArray();
+                    Console.WriteLine($"    severe {f.Category} {f.Value:F1} way {f.WayId} at {lat0+math.degrees(f.Position.z/Earth):F5},{lon0+math.degrees(f.Position.x/(Earth*Math.Cos(math.radians(lat0)))):F5} node {node} ({RailEnd(s,node)}) arms={string.Join(";",arms.Select(o=>$"{o.WayId}/{o.RailService}/{(o.Bridge?"b":o.Tunnel?"t":"g")}/len{NetworkDesignChecks.HorizontalArcLength(new Cubic3d(o.CourseStart,o.CourseControl1,o.CourseControl2,o.CourseEnd)):F0}"))} "+
+                        $"sourceWays={string.Join(",",s.SourceWayIds.Take(6))} sourceSections={src.Length} sourceServices={string.Join(",",src.Select(o=>o.RailService).Distinct())}");
+                }
+                var sourceRail=c.Source.Where(s=>s.Kind==NetworkKind.Rail).ToArray();
+                var sourceMeasured=VisualCompilerMetrics.Measure(sourceRail,c.Terrain,c.Scale,c.Width,default);
+                foreach(var g in sourceMeasured.Failures.Where(f=>f.Category is "tight-radius" or "tangent-break" or "short-segment").GroupBy(f=>f.Category).OrderBy(g=>g.Key))
+                    Console.WriteLine($"  source rail size {g.Key}: "+string.Join(", ",g.GroupBy(Bucket).OrderBy(x=>x.Key).Select(x=>$"{x.Key} {x.Count()}")));
+                // Hotspots: 1 km cells holding the most rail failures.
+                foreach(var g in rail.GroupBy(f=>((int)Math.Floor(f.Position.x/1000),(int)Math.Floor(f.Position.z/1000))).OrderByDescending(g=>g.Count()).Take(8))
+                    Console.WriteLine($"  rail hotspot ({g.Key.Item1*1000+500},{g.Key.Item2*1000+500}) at {lat0+math.degrees((g.Key.Item2*1000+500)/Earth):F4},{lon0+math.degrees((g.Key.Item1*1000+500)/(Earth*Math.Cos(math.radians(lat0)))):F4}: {g.Count()} "+
+                        string.Join(" ",g.GroupBy(f=>f.Category).Select(x=>$"{x.Key}={x.Count()}")));
+            }
+            foreach(var g in rail.GroupBy(f=>f.Category).OrderByDescending(g=>g.Count()))
+            {
+                var values=g.Select(f=>f.Value).OrderBy(v=>v).ToArray();
+                Console.WriteLine($"  rail {g.Key}: {g.Count()} (median {values[values.Length/2]:F3}, limit {g.First().Limit:F3})");
+                foreach(var f in g.OrderByDescending(f=>f.Severity).Take(shownRail))
+                {
+                    var s=sections[f.Section];
+                    Console.WriteLine($"    {f.Category} way {f.WayId} {f.Value:F3}/{f.Limit:F3} at {lat0+math.degrees(f.Position.z/Earth):F5},{lon0+math.degrees(f.Position.x/(Earth*Math.Cos(math.radians(lat0)))):F5} local=({f.Position.x:F0},{f.Position.z:F0}) "+
+                        $"{s.StartNodeId}->{s.EndNodeId} service={s.RailService} bridge={s.Bridge} tunnel={s.Tunnel} layer={s.Layer} len={NetworkDesignChecks.HorizontalArcLength(new Cubic3d(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd)):F1} y=({s.CourseStart.y:F1},{s.CourseEnd.y:F1})");
+                }
+            }
+        }
         // VISUAL_DEBUG_SHORT_ENDS=1: short sections by the degree of their end
         // nodes and whether a structure (bridge/tunnel) starts or ends there.
         if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_SHORT_ENDS")=="1")
@@ -1028,6 +1275,31 @@ static partial class VisualMetricsReplay
             }
             foreach(var g in measured.Failures.Where(f=>f.Category=="short-segment").GroupBy(f=>{var s=sections[f.Section];return string.Join("+",new[]{End(s,s.StartNodeId),End(s,s.EndNodeId)}.OrderBy(x=>x))+" "+s.Kind;}).OrderByDescending(g=>g.Count()))
                 Console.WriteLine($"  short-segment ends {g.Key}: {g.Count()} (median {g.Select(f=>f.Value).OrderBy(v=>v).ElementAt(g.Count()/2):F1} m)");
+            // What differs across the ends of short pieces between two other ways.
+            string Differs(PreparedSegment s,long node)
+            {
+                if(degree[(s.Kind,node)]>2)return "junction";
+                var o=sections.FirstOrDefault(o=>o!=s&&o.Kind==s.Kind&&(o.StartNodeId==node||o.EndNodeId==node));if(o==null)return "end";
+                var d=new List<string>();if(o.NativeAssetKey!=s.NativeAssetKey)d.Add("asset");if(o.Lanes!=s.Lanes)d.Add("lanes");if(o.Classification!=s.Classification)d.Add("class");
+                if(o.OneWay!=s.OneWay)d.Add("oneway");if(o.Bridge!=s.Bridge||o.Tunnel!=s.Tunnel)d.Add("structure");if(o.Layer!=s.Layer)d.Add("layer");
+                if(math.dot(math.normalizesafe((s.StartNodeId==node?s.CourseControl1-s.CourseStart:s.CourseControl2-s.CourseEnd).xz),
+                    math.normalizesafe((o.StartNodeId==node?o.CourseControl1-o.CourseStart:o.CourseControl2-o.CourseEnd).xz))>-.97)d.Add("bend");
+                return d.Count==0?"same":string.Join("/",d);
+            }
+            foreach(var g in measured.Failures.Where(f=>f.Category=="short-segment"&&sections[f.Section].Kind==NetworkKind.Road).GroupBy(f=>
+            {var s=sections[f.Section];return string.Join(" + ",new[]{Differs(s,s.StartNodeId),Differs(s,s.EndNodeId)}.OrderBy(x=>x));}).OrderByDescending(g=>g.Count()).Take(12))
+                Console.WriteLine($"  short-segment differs {g.Key}: {g.Count()}");
+            // Plain-joined pieces: who made the end nodes and whether they are source ports.
+            var ports=SourceTopologyObligations.Capture(c.Source).Ports.ToHashSet();
+            string Origin(long id)=>id>=0?"source":id<=long.MinValue+9000000?"compiler":id<=long.MinValue+13000000?"unit":id<=long.MinValue+44000000?"late":"earlier";
+            var differs=Environment.GetEnvironmentVariable("VISUAL_DEBUG_DIFFERS")??"same";
+            var same=measured.Failures.Where(f=>f.Category=="short-segment"&&sections[f.Section].Kind==NetworkKind.Road).Select(f=>sections[f.Section])
+                .Where(s=>Differs(s,s.StartNodeId)==differs||Differs(s,s.EndNodeId)==differs).ToArray();
+            foreach(var g in same.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}.Where(n=>Differs(s,n)==differs).Select(n=>$"{Origin(n)}{(ports.Contains(new(s.Kind,n))?"/port":"")} {s.Classification}{(s.Bridge?" bridge":s.Tunnel?" tunnel":"")}"))
+                .GroupBy(x=>x).OrderByDescending(g=>g.Count()).Take(12))
+                Console.WriteLine($"  short-segment same-end {g.Key}: {g.Count()}");
+            foreach(var s in same.Take(int.TryParse(Environment.GetEnvironmentVariable("VISUAL_DEBUG_SAME"),out var shownSame)?shownSame:0))
+                Console.WriteLine($"  same piece way={s.WayId} {s.StartNodeId}({Differs(s,s.StartNodeId)})->{s.EndNodeId}({Differs(s,s.EndNodeId)}) {s.Classification} layer={s.Layer} bridge={s.Bridge} tunnel={s.Tunnel} neighbours={string.Join("/",sections.Where(o=>o!=s&&o.Kind==s.Kind&&(o.StartNodeId==s.StartNodeId||o.EndNodeId==s.StartNodeId||o.StartNodeId==s.EndNodeId||o.EndNodeId==s.EndNodeId)).Select(o=>$"L{o.Layer}{(o.Bridge?"b":o.Tunnel?"t":"")}"))} len={NetworkDesignChecks.HorizontalArcLength(new(s.CourseStart,s.CourseControl1,s.CourseControl2,s.CourseEnd)):F1} at ({s.CourseStart.x:F0},{s.CourseStart.z:F0})");
         }
         if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_KINKS")=="1")
         {
@@ -1040,6 +1312,10 @@ static partial class VisualMetricsReplay
             foreach(var g in measured.Failures.Where(f=>f.Category=="short-segment"&&sections[f.Section].Kind==NetworkKind.Road).GroupBy(f=>
             {var s=sections[f.Section];string End(long id)=>Origin(id)+(degreeById[(s.Kind,id)]>2?"/junction":"/plain");return string.Join(" + ",new[]{End(s.StartNodeId),End(s.EndNodeId)}.OrderBy(x=>x));}).OrderByDescending(g=>g.Count()).Take(10))
                 Console.WriteLine($"    short road pieces between {g.Key}: {g.Count()}");
+            foreach(var g in measured.Failures.Where(f=>f.Category=="short-segment"&&
+                (Origin(sections[f.Section].StartNodeId)=="unit"||Origin(sections[f.Section].EndNodeId)=="unit")).GroupBy(f=>
+            {var s=sections[f.Section];return $"{s.Kind} {(s.ProtectedLink?"link":s.Classification)}{(s.Bridge?" bridge":s.Tunnel?" tunnel":"")}{(s.PairedProfileId!=0?" paired":"")}";}).OrderByDescending(g=>g.Count()).Take(10))
+                Console.WriteLine($"    short pieces at unit cuts {g.Key}: {g.Count()} (median {g.Select(f=>f.Value).OrderBy(v=>v).ElementAt(g.Count()/2):F1} m of {g.First().Limit:F0})");
             foreach(var f in breaks.Where(f=>sections[f.Section].Kind==NetworkKind.Rail||sections[f.Section].Classification=="motorway").OrderByDescending(f=>f.Value).Take(8))
                 Console.WriteLine($"    worst kink {sections[f.Section].Kind} {sections[f.Section].Reference} way {f.WayId} {f.Value:F0}° at {lat0+math.degrees(f.Position.z/Earth):F5},{lon0+math.degrees(f.Position.x/(Earth*Math.Cos(math.radians(lat0)))):F5} ({NodeClass(f)})");
         }
@@ -1524,15 +1800,18 @@ static partial class VisualMetricsReplay
     public static void Plot(string legacy,string compiler,string spots,string svgPath)
     {
         var run=JObject.Parse(File.ReadAllText(Path.Combine(legacy,RunFile)));double lat0=(double)run["latitude"]!,lon0=(double)run["longitude"]!;
-        static List<(string Kind,bool Structure,float Width,double[] P)> Sections(string folder)
+        static List<(string Kind,bool Structure,float Width,double[] P,string Label)> Sections(string folder)
         {
-            var list=new List<(string,bool,float,double[])>();
+            var list=new List<(string,bool,float,double[],string)>();
             using var file=File.OpenRead(Path.Combine(folder,PlotFile));using var zip=new GZipStream(file,CompressionMode.Decompress);using var reader=new StreamReader(zip);
-            while(reader.ReadLine() is {} line){var r=JObject.Parse(line);list.Add(((string)r["kind"]!,(bool)r["Bridge"]!||(bool)r["Tunnel"]!,(float)r["NativeWidth"]!,r["p"]!.Values<double>().ToArray()));}
+            while(reader.ReadLine() is {} line){var r=JObject.Parse(line);list.Add(((string)r["kind"]!,(bool)r["Bridge"]!||(bool)r["Tunnel"]!,(float)r["NativeWidth"]!,r["p"]!.Values<double>().ToArray(),
+                $"{(long)r["WayId"]!} {(string?)r["Classification"]}{((bool?)r["OneWay"]==true?"":"2")} w{(float)r["NativeWidth"]!:F0}"));}
             return list;
         }
         var sides=new[]{Sections(legacy),Sections(compiler)};var names=spots.Split(';',StringSplitOptions.RemoveEmptyEntries);
-        const double half=350;const int panel=560;var svg=new StringBuilder();
+        // VISUAL_PLOT_HALF zooms in (half the square's side, metres) and labels each section's way.
+        var zoom=double.TryParse(Environment.GetEnvironmentVariable("VISUAL_PLOT_HALF"),NumberStyles.Float,CultureInfo.InvariantCulture,out var h);
+        var half=zoom?h:350;const int panel=560;var svg=new StringBuilder();
         svg.Append($"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{panel*2+30}\" height=\"{names.Length*(panel+40)}\"><rect width=\"100%\" height=\"100%\" fill=\"#1d2428\"/>");
         string N(double v)=>v.ToString("0.#",CultureInfo.InvariantCulture);
         for(var row=0;row<names.Length;row++)
@@ -1550,7 +1829,13 @@ static partial class VisualMetricsReplay
                         Math.Max(Math.Max(p[2],p[5]),Math.Max(p[8],p[11]))<cz-half||Math.Min(Math.Min(p[2],p[5]),Math.Min(p[8],p[11]))>cz+half)continue;
                     var color=s.Kind=="Rail"?"#b98a5e":s.Structure?"#7fb3d5":"#c9cfd3";count++;
                     svg.Append($"<path d=\"M{N(p[0])} {N(-p[2])} C{N(p[3])} {N(-p[5])} {N(p[6])} {N(-p[8])} {N(p[9])} {N(-p[11])}\" fill=\"none\" stroke=\"{color}\" stroke-opacity=\".75\" stroke-width=\"{N(Math.Max(2,s.Width))}\"/>");
-                    svg.Append($"<circle cx=\"{N(p[0])}\" cy=\"{N(-p[2])}\" r=\"2.5\" fill=\"#e8a33d\"/>");
+                    svg.Append($"<circle cx=\"{N(p[0])}\" cy=\"{N(-p[2])}\" r=\"{N(zoom?half/150:2.5)}\" fill=\"#e8a33d\"/>");
+                    if(zoom)
+                    {
+                        var hue=(count*67)%360;var m=new[]{(p[0]+3*p[3]+3*p[6]+p[9])/8,(p[2]+3*p[5]+3*p[8]+p[11])/8};
+                        svg.Append($"<path d=\"M{N(p[0])} {N(-p[2])} C{N(p[3])} {N(-p[5])} {N(p[6])} {N(-p[8])} {N(p[9])} {N(-p[11])}\" fill=\"none\" stroke=\"hsl({hue},80%,45%)\" stroke-width=\"{N(half/250)}\"/>");
+                        svg.Append($"<text x=\"{N(m[0])}\" y=\"{N(-m[1])}\" fill=\"hsl({hue},90%,30%)\" font-size=\"{N(half/30)}\">{s.Label}</text>");
+                    }
                 }
                 svg.Append($"</svg><text x=\"{left+6}\" y=\"{top+panel+22}\" fill=\"#93a4ad\" font-size=\"11\">{count} sections (orange dots = section starts); 700 m square; blue = bridge/tunnel</text>");
             }

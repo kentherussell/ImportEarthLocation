@@ -10,9 +10,10 @@ namespace ImportEarthLocation.Processing;
 public static class RoundaboutPlanner
 {
     private static float[] _stockRadii=Array.Empty<float>();
-    public static void ConfigureStockRadii(IEnumerable<float> radii) => _stockRadii=radii.Distinct().OrderBy(r=>r).Take(3).ToArray();
+    public static void ConfigureStockRadii(IEnumerable<float> radii) => _stockRadii=radii.Where(r=>math.isfinite(r)&&r>0).Distinct().OrderBy(r=>r).ToArray();
     public static IReadOnlyList<PreparedSegment> Prepare(IReadOnlyList<PreparedSegment> source,ImportLog log,CancellationToken token)
     {
+        log.Diagnostic($"ROUNDABOUT native palette sizes={string.Join(",",_stockRadii)}; maximumCenterlineRadiusMeters={(_stockRadii.Length>0?_stockRadii[_stockRadii.Length-1]:0)}; irregularRingsRetained=true");
         var rings=source.Where(s=>s.Roundabout&&s.Kind==NetworkKind.Road&&!s.Bridge&&!s.Tunnel).ToArray();
         var incident=new Dictionary<long,List<PreparedSegment>>();
         foreach(var s in source)foreach(var id in new[]{s.StartNodeId,s.EndNodeId})
@@ -43,7 +44,12 @@ public static class RoundaboutPlanner
             var approaches=ids.SelectMany(id=>incident[id]).Where(s=>!group.Contains(s)).Distinct().ToArray();
             var stockRadii=_stockRadii;
             var stockRadius=stockRadii.Length==0?0:stockRadii.OrderBy(r=>Math.Abs(r-radius)).ThenByDescending(r=>r).First();
-            if(circular&&stockRadius>0&&radius<=stockRadii[stockRadii.Length-1] && approaches.Length>=3 && approaches.Length<=6 && approaches.All(s=>s.Kind==NetworkKind.Road&&!s.OneWay&&!s.Bridge&&!s.Tunnel&&!s.ProtectedLink&&s.Layer==edges[0].Layer&&!(ids.Contains(s.StartNodeId)&&ids.Contains(s.EndNodeId))&&math.distance(s.Start.xz,s.End.xz)>stockRadius+12))
+            var entries=approaches.Count(s=>!s.OneWay||ids.Contains(s.EndNodeId));
+            var exits=approaches.Count(s=>!s.OneWay||ids.Contains(s.StartNodeId));
+            if(circular&&stockRadius>0&&radius<=stockRadii[stockRadii.Length-1] && approaches.Length>=3 && approaches.Length<=6 && entries>0&&exits>0 &&
+                ids.All(id=>edges.Count(s=>s.StartNodeId==id)==1&&edges.Count(s=>s.EndNodeId==id)==1)&&
+                edges.All(s=>s.Layer==edges[0].Layer)&&approaches.All(s=>s.Kind==NetworkKind.Road&&!s.Bridge&&!s.Tunnel&&s.Layer==edges[0].Layer&&
+                    !(ids.Contains(s.StartNodeId)&&ids.Contains(s.EndNodeId))&&math.distance(s.Start.xz,s.End.xz)>stockRadius+12))
             {
                 while(allIds.Contains(next))next++;var node=next++;allIds.Add(node);
                 foreach(var id in ids)remap[id]=(node,center,stockRadius);

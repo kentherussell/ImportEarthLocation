@@ -331,7 +331,16 @@ public sealed class OverpassClient
     public static string BuildForestQuery(GeoBounds b)
     {
         var bbox=string.Join(",",new[]{F(b.South),F(b.West),F(b.North),F(b.East)});
-        return $"[out:xml][timeout:60];(node[\"natural\"~\"^(tree|shrub)$\"]({bbox});way[\"natural\"~\"^(tree_row|wood|scrub|heath|wetland|beach)$\"]({bbox});way[\"landuse\"~\"^(forest|orchard)$\"]({bbox});relation[\"natural\"~\"^(wood|scrub|heath|wetland|beach)$\"]({bbox});relation[\"landuse\"~\"^(forest|orchard)$\"]({bbox}););" + CompleteAreaOutput(mappedTrees: true);
+        // Besides woodland, areas where trees are inferred (parks, cemeteries,
+        // golf roughs, school grounds, residential land, swamps) and the open
+        // areas inside them that stay clear (pitches, parking, golf surfaces).
+        var areas=$"[\"landuse\"~\"^(forest|orchard|cemetery|residential|recreation_ground|village_green|religious)$\"]({bbox});" +
+            $"[\"leisure\"~\"^(park|garden|golf_course|pitch|playground|track|swimming_pool|stadium)$\"]({bbox});" +
+            $"[\"amenity\"~\"^(grave_yard|school|college|university|kindergarten|parking)$\"]({bbox});" +
+            $"[\"golf\"~\"^(fairway|green|tee|bunker|water_hazard|lateral_water_hazard|driving_range)$\"]({bbox});" +
+            $"[\"landcover\"=\"trees\"]({bbox});[\"wetland\"~\"^(swamp|mangrove)$\"]({bbox});";
+        var ways=string.Concat(areas.Split(new[]{';'},StringSplitOptions.RemoveEmptyEntries).Select(a=>"way"+a+";relation"+a+";"));
+        return $"[out:xml][timeout:120];(node[\"natural\"~\"^(tree|shrub)$\"]({bbox});way[\"natural\"~\"^(tree_row|wood|scrub|heath|wetland|beach)$\"]({bbox});relation[\"natural\"~\"^(wood|scrub|heath|wetland|beach)$\"]({bbox});{ways});" + CompleteAreaOutput(mappedTrees: true);
     }
 
     // Rock evidence, cached apart from forests and geography so enabling rocks

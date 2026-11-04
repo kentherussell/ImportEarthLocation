@@ -12,11 +12,19 @@ public static class NetworkSelection
         var result=RoadImportLevel.None;
         foreach(var item in (value??"").ToLowerInvariant().Split('|'))
             result |= item switch { "highways"=>RoadImportLevel.Highways,"routes"=>RoadImportLevel.Routes,"streets"=>RoadImportLevel.Streets,_=>RoadImportLevel.None };
+        // Keep historical flag values readable while presenting one highway group.
+        if((result&(RoadImportLevel.Highways|RoadImportLevel.Routes))!=0)result|=RoadImportLevel.Highways|RoadImportLevel.Routes;
         return result;
     }
     public static bool ParseRail(string? value) => bool.TryParse(value, out var enabled) ? enabled : true;
     public static string Id(RoadImportLevel value) {var names=new List<string>();if((value&RoadImportLevel.Highways)!=0)names.Add("highways");if((value&RoadImportLevel.Routes)!=0)names.Add("routes");if((value&RoadImportLevel.Streets)!=0)names.Add("streets");return names.Count==0?"none":string.Join("|",names);}
-    public static string Label(RoadImportLevel value) => Id(value).Replace("|",", ");
+    public static string Label(RoadImportLevel value)
+    {
+        var names=new List<string>();
+        if((value&(RoadImportLevel.Highways|RoadImportLevel.Routes))!=0)names.Add("Highways");
+        if((value&RoadImportLevel.Streets)!=0)names.Add("Main Roads");
+        return names.Count==0?"None":string.Join(", ",names);
+    }
     public static string Classes(RoadImportLevel value) {var names=new List<string>();if((value&RoadImportLevel.Highways)!=0)names.Add("motorway|motorway_link");if((value&RoadImportLevel.Routes)!=0)names.Add("trunk|trunk_link");if((value&RoadImportLevel.Streets)!=0)names.Add("primary|secondary|tertiary");return string.Join("|",names);}
     public static bool IsExcludedStreetLink(string classification) => classification is "primary_link" or "secondary_link" or "tertiary_link";
     public static int MatchedLanes(int requested,bool highway,bool oneWay)

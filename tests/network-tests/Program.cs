@@ -16,6 +16,11 @@ static class Program
     static void Run(string[] args)
     {
         if(args.Length==1&&args[0]=="--avenues-only"){AvenueTests.Run();return;}
+        if(args.Length==1&&args[0]=="--rail-crossings-only"){RailCrossingTests.Run();return;}
+        if(args.Length==1&&args[0]=="--street-smoothing-only"){StreetSmoothingTests.Run();return;}
+        if(args.Length==3&&args[0]=="--rail-crossings-capture"){VisualMetricsReplay.RailCrossings(args[1],args[2]);return;}
+        if(args.Length==3&&args[0]=="--street-smoothing-capture"){VisualMetricsReplay.StreetSmoothing(args[1],args[2]);return;}
+        if(args.Length==4&&args[0]=="--street-smoothing-capture"){VisualMetricsReplay.StreetSmoothing(args[1],args[2],args[3]);return;}
         if(args.Length==1&&args[0]=="--connectivity-only"){ConnectivityTests.Run();return;}
         if(args.Length==3&&args[0] is "--street-capture" or "--street-design-capture"){VisualMetricsReplay.Streets(args[1],args[2],args[0]=="--street-design-capture");return;}
         if(args.Length==4&&args[0]=="--road-water-capture"){VisualMetricsReplay.RoadWater(args[1],args[2],args[3]);return;}
@@ -60,6 +65,8 @@ static class Program
         if(args.Length==6&&args[0]=="--terrain-crop"){var f=System.Globalization.CultureInfo.InvariantCulture;VisualMetricsReplay.TerrainCrop(args[1],float.Parse(args[2],f),float.Parse(args[3],f),float.Parse(args[4],f),args[5]);return;}
         if(args.Length==7&&args[0]=="--terrain-teeth"){var f=System.Globalization.CultureInfo.InvariantCulture;VisualMetricsReplay.Teeth(args[1],args[2],args[3],float.Parse(args[4],f),float.Parse(args[5],f),args[6]);return;}
         if(args.Length==4&&args[0]=="--water-replay"){VisualMetricsReplay.WaterReplay(args[1],args[2],float.Parse(args[3],System.Globalization.CultureInfo.InvariantCulture));return;}
+        if(args.Length==5&&args[0]=="--water-replay"){VisualMetricsReplay.WaterReplay(args[1],args[2],float.Parse(args[3],System.Globalization.CultureInfo.InvariantCulture),args[4]);return;}
+        if(args.Length==4&&args[0]=="--channel-crossings-capture"){VisualMetricsReplay.ChannelCrossings(args[1],args[2],args[3]);return;}
         if(args.Length==2&&args[0]=="--water-banks"){VisualMetricsReplay.WaterBanks(args[1]);return;}
         if(args.Length==4&&args[0]=="--beach-check"){VisualMetricsReplay.BeachCheck(args[1],args[2],float.Parse(args[3],System.Globalization.CultureInfo.InvariantCulture));return;}
         if(args.Length==5&&args[0]=="--visual-plot"){VisualMetricsReplay.Plot(args[1],args[2],args[3],args[4]);return;}
@@ -81,6 +88,8 @@ static class Program
         CorrectivePlanTests.Run();
         CriticalReworkTests.Run();
         VisualDesignTests.Run();
+        RailCrossingTests.Run();
+        StreetSmoothingTests.Run();
         WaterRoadTests.Run();
         RebalanceRegressionTests.Run();
         ConnectivityTests.Run();
@@ -163,6 +172,10 @@ static class Program
         Check(Math.Abs(widened[1].StartCurveOffset.x-2)<1e-3&&Math.Abs(widened[1].EndCurveOffset.x-2)<1e-3&&Math.Abs(widened[2].StartCurveOffset.x-widened[1].EndCurveOffset.x)<1e-4&&
             math.lengthsq(widened[2].EndCurveOffset)<1e-6&&math.lengthsq(widened[0].EndCurveOffset)<1e-6,
             $"Lane gain not left-aligned: {widened[1].StartCurveOffset} {widened[1].EndCurveOffset} {widened[2].StartCurveOffset} {widened[2].EndCurveOffset}");
+        Check(NetworkSelection.Parse("highways")== (RoadImportLevel.Highways|RoadImportLevel.Routes)&&
+            NetworkSelection.Parse("routes")== (RoadImportLevel.Highways|RoadImportLevel.Routes)&&
+            NetworkSelection.Parse("streets")==RoadImportLevel.Streets,"Combined highway group or legacy selection migration is incorrect");
+        Check(NetworkSelection.Label(RoadImportLevel.Primary)=="Highways, Main Roads","Road group labels do not match the two-option UI");
         Check(NetworkPreferences.Parse("{}")==NetworkPreferences.Defaults&&NetworkPreferences.Parse("broken")==NetworkPreferences.Defaults,"Corrupt/missing preferences unsafe");
         Check(NetworkPreferences.Parse("{\"includeSecondaryRoads\":true}").Roads==RoadImportLevel.None,"Legacy persisted secondary enabled independent groups without an explicit selection");
         Check(NetworkPreferences.Parse("{\"roadLevel\":\"none\",\"importRail\":false}")==new NetworkPreferences(RoadImportLevel.None,false),"Explicit none/off not persisted");

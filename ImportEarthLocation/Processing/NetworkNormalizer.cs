@@ -207,6 +207,7 @@ public static class NetworkNormalizer
             ExplicitCutSides=Swap(s.ExplicitCutSides),ExplicitWallSides=Swap(s.ExplicitWallSides),RetainingWallSides=Swap(s.RetainingWallSides),
             StartRoundaboutRadius=s.EndRoundaboutRadius,EndRoundaboutRadius=s.StartRoundaboutRadius,
             StartMiniRoundabout=s.EndMiniRoundabout,EndMiniRoundabout=s.StartMiniRoundabout,StartTerminal=s.EndTerminal,EndTerminal=s.StartTerminal,
+            StartLevelCrossing=s.EndLevelCrossing,EndLevelCrossing=s.StartLevelCrossing,
             OriginalGeometry=s.OriginalGeometry.Reverse().ToArray(),SourceGeometry=s.SourceGeometry.Reverse().ToArray(),HorizontalParent=null};
     }
 
@@ -398,6 +399,7 @@ public static class NetworkNormalizer
         var c1=(float3)fitted.P1;var c2=(float3)fitted.P2;
         var candidate = first with { End = last.End, EndNodeId = last.EndNodeId, EndRoundaboutRadius=last.EndRoundaboutRadius,
             EndMiniRoundabout=last.EndMiniRoundabout,EndTerminal=last.EndTerminal,
+            EndLevelCrossing=last.EndLevelCrossing,
             SourceWayIds=source.SelectMany(s=>s.SourceWayIds.Count>0?s.SourceWayIds:new[]{s.WayId}).Distinct().ToArray(),
             SourceNodeAliases=source.SelectMany(s=>s.SourceNodeAliases).Distinct().ToArray(),
             OriginalGeometry=source.SelectMany(s=>s.OriginalGeometry.Count>0?s.OriginalGeometry:new[]{s.Start,s.End}).ToArray(),

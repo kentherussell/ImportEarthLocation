@@ -22,13 +22,24 @@ static partial class VisualMetricsReplay
         source=CoordinatedNetworkDesign.TunnelIntervals(source,log,default);
         source=NetworkStubs.Prune(source,request,log);source=NetworkLaneRuns.Smooth(source,log);
         source=NetworkOverlapConsolidator.Prepare(source,log,default);
-        var before=source;source=AvenueConsolidator.Prepare(source,log,default);
+        var before=source;source=MedianLinks.Prepare(source,log,default);
+        source=AvenueConsolidator.PrepareTrunks(source,log,default);
+        foreach(var line in log.Lines.Where(l=>l.Contains("TRUNK AVENUE",StringComparison.Ordinal)))Console.WriteLine(line);
+        foreach(var metric in new[]{"Divided trunk pairs consolidated","Divided trunk stretches kept without intersections","Median links folded into merged trunks",
+            "Divided trunk carriageway sections reshaped","Divided trunk transitions limited by nearby junctions or structures"})Console.WriteLine($"{metric}: {log.Metric(metric)}");
+        source=AvenueConsolidator.Prepare(source,log,default);
+        source=NetworkLaneRuns.NormalizeStreets(source,log);
+        source=StreetJunctionClusters.Prepare(source,log,default);
+        foreach(var line in log.Lines.Where(l=>l.Contains("STREET JUNCTION CLUSTERS",StringComparison.Ordinal)||l.Contains("STREET SPLITS",StringComparison.Ordinal)||l.Contains("MEDIAN LINKS",StringComparison.Ordinal)||l.Contains("TURN SLIPS",StringComparison.Ordinal)))Console.WriteLine(line);
         var obligations=new ImportLog{CaptureRecords=true};
         SourceTopologyObligations.Validate(SourceTopologyObligations.Capture(before),source,obligations,default);
         Directory.CreateDirectory(output);
         File.WriteAllText(Path.Combine(output,"avenues.json"),JsonConvert.SerializeObject(new{
             capture=Path.GetFileName(folder),completeCapturedOsm=true,beforeSections=before.Count,afterSections=source.Count,
             pairs=log.Metric("Opposing road pairs consolidated into avenues"),
+            streetWidthSteps=log.Metric("Street intersection width steps normalized"),
+            intersectionBoxes=log.Metric("Divided street intersection boxes consolidated"),
+            roundaboutWayIds=before.Where(s=>s.Roundabout).Select(s=>s.WayId).Distinct().ToArray(),
             highwayIntervals=log.Metric("Highway coincident intervals consolidated"),
             highwayIntervalDiagnostics=log.Lines.Where(l=>l.Contains("HIGHWAY INTERVAL",StringComparison.Ordinal)).ToArray(),
             missingPorts=obligations.Metric("Missing mandatory selected-source ports"),unresolvedRoutes=obligations.Metric("Unresolved selected-source reachability obligations"),
@@ -40,8 +51,9 @@ static partial class VisualMetricsReplay
         using(var file=File.Create(Path.Combine(output,"street-sections.ndjson.gz")))
         using(var zip=new System.IO.Compression.GZipStream(file,System.IO.Compression.CompressionLevel.Optimal))
         using(var writer=new StreamWriter(zip))foreach(var s in source)writer.WriteLine(JsonConvert.SerializeObject(new{
-            s.WayId,s.StartNodeId,s.EndNodeId,s.Name,s.Reference,s.Classification,s.OneWay,s.Lanes,s.Bridge,s.Tunnel,s.Layer,s.ConsolidatedAvenue,
-            start=new[]{s.Start.x,s.Start.y,s.Start.z},end=new[]{s.End.x,s.End.y,s.End.z},s.SourceWayIds}));
+            s.WayId,s.StartNodeId,s.EndNodeId,s.Kind,s.Name,s.Reference,s.Classification,s.OneWay,s.Lanes,s.Bridge,s.Tunnel,s.Layer,s.Roundabout,s.ConsolidatedAvenue,
+            start=new[]{s.Start.x,s.Start.y,s.Start.z},end=new[]{s.End.x,s.End.y,s.End.z},s.SourceWayIds,
+            geometry=s.SourceGeometry.SelectMany(p=>new[]{p.x,p.z}).ToArray()}));
         Console.WriteLine($"Street replay: {before.Count} -> {source.Count} sections; {log.Metric("Opposing road pairs consolidated into avenues")} pairs; missing ports={obligations.Metric("Missing mandatory selected-source ports")}; unresolved={obligations.Metric("Unresolved selected-source reachability obligations")}");
         if(!design)return;
         void Audit(string stage)

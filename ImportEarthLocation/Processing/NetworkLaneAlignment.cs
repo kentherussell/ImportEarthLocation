@@ -179,6 +179,42 @@ public static class NetworkLaneAlignment
             }
             bundles++;
         }
+        // A two-way road dividing into one-way carriageways: the native node
+        // joins them at its centre. Each carriageway instead continues its own
+        // direction's half, next to the median on its travel-right (right-hand
+        // traffic), and leaves parallel to the two-way road (NetworkLaneSlots
+        // does the same in the visual compiler).
+        var twoWay=new Dictionary<long,List<int>>();
+        for(var i=0;i<result.Length;i++)if(result[i].Kind==NetworkKind.Road&&!result[i].OneWay)
+            foreach(var id in new[]{result[i].StartNodeId,result[i].EndNodeId}){if(!twoWay.TryGetValue(id,out var list))twoWay[id]=list=new();list.Add(i);}
+        var divisions=0;
+        foreach(var node in nodes.OrderBy(p=>p.Key))
+        {
+            token.ThrowIfCancellationRequested();
+            var arms=node.Value;if(!twoWay.TryGetValue(node.Key,out var roads)||!arms.Any(e=>e.start)||!arms.Any(e=>!e.start))continue;
+            foreach(var r in roads)
+            {
+                var road=result[r];var atStart=road.StartNodeId==node.Key;var anchor=atStart?road.Start:road.End;
+                var into=atStart?Heading(road,true):-Heading(road,false);var forward=Heading(road,atStart);
+                float2 Away((int index,bool start) e)=>e.start?Heading(result[e.index],true):-Heading(result[e.index],false);
+                if(road.Bridge||arms.Any(e=>math.dot(Away(e),-into)<.82f||result[e.index].Tunnel!=road.Tunnel||result[e.index].Bridge))continue;
+                var lanes=Lanes(road);var changes=new List<((int index,bool start) Port,float3 Offset)>();
+                foreach(var arm in arms)
+                {
+                    var s=result[arm.index];var travel=Heading(s,arm.start);var normal=new float3(travel.y,0,-travel.x);
+                    var side=(math.dot(travel,forward)>0?lanes.Where(x=>x>0):lanes.Where(x=>x<0).Select(x=>-x)).OrderBy(x=>x).ToArray();
+                    if(side.Length==0){changes.Clear();break;}
+                    var own=Lanes(s);var shift=side.Take(Math.Min(own.Length,side.Length)).Average()-own.Average();
+                    var far=arm.start?s.End:s.Start;
+                    if(Math.Abs(shift)>12||math.dot(far-anchor,normal)*Math.Sign(shift)<-.5f){changes.Clear();break;}
+                    changes.Add((arm,normal*shift));
+                }
+                if(changes.Count==0)continue;
+                foreach(var (port,offset) in changes){Offset(port,offset);directions.Add(new(port.index,port.start,-(double2)into));}
+                divisions++;break;
+            }
+        }
+        log.Count("Lane slots aligned where two-way roads divide",divisions);
         log.Count("Highway lane bundles aligned",bundles);
         log.Diagnostic($"LANE BUNDLES junctions={bundles}; laneOrder=travel-frame-left-to-right; separateNodeIdentitiesCreated=false; noAddedLaneMergeAngleDegrees=20; appliedBeforeVerticalSolve=true");
         // Offset handles and ramp tangents cannot extend past a clipped map end.

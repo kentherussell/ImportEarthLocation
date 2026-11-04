@@ -90,6 +90,22 @@ internal static class RepairTests
         var dryRoad=S(501,501,502,80,140,160,140) with{Start=new(80,53,140),End=new(160,53,140)};
         var nearWaterBed=NetworkRoadbed.Prepare(flat,100,1000,new[]{dryRoad},new[]{triangularWater},Array.Empty<float3[]>(),new ImportLog(),default);
         Check(nearWaterBed[82*128+80]>flat[82*128+80],"Dry road inside the water polygon bounding box was incorrectly protected from cut/fill");
+        // The game reads the ground under a road bilinearly from the four grid
+        // samples around it (7.9 m apart here). Two parallel roads 10 m apart at
+        // heights 2 m apart share those samples, and an approach rising 5% to a
+        // bridge reads samples under the deck; each must read its own deck.
+        float Misread(ushort[] bed,PreparedSegment s,float from,float to)=>Enumerable.Range(0,41).Select(k=>
+        {var p=NetworkNormalizer.Evaluate(s,from+(to-from)*k/40f);return Math.Abs(p.y-NetworkProcessor.Sample(p.x,p.z,bed,100,1000));}).Max();
+        var lower=S(511,511,512,-150,0,150,0) with{Start=new(-150,51,0),End=new(150,51,0)};
+        var upper=S(513,513,514,-150,10,150,10) with{Start=new(-150,53,10),End=new(150,53,10)};
+        var sharedBed=NetworkRoadbed.Prepare(flat,100,1000,new[]{lower,upper},Array.Empty<float3[]>(),Array.Empty<float3[]>(),new ImportLog(),default);
+        var sharedMisread=Math.Max(Misread(sharedBed,lower,.3f,.7f),Misread(sharedBed,upper,.3f,.7f));
+        Check(sharedMisread<.3f,$"Roads sharing terrain samples read the ground {sharedMisread:F2} m off their decks");
+        var approach=S(515,515,516,-200,0,0,0) with{Start=new(-200,46,0),End=new(0,56,0)};
+        var deck=S(517,516,518,0,0,100,0) with{Start=new(0,56,0),End=new(100,61,0),Bridge=true};
+        var abutmentBed=NetworkRoadbed.Prepare(flat,100,1000,new[]{approach,deck},Array.Empty<float3[]>(),Array.Empty<float3[]>(),new ImportLog(),default);
+        var abutmentMisread=Misread(abutmentBed,approach,.95f,1);
+        Check(abutmentMisread<.05f,$"The ground under an approach's last metres before a bridge is {abutmentMisread:F2} m off its deck");
         var tunnel=new[]{S(5,10,11,-300,0,-100,0,NetworkKind.Rail),S(6,11,12,-100,0,100,0,NetworkKind.Rail) with{Tunnel=true},S(7,12,13,100,0,300,0,NetworkKind.Rail)};
         var profiled=RailVerticalProfiles.Prepare(tunnel,flat,100,1000,log,default);
         NetworkContinuity.Validate(tunnel,profiled,log,default);

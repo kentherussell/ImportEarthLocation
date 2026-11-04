@@ -153,7 +153,9 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         AddBinding(new TriggerBinding<string>(BindingGroup, "toggleRoadGroup", value =>
         {
             if(_busy.value || (value!="highways"&&value!="routes"&&value!="streets"))return;
-            _roadLevel^=NetworkSelection.Parse(value);
+            _roadLevel=NetworkSelection.Parse(NetworkSelection.Id(_roadLevel));
+            var mask=NetworkSelection.Parse(value);
+            _roadLevel=(_roadLevel&mask)!=0?_roadLevel&~mask:_roadLevel|mask;
             _roadLevelBinding.Update(NetworkSelection.Id(_roadLevel));
             _log.Diagnostic("ROAD GROUP SELECTION "+NetworkSelection.Summary(_roadLevel,_importRail));
             InvalidatePrepared();SavePreferences();
@@ -655,7 +657,10 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         rawSegments=NetworkLaneRuns.Smooth(rawSegments,log);
         sourceManifest=new SourceManifest(sourceManifest.Chains.ToArray(),SourceTopologyObligations.Capture(rawSegments));
         rawSegments=NetworkOverlapConsolidator.Prepare(rawSegments,log,token);
-        rawSegments = OsmRecovery.Run("avenue-consolidation",()=>AvenueConsolidator.Prepare(rawSegments, log, token),rawSegments,log,token);
+        rawSegments=OsmRecovery.Run("median-links",()=>MedianLinks.Prepare(rawSegments,log,token),rawSegments,log,token);
+        rawSegments=OsmRecovery.Run("trunk-avenues",()=>AvenueConsolidator.PrepareTrunks(rawSegments,log,token),rawSegments,log,token);
+        rawSegments = OsmRecovery.Run("avenue-consolidation",()=>AvenueConsolidator.Prepare(rawSegments, log, token),rawSegments,log,token);        rawSegments=NetworkLaneRuns.NormalizeStreets(rawSegments,log);
+        rawSegments=OsmRecovery.Run("junction-clusters",()=>StreetJunctionClusters.Prepare(rawSegments,log,token),rawSegments,log,token);
         rawSegments = OsmRecovery.Run("roundabouts",()=>RoundaboutPlanner.Prepare(rawSegments,log,token),rawSegments,log,token);
         if(bundle.Request.ImportRail) { progress.Begin("Combining nearby railway tracks"); rawSegments = OsmRecovery.Run("rail-consolidation",()=>RailCorridorConsolidator.Prepare(rawSegments, log, token),rawSegments,log,token); }
         rawSegments=StarterNetworkPolicy.Rail(rawSegments,log,token);
@@ -690,7 +695,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         // Both steps are timed: DC's 50 s geometry validation had no inner log.
         var stepClock=Stopwatch.StartNew();
         aligned=CoordinatedNetworkDesign.UnmappedCrossingBridges(aligned,log,token);
-        aligned=CoordinatedNetworkDesign.CulvertBridges(aligned,WaterBodyPlanner.ShortCulverts(geography,bundle.Request).Concat(WaterBodyPlanner.OpenChannels(geography,bundle.Request)).ToArray(),(int)Math.Sqrt(terrain.Heightmap.Length),
+        aligned=CoordinatedNetworkDesign.CulvertBridges(aligned,WaterBodyPlanner.BuriedChannels(geography,bundle.Request,water.WaterCellSize).Concat(WaterBodyPlanner.OpenChannels(geography,bundle.Request,water.WaterCellSize)).ToArray(),(int)Math.Sqrt(terrain.Heightmap.Length),
             bundle.Request.MapSize.WidthMeters,log,token);
         water=WaterBodyPlanner.Revalidate(water,terrain,bundle.Request.MapSize.WidthMeters,log,token,aligned,progress.Detail);
         if(water.ConditionedHeightmap!=null)terrain=terrain with{Heightmap=water.ConditionedHeightmap};
@@ -834,6 +839,7 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
             // Fast Road Design also keeps unit cuts from leaving pieces shorter than
             // the class minimum segment.
             sections=NativeDesignUnits.Prepare(sections,result.NativeAssets,log,token,compiled?s=>VisualCompilerTable.For(s).MinimumSegment:null);
+            sections=NativeEndpointPolicy.PrepareLevelCrossings(sections,log);
             SourceTopologyObligations.Validate(result.Source?.Topology,sections,log,token);
             NetworkQualityAudit.Planned(sections,log,token,result.Source?.Topology!=null);
             var portDegrees=sections.SelectMany(s=>new[]{new SourceNodeKey(s.Kind,s.StartNodeId),new SourceNodeKey(s.Kind,s.EndNodeId)})
@@ -890,6 +896,8 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
         },token);
     }
 
+    private const int VegetationCeiling=2_500_000;
+
     private Task<ProcessedBundle> FinalizeVegetationAsync(ProcessedBundle result,CancellationToken token)
     {
         var log=_log;var progress=_progress;
@@ -902,12 +910,22 @@ public sealed partial class ImportEarthLocationUISystem : UISystemBase
             {
                 var waterSurface=WaterBodyPlanner.ConstructedSurfaceSampler(result.Water,result.HabitatPolygons);
                 if(result.ForestData!=null)trees=ForestProcessor.Prepare(result.ForestData,result.Download.Request,result.Terrain,result.Segments,log,token,
-                    excludeWater:p=>waterSurface(p) is float level&&p.y<=level+.5f);
+                    excludeWater:p=>waterSurface(p) is float level&&p.y<=level+.5f,climate:result.Download.Climate);
                 vegetation=VegetationPlanner.Prepare(result.ForestData,trees,result.Download.Request,
                     result.Terrain,result.Segments,result.HabitatPolygons,result.Water,result.Download.Climate,log,token,waterSurface);
                 // The density slider keeps a share of the plan, chosen by each
                 // candidate's own seed so the thinning is even and repeatable.
                 var density=result.Download.Request.VegetationDensity;
+                // Above VegetationCeiling the same hash thins the whole plan
+                // evenly. The editor's hierarchy copies every entity each update
+                // and crashed natively at about 3.86 M trees (DC, 6 m spacing,
+                // 4.3 M planned); imports up to about 3.2 M objects completed.
+                if(vegetation.Count*density>VegetationCeiling)
+                {
+                    var share=VegetationCeiling/(float)vegetation.Count;
+                    log.Evidence($"Vegetation ceiling: {vegetation.Count:N0} planned trees and bushes at {density:P0} exceed {VegetationCeiling:N0}; density lowered to {share:P0}.");
+                    density=share;
+                }
                 if(density<1&&vegetation.Count>0)
                 {
                     var kept=vegetation.Where(c=>(Unity.Mathematics.math.hash(new Unity.Mathematics.uint2(c.Seed,0x7E5u))&0xFFFF)/65536f<density).ToArray();

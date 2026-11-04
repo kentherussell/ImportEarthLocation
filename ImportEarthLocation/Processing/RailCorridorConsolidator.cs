@@ -279,6 +279,33 @@ public static class RailCorridorConsolidator
             return math.normalizesafe(atStart?((double3)s.CourseControl1-(double3)s.CourseStart).xz:((double3)s.CourseControl2-(double3)s.CourseEnd).xz);
         }
         var removed=new HashSet<int>();var extraWays=new Dictionary<int,List<long>>();var aliases=new List<SourceNodeAlias>();var retarget=new Dictionary<long,long>();
+        int Live(long id)=>adjacency[id].Count(x=>!removed.Contains(x));
+        // Removes route c. Its ways go onto the alternative path, or for a spur
+        // onto every route still at its junction; its interior nodes become
+        // aliases of the nearer end, and a spur's dead end follows it to the
+        // junction it left.
+        void Drop(int c,List<int>? path)
+        {
+            var chain=chains[c];removed.Add(c);
+            // Ways this route took over from routes removed before it travel on too.
+            var ways=chain.Sections.SelectMany(i=>source[i].SourceWayIds.Append(source[i].WayId).Concat(extraWays.TryGetValue(i,out var inherited)?inherited:Enumerable.Empty<long>())).Distinct().ToList();
+            if(path==null)path=adjacency[Live(chain.A)>0?chain.A:chain.B].Where(x=>!removed.Contains(x)).ToList();
+            var spur=!(Live(chain.A)>0&&Live(chain.B)>0);
+            foreach(var x in path)foreach(var i in chains[x].Sections){if(!extraWays.TryGetValue(i,out var list))extraWays[i]=list=new();list.AddRange(ways);}
+            aliases.AddRange(chain.Sections.SelectMany(i=>source[i].SourceNodeAliases));
+            var station=0d;
+            for(var k=0;k<chain.Interior.Count;k++)
+            {
+                station+=Length(source[chain.Sections[k]]);var end=spur?(Live(chain.A)>0?chain.A:chain.B):station<=lengths[c]/2?chain.A:chain.B;
+                retarget[chain.Interior[k]]=end;aliases.Add(new SourceNodeAlias(chain.Interior[k],end,true));
+            }
+            if(log.DiagnosticsEnabled)log.Diagnostic($"RAIL OVERLAPPING ROUTE removed ends={chain.A},{chain.B}; liveAfter={Live(chain.A)},{Live(chain.B)}; interior={string.Join(",",chain.Interior)}; spur={spur}; lengthMeters={lengths[c]:0.#}; alternativeRoutes={path.Count}");
+            // A surviving end may have been a junction only because of this route;
+            // declaring it its own alias target keeps it as a node and a port.
+            foreach(var id in new[]{chain.A,chain.B})if(Live(id)>0&&!aliased.Contains(id)&&!retarget.ContainsKey(id))aliases.Add(new SourceNodeAlias(id,id,true));
+            if(spur)foreach(var id in new[]{chain.A,chain.B})if(Live(id)==0)
+            {var end=id==chain.A?chain.B:chain.A;retarget[id]=end;aliases.Add(new SourceNodeAlias(id,end,true));}
+        }
         // A connector becomes a spur only once a route beside it has gone (a
         // ladder's last rung: Marseille 9208479591, DC Union Station throat), so
         // candidates are revisited until a pass removes nothing.
@@ -337,32 +364,29 @@ public static class RailCorridorConsolidator
             // bend more than maximumBend there (before design a fillet smooths a
             // moderate bend; afterwards any bend is a kink). A stub's junction keeps
             // the through track it already had, so its bend is not new.
-            if(!stubs.Contains(c)&&new[]{chain.A,chain.B}.Any(id=>
+            bool Bends(long id,params int[] going)
             {
-                var rest=adjacency[id].Where(x=>x!=c&&!removed.Contains(x)).ToArray();if(rest.Length!=2)return false;
+                var rest=adjacency[id].Where(x=>!going.Contains(x)&&!removed.Contains(x)).ToArray();if(rest.Length!=2)return false;
                 var a=Away(rest[0],id);var b=Away(rest[1],id);return math.dot(a,b)>-Math.Cos(math.radians(maximumBend));
-            }))continue;
-            removed.Add(c);
-            // Ways this route took over from routes removed before it travel on too.
-            var ways=chain.Sections.SelectMany(i=>source[i].SourceWayIds.Append(source[i].WayId).Concat(extraWays.TryGetValue(i,out var inherited)?inherited:Enumerable.Empty<long>())).Distinct().ToList();
-            // A spur's ways stay on every route still at its junction.
-            if(path==null)path=adjacency[live(chain.A)>0?chain.A:chain.B].Where(x=>!removed.Contains(x)).ToList();
-            var spur=!(live(chain.A)>0&&live(chain.B)>0);
-            foreach(var x in path)foreach(var i in chains[x].Sections){if(!extraWays.TryGetValue(i,out var list))extraWays[i]=list=new();list.AddRange(ways);}
-            aliases.AddRange(chain.Sections.SelectMany(i=>source[i].SourceNodeAliases));
-            var station=0d;
-            for(var k=0;k<chain.Interior.Count;k++)
-            {
-                station+=Length(source[chain.Sections[k]]);var end=spur?(live(chain.A)>0?chain.A:chain.B):station<=lengths[c]/2?chain.A:chain.B;
-                retarget[chain.Interior[k]]=end;aliases.Add(new SourceNodeAlias(chain.Interior[k],end,true));
             }
-            // A spur's dead end follows it to the junction it left.
-            if(log.DiagnosticsEnabled)log.Diagnostic($"RAIL OVERLAPPING ROUTE removed ends={chain.A},{chain.B}; liveAfter={live(chain.A)},{live(chain.B)}; interior={string.Join(",",chain.Interior)}; spur={spur}; lengthMeters={lengths[c]:0.#}; alternativeRoutes={path.Count}");
-            // A surviving end may have been a junction only because of this route;
-            // declaring it its own alias target keeps it as a node and a port.
-            foreach(var id in new[]{chain.A,chain.B})if(live(id)>0&&!aliased.Contains(id)&&!retarget.ContainsKey(id))aliases.Add(new SourceNodeAlias(id,id,true));
-            if(spur)foreach(var id in new[]{chain.A,chain.B})if(live(id)==0)
-            {var end=id==chain.A?chain.B:chain.A;retarget[id]=end;aliases.Add(new SourceNodeAlias(id,end,true));}
+            if(!stubs.Contains(c)&&new[]{chain.A,chain.B}.Any(id=>Bends(id,c)))continue;
+            // An end that stays with one other route would become a dead end of
+            // it, once an earlier removal has taken a third route off that switch
+            // (Marseille Saint-Charles, DC Union Station: seven new dead ends,
+            // each a former switch). That route goes too if it is a spur of at
+            // most SpurLength to a junction that keeps two routes without a new
+            // bend; otherwise this route stays.
+            const double SpurLength=60;var spurs=new List<int>();var refused=false;
+            foreach(var id in new[]{chain.A,chain.B}.Where(id=>live(id)==2))
+            {
+                var r=adjacency[id].First(x=>x!=c&&!removed.Contains(x));var o=chains[r].A==id?chains[r].B:chains[r].A;
+                if(chains[r].A==chains[r].B||lengths[r]>SpurLength||live(o)<3||spurs.Contains(r)||chains[r].Interior.Any(roadNodes.Contains)||Bends(o,c,r))
+                {refused=true;break;}
+                spurs.Add(r);
+            }
+            if(refused)continue;
+            Drop(c,path);
+            foreach(var r in spurs)Drop(r,null);
         }
         if(removed.Count==before)break;
         }

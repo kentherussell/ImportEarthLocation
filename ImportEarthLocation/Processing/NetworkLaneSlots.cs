@@ -38,11 +38,99 @@ public static class NetworkLaneSlots
             { var id = start ? s.StartNodeId : s.EndNodeId; if (!ports.TryGetValue(id, out var list)) ports[id] = list = new(); list.Add((i, start)); }
         }
         var degree = source.SelectMany(s => new[] { s.StartNodeId, s.EndNodeId }).GroupBy(id => id).ToDictionary(g => g.Key, g => g.Count());
+        var twoWay = new Dictionary<long, List<int>>();
+        for (var i = 0; i < source.Count; i++)
+        {
+            var s = source[i]; if (s.Kind != NetworkKind.Road || s.OneWay) continue;
+            foreach (var id in new[] { s.StartNodeId, s.EndNodeId }) { if (!twoWay.TryGetValue(id, out var list)) twoWay[id] = list = new(); list.Add(i); }
+        }
         float[] Lanes(PreparedSegment s) => s.NativeLaneOffsets.Count > 0 ? s.NativeLaneOffsets.OrderBy(x => x).ToArray() :
             Enumerable.Range(0, Math.Max(1, s.Lanes)).Select(k => (k - (Math.Max(1, s.Lanes) - 1) * .5f) * 4f).ToArray();
         // Travel direction at the port, pointing along the road's travel.
         float2 Travel(PreparedSegment s, bool start) => math.normalizesafe(start ? (s.CourseControl1 - s.CourseStart).xz : (s.CourseEnd - s.CourseControl2).xz);
-        var aligned = 0; var shifted = 0; var skipped = 0; var widths = 0;
+        var aligned = 0; var shifted = 0; var skipped = 0; var widths = 0; var divided = 0; var undivided = 0; var wideDivisions = 0; var centred = new SortedDictionary<string, int>();
+        int Centred(string reason) { centred[reason] = centred.TryGetValue(reason, out var n) ? n + 1 : 1; return -1; }
+        // A two-way road dividing into one-way carriageways (an avenue or a
+        // divided highway beginning). The native node joins them at its centre,
+        // so each carriageway met the middle of the two-way road and the two
+        // overlapped there. Each instead continues its own direction's half: its
+        // end moves onto that half's lanes next to the median, on its travel-right
+        // (right-hand traffic), across the two-way road's axis. Along the
+        // carriageway its course blends from that lane position back to its own:
+        // a point d along it, at lateral position y, moves to h·w + y·(1 - w),
+        // w = 1 - 3x² + 2x³, x = d/Taper(h), where h is the lane position. The
+        // blend never leaves the range between the two, so a course already near
+        // the half (AvenueConsolidator's merged-trunk transitions, or the
+        // compiler's fork clearance) is not pushed further out; w reaches 0
+        // early at the first node that is not a plain continuation. Returns 1
+        // when aligned, -1 when the arms continue the road but cannot be placed,
+        // 0 when this is not a division.
+        int Divide(List<(int Index, bool Start)> arms, PreparedSegment road, long id)
+        {
+            var atStart = road.StartNodeId == id; var anchor = atStart ? road.CourseStart : road.CourseEnd;
+            // Pointing from the node into the two-way road.
+            var into = math.normalizesafe(atStart ? (road.CourseControl1 - road.CourseStart).xz : (road.CourseControl2 - road.CourseEnd).xz);
+            var forward = math.normalizesafe(atStart ? (road.CourseControl1 - road.CourseStart).xz : (road.CourseEnd - road.CourseControl2).xz);
+            float2 Away((int Index, bool Start) p) { var s = source[p.Index]; return math.normalizesafe(p.Start ? (s.CourseControl1 - s.CourseStart).xz : (s.CourseControl2 - s.CourseEnd).xz); }
+            if (!arms.Any(p => p.Start) || !arms.Any(p => !p.Start) || arms.Any(p => math.dot(Away(p), -into) < ParallelCosine || source[p.Index].Tunnel != road.Tunnel)) return 0;
+            if (road.FinalDeckCurve != null || arms.Any(p => source[p.Index].FinalDeckCurve != null)) return Centred("deck");
+            // Bridge decks and abutments keep their native alignment.
+            if (road.Bridge || arms.Any(p => source[p.Index].Bridge)) return Centred("bridge");
+            var lanes = Lanes(road); var changes = new List<(float3 Offset, double Shift, List<(int Index, bool AtNode, double From, double Length)> Chain, double Reach)>();
+            foreach (var arm in arms)
+            {
+                var s = source[arm.Index];
+                // Travel along the two-way road's axis, and its right-hand side.
+                var travel = math.dot(Travel(s, arm.Start), forward) > 0 ? forward : -forward; var normal = new float2(travel.y, -travel.x);
+                // Two-way lane offsets are in the road's own right-hand frame;
+                // the lanes on this travel's right are the other half when it
+                // runs against the road's direction.
+                var half = (math.dot(travel, forward) > 0 ? lanes.Where(x => x > 0) : lanes.Where(x => x < 0).Select(x => -x)).OrderBy(x => x).ToArray();
+                var own = Lanes(s); if (half.Length == 0) return Centred("lanes");
+                var shift = half.Take(Math.Min(own.Length, half.Length)).Average() - own.Average();
+                // A carriageway on the other side (left-hand traffic, or one
+                // crossing over) is never pulled across; one leaving along the
+                // axis is placed on its half.
+                var length = Math.Max(1, NetworkDesignChecks.HorizontalArcLength(new(s.CourseStart, s.CourseControl1, s.CourseControl2, s.CourseEnd)));
+                var probe = NetworkNormalizer.Evaluate(s, arm.Start ? (float)Math.Min(1, 30 / length) : 1 - (float)Math.Min(1, 30 / length));
+                if (Math.Abs(shift) > MaximumShift) return Centred("shift");
+                if (math.dot(probe.xz - anchor.xz, normal) * Math.Sign(shift) < -.5f) return Centred("side");
+                // Plain continuations from the node: (index, entered at its start, distance at entry, length).
+                var chain = new List<(int Index, bool AtNode, double From, double Length)>(); var index = arm.Index; var atNode = arm.Start; var covered = 0d; var seen = new HashSet<int>();
+                var reach = Taper(shift);
+                while (seen.Add(index))
+                {
+                    var section = result[index]; var span = NetworkDesignChecks.HorizontalArcLength(new(section.CourseStart, section.CourseControl1, section.CourseControl2, section.CourseEnd));
+                    chain.Add((index, atNode, covered, span)); covered += span;
+                    if (covered >= reach) break;
+                    var farId = atNode ? section.EndNodeId : section.StartNodeId;
+                    if (!ports.TryGetValue(farId, out var far) || far.Count != 2 || degree[farId] != 2) { reach = covered; break; }
+                    var next = far.First(p => p.Index != index);
+                    if (next.Start != atNode || source[next.Index].Tunnel != section.Tunnel) { reach = covered; break; }
+                    index = next.Index; atNode = next.Start;
+                }
+                // Easing a shift h out over L curves the course at a radius of
+                // about L²/6h; below 40 m a short split (a roundabout flare, or
+                // one ending at a junction or structure) keeps meeting the centre.
+                if (reach < Math.Max(20, Math.Sqrt(240 * Math.Abs(shift)))) return Centred("short");
+                changes.Add((new float3(normal.x, 0, normal.y) * shift, shift, chain, reach));
+            }
+            foreach (var (offset, shift, chain, reach) in changes)
+            {
+                float Weight(double d) { var x = Math.Min(1, d / reach); return (float)(1 - 3 * x * x + 2 * x * x * x); }
+                var across = offset / (float)shift;
+                float3 Blend(float3 p, double d) => across * (float)(shift - math.dot((p - anchor).xz, across.xz)) * Weight(d);
+                foreach (var (i, near, from, span) in chain)
+                {
+                    var s = result[i];
+                    var a = Blend(near ? s.CourseStart : s.CourseEnd, from); var b = Blend(near ? s.CourseEnd : s.CourseStart, from + span);
+                    result[i] = near ? s with { StartCurveOffset = s.StartCurveOffset + a, EndCurveOffset = s.EndCurveOffset + b }
+                        : s with { EndCurveOffset = s.EndCurveOffset + a, StartCurveOffset = s.StartCurveOffset + b };
+                    shifted++;
+                }
+            }
+            return 1;
+        }
         void Bend((int Index, bool Start) port, float2 shift)
         {
             var offset = new float3(shift.x, 0, shift.y);
@@ -109,6 +197,15 @@ public static class NetworkLaneSlots
                 widths++;
                 continue;
             }
+            if (twoWay.TryGetValue(node.Key, out var receivers))
+            {
+                // Side streets may share the node; the receiver is the two-way
+                // road that every one-way arm continues.
+                var outcome = receivers.Select(r => Divide(list, source[r], node.Key)).FirstOrDefault(o => o != 0);
+                if (outcome > 0) { divided++; continue; }
+                if (outcome < 0) { skipped++; undivided++; continue; }
+                if (list.Any(p => p.Start) && list.Any(p => !p.Start)) wideDivisions++;
+            }
             if (list.Count < 3) continue;
             var inputs = list.Where(p => !p.Start).ToArray(); var outputs = list.Where(p => p.Start).ToArray();
             var merging = outputs.Length == 1 && inputs.Length >= 2; var splitting = inputs.Length == 1 && outputs.Length >= 2;
@@ -146,7 +243,8 @@ public static class NetworkLaneSlots
         }
         log.Count("Lane slots aligned at merges and splits", aligned);
         log.Count("Lane slots aligned where lanes are added or dropped", widths);
-        log.Diagnostic($"LANE SLOTS mergesAndSplits={aligned}; laneCountChanges={widths}; branchEndsShifted={shifted}; skippedNotParallelOrAmbiguous={skipped}; maximumShiftMeters={MaximumShift}");
+        log.Count("Lane slots aligned where two-way roads divide", divided);
+        log.Diagnostic($"LANE SLOTS mergesAndSplits={aligned}; laneCountChanges={widths}; twoWayDivisions={divided}; twoWayDivisionsLeftCentred={undivided}; oneWayPairsAtTwoWayNotParallel={wideDivisions}; leftCentredBecause={string.Join(",", centred.Select(p => p.Key + ":" + p.Value))}; branchEndsShifted={shifted}; skippedNotParallelOrAmbiguous={skipped}; maximumShiftMeters={MaximumShift}");
         return result;
     }
 }

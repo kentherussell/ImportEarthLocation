@@ -69,7 +69,7 @@ public sealed class NativeNetworkPlacement
     private readonly Dictionary<(NetworkKind Kind,long WayId,long Start,long End),PreparedSegment> _sourceRoutes=new();
     // A shared source node at a bridge/tunnel portal is a real connection. Grade-separated
     // crossings with different source node IDs remain isolated, even at coincident positions.
-    private static string Identity(PreparedSegment segment, long node) => $"{segment.Kind}:{node}";
+    private static string Identity(PreparedSegment segment, long node) => NativeEndpointPolicy.Identity(segment,node);
 
     public void BeginBatch(int startIndex,int attempt,int count,bool preflight=false)
     {

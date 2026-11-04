@@ -128,14 +128,14 @@ public static class WaterBodyPlanner
     {
         if(water.ReachStages.Count==0)return SurfaceSampler(water,polygons);
         var reaches=water.ReachStages.Where(r=>r.PolygonId.HasValue).Concat(water.ReachStages.Select(r=>r with{
-            HalfWidth=Math.Max(r.HalfWidth,water.WaterCellSize),PolygonId=null})).ToArray();
+            HalfWidth=Math.Max(r.HalfWidth,water.WaterCellSize)/.6f,PolygonId=null})).ToArray();
         return SurfaceSampler(water with{ReachStages=reaches},polygons);
     }
     // reference=true answers with the original single-grid scan and no
     // prefilter, so tests can prove the indexed sampler gives the same answers.
     internal static Func<float3,float?> SurfaceSampler(WaterPlan water,IReadOnlyList<GeographicPolygon> polygons,bool reference)
     {
-        var masks=polygons.Where(p=>!Canal(p.Tags)).Where(p=>p.Tags.TryGetValue("natural",out var n)&&n=="water"||p.Tags.TryGetValue("waterway",out var w)&&w=="riverbank"||p.Tags.TryGetValue("landuse",out var l)&&l=="reservoir").Where(p=>p.Outer.Any(r=>r.Length>0))
+        var masks=polygons.Where(p=>!ExcludedChannel(p.Tags)).Where(p=>p.Tags.TryGetValue("natural",out var n)&&n=="water"||p.Tags.TryGetValue("waterway",out var w)&&w=="riverbank"||p.Tags.TryGetValue("landuse",out var l)&&l=="reservoir").Where(p=>p.Outer.Any(r=>r.Length>0))
             .Select((p,i)=>new Area(p,i,default)).ToArray();
         var maskIndex=new AreaIndex(masks);
         var flat=water.AreaStages.GroupBy(s=>s.BodyId).ToDictionary(g=>g.Key,g=>g.Min(s=>s.Level));
@@ -236,21 +236,82 @@ public static class WaterBodyPlanner
             return result;
         };
     }
-    // A waterway culvert or tunnel shorter than this (metres) carries a river
-    // under a road, embankment, interchange or rail yard; it stays in the river
-    // network so the river is not cut in two there. At 60 m, streams passing
-    // under motorway interchanges were cut into dry, disconnected reaches.
-    // Longer ones are buried rivers (Marseille's Jarret runs covered for
-    // kilometres, under the boulevard built on it) and must not become open
-    // channels.
-    public const float CulvertLength=250;
-    private static readonly string[] Waterways={"river","stream","drain","ditch"};
-    private static bool Canal(IReadOnlyDictionary<string,string> tags)=>
-        tags.TryGetValue("waterway",out var way)&&way=="canal"||tags.TryGetValue("water",out var water)&&water=="canal";
+    // The import represents mapped buried rivers as surface channels. Crossings
+    // must span the constructed cut, including its feathered banks, rather than
+    // the often much narrower mapped waterway width.
+    private static readonly string[] Waterways={"river","drain","ditch"};
+    private static bool ExcludedChannel(IReadOnlyDictionary<string,string> tags)=>
+        tags.TryGetValue("waterway",out var way)&&way is "canal" or "stream"||tags.TryGetValue("water",out var water)&&water is "canal" or "stream";
     // A dry, abandoned channel keeps its waterway tag in OSM; Marseille's
     // abandoned branches of its canal were carved as trenches across hillsides.
     private static bool Abandoned(IReadOnlyDictionary<string,string> tags)=>
         tags.TryGetValue("abandoned",out var a)&&a=="yes"||tags.TryGetValue("disused",out var d)&&d=="yes";
+    private static bool Buried(IReadOnlyDictionary<string,string> tags)=>tags.TryGetValue("tunnel",out var tunnel)&&tunnel!="no";
+    private static float ChannelExtent(IReadOnlyDictionary<string,string> tags,float cell)
+    {
+        var fallback=tags["waterway"]=="river"?32:12;var width=NetworkEvidence.Measure(tags,"width")??fallback;
+        if(!math.isfinite(width)||width<=0||width>2048)width=fallback;
+        return Math.Max(width*.5f,cell)/.6f;
+    }
+
+    // Repair only small breaks supported by both identity and downstream
+    // direction. Never jump across a mapped canal, intermittent reach or tunnel.
+    // The input dataset is shared with other planners and remains immutable.
+    private static OsmDataset ConnectRiverEndpoints(OsmDataset data,ImportRequest request,ImportLog? log=null,CancellationToken token=default)
+    {
+        const float maximumGap=28,alignment=.8660254f;
+        var ways=data.Ways.Values.Where(w=>w.Tags.TryGetValue("waterway",out var kind)&&Waterways.Contains(kind)&&!ExcludedChannel(w.Tags)&&!Abandoned(w.Tags)&&
+            !(w.Tags.TryGetValue("intermittent",out var dry)&&dry=="yes")&&w.NodeIds.Length>1&&w.NodeIds.All(data.Nodes.ContainsKey)).OrderBy(w=>w.Id).ToArray();
+        var incoming=new HashSet<long>();var outgoing=new HashSet<long>();
+        // Excluded evidence is still a real connection: do not invent a bypass.
+        foreach(var w in data.Ways.Values.Where(w=>w.Tags.ContainsKey("waterway")))for(var i=1;i<w.NodeIds.Length;i++)
+        {outgoing.Add(w.NodeIds[i-1]);incoming.Add(w.NodeIds[i]);}
+        float3 Local(long id){var p=data.Nodes[id];return GeoMath.ToLocalMeters(p.Latitude,p.Longitude,request.Latitude,request.Longitude);}
+        var heads=new Dictionary<(int,int),List<OsmWay>>();
+        (int,int) Key(float3 p)=>((int)Math.Floor(p.x/maximumGap),(int)Math.Floor(p.z/maximumGap));
+        foreach(var w in ways)
+        {
+            token.ThrowIfCancellationRequested();if(incoming.Contains(w.NodeIds[0]))continue;
+            var key=Key(Local(w.NodeIds[0]));if(!heads.TryGetValue(key,out var list))heads[key]=list=new();list.Add(w);
+        }
+        var matches=new List<(OsmWay From,OsmWay To)>();
+        foreach(var w in ways)
+        {
+            token.ThrowIfCancellationRequested();var end=w.NodeIds[w.NodeIds.Length-1];if(outgoing.Contains(end))continue;
+            var a=Local(end);var direction=math.normalizesafe((a-Local(w.NodeIds[w.NodeIds.Length-2])).xz);var (cx,cz)=Key(a);
+            var candidates=new List<OsmWay>();
+            for(var dx=-1;dx<=1;dx++)for(var dz=-1;dz<=1;dz++)if(heads.TryGetValue((cx+dx,cz+dz),out var list))foreach(var other in list)
+            {
+                if(other.Id==w.Id||w.NodeIds.Contains(other.NodeIds[0]))continue;
+                var b=Local(other.NodeIds[0]);var distance=math.distance(a.xz,b.xz);if(distance>maximumGap)continue;
+                if(distance>2&&(!w.Tags.TryGetValue("name",out var name)||string.IsNullOrWhiteSpace(name)||
+                    !other.Tags.TryGetValue("name",out var otherName)||!string.Equals(name,otherName,StringComparison.OrdinalIgnoreCase)))continue;
+                if(w.Tags.TryGetValue("name",out var left)&&other.Tags.TryGetValue("name",out var right)&&!string.Equals(left,right,StringComparison.OrdinalIgnoreCase))continue;
+                var next=math.normalizesafe((Local(other.NodeIds[1])-b).xz);
+                if(math.dot(direction,next)<alignment)continue;
+                if(distance>.1f&&(math.dot(direction,(b-a).xz/distance)<alignment||math.dot(next,(b-a).xz/distance)<alignment))continue;
+                candidates.Add(other);
+            }
+            if(candidates.Count==1)matches.Add((w,candidates[0]));
+        }
+        var unique=matches.GroupBy(m=>m.To.Id).Where(g=>g.Count()==1).Select(g=>g.Single()).ToArray();
+        if(unique.Length==0)return data;
+        var revised=data.Ways.ToDictionary(p=>p.Key,p=>p.Value);
+        var parents=ways.ToDictionary(w=>w.Id,w=>w.Id);var nodeOwners=new Dictionary<long,long>();
+        long Root(long id){while(parents[id]!=id)id=parents[id]=parents[parents[id]];return id;}
+        foreach(var w in ways)foreach(var id in w.NodeIds)
+            if(nodeOwners.TryGetValue(id,out var other))parents[Root(w.Id)]=Root(other);else nodeOwners[id]=w.Id;
+        var connected=0;
+        foreach(var (upstream,downstream) in unique)
+        {
+            token.ThrowIfCancellationRequested();var a=Root(upstream.Id);var b=Root(downstream.Id);if(a==b)continue;parents[a]=b;
+            revised[upstream.Id]=upstream with{NodeIds=upstream.NodeIds.Concat(new[]{downstream.NodeIds[0]}).ToArray()};connected++;
+            log?.Diagnostic($"WATER ENDPOINT CONNECTION upstreamWay={upstream.Id}; downstreamWay={downstream.Id}; gapMeters={math.distance(Local(upstream.NodeIds[upstream.NodeIds.Length-1]).xz,Local(downstream.NodeIds[0]).xz):R}; maximumGapMeters={maximumGap}; identityAndDirectionChecked=true; originalEvidenceUnchanged=true");
+        }
+        log?.Count("Water endpoint gaps connected",connected);
+        return new OsmDataset{Nodes=data.Nodes,NodeTags=data.NodeTags,Ways=revised,Relations=data.Relations,SupportWayIds=data.SupportWayIds,
+            RawWayTags=data.RawWayTags,MalformedFeaturesSkipped=data.MalformedFeaturesSkipped};
+    }
 
     // One sample along a waterway's line: its place on the clipped edge A–B
     // (and the next sample on that edge, if any), its distance along the way,
@@ -258,62 +319,58 @@ public static class WaterBodyPlanner
     // its dry bank probes with the lower bank's height, and the mapped
     // river polygon it lies in.
     private readonly record struct ChannelSample(float3 P,float3 A,float3 B,float3? Next,float Station,long Node,
-        float Bank,IReadOnlyList<float3> Banks,Area? Area,float Reach,float Channel,float SourceWidth);
+        float Bank,IReadOnlyList<float3> Banks,Area? Area,float Reach,float Channel,float SourceWidth,bool Bankless);
 
-    // The waterways that make up the river network: rivers and streams,
+    // The waterways that make up the river network: rivers,
     // and every ditch or drain connected to one through shared nodes, whatever
     // its width, so a river carried for a stretch by a narrow drain stays one
     // river. A ditch network touching none (field drainage) is left out unless
     // mapped at least a water cell (28 m) wide: alone it never holds a source
     // and was carved as a row of dry pits. Abandoned, disused and intermittent
-    // waterways and canals are excluded; the culvert length rule is the caller's.
+    // waterways and canals are excluded. Buried reaches retain connectivity.
     private static HashSet<long> RiverNetwork(OsmDataset data)
     {
-        var candidates=data.Ways.Values.Where(w=>w.Tags.TryGetValue("waterway",out var type)&&Waterways.Contains(type)&&!Canal(w.Tags)&&!Abandoned(w.Tags)&&
+        var candidates=data.Ways.Values.Where(w=>w.Tags.TryGetValue("waterway",out var type)&&Waterways.Contains(type)&&!ExcludedChannel(w.Tags)&&!Abandoned(w.Tags)&&
             !(w.Tags.TryGetValue("intermittent",out var intermittent)&&intermittent=="yes")&&w.NodeIds.Length>1&&w.NodeIds.All(data.Nodes.ContainsKey)).ToArray();
         var parent=candidates.ToDictionary(w=>w.Id,w=>w.Id);
         long Root(long id){while(parent[id]!=id)id=parent[id]=parent[parent[id]];return id;}
         var owner=new Dictionary<long,long>();
         foreach(var w in candidates)foreach(var node in w.NodeIds)
             if(owner.TryGetValue(node,out var other)){var a=Root(w.Id);var b=Root(other);if(a!=b)parent[a]=b;}else owner[node]=w.Id;
-        var main=new HashSet<long>(candidates.Where(w=>w.Tags["waterway"] is "river" or "stream").Select(w=>Root(w.Id)));
+        var main=new HashSet<long>(candidates.Where(w=>w.Tags["waterway"]=="river").Select(w=>Root(w.Id)));
         return new HashSet<long>(candidates.Where(w=>main.Contains(Root(w.Id))||NetworkEvidence.Measure(w.Tags,"width")>=28).Select(w=>w.Id));
     }
 
-    // Short culverts as local polylines with their channel half width (metres):
-    // the width tag, or 16 m for a river and 6 m otherwise, as for open reaches.
-    public static IReadOnlyList<(float3[] Line,float HalfWidth)> ShortCulverts(OsmDataset? data,ImportRequest request)
+    // Mapped buried routes opened at the surface, without a length cutoff.
+    // HalfWidth is the constructed cut's outer radius, in local map metres.
+    public static IReadOnlyList<(float3[] Line,float HalfWidth)> BuriedChannels(OsmDataset? data,ImportRequest request,float waterCellSize=28)
     {
-        if(data==null)return Array.Empty<(float3[],float)>();
+        if(data==null||!math.isfinite(waterCellSize)||waterCellSize<=0)return Array.Empty<(float3[],float)>();
+        data=ConnectRiverEndpoints(data,request);
         var result=new List<(float3[],float)>();var network=RiverNetwork(data);
         foreach(var w in data.Ways.Values.OrderBy(w=>w.Id))
         {
-            if(!network.Contains(w.Id)||!w.Tags.TryGetValue("tunnel",out var tunnel)||tunnel!="yes"&&tunnel!="culvert")continue;
-            var type=w.Tags["waterway"];
+            if(!network.Contains(w.Id)||!Buried(w.Tags))continue;
             var line=w.NodeIds.Select(id=>{var p=data.Nodes[id];return GeoMath.ToLocalMeters(p.Latitude,p.Longitude,request.Latitude,request.Longitude);}).ToArray();
-            var length=0f;for(var i=1;i<line.Length;i++)length+=math.distance(line[i-1].xz,line[i].xz);
-            if(length>=CulvertLength)continue;
-            var width=NetworkEvidence.Measure(w.Tags,"width")??(type=="river"?32:12);
-            result.Add((line,Math.Max(1,(float)width*.5f)));
+            result.Add((line,ChannelExtent(w.Tags,waterCellSize)));
         }
         return result;
     }
 
     // Open waterways of the river network as local polylines with their channel
-    // half width, as for ShortCulverts. A ground road crossing one without a
+    // cut half width, as for BuriedChannels. A ground road crossing one without a
     // bridge or culvert tag is an omission in the map, and its embankment would
     // dam the carved channel; CoordinatedNetworkDesign.CulvertBridges spans it.
-    public static IReadOnlyList<(float3[] Line,float HalfWidth)> OpenChannels(OsmDataset? data,ImportRequest request)
+    public static IReadOnlyList<(float3[] Line,float HalfWidth)> OpenChannels(OsmDataset? data,ImportRequest request,float waterCellSize=28)
     {
-        if(data==null)return Array.Empty<(float3[],float)>();
+        if(data==null||!math.isfinite(waterCellSize)||waterCellSize<=0)return Array.Empty<(float3[],float)>();
+        data=ConnectRiverEndpoints(data,request);
         var result=new List<(float3[],float)>();var network=RiverNetwork(data);
         foreach(var w in data.Ways.Values.OrderBy(w=>w.Id))
         {
-            if(!network.Contains(w.Id)||w.Tags.TryGetValue("tunnel",out var tunnel)&&tunnel!="no")continue;
-            var type=w.Tags["waterway"];
+            if(!network.Contains(w.Id)||Buried(w.Tags))continue;
             var line=w.NodeIds.Select(id=>{var p=data.Nodes[id];return GeoMath.ToLocalMeters(p.Latitude,p.Longitude,request.Latitude,request.Longitude);}).ToArray();
-            var width=NetworkEvidence.Measure(w.Tags,"width")??(type=="river"?32:12);
-            result.Add((line,Math.Max(1,(float)width*.5f)));
+            result.Add((line,ChannelExtent(w.Tags,waterCellSize)));
         }
         return result;
     }
@@ -322,6 +379,7 @@ public static class WaterBodyPlanner
         TerrainBuilder.Result terrain,ImportLog log,CancellationToken token,float cell,Action<string>? progress=null)
     {
         if(data==null||!math.isfinite(cell)||cell<=0)return new WaterPlan(false,0,0,0,"Water evidence or native grid unavailable; water preparation cannot be verified.");
+        data=ConnectRiverEndpoints(data,request,log,token);
         var width=(float)request.MapSize.WidthMeters;var half=width*.5f;var n=(int)Math.Sqrt(terrain.Heightmap.Length);
         var spacing=width/(n-1);var conditioned=(ushort[])terrain.Heightmap.Clone();var editMask=new byte[conditioned.Length];var editCount=0;var sources=new List<RiverSourcePlan>();
         var areaStages=new List<WaterAreaStage>();var reachStages=new List<WaterReachStage>();
@@ -342,7 +400,7 @@ public static class WaterBodyPlanner
         float Height(float3 p)=>NetworkProcessor.Sample(p.x,p.z,conditioned,terrain.HeightScaleMeters,width);
         float BankHeight(float3 p)=>NetworkProcessor.Sample(p.x,p.z,terrain.Heightmap,terrain.HeightScaleMeters,width);
         float3 Local(long id){var p=data.Nodes[id];return GeoMath.ToLocalMeters(p.Latitude,p.Longitude,request.Latitude,request.Longitude);}
-        var areas=polygons.Where(p=>!Canal(p.Tags)).Where(p=>Tag(p.Tags,"natural","water")||Tag(p.Tags,"waterway","riverbank")||Tag(p.Tags,"landuse","reservoir"))
+        var areas=polygons.Where(p=>!ExcludedChannel(p.Tags)).Where(p=>Tag(p.Tags,"natural","water")||Tag(p.Tags,"waterway","riverbank")||Tag(p.Tags,"landuse","reservoir"))
             .Where(p=>p.Outer.Any(r=>r.Length>0)).Select((p,i)=>{Pulse();return new Area(p,i,token,()=>Pulse());}).ToArray();
         var areaIndex=new AreaIndex(areas,token);var holeIndex=new AreaIndex(areas.Where(a=>a.HasHoles),token);
         bool Coastal(Area a)=>Tag(a.Polygon.Tags,"water","sea")||Tag(a.Polygon.Tags,"water","ocean")||Tag(a.Polygon.Tags,"water","bay")||Tag(a.Polygon.Tags,"natural","bay")||Tag(a.Polygon.Tags,"tidal","yes");
@@ -537,8 +595,10 @@ public static class WaterBodyPlanner
         }
         float Length(OsmWay w){var length=0f;for(var i=1;i<w.NodeIds.Length;i++)length+=math.distance(Local(w.NodeIds[i-1]).xz,Local(w.NodeIds[i]).xz);return length;}
         var network=RiverNetwork(data);
-        var lines=data.Ways.Values.Where(w=>network.Contains(w.Id)&&
-                (!Tag(w.Tags,"tunnel","yes")&&!Tag(w.Tags,"tunnel","culvert")||Length(w)<CulvertLength)).OrderBy(w=>w.Id).ToArray();
+        var lines=data.Ways.Values.Where(w=>network.Contains(w.Id)).OrderBy(w=>w.Id).ToArray();
+        var buried=lines.Where(w=>Buried(w.Tags)).ToArray();
+        log.Count("Water buried waterways opened",buried.Length);log.Count("Water buried channel metres",(int)Math.Min(int.MaxValue,Math.Round(buried.Sum(w=>(double)Length(w)))));
+        log.Diagnostic($"WATER BURIED CHANNELS selectedWays={buried.Length}; openedAtSurface=true; lengthCutoff=false; crossingBridgesRequired=true; canalsAndIntermittentWaysExcluded=true; nativeFlowVerified=false");
         totalWays=lines.Length;phase="connecting river reaches";Pulse(true);
         // Connected waterway ways share a durable body identity independent of controls.
         // Attach roots by rank, not source iteration order. A long river must
@@ -751,11 +811,32 @@ public static class WaterBodyPlanner
         for(var q=0;q<seaQueue.Count;q++)foreach(var u in upstreamOf[seaQueue[q]])if(toSea.Add(u))seaQueue.Add(u);
         var upstreamOrder=new Dictionary<long,int>();for(var k=0;k<ready.Count;k++)upstreamOrder[ready[k]]=k;
         var nodeSurface=new Dictionary<long,float>();var nodeBed=new Dictionary<long,float>();
+        var waySurface=new Dictionary<long,float>();var wayBed=new Dictionary<long,float>();
         var levees=new List<(float3 A,float3 B,float3 P,float Channel,float Height)>();var bridgedSamples=0;var seaRaisedSamples=0;
-        foreach(var way in lines.OrderBy(w=>upstreamOrder.TryGetValue(w.NodeIds[w.NodeIds.Length-1],out var k)?k:int.MaxValue).ThenBy(w=>w.Id))
+        // A mapped way can continue through a confluence or branch. Condition
+        // its junction-to-junction pieces in node order, retaining the source
+        // way identity. Sorting whole ways by their final node can process a
+        // branch before the level/bed reaches its interior starting junction.
+        var junctionPieces=0;
+        IEnumerable<OsmWay> Pieces()
         {
-            token.ThrowIfCancellationRequested();riverCount++;var body=bodyIds[Root(way.Id)];activeBody=body;Pulse();
+            foreach(var line in lines)
+            {
+                token.ThrowIfCancellationRequested();
+                var start=0;
+                for(var i=1;i<line.NodeIds.Length;i++)
+                {
+                    var id=line.NodeIds[i];if(i<line.NodeIds.Length-1&&upstreamOf[id].Count==1&&outgoing[id].Count==1)continue;
+                    junctionPieces++;yield return start==0&&i==line.NodeIds.Length-1?line:line with{NodeIds=line.NodeIds.Skip(start).Take(i-start+1).ToArray()};start=i;
+                }
+            }
+        }
+        var conditionedWays=new HashSet<long>();
+        foreach(var way in Pieces().OrderBy(w=>upstreamOrder.TryGetValue(w.NodeIds[w.NodeIds.Length-1],out var k)?k:int.MaxValue).ThenBy(w=>w.Id))
+        {
+            token.ThrowIfCancellationRequested();if(conditionedWays.Add(way.Id))riverCount++;var body=bodyIds[Root(way.Id)];activeBody=body;Pulse();
             var bedLimit=nodeBed.TryGetValue(way.NodeIds[0],out var carried)?carried:float.PositiveInfinity;
+            if(wayBed.TryGetValue(way.Id,out var previousBed))bedLimit=Math.Min(bedLimit,previousBed);
             if(unsupportedBodies.Contains(body))log.Count("Water bodies using local feasible reaches");
             var sourceWidth=NetworkEvidence.Measure(way.Tags,"width")??(Tag(way.Tags,"waterway","river")?32:12);
             if(!math.isfinite(sourceWidth)||sourceWidth<=0||sourceWidth>2048){log.Count("Water width repaired");sourceWidth=Tag(way.Tags,"waterway","river")?32:12;}
@@ -779,16 +860,25 @@ public static class WaterBodyPlanner
                     // Do not silently inflate a known 4m canal to the native
                     // 56m source diameter, or reinterpret an island as unmapped water.
                     Func<float3,bool> mask=area!=null?q=>area.Contains(q)&&!MappedDry(q):q=>!MappedDry(q)&&NetworkNormalizer.DistanceToSegment(q,a,b)<=reach;
-                    var banks=new List<float3>();
+                    var banks=new List<float3>();var bankSides=0;
                     foreach(var side in new[]{-1,1})
                     {
                         var distance=Math.Max(cell,reach);
                         while(distance<512&&mask(p+normal*(distance*side)))distance+=Math.Max(cell,reach*.5f);
-                        var bankPoint=DryProbe(p,normal*side,mask,distance);if(bankPoint.HasValue)banks.Add(bankPoint.Value);
+                        var bankPoint=DryProbe(p,normal*side,mask,distance);if(bankPoint.HasValue){banks.Add(bankPoint.Value);bankSides++;}
+                        // DryProbe deliberately clears a full native footprint.
+                        // On a narrow urban stream it can land on a high terrace
+                        // beyond a low near bank. That terrace cannot contain the
+                        // water: constrain the stage at the actual cut's rim too.
+                        if(area==null)
+                        {
+                            var rim=p+normal*(side*(channel/.6f+cell*.5f));
+                            if(Inside(rim)&&!areaIndex.Nearby(rim).Any(r=>!Dry(r)&&r.Contains(rim)))banks.Add(rim);
+                        }
                     }
                     var node=j==0&&lo<=0?way.NodeIds[i-1]:j==steps&&hi>=1?way.NodeIds[i]:0;
                     samples.Add(new(p,a,b,j<steps?math.lerp(a,b,(j+1)/(float)steps):null,station+length*j/steps,node,
-                        banks.Count<2?BankHeight(p):banks.Min(BankHeight),banks,area,reach,channel,sourceWidth));
+                        bankSides<2?BankHeight(p):banks.Min(BankHeight),banks,area,reach,channel,sourceWidth,bankSides<2));
                 }
                 station+=length;
             }
@@ -809,6 +899,10 @@ public static class WaterBodyPlanner
                 while(hi+1<count&&samples[hi+1].Station-samples[k].Station<=bridge/2)hi++;
                 var value=float.PositiveInfinity;for(var q=lo;q<=hi;q++)value=Math.Min(value,dilated[q]);
                 surface[k]=Math.Min(value,bound[k]+leveeMax);
+                // Preserve the original whole-way running minimum even when
+                // clipped/cyclic evidence leaves a junction piece disconnected
+                // from the last sampled endpoint of the preceding piece.
+                if(waySurface.TryGetValue(way.Id,out var previousSurface))surface[k]=Math.Min(surface[k],previousSurface);
                 if(samples[k].Node!=0&&nodeSurface.TryGetValue(samples[k].Node,out var arriving))surface[k]=Math.Min(surface[k],arriving);
                 if(k>0)surface[k]=Math.Min(surface[k],surface[k-1]);
             }
@@ -820,7 +914,7 @@ public static class WaterBodyPlanner
             }
             for(var k=0;k<count;k++)
             {
-                var sample=samples[k];var p=sample.P;var a=sample.A;var b=sample.B;var area=sample.Area;var stage=surface[k];var banks=sample.Banks;var bankless=banks.Count<2;
+                var sample=samples[k];var p=sample.P;var a=sample.A;var b=sample.B;var area=sample.Area;var stage=surface[k];var banks=sample.Banks;var bankless=sample.Bankless;
                 Func<float3,bool> mask=area!=null?q=>area.Contains(q)&&!MappedDry(q):q=>!MappedDry(q)&&NetworkNormalizer.DistanceToSegment(q,a,b)<=reach;
                 // The carved channel and its sloping banks (ChannelDepth note).
                 // A mapped river polygon narrower than that channel gets the
@@ -851,7 +945,7 @@ public static class WaterBodyPlanner
                     var nextLevel=k+1<count?Math.Min(stage,surface[k+1]):stage;
                     var candidate=new WaterReachStage(body,way.Id,p,next,stage,nextLevel,reach,area?.Polygon.Identity);
                     var last=reachStages.Count>0?reachStages[reachStages.Count-1]:null;
-                    if(last!=null&&last.WayId==candidate.WayId&&last.PolygonId==candidate.PolygonId&&math.distance(last.End.xz,p.xz)<.01f&&
+                    if(last!=null&&last.WayId==candidate.WayId&&last.PolygonId==candidate.PolygonId&&last.BlockedByBuriedInlet==candidate.BlockedByBuriedInlet&&math.distance(last.End.xz,p.xz)<.01f&&
                         math.dot(math.normalizesafe((last.End-last.Start).xz),math.normalizesafe((next-p).xz))>.99999f&&
                         Math.Abs((last.EndLevel-last.StartLevel)/Math.Max(.1f,math.distance(last.Start.xz,last.End.xz))-(nextLevel-stage)/Math.Max(.1f,math.distance(p.xz,next.xz)))<.0001f)
                         reachStages[reachStages.Count-1]=last with{End=next,EndLevel=nextLevel};
@@ -874,8 +968,12 @@ public static class WaterBodyPlanner
             }
             var end=way.NodeIds[way.NodeIds.Length-1];
             nodeSurface[end]=nodeSurface.TryGetValue(end,out var arrivingSurface)?Math.Min(arrivingSurface,surface[count-1]):surface[count-1];
+            waySurface[way.Id]=surface[count-1];
+            if(math.isfinite(bedLimit))wayBed[way.Id]=bedLimit;
             if(math.isfinite(bedLimit))nodeBed[end]=nodeBed.TryGetValue(end,out var downstream)?Math.Min(downstream,bedLimit):bedLimit;
         }
+        log.Count("Water interior junction splits",junctionPieces-lines.Length);
+        log.Diagnostic($"WATER JUNCTION CONTINUITY mappedWays={lines.Length}; conditioningPieces={junctionPieces}; interiorJunctionsCarryStageAndBed=true; sourceWayIdsPreserved=true");
         // Levees go up after every channel is cut, never across a channel or
         // into mapped water: full height from the channel's cut out to a water
         // cell beyond it, then easing back to the ground over two more cells.
@@ -993,7 +1091,7 @@ public static class WaterBodyPlanner
         log.Diagnostic($"WATER SHORE PROFILE bedBandMeters={bedBand:0.#}; bankBandMeters={shoreBand:0.#}; ramp=smoothstep; bankSamplesShaped={shapedBank}; lowBankSamplesRaised={raisedBank};bedSamplesEasedFromControlHollows={easedShore}; controlNeighbourhoodsKept={controlCells.Count}");
         TerrainArtifactRepair.TraceEncoded(conditioned, terrain.HeightScaleMeters, terrain.SeaLevelMeters, "after-water-bed-planning", log.Diagnostic);
         var coastal=data.Ways.Values.Any(w=>Tag(w.Tags,"natural","coastline"));
-        var report=$"Water: {sources.Count} bank-limited river/lake controls; {lakeCount} mapped lakes; {unresolved} unresolved narrow/height sites. No flooding bypass. Coverage requires simulation verification.";
+        var report=$"Water: {sources.Count} bank-limited river/lake controls; {lakeCount} mapped lakes; {unresolved} unresolved narrow/height sites; {buried.Length} mapped buried waterways opened as surface channels. No flooding bypass. Coverage requires simulation verification.";
         log.Info(report);log.Diagnostic($"WATER BODY SUMMARY bodies={sources.Select(s=>s.BodyId).Distinct().Count()}; controls={sources.Count}; bedEdits={editCount}; cellMeters={cell:R}; mappedRiverBankWidthUsed=true; polygonBedCutsMaskOwned=true; fixedDepthFallback=false; floodingAccepted=false; unresolved={unresolved}; indexedPolygonPredicates=true; bedCellsVisited={bedVisits}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.###}; canonicalAreas={areaStages.Count}; canonicalReaches={reachStages.Count}; maskBytes={editMask.Length}; geometryVersion={WaterPlan.GeometryVersion}");
         var plan=new WaterPlan(coastal,riverCount,lakeCount,unresolved,report){Sources=sources,ConditionedHeightmap=editCount>0?conditioned:null,PlannedBedHeightmap=conditioned,WaterCellSize=cell,AreaStages=areaStages,ReachStages=reachStages,BedEdits=new TerrainEditSet("water-bed","pre-water-terrain",n,editMask)};
         return WaterContainment.Validate(plan,terrain with{Heightmap=conditioned},width,polygons,log,token);

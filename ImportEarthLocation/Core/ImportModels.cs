@@ -140,6 +140,10 @@ public sealed record PreparedSegment(
     public bool EndMiniRoundabout { get; init; }
     public bool StartTerminal { get; init; }
     public bool EndTerminal { get; init; }
+    // Verified ground road/rail ports share a native node, while source route
+    // obligations remain separated by network kind. Old captures default false.
+    public bool StartLevelCrossing { get; init; }
+    public bool EndLevelCrossing { get; init; }
     public int PhysicalTracks { get; init; }
     public int BothWaysLanes { get; init; }
     public float? SourceWidthMeters { get; init; }
@@ -292,12 +296,15 @@ public sealed record WaterPlan(bool Coastal, int Rivers, int Lakes, int Skipped,
     public TerrainEditSet? BedEdits { get; init; }
     public TerrainEditSet? FinalBedEdits { get; init; }
     public ushort[]? PlannedBedHeightmap { get; init; }
-    public const string GeometryVersion = "geographic-stage-v2";
+    public const string GeometryVersion = "geographic-stage-v3-rivers-only";
 }
 
 public sealed record WaterAreaStage(long BodyId, string Kind, float Level);
 public sealed record WaterReachStage(long BodyId, long WayId, float3 Start, float3 End,
-    float StartLevel, float EndLevel, float HalfWidth, long? PolygonId);
+    float StartLevel, float EndLevel, float HalfWidth, long? PolygonId)
+{
+    public bool BlockedByBuriedInlet { get; init; }
+}
 public sealed record TerrainEditSet(string Producer, string Baseline, int Resolution, byte[] Mask);
 // 0 known land/barrier, 1 accepted directed ocean, 2 conflicting, 3 unseeded.
 public sealed record OceanMask(int Resolution,double WidthMeters,byte[] Classification,string Version);

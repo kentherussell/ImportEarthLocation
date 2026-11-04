@@ -7,7 +7,7 @@ The goal is simple: take any location in the world and turn it into a realistic 
 ## How to use it
 
 1. Open a map in the Map Editor and choose a location or enter coordinates.
-2. Select your map size, road level and whether to include rail.
+2. Select your map size, road groups and whether to include rail. **Highways** includes motorways, trunk roads and their ramps. **Main Roads** includes primary, secondary and tertiary roads.
 3. Prepare the import, review the results, then confirm replacement.
 
 Save a backup first: importing replaces the current map contents.

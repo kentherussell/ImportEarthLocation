@@ -31,8 +31,8 @@ public static class NetworkBoundaryPolicy
     }
 
     public static bool EndpointMarker(PreparedSegment s,bool start)=>start?
-        s.StartTerminal||s.StartMiniRoundabout||s.StartRoundaboutRadius!=0:
-        s.EndTerminal||s.EndMiniRoundabout||s.EndRoundaboutRadius!=0;
+        s.StartTerminal||s.StartLevelCrossing||s.StartMiniRoundabout||s.StartRoundaboutRadius!=0:
+        s.EndTerminal||s.EndLevelCrossing||s.EndMiniRoundabout||s.EndRoundaboutRadius!=0;
 
     public static bool SameCapturedComposition(PreparedSegment a,PreparedSegment b,IReadOnlyDictionary<string,NativeAssetContract>? assets)
         =>assets!=null&&a.NativeAssetKey.Length>0&&a.NativeAssetKey==b.NativeAssetKey&&a.NativeWidth>0&&SparseProfileRows.Finite(a.NativeWidth)&&a.NativeWidth==b.NativeWidth&&

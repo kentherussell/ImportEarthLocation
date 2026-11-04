@@ -38,7 +38,7 @@ public static class VegetationPlanner
                 wet|=Tag(tags,"natural","water")||tags.ContainsKey("water")||Tag(tags,"waterway","riverbank");
                 beach|=Tag(tags,"natural","beach");
                 built|=tags.ContainsKey("building")||Tag(tags,"amenity","parking");
-                if(forest==null&&(Tag(tags,"natural","wood")||Tag(tags,"landuse","forest")))forest=h;
+                if(forest==null&&ForestProcessor.Kind(tags)==ForestProcessor.AreaKind.Woodland)forest=h;
             }
             return(wet,beach,forest,built);
         }

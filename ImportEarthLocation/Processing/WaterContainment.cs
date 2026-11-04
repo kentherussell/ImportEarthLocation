@@ -23,7 +23,12 @@ public static class WaterContainment
         var outlines=polygons.GroupBy(p=>p.Identity).ToDictionary(g=>g.Key,g=>g.First());
         // A neighbouring standing-water body may itself fail this screen. Only
         // mapped flowing reaches can establish an intended outlet here.
-        var surface=WaterBodyPlanner.ConstructedSurfaceSampler(plan with{AreaStages=Array.Empty<WaterAreaStage>()},polygons);
+        // Channel cuts feather to zero over their outer 40 percent. Their wet
+        // sloping rim may extend beyond the nominal one-cell flat core. Test
+        // that rim against actual terrain below the reach's level; treating it
+        // as dry exterior rejects otherwise contained lakes with stream outlets.
+        var flowing=plan.ReachStages.Where(r=>!r.BlockedByBuriedInlet).ToArray();
+        var surface=WaterBodyPlanner.ConstructedSurfaceSampler(plan with{AreaStages=Array.Empty<WaterAreaStage>(),ReachStages=flowing},polygons);
         var levels=new Dictionary<long,float>();var rejected=new HashSet<long>();var checkedBodies=0;var lowered=0;
         foreach(var lake in lakes)
         {
@@ -90,19 +95,27 @@ public static class WaterContainment
                 }
             }
         }
-        foreach(var ring in polygon.Outer)Fill(ring,1);foreach(var ring in polygon.Inner)Fill(ring,0);
+        foreach(var ring in polygon.Outer)Fill(ring,1);foreach(var ring in polygon.Inner)Fill(ring,2);
         // A one-water-cell shoreline collar accommodates the sloping bank, but
         // cannot conceal a path continuing into surrounding downhill terrain.
         var allowed=(byte[])inside.Clone();var collar=Math.Max(1,(int)Math.Ceiling(waterCell/step));
-        for(var z=0;z<nz;z++)for(var x=0;x<nx;x++)if(inside[z*nx+x]!=0)
+        for(var z=0;z<nz;z++)for(var x=0;x<nx;x++)if(inside[z*nx+x]==1)
         {
             if(x>0&&x<nx-1&&z>0&&z<nz-1&&inside[z*nx+x-1]!=0&&inside[z*nx+x+1]!=0&&inside[(z-1)*nx+x]!=0&&inside[(z+1)*nx+x]!=0)continue;
             for(var dz=-collar;dz<=collar;dz++)for(var dx=-collar;dx<=collar;dx++)
-                if(x+dx>=0&&x+dx<nx&&z+dz>=0&&z+dz<nz)allowed[(z+dz)*nx+x+dx]=1;
+                if(x+dx>=0&&x+dx<nx&&z+dz>=0&&z+dz<nz&&inside[(z+dz)*nx+x+dx]!=2)allowed[(z+dz)*nx+x+dx]=1;
         }
+        // The shoreline collar must not erase small mapped islands. Their
+        // terrain, like the downhill exterior, must stand above the lake.
+        for(var i=0;i<inside.Length;i++)if(inside[i]==2)allowed[i]=0;
         var best=new float[(int)count];for(var k=0;k<best.Length;k++)best[k]=float.PositiveInfinity;
         var heap=new List<(int Index,float Cost)>();
-        float Height(int index)=>terrain.Heightmap[(index/nx+z0)*n+index%nx+x0]/65535f*terrain.HeightScaleMeters;
+        // A sub-cell ridge can hold water on the DEM yet disappear on the
+        // coarser fluid grid. Require the escape barrier to survive a half-cell
+        // neighbourhood, rather than accepting a single high terrain vertex.
+        var bankHeights=GridBankHeights(terrain.Heightmap,n,x0,z0,nx,nz,
+            Math.Max(0,(int)Math.Ceiling(waterCell/(2*step))),token);
+        float Height(int index)=>(inside[index]==2?terrain.Heightmap[(index/nx+z0)*n+index%nx+x0]:bankHeights[index])/65535f*terrain.HeightScaleMeters;
         void Push(int index,float cost)
         {
             if(cost>=best[index])return;best[index]=cost;heap.Add((index,cost));var k=heap.Count-1;
@@ -112,6 +125,16 @@ public static class WaterContainment
         {
             var first=heap[0];var last=heap[heap.Count-1];heap.RemoveAt(heap.Count-1);if(heap.Count==0)return first;
             var k=0;while(k*2+1<heap.Count){var child=k*2+1;if(child+1<heap.Count&&heap[child+1].Cost<heap[child].Cost)child++;if(heap[child].Cost>=last.Cost)break;heap[k]=heap[child];k=child;}heap[k]=last;return first;
+        }
+        // Check every wet part of the mapped basin, including disconnected
+        // outer rings and shallow shelves without a nearby circular control.
+        // Seeding only controls can hide a low escape behind an uncut DEM ridge.
+        for(var i=0;i<inside.Length;i++)
+        {
+            if((i&16383)==0)token.ThrowIfCancellationRequested();
+            var x=i%nx;var z=i/nx;
+            if(inside[i]==1&&Height(i)<stage&&(x==0||z==0||x==nx-1||z==nz-1||
+                inside[i-1]!=1||inside[i+1]!=1||inside[i-nx]!=1||inside[i+nx]!=1))Push(i,Height(i));
         }
         foreach(var source in controls)
         {
@@ -126,7 +149,7 @@ public static class WaterContainment
             if(allowed[index]==0||x+x0==0||z+z0==0||x+x0==n-1||z+z0==n-1)
             {
                 var p=new float3((x+x0)*step-half,Height(index),(z+z0)*step-half);var outlet=surface(p);
-                if(allowed[index]==0&&outlet.HasValue&&outlet.Value<=stage+.1f&&p.y<outlet.Value+.1f)continue;
+                if(inside[index]!=2&&allowed[index]==0&&outlet.HasValue&&outlet.Value<=stage+.1f&&p.y<outlet.Value+.1f)continue;
                 return cost;
             }
             for(var dz=-1;dz<=1;dz++)for(var dx=-1;dx<=1;dx++)
@@ -137,5 +160,35 @@ public static class WaterContainment
         }
         // Every exit was an evidenced planned water connection.
         return float.MaxValue;
+    }
+
+    private static ushort[] GridBankHeights(ushort[] terrain,int n,int x0,int z0,int nx,int nz,int radius,CancellationToken token)
+    {
+        var first=Math.Max(0,z0-radius);var last=Math.Min(n-1,z0+nz-1+radius);
+        var rows=last-first+1;var horizontal=new ushort[rows*nx];var result=new ushort[nx*nz];
+        var queue=new int[Math.Max(n,rows)];
+        for(var z=first;z<=last;z++)
+        {
+            token.ThrowIfCancellationRequested();var head=0;var tail=0;var added=Math.Max(0,x0-radius)-1;
+            for(var x=0;x<nx;x++)
+            {
+                var right=Math.Min(n-1,x0+x+radius);
+                while(added<right){added++;while(tail>head&&terrain[z*n+queue[tail-1]]>=terrain[z*n+added])tail--;queue[tail++]=added;}
+                while(queue[head]<x0+x-radius)head++;
+                horizontal[(z-first)*nx+x]=terrain[z*n+queue[head]];
+            }
+        }
+        for(var x=0;x<nx;x++)
+        {
+            token.ThrowIfCancellationRequested();var head=0;var tail=0;var added=-1;
+            for(var z=0;z<nz;z++)
+            {
+                var bottom=Math.Min(rows-1,z0+z+radius-first);
+                while(added<bottom){added++;while(tail>head&&horizontal[queue[tail-1]*nx+x]>=horizontal[added*nx+x])tail--;queue[tail++]=added;}
+                while(queue[head]<z0+z-radius-first)head++;
+                result[z*nx+x]=horizontal[queue[head]*nx+x];
+            }
+        }
+        return result;
     }
 }

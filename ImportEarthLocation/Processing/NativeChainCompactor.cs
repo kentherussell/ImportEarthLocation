@@ -120,6 +120,7 @@ public static class NativeChainCompactor
             SourceFitToleranceMeters=spans.Min(s=>s.SourceFitToleranceMeters??NetworkNormalizer.Tolerance(s.Kind)),
             MaximumNativeWidth=spans.Min(s=>s.MaximumNativeWidth),
             EndMiniRoundabout=b.EndMiniRoundabout,EndTerminal=b.EndTerminal,EndRoundaboutRadius=b.EndRoundaboutRadius,
+            EndLevelCrossing=b.EndLevelCrossing,
             SourceWayIds=spans.SelectMany(s=>s.SourceWayIds.Append(s.WayId)).Distinct().ToArray(),
             SourceNodeAliases=spans.SelectMany(s=>s.SourceNodeAliases).Distinct().ToArray(),
             SourceGeometry=reference,OriginalGeometry=original,FinalDeckCurve=null,HorizontalParent=null,ParentStartT=0,ParentEndT=1};

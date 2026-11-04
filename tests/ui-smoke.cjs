@@ -93,7 +93,7 @@ assert(!nodes.some(n=>n.props?.role==='note'),'Location hint shown with a locati
 assert(!nodes.some(n=>n.type==='input'),'Main panel must not duplicate location inputs');
 assert(!nodes.some(n => n.type === 'input' && n.props.type === 'checkbox'), 'Unsupported browser checkbox must not render');
 assert.equal(nodes.filter(n=>n.props?.role==='radio').length,0);
-assert.equal(button(nodes,'iel-roads-routes').props.role,'checkbox');assert.equal(button(nodes,'iel-rail').props['aria-checked'],true);
+assert.equal(button(nodes,'iel-roads-highways').props.role,'checkbox');assert.equal(button(nodes,'iel-rail').props['aria-checked'],true);
 assert(nodes.filter(n=>n.props?.role==='checkbox').every(n=>n.props.selected===undefined),'Checkbox selection must not activate the native full-width selected background');
 assert.deepEqual(nodes.find(n=>n.type==='Panel').props.theme,{header:'panelHeader',titleBar:'panelTitleBar',title:'panelTitle',iconSpace:'panelIconSpace',closeButton:'panelCloseButton',content:'panelContent'},'Panel needs a left-aligned title without a reserved native icon slot');
 const options=nodes.find(n=>n.props?.['aria-label']==='Options').props.children;
@@ -102,7 +102,7 @@ assert.deepEqual(options.map(n=>n.props.children.props.label??n.props.children.p
 assert(options.every(n=>typeof n.props['data-tip']==='string'&&n.props['data-tip'].length>0&&n.props['data-tip'].length<=100),'Hover help must be short and present');
 const roadGroup=nodes.find(n=>n.props?.['aria-label']==='Road groups');
 assert.equal(roadGroup.props.children[1].props.className,'options');
-assert.deepEqual(roadGroup.props.children[1].props.children.map(n=>n.props.children.props.focusKey),['iel-roads-highways','iel-roads-routes','iel-roads-streets']);
+assert.deepEqual(roadGroup.props.children[1].props.children.map(n=>n.props.children.props.focusKey),['iel-roads-highways','iel-roads-streets']);
 assert(roadGroup.props.children[1].props.children.every(n=>n.props.className==='tipHost'&&n.props['data-tip'].length>0),'Every road group needs hover help');
 // Hover help is a viewport overlay beside the panel, not a native tooltip under it.
 options[3].props.onMouseEnter({currentTarget:{getBoundingClientRect:()=>({top:240,left:700}),closest:()=>({getBoundingClientRect:()=>({left:640})})}});nodes=render();
@@ -132,8 +132,10 @@ assert.equal(button(nodes,'iel-rail').props['aria-checked'],true);
 // backend to implement the bitmask policy itself. Each click requests an atomic toggle.
 for(let mask=0;mask<8;mask++) {
  const groups=['highways','routes','streets'];bindings.roadLevel=groups.filter((_,i)=>mask&(1<<i)).join('|');nodes=render();
- for(let i=0;i<groups.length;i++)assert.equal(button(nodes,`iel-roads-${groups[i]}`).props['aria-checked'],!!(mask&(1<<i)));
- for(const group of groups){button(nodes,`iel-roads-${group}`).props.onSelect();assert.deepEqual(events.at(-1),['toggleRoadGroup',group]);}
+ assert.equal(button(nodes,'iel-roads-highways').props['aria-checked'],!!(mask&3));
+ assert.equal(button(nodes,'iel-roads-streets').props['aria-checked'],!!(mask&4));
+ assert(!nodes.some(n=>n.props?.focusKey==='iel-roads-routes'));
+ for(const group of ['highways','streets']){button(nodes,`iel-roads-${group}`).props.onSelect();assert.deepEqual(events.at(-1),['toggleRoadGroup',group]);}
  const before=bindings.roadLevel;button(nodes,'iel-rail').props.onSelect();nodes=render();assert.equal(bindings.roadLevel,before);assert.equal(button(nodes,'iel-rail').props['aria-checked'],false);
  button(nodes,'iel-rail').props.onSelect();nodes=render();
 }

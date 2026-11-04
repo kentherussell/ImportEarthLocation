@@ -50,31 +50,97 @@ static class WaterTests
         Check(Plan(new[]{river},cell:float.NaN).Sources.Count==0,"Unknown native water-grid size should not create controls");
         var intermittent=new OsmDataset{Nodes=nodes,Ways=new Dictionary<long,OsmWay>{{1,way with{Tags=new Dictionary<string,string>{{"waterway","river"},{"intermittent","yes"}}}}}};
         Check(Plan(new[]{river},data:intermittent).Sources.Count==0,"Intermittent river received permanent sources");
-        // A 40 m culvert under a road stays part of the river; a 600 m buried
-        // river does not become an open channel.
+        // Both short culverts and long buried rivers become connected open
+        // channels. Their crossings must use the full constructed footprint.
         OsmDataset Culverted(float halfLength)
         {
             var culvertNodes=new Dictionary<long,OsmNode>(nodes){{7,Node(7,0,-halfLength)},{8,Node(8,0,halfLength)}};
             var tags=new Dictionary<string,string>{{"waterway","river"},{"tunnel","culvert"}};
             return new OsmDataset{Nodes=culvertNodes,Ways=new Dictionary<long,OsmWay>{{61,way with{Id=61,NodeIds=new long[]{1,7}}},{62,way with{Id=62,NodeIds=new long[]{7,8},Tags=tags}},{63,way with{Id=63,NodeIds=new long[]{8,3}}}}};
         }
-        Check(Plan(new[]{river},data:Culverted(20)).ReachStages.Any(r=>r.WayId==62)&&WaterBodyPlanner.ShortCulverts(Culverted(20),request).Count==1,"A short culvert broke the river");
+        Check(Plan(new[]{river},data:Culverted(20)).ReachStages.Any(r=>r.WayId==62)&&WaterBodyPlanner.BuriedChannels(Culverted(20),request).Count==1,"A short culvert broke the river");
         // A 200 m culvert under an interchange still carries the river.
-        Check(Plan(new[]{river},data:Culverted(100)).ReachStages.Any(r=>r.WayId==62)&&WaterBodyPlanner.ShortCulverts(Culverted(100),request).Count==1,"An interchange culvert broke the river");
-        // A stream without a polygon is carved a water cell (28 m) either side of
+        Check(Plan(new[]{river},data:Culverted(100)).ReachStages.Any(r=>r.WayId==62)&&WaterBodyPlanner.BuriedChannels(Culverted(100),request).Count==1,"An interchange culvert broke the river");
+        // A river without a polygon is carved a water cell (28 m) either side of
         // its line, so the simulation's cells can carry it; a ditch stays narrow.
         OsmDataset Stream(string type)=>new OsmDataset{Nodes=nodes,Ways=new Dictionary<long,OsmWay>{{70,way with{Id=70,Tags=new Dictionary<string,string>{{"waterway",type}}}}}};
-        var stream=Plan(Array.Empty<GeographicPolygon>(),data:Stream("stream")).ConditionedHeightmap!;
-        Check(stream[Pixel(16,0)]<original[Pixel(16,0)]&&stream[Pixel(32,0)]<original[Pixel(32,0)],"A stream was carved narrower than a water cell");
-        Check(stream[Pixel(0,0)]<=stream[Pixel(32,0)],"A stream channel is not deepest along its line");
+        var stream=Plan(Array.Empty<GeographicPolygon>(),data:Stream("river")).ConditionedHeightmap!;
+        Check(stream[Pixel(16,0)]<original[Pixel(16,0)]&&stream[Pixel(32,0)]<original[Pixel(32,0)],"A river was carved narrower than a water cell");
+        Check(stream[Pixel(0,0)]<=stream[Pixel(32,0)],"A river channel is not deepest along its line");
+        var terrace=heights.ToArray();
+        for(var z=0;z<64;z++)for(var x=0;x<64;x++)
+        {
+            var px=x*1000f/63-500;
+            if(px>=48&&px<=72)terrace[z*64+x]=(ushort)(20f/100*65535);
+        }
+        var terracePlan=Plan(Array.Empty<GeographicPolygon>(),terrain with{Heightmap=terrace},data:Stream("river"));
+        Check(terracePlan.Sources.Count>0&&terracePlan.ReachStages.All(r=>Math.Max(r.StartLevel,r.EndLevel)<22),"A high distant terrace concealed a low bank beside the native channel");
+        var junctionNodes=new Dictionary<long,OsmNode>{{101,Node(101,-420,0)},{102,Node(102,0,0)},{103,Node(103,420,0)},{104,Node(104,0,420)}};
+        var junctionWays=new[]{new OsmWay(101,new long[]{101,102,103},new Dictionary<string,string>{{"waterway","river"}}),
+            new OsmWay(102,new long[]{102,104},new Dictionary<string,string>{{"waterway","river"}})};
+        var junctionHeights=heights.ToArray();
+        for(var z=0;z<64;z++)for(var x=0;x<64;x++)
+        {
+            var px=x*1000f/63-500;var pz=z*1000f/63-500;
+            if(px>=-320&&px<=-160&&Math.Abs(pz)>=48&&Math.Abs(pz)<=104)junctionHeights[z*64+x]=(ushort)(20f/100*65535);
+        }
+        var junction=Plan(Array.Empty<GeographicPolygon>(),terrain with{Heightmap=junctionHeights},data:new OsmDataset{Nodes=junctionNodes,Ways=junctionWays.ToDictionary(w=>w.Id)});
+        var arriving=junction.ReachStages.Where(r=>r.WayId==101&&r.Start.x<=0&&r.End.x>=0)
+            .Min(r=>math.lerp(r.StartLevel,r.EndLevel,-r.Start.x/Math.Max(.01f,r.End.x-r.Start.x)));
+        Check(junction.ReachStages.Where(r=>r.WayId==102).All(r=>r.StartLevel<=arriving+.01f&&r.EndLevel<=arriving+.01f),
+            "A branch beginning at an interior way node reset to a higher water level");
+        foreach(var group in junction.ReachStages.GroupBy(r=>r.WayId))
+        {
+            var previous=float.PositiveInfinity;
+            foreach(var reach in group)
+            {
+                Check(reach.StartLevel<=previous+.01f&&reach.EndLevel<=reach.StartLevel+.01f,"Junction splitting raised water along one source way");
+                previous=reach.EndLevel;
+            }
+        }
         var ditch=Plan(Array.Empty<GeographicPolygon>(),data:Stream("ditch")).ConditionedHeightmap;
         Check(ditch==null||ditch[Pixel(32,0)]==original[Pixel(32,0)],"A ditch was widened like a stream");
-        Check(Plan(new[]{river},data:Culverted(300)).ReachStages.All(r=>r.WayId!=62)&&WaterBodyPlanner.ShortCulverts(Culverted(300),request).Count==0,"A buried river became an open channel");
+        var openedPlan=Plan(new[]{river},data:Culverted(300));
+        Check(new long[]{61,62,63}.All(id=>openedPlan.ReachStages.Any(r=>r.WayId==id))&&WaterBodyPlanner.BuriedChannels(Culverted(300),request).Count==1,
+            "A long buried river still broke at its portals");
+        Check(openedPlan.Sources.Any(s=>s.WayId==61)&&openedPlan.Sources.Any(s=>s.WayId==62)&&
+            openedPlan.Sources.Select(s=>s.BodyId).Distinct().Count()==1&&openedPlan.ReachStages.All(r=>!r.BlockedByBuriedInlet),
+            "Opening a buried river withheld its upstream sources or split its hydraulic identity");
+        Check(WaterBodyPlanner.BuriedChannels(Culverted(300),request,28).Single().HalfWidth>46&&
+            WaterBodyPlanner.BuriedChannels(Culverted(300),request,56).Single().HalfWidth>93,
+            "Opened-channel bridge footprints do not follow the actual native grid");
+        Check(WaterBodyPlanner.BuriedChannels(Culverted(300),request,float.NaN).Count==0,"An unknown grid generated guessed buried-channel footprints");
+        var outsideData=Culverted(300);var outsideNodes=outsideData.Nodes.ToDictionary(p=>p.Key,p=>p.Value);
+        outsideNodes[7]=Node(7,0,600);outsideNodes[8]=Node(8,0,900);outsideNodes[3]=Node(3,0,1200);
+        Check(Plan(new[]{river},data:new OsmDataset{Nodes=outsideNodes,Ways=outsideData.Ways}).Sources.Any(s=>s.WayId==61),
+            "A buried inlet outside the map disabled a valid map-edge river outlet");
+        var bypassData=Culverted(300);var bypassWays=bypassData.Ways.ToDictionary(p=>p.Key,p=>p.Value);
+        bypassWays[64]=way with{Id=64,NodeIds=new long[]{7,3}};
+        Check(Plan(new[]{river},data:new OsmDataset{Nodes=bypassData.Nodes,Ways=bypassWays}).Sources.Any(s=>s.WayId==61),"A real open alternative was disabled by a buried side branch");
+        // A short geometric gap in the same named downstream river is repairable.
+        // Diverging, ambiguous and differently named streetside channels are not.
+        var gapNodes=new Dictionary<long,OsmNode>(nodes){{7,Node(7,0,-10)},{8,Node(8,0,10)}};
+        var named=new Dictionary<string,string>{{"waterway","river"},{"name","Test Creek"}};
+        var gapWays=new[]{way with{Id=81,NodeIds=new long[]{1,7},Tags=named},way with{Id=82,NodeIds=new long[]{8,3},Tags=named}};
+        var gapData=new OsmDataset{Nodes=gapNodes,Ways=gapWays.ToDictionary(w=>w.Id)};
+        var joined=Plan(Array.Empty<GeographicPolygon>(),data:gapData);
+        Check(joined.Sources.Select(s=>s.BodyId).Distinct().Count()==1&&gapData.Ways[81].NodeIds.Length==2,"A supported river gap stayed disconnected or mutated shared source evidence");
+        Check(WaterBodyPlanner.OpenChannels(gapData,request).Any(c=>c.Line.Length==3),"Road crossings did not receive the same repaired channel geometry");
+        var otherName=gapWays[1] with{Tags=new Dictionary<string,string>{{"waterway","river"},{"name","Different Creek"}}};
+        Check(WaterBodyPlanner.OpenChannels(new OsmDataset{Nodes=gapNodes,Ways=new[]{gapWays[0],otherName}.ToDictionary(w=>w.Id)},request).All(c=>c.Line.Length==2),"Different named channels were joined");
+        var ambiguousWays=gapWays.Concat(new[]{gapWays[1] with{Id=83}}).ToDictionary(w=>w.Id);
+        Check(WaterBodyPlanner.OpenChannels(new OsmDataset{Nodes=gapNodes,Ways=ambiguousWays},request).All(c=>c.Line.Length==2),"An ambiguous urban waterway connection was guessed");
         // A dry abandoned canal and a ditch narrower than a water cell are not
         // carved: one was a trench across a hillside, the other a row of pits.
         OsmDataset Tagged(params (string Key,string Value)[] tags)=>new OsmDataset{Nodes=nodes,Ways=new Dictionary<long,OsmWay>{{71,way with{Id=71,Tags=tags.ToDictionary(t=>t.Key,t=>t.Value)}}}};
         Check(Plan(Array.Empty<GeographicPolygon>(),data:Tagged(("waterway","canal"),("abandoned","yes"))).ConditionedHeightmap==null,"An abandoned canal was carved");
         Check(Plan(Array.Empty<GeographicPolygon>(),data:Tagged(("waterway","ditch"))).ConditionedHeightmap==null,"A sub-grid ditch was carved");
+        var excludedStream=Tagged(("waterway","stream"),("width","50"));
+        var streamPlan=Plan(Array.Empty<GeographicPolygon>(),data:excludedStream);
+        Check(streamPlan.Sources.Count==0&&streamPlan.ReachStages.Count==0&&streamPlan.ConditionedHeightmap==null&&
+            WaterBodyPlanner.OpenChannels(excludedStream,request).Count==0,"An excluded stream generated water, terrain cuts or road bridges");
+        var streamArea=river with{Tags=new Dictionary<string,string>{{"natural","water"},{"water","stream"}}};
+        Check(Plan(new[]{streamArea},data:new OsmDataset()).AreaStages.Count==0,"A stream polygon was imported as a lake");
         Check(WaterBodyPlanner.OpenChannels(Tagged(("waterway","canal"),("abandoned","yes")),request).Count==0,"An abandoned canal still forces culvert bridges");
         // A river polygon narrower than the grid still gets a channel along its
         // line below its stage; masked to the polygon, the Huveaune's bed stood
@@ -87,18 +153,18 @@ static class WaterTests
         // the stream's nodes; downstream, under a higher stage, the bed stays
         // as deep.
         var dipped=heights.ToArray();for(var z=11;z<=15;z++)for(var x=35;x<=37;x++)dipped[z*64+x]=(ushort)(20f/100*65535);
-        var dipPlan=Plan(Array.Empty<GeographicPolygon>(),terrain with{Heightmap=dipped},data:Stream("stream"));var dipBed=dipPlan.ConditionedHeightmap!;
+        var dipPlan=Plan(Array.Empty<GeographicPolygon>(),terrain with{Heightmap=dipped},data:Stream("river"));var dipBed=dipPlan.ConditionedHeightmap!;
         float LineBed(float z)=>NetworkProcessor.Sample(0,z,dipBed,100,1000);
         Check(LineBed(-300)<LineBed(-450)-1,"Bank-dip fixture does not lower the stage midway");
-        Check(Enumerable.Range(-12,33).All(k=>LineBed(k*20)<=LineBed(-300)+.1f),"The stream bed rose downstream of a bank dip, damming the water above it");
-        // A lake's outlet stream runs through one of its bank probes (each
+        Check(Enumerable.Range(-12,33).All(k=>LineBed(k*20)<=LineBed(-300)+.1f),"The river bed rose downstream of a bank dip, damming the water above it");
+        // A lake's outlet river runs through one of its bank probes (each
         // shore vertex probes east first). Water reaching the stream's own
         // channel is not a spill: the lake keeps its control instead of
         // staying a dry pit.
         var pond=river with{Id=97,Tags=new Dictionary<string,string>{{"natural","water"},{"water","lake"}},
             Outer=new(){new[]{new float3(-200,0,-200),new float3(200,0,-200),new float3(200,0,0),new float3(200,0,200),new float3(-200,0,200)}}};
         var outletNodes=new Dictionary<long,OsmNode>{{20,Node(20,150,0)},{21,Node(21,480,0)}};
-        var outlet=new OsmDataset{Nodes=outletNodes,Ways=new Dictionary<long,OsmWay>{{72,new OsmWay(72,new long[]{20,21},new Dictionary<string,string>{{"waterway","stream"}})}}};
+        var outlet=new OsmDataset{Nodes=outletNodes,Ways=new Dictionary<long,OsmWay>{{72,new OsmWay(72,new long[]{20,21},new Dictionary<string,string>{{"waterway","river"}})}}};
         var pondPlan=Plan(new[]{pond},data:outlet);
         Check(pondPlan.Sources.Any(s=>s.BodyKind=="lake")&&NetworkProcessor.Sample(256,0,pondPlan.ConditionedHeightmap!,100,1000)<pondPlan.AreaStages.Single(a=>a.BodyId==pond.Identity).Level-1,"Outlet fixture has no lake control or no channel through its east probe");
         var pondFinal=WaterBodyPlanner.Revalidate(pondPlan,terrain with{Heightmap=pondPlan.ConditionedHeightmap!},1000,new ImportLog(),default);
@@ -111,7 +177,7 @@ static class WaterTests
             highNominalSea.Sources.All(s=>s.TargetSurfaceLevel<=s.BankLevel-.35f),"Nominal sea metadata changed an unconnected river stage or bypassed bank containment");
         // Classification selects natural waterways independently of mapped width.
         // The simulated channel still needs enough room for the native water grid.
-        foreach(var type in new[]{"river","stream"})foreach(var mappedWidth in new[]{"0.5","4"})
+        foreach(var type in new[]{"river"})foreach(var mappedWidth in new[]{"0.5","4"})
         {
             var narrow=Tagged(("waterway",type),("width",mappedWidth));var narrowPlan=Plan(Array.Empty<GeographicPolygon>(),data:narrow);
             Check(narrowPlan.Sources.Count>0&&narrowPlan.ReachStages.Any(r=>r.WayId==71)&&
@@ -134,7 +200,7 @@ static class WaterTests
         Check(WaterBodyPlanner.OpenChannels(directDrain,request).Count==2,"Excluding canals broke a narrow drain directly connected to a river");
         var canalCulvert=Culverted(20);var culvertWays=canalCulvert.Ways.ToDictionary(p=>p.Key,p=>p.Value);
         culvertWays[62]=culvertWays[62] with{Tags=new Dictionary<string,string>{{"waterway","canal"},{"tunnel","culvert"}}};
-        Check(WaterBodyPlanner.ShortCulverts(new OsmDataset{Nodes=canalCulvert.Nodes,Ways=culvertWays},request).Count==0,"An excluded canal culvert forced a road bridge");
+        Check(WaterBodyPlanner.BuriedChannels(new OsmDataset{Nodes=canalCulvert.Nodes,Ways=culvertWays},request).Count==0,"An excluded canal culvert forced a road bridge");
         foreach(var canalTags in new[]{new Dictionary<string,string>{{"natural","water"},{"water","canal"}},
             new Dictionary<string,string>{{"natural","water"},{"waterway","canal"}},
             new Dictionary<string,string>{{"waterway","riverbank"},{"water","canal"}}})

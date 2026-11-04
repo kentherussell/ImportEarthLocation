@@ -86,7 +86,7 @@ public static class WaterPlanner
         bool Tag(OsmWay w, string key, string value) => w.Tags.TryGetValue(key, out var v) && v == value;
         float3 Local(long id) { var n = data.Nodes[id]; return GeoMath.ToLocalMeters(n.Latitude, n.Longitude, request.Latitude, request.Longitude); }
         var coastal = data.Ways.Values.Any(w => Tag(w, "natural", "coastline") && w.NodeIds.Any(id => data.Nodes.ContainsKey(id) && Inside(Local(id))));
-        var ways = data.Ways.Values.Where(w => Tag(w, "waterway", "river") || Tag(w, "waterway", "stream")).OrderBy(w => w.Id).ToArray();
+        var ways = data.Ways.Values.Where(w => Tag(w, "waterway", "river")).OrderBy(w => w.Id).ToArray();
         var incoming = new HashSet<long>();
         // A rejected upstream piece must not turn the next segment into an apparent spring.
         foreach (var way in ways) foreach (var id in way.NodeIds.Skip(1)) incoming.Add(id);
@@ -325,7 +325,7 @@ public static class WaterPlanner
         if(repairs.Count>0){conditioned=(ushort[])terrain.Heightmap.Clone();foreach(var edit in repairs)conditioned[edit.Key]=edit.Value;}
         log.Count("Riverbed samples corrected",repairs.Count);
         log.Diagnostic("WATER REPAIR SUMMARY rejectedAttempts="+repairReasons.Values.Sum()+"; reasons="+string.Join(" | ",repairReasons.OrderBy(p=>p.Key).Select(p=>$"{p.Key}:{p.Value}"))+"; detailedMessagesLimitedTo=50; sourceCreationNotProven=true");
-        var report = $"Water: {sources.Count} river/stream sources planned, including {sources.Count(s=>s.BoundaryDriven)} boundary-driven test sources; {skipped} strict candidates skipped; {repairs.Count} riverbed samples corrected; {lakes} lake/reservoir features (unchanged). Local flooding is allowed for boundary-driven sources; downstream filling requires simulation verification.";
+        var report = $"Water: {sources.Count} river sources planned, including {sources.Count(s=>s.BoundaryDriven)} boundary-driven test sources; {skipped} strict candidates skipped; {repairs.Count} riverbed samples corrected; {lakes} lake/reservoir features (unchanged). Local flooding is allowed for boundary-driven sources; downstream filling requires simulation verification.";
         log.Info(report);
         log.Diagnostic($"WATER PLAN SUMMARY mappedWays={ways.Length}; connectedEdges={edges.Count}; mapEntryCandidates={candidates.Count(c=>c.Origin=="map-entry")}; inlandHeadCandidates={candidates.Count(c=>c.Origin=="mapped-inland-headwater")}; sourcesPlanned={sources.Count}; seaPlaneLevel={WaterLevels.Effective(terrain.SeaLevelMeters):R}; skipReasons="+string.Join(" | ",reasons.OrderBy(p=>p.Key).Select(p=>$"{p.Key}:{p.Value}")));
         return new WaterPlan(coastal, ways.Length, lakes, skipped, report) { Sources = sources,WaterCellSize=waterCellSize,ConditionedHeightmap=conditioned };

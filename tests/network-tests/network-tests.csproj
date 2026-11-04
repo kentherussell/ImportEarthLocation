@@ -3,7 +3,9 @@
   <ItemGroup>
     <None Update="fixtures/avenue-boise-northside.ndjson" CopyToOutputDirectory="PreserveNewest" />
     <None Update="fixtures/ramp-dc-loop.json" CopyToOutputDirectory="PreserveNewest" />
-    <Compile Include="../../ImportEarthLocation/Processing/NativeJunctionSimplifier.cs" Link="NativeJunctionSimplifier.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/StreetIntersectionConsolidator.cs" Link="StreetIntersectionConsolidator.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/StreetJunctionClusters.cs" Link="StreetJunctionClusters.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/MedianLinks.cs" Link="MedianLinks.cs" />    <Compile Include="../../ImportEarthLocation/Processing/NativeJunctionSimplifier.cs" Link="NativeJunctionSimplifier.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/ProfileStarCoordinates.cs" Link="ProfileStarCoordinates.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkProfileParents.cs" Link="NetworkProfileParents.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkBoundaryPolicy.cs" Link="NetworkBoundaryPolicy.cs" />
@@ -46,6 +48,7 @@
     <Compile Include="../../ImportEarthLocation/Processing/StreetGridAlignment.cs" Link="StreetGridAlignment.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkLaneSlots.cs" Link="NetworkLaneSlots.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/VisualCompilerProfile.cs" Link="VisualCompilerProfile.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/VisualCompilerInterchanges.cs" Link="VisualCompilerInterchanges.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NativeDesignUnits.cs" Link="NativeDesignUnits.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/StarterNetworkPolicy.cs" Link="StarterNetworkPolicy.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NativeJunctionReconciliation.cs" Link="NativeJunctionReconciliation.cs" />

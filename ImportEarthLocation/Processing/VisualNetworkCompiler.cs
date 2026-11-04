@@ -70,9 +70,13 @@ public static class VisualNetworkCompiler
         source=RailCorridorConsolidator.NativeJunctionFootprints(source,log,token);
         var structureSource=source;var structurePorts=SourceTopologyObligations.Capture(source).Ports;
         source=BridgeGaps(source,log,token);
-        // Topology ports and every earlier alias target must survive as nodes.
+        // Topology ports and every mandatory alias target must survive as nodes.
+        // A plain road alias (a source node that was never a port, such as a way
+        // boundary inside a merged avenue) may be joined into its run. Rail keeps
+        // every alias target: its formation and turnout nodes are aliases, and
+        // joining past them steepened a DC rail tunnel from 8.2% to 9.5%.
         var ports=new HashSet<SourceNodeKey>(SourceTopologyObligations.Capture(source).Ports);
-        foreach(var s in source)foreach(var alias in s.SourceNodeAliases)ports.Add(new(s.Kind,alias.CanonicalNodeId));
+        foreach(var s in source)foreach(var alias in s.SourceNodeAliases)if(alias.Mandatory||s.Kind==NetworkKind.Rail)ports.Add(new(s.Kind,alias.CanonicalNodeId));
         var retiredStructurePorts=new HashSet<SourceNodeKey>(structurePorts.Where(p=>p.Kind==NetworkKind.Road&&!ports.Contains(p)));
         var structureAliases=new Dictionary<long,long>();
         SourceNodeKey A(PreparedSegment s)=>new(s.Kind,s.StartNodeId);
@@ -83,6 +87,9 @@ public static class VisualNetworkCompiler
             position[A(s)]=((float3)s.CourseStart).xz;position[B(s)]=((float3)s.CourseEnd).xz;
             foreach(var key in new[]{A(s),B(s)}){degree[key]=degree.TryGetValue(key,out var d)?d+1:1;if(s.Roundabout)fixedNodes.Add(key);}
         }
+        var levelCrossings=NativeEndpointPolicy.LevelCrossings(source);
+        foreach(var node in levelCrossings)
+        {fixedNodes.Add(new(NetworkKind.Road,node));fixedNodes.Add(new(NetworkKind.Rail,node));}
 
         // Contract short connectors between junctions (report 64 V1 step 2).
         var parent=new Dictionary<SourceNodeKey,SourceNodeKey>();
@@ -113,6 +120,36 @@ public static class VisualNetworkCompiler
         var ends=new Dictionary<SourceNodeKey,List<(int Section,bool Start)>>();
         for(var i=0;i<source.Count;i++)foreach(var start in new[]{true,false})
         {var key=start?A(source[i]):B(source[i]);if(!ends.TryGetValue(key,out var list))ends[key]=list=new();list.Add((i,start));}
+        var streetTags=0;PreparedSegment[]? streetSource=null;
+        bool GroundStreet(PreparedSegment s)=>s.Kind==NetworkKind.Road&&!NativeAssetKeys.IsHighway(s)&&!s.ProtectedLink&&!s.Roundabout&&!NetworkStructure.IsStructure(s);
+        foreach(var i in Enumerable.Range(0,source.Count).OrderBy(i=>source[i].WayId).ThenBy(i=>source[i].StartNodeId).ThenBy(i=>source[i].EndNodeId))
+        {
+            token.ThrowIfCancellationRequested();var s=source[i];
+            if(contracted[i]||A(s)==B(s)||!GroundStreet(s)||fixedNodes.Contains(A(s))||fixedNodes.Contains(B(s))||
+                degree[A(s)]<2||degree[B(s)]<2||NetworkBoundaryPolicy.EndpointMarker(s,true)||NetworkBoundaryPolicy.EndpointMarker(s,false)||
+                NetworkDesignChecks.HorizontalArcLength(Curve(s))>10)continue;
+            foreach(var start in new[]{true,false})
+            {
+                var key=start?A(s):B(s);if(degree[key]!=2)continue;
+                var other=ends[key].First(p=>p.Section!=i);var streetNeighbor=source[other.Section];
+                if(contracted[other.Section]||!GroundStreet(streetNeighbor)||s.Lanes!=streetNeighbor.Lanes||s.OneWay!=streetNeighbor.OneWay||s.Layer!=streetNeighbor.Layer||
+                    s.NativeWidth!=streetNeighbor.NativeWidth||s.NativeAssetKey!=streetNeighbor.NativeAssetKey||NetworkBoundaryPolicy.EndpointMarker(streetNeighbor,other.Start)||
+                    s.OneWay&&start==other.Start||math.dot(Leaving(s,start),Leaving(streetNeighbor,other.Start))>-Math.Cos(math.radians(10)))continue;
+                var far=start?B(s):A(s);var nextFar=other.Start?B(streetNeighbor):A(streetNeighbor);
+                if(Root(nextFar)==Root(far)||Root(A(s))==Root(B(s)))continue;
+                var delta=position[A(s)]-position[B(s)];var heading=Leaving(streetNeighbor,other.Start);
+                if(Math.Abs(NetworkDesignChecks.Cross(delta,heading))>Math.Min(2,VisualCompilerTable.For(s).Deviation))continue;
+                // Retire only a plain, nearly straight tag/alias station. Keep
+                // its way evidence and aliases on the surviving continuation.
+                streetSource??=source.ToArray();
+                streetSource[other.Section]=streetNeighbor with{
+                    SourceWayIds=streetNeighbor.SourceWayIds.Append(streetNeighbor.WayId)
+                        .Concat(s.SourceWayIds).Append(s.WayId).Distinct().ToArray(),
+                    SourceNodeAliases=streetNeighbor.SourceNodeAliases.Concat(s.SourceNodeAliases).Distinct().ToArray()};
+                source=streetSource;parent[Root(B(s))]=Root(A(s));contracted[i]=true;streetTags++;break;
+            }
+        }
+        log.Count("Short plain street stations absorbed",streetTags);
         for(var i=0;i<source.Count;i++)
         {
             var s=source[i];if(contracted[i]||s.Roundabout||A(s)==B(s)||fixedNodes.Contains(A(s))||fixedNodes.Contains(B(s))||
@@ -177,6 +214,12 @@ public static class VisualNetworkCompiler
             foreach(var key in group)canonical[key]=best;
         }
         SourceNodeKey Canon(SourceNodeKey key)=>canonical[key];
+        var roundaboutRadii=new Dictionary<SourceNodeKey,float>();
+        foreach(var s in source.Where(s=>s.Kind==NetworkKind.Road))
+        {
+            if(s.StartRoundaboutRadius>0)roundaboutRadii[Canon(A(s))]=s.StartRoundaboutRadius;
+            if(s.EndRoundaboutRadius>0)roundaboutRadii[Canon(B(s))]=s.EndRoundaboutRadius;
+        }
         var absorbed=canonical.Where(p=>p.Key!=p.Value).ToDictionary(p=>p.Key,p=>p.Value);
 
         var arms=new Dictionary<SourceNodeKey,List<Arm>>();
@@ -332,8 +375,27 @@ public static class VisualNetworkCompiler
         }
         bool BranchOf(int t,int s)=>t!=s&&(interior[s].Contains(strokeEnds[t].Start)||interior[s].Contains(strokeEnds[t].End));
         var laneShifted=LaneDatum();
+        var dryStreets=new HashSet<int>();
         var streetLines=AlignStreets();
         var twoWayApproaches=0;var carriagewaySplits=0;var approach=MergeApproaches();
+        var crossingDirections=new Dictionary<Arm,double2>();
+        foreach(var node in arms.Where(p=>levelCrossings.Contains(p.Key.Id)&&p.Value.Count==2))
+        {
+            double2 Heading(Arm arm)
+            {
+                var chain=Chain(arm,100);var walked=0d;
+                for(var k=1;k<chain.Count;k++)
+                {
+                    var length=math.distance(chain[k-1],chain[k]);
+                    if(walked+length>=100)return math.normalizesafe(math.lerp(chain[k-1],chain[k],(100-walked)/length)-chain[0]);
+                    walked+=length;
+                }
+                return math.normalizesafe(chain[^1]-chain[0]);
+            }
+            var a=node.Value[0];var b=node.Value[1];var da=Heading(a);var db=Heading(b);
+            if(math.dot(da,db)>-Math.Cos(math.radians(35)))continue;
+            var axis=math.normalizesafe(da-db);crossingDirections[a]=axis;crossingDirections[b]=-axis;
+        }
         var forks=ForkClearance();var forkPushes=0;
         foreach(var path in paths)EmitStroke(path);
         var roundaboutFloors=RoundaboutWaterFloors();
@@ -349,6 +411,11 @@ public static class VisualNetworkCompiler
         }
         foreach(var pair in roundaboutFloors)
             nodeY[pair.Key]=(float)Math.Max(JunctionHeight(pair.Key),pair.Value);
+        foreach(var node in levelCrossings)
+        {
+            var rail=new SourceNodeKey(NetworkKind.Rail,node);var road=new SourceNodeKey(NetworkKind.Road,node);
+            if(nodeY.TryGetValue(rail,out var height)&&nodeY.TryGetValue(road,out var roadHeight)&&Math.Abs(roadHeight-height)<=.25f)nodeY[road]=height;
+        }
         var mismatch=plans.SelectMany(p=>p.Pins.Select(pin=>Math.Abs(p.HeightAt(pin.Station)-nodeY[pin.Node]))).OrderBy(d=>d).ToArray();
         double MismatchAt(double q)=>mismatch.Length==0?0:mismatch[(int)(q*(mismatch.Length-1))];
         log.Diagnostic($"VISUAL COMPILER junction height mismatch pins={mismatch.Length}; p50={MismatchAt(.5):F3}; p90={MismatchAt(.9):F3}; p99={MismatchAt(.99):F3}; max={MismatchAt(1):F2}; over10cm={mismatch.Count(d=>d>.1)}; over30cm={mismatch.Count(d=>d>.3)}");
@@ -363,7 +430,9 @@ public static class VisualNetworkCompiler
         var approaches=ElevateApproaches(RailCorridorConsolidator.RedundantOverlappingRoutes(aligned,log,token,2),terrain,scale,width,log,token);
         var finished=GroundAtJunctions(ElevateApproaches(approaches,terrain,scale,width,log,token,sink:true),log,token);
         log.Count("Former bridge-boundary ports retained as aliases",structureAliases.Count);
-        return SourceTopologyObligations.Transfer(structureSource,finished,NetworkKind.Road,structureAliases);
+        var required=new HashSet<SourceNodeKey>(ports);required.UnionWith(structurePorts);
+        var transferred=SourceTopologyObligations.Transfer(structureSource,finished,NetworkKind.Road,structureAliases);
+        return RetargetPlainAliases(JoinShortPieces(transferred,required,levelCrossings,log,token),position,log);
 
         // Travel-left lane continuity (report 64 V2 step 4). Along a one-way stroke
         // the left edge stays continuous where the native width changes, so a lane
@@ -414,9 +483,29 @@ public static class VisualNetworkCompiler
 
         IReadOnlyDictionary<int,StreetGridAlignment.Line> AlignStreets()
         {
+            var highways=new Dictionary<(int,int),List<double2>>();
+            (int,int) HighwayCell(double2 p)=>((int)Math.Floor(p.x/128),(int)Math.Floor(p.y/128));
+            foreach(var s in source.Where(s=>s.Kind==NetworkKind.Road&&NativeAssetKeys.IsHighway(s)))
+            {
+                token.ThrowIfCancellationRequested();
+                var curve=Curve(s);var count=Math.Max(1,(int)Math.Ceiling(NetworkDesignChecks.HorizontalArcLength(curve)/20));
+                for(var k=0;k<=count;k++)
+                {
+                    var p=NetworkDesignChecks.Evaluate(curve,k/(double)count).xz;var key=HighwayCell(p);
+                    if(!highways.TryGetValue(key,out var nearby))highways[key]=nearby=new();nearby.Add(p);
+                }
+            }
+            bool NearHighway(double2 p)
+            {
+                var (x,z)=HighwayCell(p);
+                for(var dz=-1;dz<=1;dz++)for(var dx=-1;dx<=1;dx++)
+                    if(highways.TryGetValue((x+dx,z+dz),out var nearby)&&nearby.Any(q=>math.distancesq(p,q)<100*100))return true;
+                return false;
+            }
             var protectedNodes=new HashSet<SourceNodeKey>(arms.Where(n=>n.Value.Any(a=>
                 source[a.Section].Kind!=NetworkKind.Road||NativeAssetKeys.IsHighway(source[a.Section])||
                 source[a.Section].Roundabout||NetworkStructure.IsStructure(source[a.Section]))).Select(n=>n.Key));
+            protectedNodes.UnionWith(fixedNodes);
             foreach(var node in position.Keys)if(math.cmax(math.abs(position[node]))>=width/2-16)protectedNodes.Add(node);
             var streets=new List<StreetGridAlignment.Street>();
             for(var id=0;id<paths.Count;id++)
@@ -436,7 +525,7 @@ public static class VisualNetworkCompiler
                     var d=math.normalizesafe(line[Math.Min(k+1,line.Count-1)]-line[Math.Max(0,k-1)]);var n=new double2(-d.y,d.x)*(first.NativeWidth/2+12);
                     for(var side=-1;side<=1;side++)if(water(new((float)(line[k].x+n.x*side),0,(float)(line[k].y+n.y*side))).HasValue){wet=true;break;}
                 }
-                if(!wet)streets.Add(new(id,nodes.ToArray(),at.ToArray(),line.ToArray(),first.NativeWidth));
+                if(!wet){streets.Add(new(id,nodes.ToArray(),at.ToArray(),line.ToArray(),first.NativeWidth));if(!line.Any(NearHighway))dryStreets.Add(id);}
                 else foreach(var node in nodes)protectedNodes.Add(node);
             }
             var result=StreetGridAlignment.Prepare(streets,protectedNodes,log,token);
@@ -968,6 +1057,12 @@ public static class VisualNetworkCompiler
                 for(var k=0;k<nodes.Count;k++)line[at[k]]=position[nodes[k]];
             }
             var tolerance=VisualCompilerTable.For(source[path[0].Section]);
+            // Reshaping a stroke containing a bridge or tunnel also changes its
+            // profile stations and approach grades. Preserve its established
+            // corners until horizontal and vertical structure fitting agree.
+            var optionalCornerRadius=path.Any(a=>NetworkStructure.IsStructure(source[a.Section]))?8:Math.Max(8,tolerance.RadiusFloor);
+            var smoothStreet=dryStreets.Contains(strokeOf[path[0].Section]);
+            var smoothMajor=Mainline(source[path[0].Section])&&!path.Any(a=>NetworkStructure.IsStructure(source[a.Section]));
             var interiorJunctions=new HashSet<int>(Enumerable.Range(1,Math.Max(0,nodes.Count-2)).Where(Junction).Select(k=>at[k]));
             var unpushed=line.ToList();
             // Side clearance first, so an approach (which only ever moves a point
@@ -981,6 +1076,29 @@ public static class VisualNetworkCompiler
             if(!approach.ContainsKey(new Arm(path[0].Section,path[0].Forward))&&forks.TryGetValue(new Arm(path[0].Section,path[0].Forward),out var startForks))foreach(var fork in startForks)Clear(line,true,fork,interiorJunctions);
             if(!approach.ContainsKey(new Arm(last.Section,!last.Forward))&&forks.TryGetValue(new Arm(last.Section,!last.Forward),out var endForks))foreach(var fork in endForks)Clear(line,false,fork,interiorJunctions);
             GuardPushes(line,unpushed,sectionAt,path,interiorJunctions);
+            var crossingKeep=new HashSet<int>();
+            void CrossingApproach(Arm arm,bool start)
+            {
+                if(!crossingDirections.TryGetValue(arm,out var axis))return;
+                var node=start?line[0]:line[^1];var moved=new List<(int Index,double2 Point)>();var walked=0d;var previous=node;
+                // A short straight through the footprint, then a smooth return
+                // over 80 m. Never move another junction or exceed the existing
+                // class allowance merely to straighten a level crossing.
+                var straight=Math.Max(12,source[arm.Section].NativeWidth);var reach=straight+80;
+                for(var j=1;j<line.Count-1;j++)
+                {
+                    var k=start?j:line.Count-1-j;var p=line[k];walked+=math.distance(previous,p);previous=p;
+                    if(walked>=reach||interiorJunctions.Contains(k))break;
+                    var u=math.clamp((walked-straight)/(reach-straight),0,1);var weight=1-u*u*(3-2*u);
+                    var projected=node+axis*math.dot(p-node,axis);var q=math.lerp(p,projected,weight);
+                    if(math.distance(q,p)>tolerance.Deviation){log.Count("Level crossing approach alignments requiring review");return;}
+                    moved.Add((k,q));
+                }
+                foreach(var (k,p) in moved)line[k]=p;
+                if(moved.Count>0)crossingKeep.Add(moved[0].Index);
+            }
+            CrossingApproach(new(path[0].Section,path[0].Forward),true);
+            CrossingApproach(new(last.Section,!last.Forward),false);
             bool Junction(int k)=>k==0||k==nodes.Count-1||arms[nodes[k]].Count>=3||fixedNodes.Contains(nodes[k]);
             bool Port(int k)=>!Junction(k)&&(ports.Contains(nodes[k])||absorbed.ContainsValue(nodes[k]));
             double Stub(int k)=>arms[nodes[k]].Count>=3?Math.Max(10,.75*arms[nodes[k]].Max(a=>source[a.Section].NativeWidth)):0;
@@ -1065,7 +1183,7 @@ public static class VisualNetworkCompiler
                 if(!t.Tunnel&&(t.Bridge||t.Kind==NetworkKind.Road))
                 {
                     var q=new float3((float)plan.Point[k].x,0,(float)plan.Point[k].y);var surface=water?.Invoke(q)??float.NaN;
-                    if(t.Kind==NetworkKind.Road&&water!=null)
+                    if((t.Kind==NetworkKind.Road||t.Bridge)&&water!=null)
                     {
                         // Cover the gap between profile samples and small lateral
                         // differences between the polyline and its emitted cubic.
@@ -1084,6 +1202,7 @@ public static class VisualNetworkCompiler
             }
             plan.Pins.Add((0,nodes[0],arms[nodes[0]].Count>=3));
             foreach(var cut in allCuts)if(cut.StrokeNode>0&&Junction(cut.StrokeNode))plan.Pins.Add((stations[cut.Piece+1],nodes[cut.StrokeNode],arms[nodes[cut.StrokeNode]].Count>=3));
+            foreach(var pin in plan.Pins)if(levelCrossings.Contains(pin.Node.Id))plan.LevelCrossingNodes.Add(pin.Node.Id);
             plans.Add(plan);
 
             // Emission waits for the vertical stage; cubics merge greedily up to 400 m.
@@ -1094,13 +1213,38 @@ public static class VisualNetworkCompiler
                 // the solved profile (report 64 V5). At 0.15 m, and the class merge
                 // tolerance alone in plan, straight roads were cut into many short
                 // pieces whose joints read as bumps; both are now doubled.
-                bool Vertical(Piece c,double s0,double s1,double limit=.3)
+                bool Vertical(Piece c,double s0,double s1,double limit=.3,bool bend=true)
                 {
                     var y0=plan.HeightAt(s0);var y3=plan.HeightAt(s1);
                     var y1=y0+math.distance(c.P0,c.P1)*plan.GradeAt(s0);var y2=y3-math.distance(c.P2,c.P3)*plan.GradeAt(s1);
                     for(var q=1;q<4;q++){var t=q/4d;var u=1-t;var y=u*u*u*y0+3*u*u*t*y1+3*u*t*t*y2+t*t*t*y3;if(Math.Abs(y-plan.HeightAt(s0+t*(s1-s0)))>limit)return false;}
-                    return true;
+                    // A Hermite height has a linear second derivative, so a vertical
+                    // curve filling only part of the cubic is drawn up to twice as
+                    // sharp at one end (DC motorway bridge ends: 1.6–2.1× the class
+                    // K). The cubic may bend no more than the class allows, or than
+                    // the solved profile itself does over the same stretch. Joining a
+                    // piece shorter than the class minimum ignores this: a short
+                    // section reads as a kink itself, and the check added 2–3% more.
+                    if(!bend||plan.Kind!=NetworkKind.Road)return true;
+                    var rate=HermiteRate(c,y0,y1,y2,y3);
+                    return rate<=RateLimit(s0,s1)||rate<=1.05*plan.GradeChangeRate(s0,s1);
                 }
+                // Steepest grade change along a Hermite height curve, in grade per metre.
+                static double HermiteRate(Piece c,double y0,double y1,double y2,double y3)
+                {
+                    const int n=16;var worst=0d;var previousGrade=0d;var walked=0d;var previousStation=0d;var previous=c.P0;
+                    for(var q=0;q<=n;q++)
+                    {
+                        var t=q/(double)n;var u=1-t;var p=Evaluate(c,t);walked+=math.distance(previous,p);previous=p;
+                        var dxz=3*(u*u*(c.P1-c.P0)+2*u*t*(c.P2-c.P1)+t*t*(c.P3-c.P2));var dy=3*(u*u*(y1-y0)+2*u*t*(y2-y1)+t*t*(y3-y2));
+                        var grade=dy/Math.Max(1e-9,math.length(dxz));
+                        if(q>0&&walked-previousStation>1e-6)worst=Math.Max(worst,Math.Abs(grade-previousGrade)/(walked-previousStation));
+                        previousGrade=grade;previousStation=walked;
+                    }
+                    return worst;
+                }
+                // The class rate: 1% of grade per K metres, looser in a tunnel.
+                double RateLimit(double s0,double s1)=>.01/(tolerance.K*(plan.AllTunnel(s0,s1)?VisualCompilerTable.TunnelKShare:1));
                 foreach(var run in runs)
                 {
                     var merge=2*(run.Template.Kind==NetworkKind.Rail?.3:tolerance.MergeTolerance);var runStartNode=run.StartNode;
@@ -1124,7 +1268,7 @@ public static class VisualNetworkCompiler
                     // A cubic shorter than the class minimum joins a neighbour when one
                     // cubic still fits within twice the merge tolerance and 0.6 m of the
                     // profile: a short piece reads as a kink, a decimetre of drift does not.
-                    var minimum=VisualCompilerTable.For(run.Template).MinimumSegment;
+                    var minimum=Math.Max(smoothStreet?30:0,VisualCompilerTable.For(run.Template).MinimumSegment);
                     for(var g=0;g<groups.Count;g++)
                     {
                         var (a,b,_)=groups[g];if(queue[b].S1-queue[a].S0>=minimum)continue;
@@ -1132,7 +1276,7 @@ public static class VisualNetworkCompiler
                         {
                             if(other<0||other>=groups.Count)continue;
                             var lo=Math.Min(a,groups[other].A);var hi=Math.Max(b,groups[other].B);
-                            if(queue[hi].S1-queue[lo].S0>MaximumSpan||!Fit(list,lo,hi,2*merge,out var merged)||!Vertical(merged,queue[lo].S0,queue[hi].S1,.6))continue;
+                            if(queue[hi].S1-queue[lo].S0>MaximumSpan||!Fit(list,lo,hi,2*merge,out var merged)||!Vertical(merged,queue[lo].S0,queue[hi].S1,.6,bend:false))continue;
                             groups[Math.Min(g,other)]=(lo,hi,merged);groups.RemoveAt(Math.Max(g,other));counts.Absorbed++;g=Math.Min(g,other)-1;break;
                         }
                     }
@@ -1165,8 +1309,8 @@ public static class VisualNetworkCompiler
                                 if(hi<=middle)left.Add(piece);else if(lo>=middle)right.Add(piece);
                                 else{var (l,r)=Split(piece,(middle-lo)/(hi-lo));left.Add(l);right.Add(r);}
                             }
-                            if(!Fit(left,0,left.Count-1,2*merge,out var first)||!Vertical(first,u0,middle,.6)||
-                               !Fit(right,0,right.Count-1,2*merge,out var second)||!Vertical(second,middle,u1,.6))continue;
+                            if(!Fit(left,0,left.Count-1,2*merge,out var first)||!Vertical(first,u0,middle,.6,bend:false)||
+                               !Fit(right,0,right.Count-1,2*merge,out var second)||!Vertical(second,middle,u1,.6,bend:false))continue;
                             // A repeated redistribution must not introduce or
                             // deepen a water intrusion while repairing the join.
                             // Inspect only these clipped pairs, on their actual
@@ -1212,17 +1356,18 @@ public static class VisualNetworkCompiler
                 }
             });
 
-            (List<Piece> Pieces,List<Cut> Cuts,List<int> Missed) Build()
+            (List<Piece> Pieces,List<Cut> Cuts,List<int> Missed) Build(bool smoothTangents=true)
             {
                 // Douglas–Peucker between pinned nodes; other ports are projected later.
                 var keep=new bool[line.Count];var pinnedAt=new Dictionary<int,int>();
+                foreach(var k in crossingKeep)keep[k]=true;
                 for(var k=0;k<nodes.Count;k++)if(Junction(k)||forced.Contains(k)){keep[at[k]]=true;pinnedAt[at[k]]=k;}                var anchors=Enumerable.Range(0,line.Count).Where(j=>keep[j]).ToArray();
                 for(var j=1;j<anchors.Length;j++)Simplify(line,anchors[j-1],anchors[j],tolerance.Epsilon,keep);
                 var vertices=Enumerable.Range(0,line.Count).Where(j=>keep[j]).ToArray();
                 const double cornerRadius=8;
-                // A vertex whose fillet cannot fit (a short tangent beside a
-                // junction) would become a node corner: a visible kink on an
-                // otherwise smooth road. Where the line without it stays within
+                // A vertex whose fillet falls below the class radius floor
+                // leaves an unnecessarily tight bend beside a short tangent.
+                // Where the line without it stays within
                 // the class deviation of every source point it spans, the vertex
                 // is dropped instead; three passes let neighbours follow.
                 double FilletRadius(IReadOnlyList<int> list,int v)
@@ -1242,7 +1387,7 @@ public static class VisualNetworkCompiler
                     var dropped=false;
                     for(var v=1;v<kept.Count-1;v++)
                     {
-                        if(pinnedAt.ContainsKey(kept[v])||FilletRadius(kept,v)>=cornerRadius)continue;
+                        if(pinnedAt.ContainsKey(kept[v])||FilletRadius(kept,v)>=optionalCornerRadius)continue;
                         var a=line[kept[v-1]];var b=line[kept[v+1]];var ab=b-a;var worst=0d;
                         for(var j=kept[v-1]+1;j<kept[v+1];j++){var t=math.clamp(math.dot(line[j]-a,ab)/Math.Max(1e-9,math.lengthsq(ab)),0,1);worst=Math.Max(worst,math.distance(line[j],a+ab*t));}
                         if(worst>tolerance.Deviation)continue;
@@ -1278,6 +1423,26 @@ public static class VisualNetworkCompiler
                 }
                 var missed=new List<int>();if(pieces.Count==0)return (pieces,cuts,missed);
 
+                // A retained street junction is a position constraint, not a
+                // corner. Keep one tangent through a gently continuing route;
+                // the old pair of straight chords left a kink at every small
+                // survey offset. Endpoints and connecting side streets stay put.
+                if((smoothStreet||smoothMajor)&&smoothTangents)foreach(var cut in cuts)
+                {
+                    var k=cut.StrokeNode;var p=cut.Piece;
+                    if(!smoothStreet&&k>=0)continue; // Mainline source junctions keep their established approach geometry.
+                    if(p+1>=pieces.Count||k>=0&&(k==0||k>=nodes.Count-1||fixedNodes.Contains(nodes[k])||
+                        arms[nodes[k]].Any(a=>source[a.Section].Kind!=NetworkKind.Road||NativeAssetKeys.IsHighway(source[a.Section])||
+                            source[a.Section].ProtectedLink||source[a.Section].Roundabout||NetworkStructure.IsStructure(source[a.Section]))))continue;
+                    var a=pieces[p];var b=pieces[p+1];
+                    var da=math.normalizesafe(a.P3-a.P2);var db=math.normalizesafe(b.P1-b.P0);
+                    if(math.dot(da,db)<Math.Cos(math.radians(!smoothStreet?20:k<0?120:35)))continue;
+                    var direction=math.normalizesafe(da+db);
+                    var c2=a.P3-direction*math.distance(a.P2,a.P3);var c1=b.P0+direction*math.distance(b.P0,b.P1);
+                    if(math.distance(c2,a.P2)>tolerance.Deviation||math.distance(c1,b.P1)>tolerance.Deviation)continue;
+                    pieces[p]=a with{P2=c2};pieces[p+1]=b with{P1=c1};
+                }
+
                 // Degree-two ports (attribute changes, absorbed targets) keep their
                 // identity: split the alignment at their nearest point, in order. A
                 // port landing on an existing cut moves to the middle of its piece.
@@ -1306,6 +1471,10 @@ public static class VisualNetworkCompiler
                 }
                 cuts=cuts.OrderBy(c=>c.Piece).ToList();
                 if(cuts.Count==0||cuts[cuts.Count-1].Piece!=pieces.Count-1)cuts.Add(new(pieces.Count-1,nodes[nodes.Count-1].Id,nodes.Count-1));
+                if(smoothStreet&&smoothTangents&&pieces.Any(p=>Length(p)<3))
+                {
+                    log.Count("Street tangent smoothing sliver fallbacks");return Build(false);
+                }
                 return (pieces,cuts,missed);
             }
         }
@@ -1319,7 +1488,7 @@ public static class VisualNetworkCompiler
             var p0=Exact(kind,startNode,P(c.P0,y0));var p3=Exact(kind,endNode,P(c.P3,y3));
             var p1=P(c.P1,(float)(y0+math.distance(c.P0,c.P1)*plan.GradeAt(s0)));var p2=P(c.P2,(float)(y3-math.distance(c.P2,c.P3)*plan.GradeAt(s1)));
             if(backwards){(p0,p3)=(p3,p0);(p1,p2)=(p2,p1);(startNode,endNode)=(endNode,startNode);}
-            var ways=covered.SelectMany(i=>source[i].SourceWayIds.Count>0?source[i].SourceWayIds:new[]{source[i].WayId}).Distinct().OrderBy(w=>w).ToArray();
+            var ways=covered.SelectMany(i=>source[i].SourceWayIds.Append(source[i].WayId)).Distinct().OrderBy(w=>w).ToArray();
             // An earlier alias onto a node this compiler absorbed follows it.
             var aliases=covered.SelectMany(i=>source[i].SourceNodeAliases)
                 .Select(a=>absorbed.TryGetValue(new(kind,a.CanonicalNodeId),out var merged)?a with{CanonicalNodeId=merged.Id}:a)
@@ -1333,7 +1502,8 @@ public static class VisualNetworkCompiler
                 StartCurveOffset=default,EndCurveOffset=default,FinalDeckCurve=null,HorizontalParent=null,HorizontalEmissionReference=null,
                 SourceWayIds=ways,SourceNodeAliases=aliases,SourceGeometry=geometry,NativeUnitId=-1,
                 StartTerminal=template.StartTerminal&&startNode==template.StartNodeId,EndTerminal=template.EndTerminal&&endNode==template.EndNodeId,
-                StartMiniRoundabout=template.StartMiniRoundabout&&startNode==template.StartNodeId,EndMiniRoundabout=template.EndMiniRoundabout&&endNode==template.EndNodeId};
+                StartMiniRoundabout=template.StartMiniRoundabout&&startNode==template.StartNodeId,EndMiniRoundabout=template.EndMiniRoundabout&&endNode==template.EndNodeId,
+                StartRoundaboutRadius=roundaboutRadii.GetValueOrDefault(new(kind,startNode)),EndRoundaboutRadius=roundaboutRadii.GetValueOrDefault(new(kind,endNode))};
         }
         float NodeHeight(NetworkKind kind,long node,float fallback)=>nodeY.TryGetValue(new(kind,node),out var y)?y:fallback;
         float3 Exact(NetworkKind kind,long node,float3 p)
@@ -1398,6 +1568,166 @@ public static class VisualNetworkCompiler
         }
         log.Count("Ground gaps between bridges built as bridge",runs);
         return result??source;
+    }
+
+    // A road or track piece shorter than its class minimum, left between two
+    // emitted pieces that the game builds identically (the same asset, lanes,
+    // direction and structure; for track also service, track count and
+    // terminal formation), joins its neighbour as one cubic. Approach elevation
+    // is the usual cause on roads: it turns the ground either side of a short
+    // source bridge into bridge, and the source's bridge and layer boundaries
+    // become plain joints. On track the removed nodes are mostly aliases left
+    // by consolidating parallel tracks. A port on the removed node becomes a
+    // mandatory alias of the short piece's far end, which lies less than the
+    // minimum away. The join must stay within the compiler's short-piece
+    // allowance: twice the doubled merge tolerance across, 0.6 m in height. A
+    // joined track may curve no tighter than the class radius floor or the
+    // tighter of its two pieces, and must pass the native train-curvature check.
+    private static IReadOnlyList<PreparedSegment> JoinShortPieces(IReadOnlyList<PreparedSegment> source,HashSet<SourceNodeKey> required,
+        HashSet<long> levelCrossings,ImportLog log,CancellationToken token)
+    {
+        var list=source.ToList<PreparedSegment?>();var ends=new Dictionary<SourceNodeKey,List<int>>();
+        void Attach(int i,long id){var key=new SourceNodeKey(list[i]!.Kind,id);if(!ends.TryGetValue(key,out var arms))ends[key]=arms=new();arms.Add(i);}
+        for(var i=0;i<list.Count;i++){Attach(i,list[i]!.StartNodeId);Attach(i,list[i]!.EndNodeId);}
+        double Length(PreparedSegment s)=>NetworkDesignChecks.HorizontalArcLength(Curve(s));
+        bool Short(PreparedSegment s)=>!s.Roundabout&&Length(s)<VisualCompilerTable.For(s).MinimumSegment;
+        double Curvature(Cubic3d c)=>Enumerable.Range(0,33).Max(k=>Math.Abs(NetworkDesignChecks.Curvature(c,k/32d)));
+        bool Same(PreparedSegment a,PreparedSegment b)=>a.Kind==b.Kind&&a.Classification==b.Classification&&a.NativeAssetKey==b.NativeAssetKey&&a.NativeWidth==b.NativeWidth&&
+            a.Lanes==b.Lanes&&a.ForwardLanes==b.ForwardLanes&&a.BackwardLanes==b.BackwardLanes&&a.BothWaysLanes==b.BothWaysLanes&&a.OneWay==b.OneWay&&
+            a.Bridge==b.Bridge&&a.Tunnel==b.Tunnel&&!a.Roundabout&&!b.Roundabout&&a.NativeLaneOffsets.SequenceEqual(b.NativeLaneOffsets)&&
+            a.PairedProfileId==b.PairedProfileId&&a.PairedSpanId==0&&b.PairedSpanId==0&&a.ConsolidatedAvenue==b.ConsolidatedAvenue&&
+            a.ExplicitCutSides==b.ExplicitCutSides&&a.ExplicitWallSides==b.ExplicitWallSides&&a.RetainingWallSides==b.RetainingWallSides&&a.QuaySides==b.QuaySides&&
+            a.FinalDeckCurve==null&&b.FinalDeckCurve==null&&a.RailService==b.RailService&&a.PhysicalTracks==b.PhysicalTracks&&
+            a.RailTerminalFormationId==b.RailTerminalFormationId&&a.NativeCenterlineCurvatureLimit==b.NativeCenterlineCurvatureLimit;
+        var removed=new Dictionary<SourceNodeKey,(long Keep,bool Mandatory)>();var joined=0;
+        var queue=Enumerable.Range(0,list.Count).Where(i=>Short(list[i]!)).ToList();
+        for(var q=0;q<queue.Count;q++)
+        {
+            token.ThrowIfCancellationRequested();var i=queue[q];var s=list[i];if(s==null||!Short(s))continue;
+            (PreparedSegment Merged,int Other,SourceNodeKey Node,double Error)? best=null;
+            foreach(var atStart in new[]{true,false})
+            {
+                var node=new SourceNodeKey(s.Kind,atStart?s.StartNodeId:s.EndNodeId);
+                if(!ends.TryGetValue(node,out var arms)||arms.Count!=2||levelCrossings.Contains(node.Id))continue;
+                var j=arms[0]==i?arms[1]:arms[0];var o=list[j];if(j==i||o==null)continue;
+                // Orient as a then b through the node; a two-way piece may be reversed.
+                var a=atStart?o:s;var b=atStart?s:o;
+                if(a.EndNodeId!=node.Id){if(a.OneWay)continue;a=NetworkNormalizer.Reverse(a);}
+                if(b.StartNodeId!=node.Id){if(b.OneWay)continue;b=NetworkNormalizer.Reverse(b);}
+                if(a.EndNodeId!=node.Id||b.StartNodeId!=node.Id||a.StartNodeId==b.EndNodeId||!Same(a,b)||
+                   math.any(a.EndCurveOffset!=0)||math.any(b.StartCurveOffset!=0)||a.EndTerminal||b.StartTerminal||a.EndMiniRoundabout||b.StartMiniRoundabout||
+                   a.EndLevelCrossing||b.StartLevelCrossing||a.EndRoundaboutRadius>0||b.StartRoundaboutRadius>0)continue;
+                if(Length(a)+Length(b)>MaximumSpan||!TryJoin(a,b,out var merged,out var error))continue;
+                var tolerance=VisualCompilerTable.For(s);
+                if(error.Across>4*tolerance.MergeTolerance||error.Height>.6)continue;
+                if(s.Kind==NetworkKind.Rail)
+                {
+                    var c=Curve(merged);
+                    if(Curvature(c)>Math.Max(1/tolerance.RadiusFloor,Math.Max(Curvature(Curve(a)),Curvature(Curve(b))))+1e-9)continue;
+                    if(merged.NativeCenterlineCurvatureLimit is double k&&NetworkDesignChecks.Certify(c,k,double.PositiveInfinity,token:token,maximumLeaves:4096).Quality!=DesignQuality.Certified)continue;
+                }
+                // A structure keeps its highest (bridge) or lowest (tunnel) layer.
+                merged=merged with{Layer=s.Tunnel?Math.Min(a.Layer,b.Layer):s.Bridge?Math.Max(a.Layer,b.Layer):(Length(a)>=Length(b)?a:b).Layer};
+                if(best==null||error.Across<best.Value.Error)best=(merged,j,node,error.Across);
+            }
+            if(best==null)continue;
+            var (result,other,removedNode,_)=best.Value;
+            var keep=removedNode.Id==s.StartNodeId?s.EndNodeId:s.StartNodeId;
+            removed[removedNode]=(keep,required.Contains(removedNode));
+            list[i]=result;list[other]=null;ends.Remove(removedNode);joined++;
+            var far=new SourceNodeKey(s.Kind,result.StartNodeId==keep?result.EndNodeId:result.StartNodeId);
+            var farArms=ends[far];farArms[farArms.IndexOf(other)]=i;
+            if(Short(result))queue.Add(i);
+        }
+        if(joined==0)return source;
+        log.Count("Short pieces joined across plain joints after approach elevation",joined);
+        long Resolve(SourceNodeKey key){while(removed.TryGetValue(key,out var r))key=key with{Id=r.Keep};return key.Id;}
+        var byKeep=removed.GroupBy(r=>new SourceNodeKey(r.Key.Kind,Resolve(r.Key))).ToDictionary(g=>g.Key,g=>g.Select(r=>new SourceNodeAlias(r.Key.Id,g.Key.Id,r.Value.Mandatory)).ToArray());
+        return list.OfType<PreparedSegment>().Select(s=>
+        {
+            var start=byKeep.TryGetValue(new(s.Kind,s.StartNodeId),out var x)?x:Array.Empty<SourceNodeAlias>();
+            var end=byKeep.TryGetValue(new(s.Kind,s.EndNodeId),out var y)?y:Array.Empty<SourceNodeAlias>();
+            if(start.Length==0&&end.Length==0&&!s.SourceNodeAliases.Any(a=>removed.ContainsKey(new(s.Kind,a.CanonicalNodeId))))return s;
+            var aliases=s.SourceNodeAliases.Select(a=>removed.ContainsKey(new(s.Kind,a.CanonicalNodeId))?a with{CanonicalNodeId=Resolve(new(s.Kind,a.CanonicalNodeId))}:a)
+                .Concat(start).Concat(end).GroupBy(a=>a.SourceNodeId).Select(g=>g.OrderByDescending(a=>a.Mandatory).First()).OrderBy(a=>a.SourceNodeId).ToArray();
+            return s with{SourceNodeAliases=aliases};
+        }).ToArray();
+    }
+
+    // One cubic through a then b: the outer ends and tangent directions stay,
+    // and the two handle lengths are a least-squares fit to points along both
+    // pieces at chord-length parameters. Error is the largest horizontal and
+    // vertical departure of those points from the joined curve.
+    private static bool TryJoin(PreparedSegment a,PreparedSegment b,out PreparedSegment merged,out (double Across,double Height) error)
+    {
+        merged=a;error=(double.PositiveInfinity,double.PositiveInfinity);
+        var ca=Curve(a);var cb=Curve(b);var p0=ca.P0;var p3=cb.P3;
+        var ta=math.normalizesafe(ca.P1-ca.P0);var tb=math.normalizesafe(cb.P3-cb.P2);
+        if(math.lengthsq(ta)<.5||math.lengthsq(tb)<.5||math.dot(ta.xz,tb.xz)<0)return false;
+        var points=new List<double3>();
+        for(var k=0;k<=8;k++)points.Add(NetworkDesignChecks.Evaluate(ca,k/8d));
+        for(var k=1;k<=8;k++)points.Add(NetworkDesignChecks.Evaluate(cb,k/8d));
+        var u=new double[points.Count];for(var k=1;k<points.Count;k++)u[k]=u[k-1]+math.distance(points[k-1],points[k]);
+        var total=u[^1];if(total<1e-3)return false;
+        double m11=0,m12=0,m22=0,r1=0,r2=0;
+        for(var k=0;k<points.Count;k++)
+        {
+            var t=u[k]/total;var w=1-t;var b0=w*w*w;var b1=3*w*w*t;var b2=3*w*t*t;var b3=t*t*t;
+            var r=points[k]-(b0+b1)*p0-(b2+b3)*p3;
+            m11+=b1*b1;m12-=b1*b2*math.dot(ta,tb);m22+=b2*b2;r1+=b1*math.dot(ta,r);r2-=b2*math.dot(tb,r);
+        }
+        var det=m11*m22-m12*m12;if(Math.Abs(det)<1e-12)return false;
+        var alpha=(r1*m22-m12*r2)/det;var beta=(m11*r2-m12*r1)/det;
+        if(!(alpha>0&&beta>0)||alpha>total||beta>total)return false;
+        var c=new Cubic3d(p0,p0+alpha*ta,p3-beta*tb,p3);
+        var samples=Enumerable.Range(0,129).Select(k=>NetworkDesignChecks.Evaluate(c,k/128d)).ToArray();
+        double across=0,height=0;
+        foreach(var p in points)
+        {
+            // Nearest point of the sampled joined curve, by projection onto its chords.
+            var best=(Distance:double.PositiveInfinity,Y:0d);
+            for(var k=1;k<samples.Length;k++)
+            {
+                var o=samples[k-1];var d=samples[k]-o;var t=math.clamp(math.dot(p.xz-o.xz,d.xz)/Math.Max(1e-12,math.lengthsq(d.xz)),0,1);
+                var q=o+d*t;var distance=math.distance(q.xz,p.xz);if(distance<best.Distance)best=(distance,q.y);
+            }
+            across=Math.Max(across,best.Distance);height=Math.Max(height,Math.Abs(best.Y-p.y));
+        }
+        error=(across,height);
+        merged=a with{EndNodeId=b.EndNodeId,End=b.End,Control1=(float3)c.P1-a.StartCurveOffset,Control2=(float3)c.P2-b.EndCurveOffset,
+            EndCurveOffset=b.EndCurveOffset,EndElevation=b.EndElevation,EndTerminal=b.EndTerminal,EndMiniRoundabout=b.EndMiniRoundabout,
+            EndRoundaboutRadius=b.EndRoundaboutRadius,EndLevelCrossing=b.EndLevelCrossing,EndHeightFamily=b.EndHeightFamily,
+            HorizontalEmissionReference=null,HorizontalParent=null,ParentStartT=0,ParentEndT=1,
+            SourceWayIds=a.SourceWayIds.Append(a.WayId).Concat(b.SourceWayIds.Append(b.WayId)).Distinct().OrderBy(w=>w).ToArray(),
+            SourceNodeAliases=a.SourceNodeAliases.Concat(b.SourceNodeAliases).Distinct().ToArray(),
+            SourceGeometry=a.SourceGeometry.Concat(b.SourceGeometry).ToArray(),OriginalGeometry=a.OriginalGeometry.Concat(b.OriginalGeometry).ToArray(),
+            MaximumNativeWidth=Math.Min(a.MaximumNativeWidth,b.MaximumNativeWidth),ExplicitLanes=a.ExplicitLanes||b.ExplicitLanes};
+        return true;
+    }
+
+    // A plain alias whose canonical node was joined into a run follows the
+    // nearest emitted end, judged from the old node's position, so every alias
+    // names a node that exists. Mandatory aliases are ports and never move.
+    private static IReadOnlyList<PreparedSegment> RetargetPlainAliases(IReadOnlyList<PreparedSegment> source,IReadOnlyDictionary<SourceNodeKey,double2> position,ImportLog log)
+    {
+        var present=new HashSet<SourceNodeKey>();
+        foreach(var s in source){present.Add(new(s.Kind,s.StartNodeId));present.Add(new(s.Kind,s.EndNodeId));}
+        // A target still present on another section wins (distance -1), so one
+        // source node never names two canonical nodes.
+        var target=new Dictionary<SourceNodeKey,(long Id,double Distance)>();var stale=0;
+        foreach(var s in source)foreach(var alias in s.SourceNodeAliases)
+        {
+            var old=new SourceNodeKey(s.Kind,alias.CanonicalNodeId);var key=new SourceNodeKey(s.Kind,alias.SourceNodeId);if(alias.Mandatory)continue;
+            if(present.Contains(old)){target[key]=(old.Id,-1);continue;}
+            stale++;var at=position.TryGetValue(old,out var p)?p:((float3)s.CourseStart).xz;
+            foreach(var (id,end) in new[]{(s.StartNodeId,((float3)s.CourseStart).xz),(s.EndNodeId,((float3)s.CourseEnd).xz)})
+            {var d=math.distance(at,(double2)end);if(!target.TryGetValue(key,out var best)||d<best.Distance)target[key]=(id,d);}
+        }
+        if(stale==0)return source;
+        log.Count("Plain aliases moved to the nearest emitted node",stale);
+        return source.Select(s=>!s.SourceNodeAliases.Any(a=>target.ContainsKey(new(s.Kind,a.SourceNodeId))&&!present.Contains(new(s.Kind,a.CanonicalNodeId)))?s:
+            s with{SourceNodeAliases=s.SourceNodeAliases.Select(a=>!a.Mandatory&&!present.Contains(new(s.Kind,a.CanonicalNodeId))&&target.TryGetValue(new(s.Kind,a.SourceNodeId),out var t)
+                ?a with{CanonicalNodeId=t.Id}:a).ToArray()}).ToArray();
     }
 
     // Where ground and elevated road pieces meet at one junction (an exit leaving

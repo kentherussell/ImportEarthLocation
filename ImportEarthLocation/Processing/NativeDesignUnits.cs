@@ -16,6 +16,9 @@ public static class NativeDesignUnits
     private const double MinimumPiece=3;
     // No unit cut within this distance (metres) of another node of its kind.
     private const float CutClearance=3;
+    // Added to a class minimum (metres): a cut placed exactly at the minimum
+    // measures a few millimetres short once the pieces are refitted.
+    private const double MinimumMargin=.5;
     private sealed class Chain
     {
         public SourceNodeKey Start, End;
@@ -139,7 +142,7 @@ public static class NativeDesignUnits
         foreach(var chain in chains)
         {
             token.ThrowIfCancellationRequested();var startUnit=Core(chain.Start);var endUnit=Core(chain.End);
-            var minimum=minimumPiece?.Invoke(source[chain.Spans[0].Index])??0;
+            var minimum=minimumPiece==null?0:minimumPiece(source[chain.Spans[0].Index])+MinimumMargin;
             var boundaries=new SortedSet<double>();var corridorUnits=new List<int>();
             // One already-fitted span needs one safe handoff, not two cuts
             // enclosing a third, otherwise empty corridor batch. The boundary
@@ -177,6 +180,8 @@ public static class NativeDesignUnits
             foreach(var span in chain.Spans)
             {
                 var s=source[span.Index];var cuts=new List<double>();var joined=new List<(double T,int Unit)>();
+                // Every piece but a roundabout ring keeps the class minimum on both sides.
+                var bounded=minimum>0&&!s.Roundabout;
                 if(!chain.Indivisible)
                 {
                     foreach(var boundary in stations)
@@ -216,11 +221,19 @@ public static class NativeDesignUnits
                             foreach(var shift in shifts)
                             {
                                 var at=local+shift;if(at<MinimumPiece||span.Length-at<MinimumPiece)continue;
+                                if(bounded&&Math.Min(at,span.Length-at)<minimum)continue;
                                 var u=Parameter(curve,span.Forward?at:span.Length-at);
+                                if(bounded&&cuts.Any(c=>Length(curve,Math.Min(c,u),Math.Max(c,u))<minimum))continue;
                                 if(u<=0||u>=1||!CanSplit(s,u)||!Clear(s.Kind,((float3)NetworkDesignChecks.Evaluate(curve,u)).xz))continue;
                                 chosen=u;if(shift!=0)moved++;break;
                             }
-                            if(double.IsNaN(chosen)){crowded++;continue;}
+                            if(double.IsNaN(chosen))
+                            {
+                                if(bounded&&(startCore||endCore))
+                                {joined.Add((t,startCore?startUnit:endUnit));slivers++;}
+                                else crowded++;
+                                continue;
+                            }
                             cuts.Add(chosen);AddNode(s.Kind,((float3)NetworkDesignChecks.Evaluate(curve,chosen)).xz);
                         }
                     }
@@ -269,7 +282,9 @@ public static class NativeDesignUnits
                 if(!CanSplit(remaining,local)){log.Count("Unrepresentable optional unit cuts avoided");continue;}
                 // The opposite carriageway's cut can fall beside a node of this one.
                 var piece=new Cubic3d(remaining.CourseStart,remaining.CourseControl1,remaining.CourseControl2,remaining.CourseEnd);
-                if(Math.Min(Length(piece,0,local),Length(piece,local,1))<MinimumPiece){log.Count("Paired unit cuts beside a node skipped");continue;}                var cutAt=((float3)NetworkDesignChecks.Evaluate(piece,local)).xz;
+                var cutMinimum=!s.Roundabout?
+                    Math.Max(MinimumPiece,minimumPiece==null?0:minimumPiece(s)+MinimumMargin):MinimumPiece;
+                if(Math.Min(Length(piece,0,local),Length(piece,local,1))<cutMinimum){log.Count("Paired unit cuts beside a node skipped");continue;}                var cutAt=((float3)NetworkDesignChecks.Evaluate(piece,local)).xz;
                 if(!Clear(remaining.Kind,cutAt)){log.Count("Paired unit cuts on another node skipped");continue;}
                 AddNode(remaining.Kind,cutAt);
                 var pair=Split(remaining,local,Node());synchronized.Add(pair.Left);remaining=pair.Right;begin=t;splits++;
@@ -363,12 +378,12 @@ public static class NativeDesignUnits
             PairedSpanId=0,ReferenceSpan=0,EndHeightFamily=0,
             PairedReferenceEnd=station,
             Control1=(float3)pair.Left.P1-s.StartCurveOffset,Control2=(float3)pair.Left.P2-offset,
-            EndTerminal=false,EndMiniRoundabout=false,EndRoundaboutRadius=0,FinalDeckCurve=null,HorizontalParent=null,HorizontalEmissionReference=reference?.Left};
+            EndTerminal=false,EndLevelCrossing=false,EndMiniRoundabout=false,EndRoundaboutRadius=0,FinalDeckCurve=null,HorizontalParent=null,HorizontalEmissionReference=reference?.Left};
         var right=s with{StartNodeId=node,Start=anchor,StartCurveOffset=offset,StartElevation=elevation,
             PairedSpanId=0,ReferenceSpan=0,StartHeightFamily=0,
             PairedReferenceBegin=station,
             Control1=(float3)pair.Right.P1-offset,Control2=(float3)pair.Right.P2-s.EndCurveOffset,
-            StartTerminal=false,StartMiniRoundabout=false,StartRoundaboutRadius=0,FinalDeckCurve=null,HorizontalParent=null,HorizontalEmissionReference=reference?.Right};
+            StartTerminal=false,StartLevelCrossing=false,StartMiniRoundabout=false,StartRoundaboutRadius=0,FinalDeckCurve=null,HorizontalParent=null,HorizontalEmissionReference=reference?.Right};
         left=left with{FinalDeckCurve=new((float3)pair.Left.P0,(float3)pair.Left.P1,(float3)pair.Left.P2,middle)};
         right=right with{FinalDeckCurve=new(middle,(float3)pair.Right.P1,(float3)pair.Right.P2,(float3)pair.Right.P3)};
         // Keep the rounded split port identical on both sides, including its

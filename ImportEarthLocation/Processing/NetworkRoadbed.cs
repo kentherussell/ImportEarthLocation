@@ -219,12 +219,16 @@ public static class NetworkRoadbed
         var structureEnds=new Dictionary<(int,int),List<float2>>();
         foreach(var s in segments.Where(NetworkStructure.IsStructure))foreach(var end in new[]{s.CourseStart.xz,s.CourseEnd.xz})
         {var key=((int)Math.Floor(end.x/ApproachReach),(int)Math.Floor(end.y/ApproachReach));if(!structureEnds.TryGetValue(key,out var list))structureEnds[key]=list=new();list.Add(end);}
-        float StructureEndDistance(float2 p)
+        var bridgeEnds=new Dictionary<(int,int),List<float2>>();
+        foreach(var s in segments.Where(s=>s.Bridge&&!s.Tunnel))foreach(var end in new[]{s.CourseStart.xz,s.CourseEnd.xz})
+        {var key=((int)Math.Floor(end.x/ApproachReach),(int)Math.Floor(end.y/ApproachReach));if(!bridgeEnds.TryGetValue(key,out var list))bridgeEnds[key]=list=new();list.Add(end);}
+        float EndDistance(Dictionary<(int,int),List<float2>> ends,float2 p)
         {
             var best=float.PositiveInfinity;int cx=(int)Math.Floor(p.x/ApproachReach),cz=(int)Math.Floor(p.y/ApproachReach);
-            for(var dz=-1;dz<=1;dz++)for(var dx=-1;dx<=1;dx++)if(structureEnds.TryGetValue((cx+dx,cz+dz),out var list))foreach(var end in list)best=Math.Min(best,math.distance(p,end));
+            for(var dz=-1;dz<=1;dz++)for(var dx=-1;dx<=1;dx++)if(ends.TryGetValue((cx+dx,cz+dz),out var list))foreach(var end in list)best=Math.Min(best,math.distance(p,end));
             return best;
         }
+        float StructureEndDistance(float2 p)=>EndDistance(structureEnds,p);
         log.Quality(new("planned","mixed-mode-formation","roadbed",mixedFormations+incompatibleFormations,0,incompatibleFormations,0,0,
             "Trusted common profile; ground/median half-formation only; structural interpolation support protected; actual raster support checked separately"));
         log.Diagnostic($"ROADBED FORMATIONS sharedGroundProfiles={sharedFormations}; sharedMixedModeHalfFormations={mixedFormations}; incompatibleProfiles={incompatibleFormations}; structuralFootprintsProtected=true; explicitWallsRetainedSeparately=true; profileHeightsNotReoptimized=true");
@@ -234,14 +238,24 @@ public static class NetworkRoadbed
             var budget=NetworkVerticalProfiles.CutFillBudget(s);
             var half=s.NativeWidth>0?s.NativeWidth*.5f:Math.Min(12,Math.Max(4,s.Lanes*1.75f));
             var unsupported=false;
-            var steps=Math.Max(1,(int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(s)/(cell*.5f)));
-            for(var i=0;i<=steps;i++)
+            var length=NetworkVerticalProfiles.ArcLength(s);var steps=Math.Max(1,(int)Math.Ceiling(length/(cell*.5f)));
+            // A ground road ending at a bridge carries its formation one sample
+            // step (half a cell) on along its end tangent and grade: the game
+            // reads the ground under the road's last metres from grid samples
+            // under the bridge, which no other formation stamps (DC's motorway
+            // approaches stood up to 3 m above the ground there). A full cell
+            // raised more ground under roads passing beneath the bridge end.
+            var extendStart=EndDistance(bridgeEnds,s.CourseStart.xz)<.5f?1:0;var extendEnd=EndDistance(bridgeEnds,s.CourseEnd.xz)<.5f?1:0;
+            var startPoint=NetworkNormalizer.Evaluate(s,0);var endPoint=NetworkNormalizer.Evaluate(s,1);
+            var outStart=math.normalizesafe(startPoint-NetworkNormalizer.Evaluate(s,.001f));var outEnd=math.normalizesafe(endPoint-NetworkNormalizer.Evaluate(s,.999f));
+            float3 Station(int i)=>i<0?startPoint+outStart*(-i*length/steps):i>steps?endPoint+outEnd*((i-steps)*length/steps):NetworkNormalizer.Evaluate(s,i/(float)steps);
+            for(var i=-extendStart;i<=steps+extendEnd;i++)
             {
                 token.ThrowIfCancellationRequested();
                 if(clock.Elapsed.TotalSeconds>=nextProgress)
                 {log.Diagnostic($"PROCESS roadbed sections={processed}; sectionSample={i}/{steps}; affectedSamples={targets.Count}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.0}");nextProgress=clock.Elapsed.TotalSeconds+5;}
-                var t=i/(float)steps;var p=NetworkNormalizer.Evaluate(s,t);var px=Pixel(p.x);var pz=Pixel(p.z);
-                var previous=NetworkNormalizer.Evaluate(s,Math.Max(0,(i-1)/(float)steps));
+                var t=math.clamp(i/(float)steps,0,1);var p=Station(i);var px=Pixel(p.x);var pz=Pixel(p.z);
+                var previous=Station(Math.Max(-extendStart,i-1));
                 var span=p.xz-previous.xz;var spanLengthSquared=math.lengthsq(span);
                 var originalCenter=NetworkProcessor.Sample(p.x,p.z,source,scale,width);
                 var deficit=Math.Abs(originalCenter-p.y)-budget;
@@ -273,6 +287,10 @@ public static class NetworkRoadbed
                     // Automatically inferred walls are not ground truth and must
                     // not turn otherwise natural earthworks into vertical stamps.
                     var wall=((s.ExplicitWallSides|s.QuaySides)&side)!=0;var sideRadius=half+(wall?cell*.75f:earthBlend);
+                    // The ground under the centreline is read from the four
+                    // surrounding grid samples, so the formation stands at full
+                    // height out to one cell beyond the deck before feathering.
+                    var full=wall?half:half+cell;
                     if(distance>sideRadius)continue;
                     var id=z*n+x;if(protectedMask[id]||lineGuard[id]&&distance>half+cell){protectedSamples++;continue;}
                     var original=source[id]/65535f*scale;if(Math.Abs(nearest.y-original)>budget+.05f)
@@ -284,8 +302,8 @@ public static class NetworkRoadbed
                         // that it cannot support the requested road height.
                     }
                     var supportedTarget=math.clamp(nearest.y,Math.Max(0,original-budget),Math.Min(scale,original+budget));
-                    var blendT=math.clamp((sideRadius-distance)/Math.Max(.01f,sideRadius-half),0,1);
-                    var weight=distance<=half?1:blendT*blendT*(3-2*blendT);
+                    var blendT=math.clamp((sideRadius-distance)/Math.Max(.01f,sideRadius-full),0,1);
+                    var weight=distance<=full?1:blendT*blendT*(3-2*blendT);
                     if(weight<=0)continue;
                     targets.TryGetValue(id,out var old);
                     // Follow the nearest curve station, not an average of many
@@ -389,6 +407,52 @@ public static class NetworkRoadbed
             }
         }
         log.Count("Roadbed tunnel roof samples filled",roofSamples);
+        // Each formation sample takes its nearest road's height, but the game
+        // reads the ground under a road bilinearly from the four surrounding
+        // samples, and where two roads at different heights share those samples
+        // (a frontage road beside a raised main road, the arms of a sloping
+        // junction) one of them read a blend. Kaczmarz sweeps over every ground
+        // deck sample, at the formation's half-cell spacing, move only samples a
+        // formation already owns, within their cut/fill budget, toward the
+        // least-squares compromise of all the decks that read them. Twelve sweeps
+        // halved the replayed terrain mismatches for about 0.3 s; three gave a
+        // third, and the gain per sweep was still falling at twelve.
+        const int RefineSweeps=12;var refined=new Dictionary<int,float>();
+        float Height(int id)=>refined.TryGetValue(id,out var h)?h:result[id]/65535f*scale;
+        var deckPoints=new List<float3>();
+        foreach(var s in segments.Where(s=>!NetworkStructure.IsStructure(s)))
+        {
+            var steps=Math.Max(1,(int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(s)/(cell*.5f)));
+            for(var i=0;i<=steps;i++)deckPoints.Add(NetworkNormalizer.Evaluate(s,i/(float)steps));
+        }
+        var ids=new int[4];var weights=new float[4];
+        for(var sweep=0;sweep<RefineSweeps;sweep++)foreach(var p in deckPoints)
+        {
+            token.ThrowIfCancellationRequested();
+            var gx=math.clamp(p.x/width+.5,0,1)*(n-1);var gz=math.clamp(p.z/width+.5,0,1)*(n-1);
+            int x0=(int)gx,z0=(int)gz,x1=Math.Min(x0+1,n-1),z1=Math.Min(z0+1,n-1);var tx=(float)(gx-x0);var tz=(float)(gz-z0);
+            ids[0]=z0*n+x0;ids[1]=z0*n+x1;ids[2]=z1*n+x0;ids[3]=z1*n+x1;
+            weights[0]=(1-tx)*(1-tz);weights[1]=tx*(1-tz);weights[2]=(1-tx)*tz;weights[3]=tx*tz;
+            var read=0f;var norm=0f;var movable=0f;
+            for(var k=0;k<4;k++)
+            {
+                read+=weights[k]*Height(ids[k]);var x=k%2==0?x0:x1;var z=k<2?z0:z1;
+                if(x<region.x||x>region.z||z<region.y||z>region.w||protectedMask[ids[k]]||!targets.ContainsKey(ids[k]))weights[k]=0;
+                norm+=weights[k]*weights[k];movable+=weights[k];
+            }
+            // Where most of the read is fixed ground the step would be amplified
+            // into a spike; a sample may pass the deck height by at most 1 m.
+            var residual=p.y-read;if(Math.Abs(residual)<.05f||movable<.5f)continue;
+            for(var k=0;k<4;k++)
+            {
+                if(weights[k]==0)continue;var id=ids[k];var original=source[id]/65535f*scale;var budget=targets[id].budget;var current=Height(id);
+                var next=math.clamp(current+residual*weights[k]/norm,Math.Min(current,p.y)-1,Math.Max(current,p.y)+1);
+                refined[id]=math.clamp(next,Math.Max(0,original-budget),Math.Min(scale,original+budget));
+            }
+        }
+        foreach(var (id,height) in refined)
+        {var value=(ushort)Math.Round(math.clamp(height/scale,0,1)*65535);if(value!=result[id]){if(result[id]==source[id])changed++;result[id]=value;}}
+        log.Count("Roadbed samples refined to the decks that read them",refined.Count);
         log.Count("Roadbed terrain samples changed",changed);log.Count("Roadbed protected samples avoided",protectedSamples);
         log.Count("Roadbed samples beyond cut/fill budget",beyondBudget);
         log.Count("Roadbed ground formations beyond support budget",unsupportedSections);

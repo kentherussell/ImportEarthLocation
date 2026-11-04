@@ -314,14 +314,14 @@ public static class CoordinatedNetworkDesign
         return result;
     }
 
-    // A ground road or railway over a short culvert (WaterBodyPlanner.ShortCulverts)
+    // A ground road or railway over an opened buried waterway (WaterBodyPlanner.BuriedChannels)
     // or an untagged crossing of an open channel (WaterBodyPlanner.OpenChannels)
     // becomes a bridge across it. Otherwise water revalidation, which never
     // carves beside a ground road, leaves the river dammed by the embankment.
-    // The span reaches past the channel (widened for an oblique crossing) by
-    // the road's half width plus the two raster cells revalidation protects
-    // beside a ground road, at most 50 m each side; a span ending within
-    // 10 m of a section end takes the rest of the section.
+    // Span the complete overlap with the constructed cut, including parallel
+    // and oblique approaches. Road half width and the two raster cells protected
+    // by revalidation keep ground support outside the channel. A span ending
+    // within 10 m of a section end takes the rest of the section.
     public static IReadOnlyList<PreparedSegment> CulvertBridges(IReadOnlyList<PreparedSegment> source,IReadOnlyList<(float3[] Line,float HalfWidth)> culverts,
         int resolution,double width,ImportLog log,CancellationToken token)
     {
@@ -331,15 +331,18 @@ public static class CoordinatedNetworkDesign
         // thousands of open waterways cost a lookup per section, not a scan.
         const double GridCell=128;
         var pieces=new List<(int Culvert,double2 A,double2 B)>();var grid=new Dictionary<(int,int),List<int>>();
-        void Cells(double2 a,double2 b,Action<(int,int)> visit)
+        void Cells(double2 a,double2 b,double margin,Action<(int,int)> visit)
         {
-            for(var x=(int)Math.Floor(Math.Min(a.x,b.x)/GridCell);x<=(int)Math.Floor(Math.Max(a.x,b.x)/GridCell);x++)
-            for(var z=(int)Math.Floor(Math.Min(a.y,b.y)/GridCell);z<=(int)Math.Floor(Math.Max(a.y,b.y)/GridCell);z++)visit((x,z));
+            for(var x=(int)Math.Floor((Math.Min(a.x,b.x)-margin)/GridCell);x<=(int)Math.Floor((Math.Max(a.x,b.x)+margin)/GridCell);x++)
+            {
+                token.ThrowIfCancellationRequested();
+                for(var z=(int)Math.Floor((Math.Min(a.y,b.y)-margin)/GridCell);z<=(int)Math.Floor((Math.Max(a.y,b.y)+margin)/GridCell);z++)visit((x,z));
+            }
         }
         for(var c=0;c<culverts.Count;c++)for(var m=1;m<culverts[c].Line.Length;m++)
         {
             var a=(double2)culverts[c].Line[m-1].xz;var b=(double2)culverts[c].Line[m].xz;var index=pieces.Count;pieces.Add((c,a,b));
-            Cells(a,b,key=>{if(!grid.TryGetValue(key,out var list))grid[key]=list=new List<int>();list.Add(index);});
+            Cells(a,b,culverts[c].HalfWidth+2*cell,key=>{if(!grid.TryGetValue(key,out var list))grid[key]=list=new List<int>();list.Add(index);});
         }
         var occupied=new HashSet<long>(source.SelectMany(s=>new[]{s.StartNodeId,s.EndNodeId}));var next=long.MinValue+40000000;
         long Id(){while(occupied.Contains(next))next++;occupied.Add(next);return next++;}
@@ -349,7 +352,8 @@ public static class CoordinatedNetworkDesign
             token.ThrowIfCancellationRequested();
             if(s.Bridge||s.Tunnel){result.Add(s);continue;}
             var (points,at)=Polyline(s);var n=points.Length-1;
-            candidates.Clear();for(var k=1;k<=n;k++)Cells(points[k-1],points[k],key=>{if(grid.TryGetValue(key,out var list))candidates.UnionWith(list);});
+            var roadHalf=Math.Max(4,s.NativeWidth*.5);
+            candidates.Clear();for(var k=1;k<=n;k++)Cells(points[k-1],points[k],roadHalf,key=>{if(grid.TryGetValue(key,out var list))candidates.UnionWith(list);});
             if(candidates.Count==0){result.Add(s);continue;}
             var spans=new List<(double From,double To)>();
             foreach(var piece in candidates.OrderBy(i=>i))
@@ -357,16 +361,46 @@ public static class CoordinatedNetworkDesign
                 var (c,c0,c1)=pieces[piece];
                 for(var k=1;k<=n;k++)
                 {
-                    if(!Cross(points[k-1],points[k],c0,c1,out var u,out _))continue;
-                    var sine=Math.Abs(NetworkDesignChecks.Cross(math.normalizesafe(points[k]-points[k-1]),math.normalizesafe(c1-c0)));
-                    var reach=Math.Min(50,culverts[c].HalfWidth/Math.Max(.5,sine)+Math.Max(4,s.NativeWidth*.5)+2*cell);
-                    var station=math.lerp(at[k-1],at[k],u);spans.Add((station-reach,station+reach));
+                    var radius=culverts[c].HalfWidth+roadHalf+2*cell;
+                    if(!ChannelSpan(points[k-1],points[k],c0,c1,radius,out var entry,out var exit))continue;
+                    spans.Add((math.lerp(at[k-1],at[k],entry),math.lerp(at[k-1],at[k],exit)));
                 }            }
             if(spans.Count==0){result.Add(s);continue;}
             Bridged(s,at,spans,s.Layer,Id,result);bridged++;
         }
         log.Count("Sections bridged over short culverts",bridged);
+        log.Count("Sections bridged over water channel footprints",bridged);
         return result;
+    }
+
+    // Intersection of a road segment with a channel segment's capsule, in XZ
+    // metres. A rectangle and its two circular caps cover the entire capsule;
+    // its convexity makes the union of their parameter intervals continuous.
+    private static bool ChannelSpan(double2 a,double2 b,double2 c,double2 d,double radius,out double entry,out double exit)
+    {
+        var delta=b-a;var squared=math.lengthsq(delta);var axis=d-c;var length=math.length(axis);
+        var first=double.PositiveInfinity;var last=double.NegativeInfinity;
+        void Include(double lo,double hi)
+        {lo=Math.Max(0,lo);hi=Math.Min(1,hi);if(lo<=hi){first=Math.Min(first,lo);last=Math.Max(last,hi);}}
+        void Disk(double2 center)
+        {
+            if(squared<1e-12){if(math.distancesq(a,center)<=radius*radius)Include(0,1);return;}
+            var t=math.dot(center-a,delta)/squared;var reach=(radius*radius-math.distancesq(a+delta*t,center))/squared;
+            if(reach>=0){reach=Math.Sqrt(reach);Include(t-reach,t+reach);}
+        }
+        bool Slab(double origin,double slope,double lo,double hi,ref double from,ref double to)
+        {
+            if(Math.Abs(slope)<1e-12)return origin>=lo&&origin<=hi;
+            var x=(lo-origin)/slope;var y=(hi-origin)/slope;
+            from=Math.Max(from,Math.Min(x,y));to=Math.Min(to,Math.Max(x,y));return from<=to;
+        }
+        if(length>1e-8)
+        {
+            axis/=length;var offset=a-c;var lo=0d;var hi=1d;
+            if(Slab(math.dot(offset,axis),math.dot(delta,axis),0,length,ref lo,ref hi)&&
+                Slab(NetworkDesignChecks.Cross(axis,offset),NetworkDesignChecks.Cross(axis,delta),-radius,radius,ref lo,ref hi))Include(lo,hi);
+        }
+        Disk(c);Disk(d);entry=first;exit=last;return first<=last;
     }
 
     // Two ground highway-class roads (motorway, trunk or their links) crossing at
