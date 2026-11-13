@@ -17,31 +17,48 @@ public static class MapExtDetector
     {
         get
         {
-            try { return PatchManager?.GetProperty("CurrentMapSize", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) is IConvertible value && IsSupported(value.ToDouble(System.Globalization.CultureInfo.InvariantCulture)); }
-            catch { return false; }
+            try
+            {
+                return PatchManager?.GetProperty(
+                    "CurrentMapSize",
+                    BindingFlags.Public | BindingFlags.Static)?.GetValue(null) is IConvertible value
+                    && IsSupported(value.ToDouble(System.Globalization.CultureInfo.InvariantCulture));
+            }
+            catch
+            {
+                return false;
+            }
         }
     }
 
-    private static bool IsSupported(double width) => new[] { 14_336d, 28_672d, 57_344d }.Any(size => Math.Abs(size - width) < 2d);
+    private static bool IsSupported(double width)
+        => new[] { 14_336d, 28_672d, 57_344d }.Any(size => Math.Abs(size - width) < 2d);
 
     public static bool TryGetCurrentMapWidth(out double widthMeters)
     {
         widthMeters = 14_336d;
         var patchManager = PatchManager;
-        if (patchManager == null && !IsInstalled) return true;
+
+        if (patchManager == null && !IsInstalled)
+            return true;
 
         try
         {
             var property = patchManager?.GetProperty("CurrentMapSize", BindingFlags.Public | BindingFlags.Static);
+
             if (property?.GetValue(null) is IConvertible value)
             {
                 widthMeters = value.ToDouble(System.Globalization.CultureInfo.InvariantCulture);
-                if (IsSupported(widthMeters)) return true;
+
+                if (IsSupported(widthMeters))
+                    return true;
             }
         }
         catch { }
+
         // A loaded but incompatible MapExt must never be assumed to be 57 km.
         widthMeters = 14_336d;
+
         return false;
     }
 }

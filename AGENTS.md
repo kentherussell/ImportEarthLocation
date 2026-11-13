@@ -1,7 +1,8 @@
 # Import Earth coding conventions
 
 - Write professional, idiomatic, human-readable C# and follow nearby repository conventions.
-- Use meaningful, concise names; retain conventional mathematical notation where it helps clarity.
+- Keep all code easy for a human to read: one statement per line, blank lines between members and logical blocks, and lines within 120 characters where possible (see `.editorconfig`).
+- Use meaningful, concise names rather than abbreviations; retain conventional mathematical notation where it helps clarity.
 - Prefer straightforward implementations without unnecessary abstractions, boilerplate, or repetitive comments.
 - Explain non-obvious mathematical assumptions, coordinate systems, units, numerical limits, and ECS ownership/lifecycle decisions when needed. Verify explanations against the code and authoritative specification; do not speculate.
 - Preserve hot-path performance characteristics, including allocation, iteration, and synchronization behavior.

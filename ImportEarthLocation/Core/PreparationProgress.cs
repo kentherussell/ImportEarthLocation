@@ -1,4 +1,3 @@
-using System;
 using System.Diagnostics;
 
 namespace ImportEarthLocation.Core;
@@ -12,17 +11,24 @@ public sealed class PreparationProgress
 
     public void Begin(string step)
     {
-        lock (_gate) { _step = step; _clock.Restart(); }
+        lock (_gate)
+        {
+            _step = step;
+            _clock.Restart();
+        }
     }
 
     // Change worker detail without resetting the elapsed time for its stage.
     public void Detail(string step)
     {
-        lock(_gate) _step=step;
+        lock (_gate)
+            _step = step;
     }
 
     public string Snapshot(bool mapUnchanged = true)
     {
-        lock (_gate) return $"{_step}… {_clock.Elapsed.TotalSeconds:0} seconds in this step." + (mapUnchanged ? " Your map has not changed." : " Please wait.");
+        lock (_gate)
+            return $"{_step}… {_clock.Elapsed.TotalSeconds:0} seconds in this step."
+                + (mapUnchanged ? " Your map has not changed." : " Please wait.");
     }
 }

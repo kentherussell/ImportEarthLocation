@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading;
@@ -13,124 +14,447 @@ namespace ImportEarthLocation.Processing;
 // Only the diagnostic drawings/witness examples are bounded to the worst cases.
 public static class NetworkVisualQuality
 {
-    public static void Audit(IReadOnlyList<PreparedSegment> sections,NetworkCurveObservations.Observation[] observations,
-        ImportLog log,CancellationToken token)
+    public static void Audit(
+        IReadOnlyList<PreparedSegment> sections,
+        NetworkCurveObservations.Observation[] observations,
+        ImportLog log, CancellationToken token)
     {
-        var rates=0;var normalRates=0;var oscillations=0;var shortSpans=0;var backward=0;var candidates=0;var maximum=0d;
-        var worst=new List<(int Index,double Score)>();
-        for(var i=0;i<sections.Count;i++)
+        var rates = 0;
+        var normalRates = 0;
+        var oscillations = 0;
+        var shortSpans = 0;
+        var backward = 0;
+        var candidates = 0;
+        var maximum = 0d;
+        var worst = new List<(int Index, double Score)>();
+
+        for (var i = 0; i < sections.Count; i++)
         {
-            token.ThrowIfCancellationRequested();var s=sections[i];var o=observations[i];
-            var window=s.Kind==NetworkKind.Rail||!s.ProtectedLink&&(s.Classification is "motorway" or "trunk")?500d:100d;
-            var threshold=4*NetworkVerticalProfiles.DesiredGrade(s)/window;
-            var rate=o.SampledMaximumGradeChangePerMeter>threshold;
-            if(o.SampledMaximumGradeChangePerMeter>threshold/4)normalRates++;
-            var oscillating=o.SampledGradeSignChanges>=2&&o.SampledSignedGradeVariation>2*NetworkVerticalProfiles.DesiredGrade(s)&&o.SampledLengthMeters<2*window;
-            var shortSpan=o.SampledLengthMeters<Math.Max(8,s.NativeWidth*.75);
-            var nonregular=o.MinimumControlProgressMeters<=0&&!s.Roundabout;
-            if(rate)rates++;if(oscillating)oscillations++;if(shortSpan)shortSpans++;if(nonregular)backward++;
-            if(rate||oscillating||shortSpan||nonregular)candidates++;
-            maximum=Math.Max(maximum,o.SampledMaximumGradeChangePerMeter);
-            if(log.DiagnosticsEnabled&&(rate||oscillating||shortSpan||nonregular))
+            token.ThrowIfCancellationRequested();
+            var segment = sections[i];
+            var otherObservation = observations[i];
+            var window =
+                segment.Kind == NetworkKind.Rail
+                    || !segment.ProtectedLink && (segment.Classification is "motorway" or "trunk")
+                    ? 500d
+                    : 100d;
+
+            var threshold = 4 * NetworkVerticalProfiles.DesiredGrade(segment) / window;
+            var rate = otherObservation.SampledMaximumGradeChangePerMeter > threshold;
+
+            if (otherObservation.SampledMaximumGradeChangePerMeter > threshold / 4)
+                normalRates++;
+
+            var oscillating =
+                otherObservation.SampledGradeSignChanges >= 2
+                    && otherObservation.SampledSignedGradeVariation > 2 * NetworkVerticalProfiles.DesiredGrade(segment)
+                    && otherObservation.SampledLengthMeters < 2 * window;
+
+            var shortSpan = otherObservation.SampledLengthMeters < Math.Max(8, segment.NativeWidth * .75);
+            var nonregular = otherObservation.MinimumControlProgressMeters <= 0 && !segment.Roundabout;
+
+            if (rate)
+                rates++;
+
+            if (oscillating)
+                oscillations++;
+
+            if (shortSpan)
+                shortSpans++;
+
+            if (nonregular)
+                backward++;
+
+            if (rate || oscillating || shortSpan || nonregular)
+                candidates++;
+
+            maximum = Math.Max(maximum, otherObservation.SampledMaximumGradeChangePerMeter);
+
+            if (log.DiagnosticsEnabled && (rate || oscillating || shortSpan || nonregular))
             {
-                var score=(rate?Math.Min(100,o.SampledMaximumGradeChangePerMeter/threshold):0)+(oscillating?10:0)+(shortSpan?2:0)+(nonregular?20:0);
-                worst.Add((i,score));if(worst.Count>48)worst=worst.OrderByDescending(p=>p.Score).ThenBy(p=>sections[p.Index].WayId).Take(24).ToList();
+                var score =
+                    (rate ? Math.Min(100, otherObservation.SampledMaximumGradeChangePerMeter / threshold) : 0)
+                        + (oscillating ? 10 : 0)
+                        + (shortSpan ? 2 : 0)
+                        + (nonregular ? 20 : 0);
+
+                worst.Add((i, score));
+
+                if (worst.Count > 48)
+                    worst =
+                        worst
+                            .OrderByDescending(item => item.Score)
+                            .ThenBy(item => sections[item.Index].WayId)
+                            .Take(24)
+                            .ToList();
             }
         }
-        void Put(string name,int failed,double peak,string meaning)=>log.Quality(new("planned",name,"visual-screen",sections.Count,failed,0,peak,0,meaning+"; sampled screening; RequiresReview only; native mesh acceptance unknown"));
-        Put("visual-grade-rate",rates,maximum,"Grade-change/meter above 4*desiredGrade/window; windows 500m mainline/rail, 100m others");
-        Put("visual-normal-grade-rate",normalRates,maximum,"Normal visual target desiredGrade/window, distinct from the 4x severe screen");
-        Put("visual-oscillation",oscillations,oscillations,"At least two grade reversals and total variation above 2*desiredGrade within two windows");
-        Put("short-native-span",shortSpans,shortSpans,"Length below max(8m,0.75*nativeWidth); may be a necessary junction/portal, not automatically removable");
-        Put("backward-control-progress",backward,backward,"Nonpositive control-polygon progress outside roundabouts; conservative screening, not proof of a cusp");
-        RouteVariation(sections,observations,log,token);
-        if(!log.DiagnosticsEnabled)return;
-        log.DiagnosticCompressedRecords("visual-quality-sections.ndjson.gz",sections.Select((s,i)=>(object)new{
-            section=i,s.WayId,s.StartNodeId,s.EndNodeId,s.PairedProfileId,s.PairedProfileOnly,s.RailTerminalFormationId,
-            expectedMode=NativeAssetContract.Mode(s).ToString(),observation=observations[i],sampledScreen=true,
-            shortSpanReason=observations[i].SampledLengthMeters>=Math.Max(8,s.NativeWidth*.75)?"not-short":
-                s.StartTerminal||s.EndTerminal?"declared-terminal":s.SourceNodeAliases.Any(a=>a.Mandatory&&(a.CanonicalNodeId==s.StartNodeId||a.CanonicalNodeId==s.EndNodeId))?
-                "declared-source-port":"unclassified-fit-or-emission-cut"}));
-        var selected=worst.OrderByDescending(p=>p.Score).ThenBy(p=>sections[p.Index].WayId).Take(24).ToArray();
-        var distribution=observations.Where(o=>o.Finite&&SparseProfileRows.Finite(o.SampledMaximumGradeChangePerMeter))
-            .Select(o=>o.SampledMaximumGradeChangePerMeter).OrderBy(v=>v).ToArray();
-        double? Percentile(double p)=>distribution.Length==0?null:distribution[(int)Math.Ceiling(p*(distribution.Length-1))];
-        log.DiagnosticJson("visual-quality-summary.json",new{sections=sections.Count,rates,oscillations,shortSpans,backward,
-            examples=selected.Length,examplesComplete=selected.Length==candidates,
-            gradeChangePerMeter=new{finiteObservations=distribution.Length,p50=Percentile(.5),p95=Percentile(.95),p99=Percentile(.99)},
-            nativeOutcome="Unknown",screeningOnly=true});
-        log.DiagnosticRecords("visual-quality-worst.ndjson",selected.Select(p=>(object)new{section=p.Index,score=p.Score,
-            sections[p.Index].WayId,sections[p.Index].StartNodeId,sections[p.Index].EndNodeId,observation=observations[p.Index]}));
-        var neighbours=new Dictionary<SourceNodeKey,List<int>>();
-        for(var i=0;i<sections.Count;i++)foreach(var id in new[]{sections[i].StartNodeId,sections[i].EndNodeId})
-        {var key=new SourceNodeKey(sections[i].Kind,id);if(!neighbours.TryGetValue(key,out var list))neighbours[key]=list=new();list.Add(i);}
-        var svg=new StringBuilder("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"900\" height=\"")
-            .Append(Math.Max(1,selected.Length)*360).Append("\" viewBox=\"0 0 900 ").Append(Math.Max(1,selected.Length)*360).Append("\"><rect width=\"100%\" height=\"100%\" fill=\"#20292e\"/>");
-        string N(double value)=>value.ToString("0.##",CultureInfo.InvariantCulture);
-        for(var row=0;row<selected.Length;row++)
+
+        void Put(string name, int failed, double peak, string meaning)
+            => log.Quality(
+                new(
+                    "planned",
+                    name,
+                    "visual-screen",
+                    sections.Count,
+                    failed,
+                    0,
+                    peak,
+                    0,
+                    meaning + "; sampled screening; RequiresReview only; native mesh acceptance unknown"));
+
+        Put(
+            "visual-grade-rate",
+            rates,
+            maximum,
+            "Grade-change/meter above 4*desiredGrade/window; windows 500m mainline/rail, 100m others");
+
+        Put(
+            "visual-normal-grade-rate",
+            normalRates,
+            maximum,
+            "Normal visual target desiredGrade/window, distinct from the 4x severe screen");
+
+        Put(
+            "visual-oscillation",
+            oscillations,
+            oscillations,
+            "At least two grade reversals and total variation above 2*desiredGrade within two windows");
+
+        Put(
+            "short-native-span",
+            shortSpans,
+            shortSpans,
+            "Length below max(8m,0.75*nativeWidth); may be a necessary junction/portal, not automatically removable");
+
+        Put(
+            "backward-control-progress",
+            backward,
+            backward,
+            "Nonpositive control-polygon progress outside roundabouts; conservative screening, not proof of a cusp");
+
+        RouteVariation(sections, observations, log, token);
+
+        if (!log.DiagnosticsEnabled)
+            return;
+
+        log.DiagnosticCompressedRecords("visual-quality-sections.ndjson.gz", sections.Select((segment, i) => (object)new
         {
-            token.ThrowIfCancellationRequested();var chosen=selected[row].Index;var target=sections[chosen];var ids=new HashSet<int>{chosen};var frontier=new[]{chosen};
-            for(var depth=0;depth<3;depth++)
+            section = i,
+            segment.WayId,
+            segment.StartNodeId,
+            segment.EndNodeId,
+            segment.PairedProfileId,
+            segment.PairedProfileOnly,
+            segment.RailTerminalFormationId,
+            expectedMode = NativeAssetContract.Mode(segment).ToString(),
+            observation = observations[i],
+            sampledScreen = true,
+            shortSpanReason = observations[i].SampledLengthMeters >= Math.Max(8, segment.NativeWidth * .75)
+                ? "not-short"
+                :
+                segment.StartTerminal || segment.EndTerminal
+                    ? "declared-terminal"
+                    : segment.SourceNodeAliases.Any(
+                        alias => alias.Mandatory
+                            && (alias.CanonicalNodeId == segment.StartNodeId
+                                || alias.CanonicalNodeId == segment.EndNodeId))
+                        ?
+                "declared-source-port" : "unclassified-fit-or-emission-cut"
+        }));
+
+        var selected =
+            worst.OrderByDescending(item => item.Score).ThenBy(item => sections[item.Index].WayId).Take(24).ToArray();
+
+        var distribution =
+            observations
+                .Where(
+                    otherObservation => otherObservation.Finite
+                        && math.isfinite(otherObservation.SampledMaximumGradeChangePerMeter))
+            .Select(otherObservation => otherObservation.SampledMaximumGradeChangePerMeter).OrderBy(v => v).ToArray();
+
+        double? Percentile(double p)
+            => distribution.Length == 0 ? null : distribution[(int)Math.Ceiling(p * (distribution.Length - 1))];
+
+        log.DiagnosticJson("visual-quality-summary.json", new
+        {
+            sections = sections.Count,
+            rates,
+            oscillations,
+            shortSpans,
+            backward,
+            examples = selected.Length,
+            examplesComplete = selected.Length == candidates,
+            gradeChangePerMeter = new
             {
-                var next=new List<int>();foreach(var i in frontier)foreach(var node in new[]{sections[i].StartNodeId,sections[i].EndNodeId})
-                    foreach(var j in neighbours[new(target.Kind,node)])if(ids.Count<16&&ids.Add(j))next.Add(j);
-                frontier=next.ToArray();
+                finiteObservations = distribution.Length,
+                p50 = Percentile(.5),
+                p95 = Percentile(.95),
+                p99 = Percentile(.99)
+            },
+            nativeOutcome = "Unknown",
+            screeningOnly = true
+        });
+
+        log.DiagnosticRecords("visual-quality-worst.ndjson", selected.Select(item => (object)new
+        {
+            section = item.Index,
+            score = item.Score,
+            sections[item.Index].WayId,
+            sections[item.Index].StartNodeId,
+            sections[item.Index].EndNodeId,
+            observation = observations[item.Index]
+        }));
+
+        var neighbours = new Dictionary<SourceNodeKey, List<int>>();
+
+        for (var i = 0; i < sections.Count; i++)
+            foreach (var id in new[] { sections[i].StartNodeId, sections[i].EndNodeId })
+            {
+                var key = new SourceNodeKey(sections[i].Kind, id);
+
+                if (!neighbours.TryGetValue(key, out var list))
+                    neighbours[key] = list = new();
+
+                list.Add(i);
             }
-            var curves=ids.OrderBy(i=>i).Select(i=>(Index:i,Points:Enumerable.Range(0,33).Select(k=>NetworkDesignChecks.Evaluate(new(sections[i].CourseStart,sections[i].CourseControl1,sections[i].CourseControl2,sections[i].CourseEnd),k/32d)).ToArray())).ToArray();
-            if(curves.Any(c=>c.Points.Any(p=>!math.all(math.isfinite(p)))))continue;
-            var all=curves.SelectMany(c=>c.Points).ToArray();var low=new double2(all.Min(p=>p.x),all.Min(p=>p.z));var high=new double2(all.Max(p=>p.x),all.Max(p=>p.z));
-            var halfWidth=ids.Max(i=>sections[i].NativeWidth)/2;low-=halfWidth;high+=halfWidth;
-            var range=high-low;var scale=Math.Min(820/Math.Max(1,range.x),160/Math.Max(1,range.y));var axis=math.normalizesafe((double2)(target.End-target.Start).xz,new double2(1,0));
-            var station=all.Select(p=>math.dot(p.xz,axis)).ToArray();var xmin=station.Min();var xmax=station.Max();var ymin=all.Min(p=>p.y);var ymax=all.Max(p=>p.y);
-            svg.Append("<text x=\"20\" y=\"").Append(row*360+22).Append("\" fill=\"#d7e1e7\" font-size=\"13\">Way ").Append(target.WayId).Append(" — plan and chord-projected elevation; sampled, not rendered</text>");
-            foreach(var c in curves)
+
+        var svg = new StringBuilder("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"900\" height=\"")
+            .Append(Math.Max(1, selected.Length) * 360)
+                .Append("\" viewBox=\"0 0 900 ")
+                .Append(Math.Max(1, selected.Length) * 360)
+                .Append("\"><rect width=\"100%\" height=\"100%\" fill=\"#20292e\"/>");
+
+        string FormatNumber(double value) => value.ToString("0.##", CultureInfo.InvariantCulture);
+
+        for (var row = 0; row < selected.Length; row++)
+        {
+            token.ThrowIfCancellationRequested();
+            var chosen = selected[row].Index;
+            var target = sections[chosen];
+            var ids = new HashSet<int> { chosen };
+            var frontier = new[] { chosen };
+
+            for (var depth = 0; depth < 3; depth++)
             {
-                var color=c.Index==chosen?"#ddb484":"#8baebb";
-                var stroke=Math.Max(1,sections[c.Index].NativeWidth*scale);
-                svg.Append("<polyline fill=\"none\" stroke=\"").Append(color).Append("\" stroke-width=\"").Append(N(stroke)).Append("\" points=\"");
-                foreach(var p in c.Points)svg.Append(N(40+(p.x-low.x)*scale)).Append(',').Append(N(row*360+195-(p.z-low.y)*scale)).Append(' ');
-                svg.Append("\"/><polyline fill=\"none\" stroke=\"").Append(color).Append("\" stroke-width=\"2\" points=\"");
-                foreach(var p in c.Points)svg.Append(N(40+820*(math.dot(p.xz,axis)-xmin)/Math.Max(1,xmax-xmin))).Append(',').Append(N(row*360+330-90*(p.y-ymin)/Math.Max(1,ymax-ymin))).Append(' ');
+                var next = new List<int>();
+
+                foreach (var i in frontier)
+                    foreach (var node in new[] { sections[i].StartNodeId, sections[i].EndNodeId })
+                        foreach (var j in neighbours[new(target.Kind, node)])
+                            if (ids.Count < 16 && ids.Add(j))
+                                next.Add(j);
+
+                frontier = next.ToArray();
+            }
+
+            var curves =
+                ids
+                    .OrderBy(i => i)
+                    .Select(
+                        i => (
+                            Index: i,
+                            Points: Enumerable
+                                .Range(0, 33)
+                                .Select(
+                                    k => NetworkDesignChecks.Evaluate(
+                                        new(
+                                            sections[i].CourseStart,
+                                            sections[i].CourseControl1,
+                                            sections[i].CourseControl2,
+                                            sections[i].CourseEnd),
+                                        k / 32d))
+                                .ToArray()))
+                    .ToArray();
+
+            if (curves.Any(item => item.Points.Any(point => !math.all(math.isfinite(point)))))
+                continue;
+
+            var all = curves.SelectMany(item => item.Points).ToArray();
+            var low = new double2(all.Min(point => point.x), all.Min(point => point.z));
+            var high = new double2(all.Max(point => point.x), all.Max(point => point.z));
+            var halfWidth = ids.Max(i => sections[i].NativeWidth) / 2;
+            low -= halfWidth;
+            high += halfWidth;
+            var range = high - low;
+            var scale = Math.Min(820 / Math.Max(1, range.x), 160 / Math.Max(1, range.y));
+            var axis = math.normalizesafe((double2)(target.End - target.Start).xz, new double2(1, 0));
+            var station = all.Select(point => math.dot(point.xz, axis)).ToArray();
+            var xmin = station.Min();
+            var xmax = station.Max();
+            var ymin = all.Min(point => point.y);
+            var ymax = all.Max(point => point.y);
+            svg
+                .Append("<text x=\"20\" y=\"")
+                .Append(row * 360 + 22)
+                .Append("\" fill=\"#d7e1e7\" font-size=\"13\">Way ")
+                .Append(target.WayId)
+                .Append(" — plan and chord-projected elevation; sampled, not rendered</text>");
+
+            foreach (var item in curves)
+            {
+                var color = item.Index == chosen ? "#ddb484" : "#8baebb";
+                var stroke = Math.Max(1, sections[item.Index].NativeWidth * scale);
+                svg
+                    .Append("<polyline fill=\"none\" stroke=\"")
+                    .Append(color)
+                    .Append("\" stroke-width=\"")
+                    .Append(FormatNumber(stroke))
+                    .Append("\" points=\"");
+
+                foreach (var point in item.Points)
+                    svg
+                        .Append(FormatNumber(40 + (point.x - low.x) * scale))
+                        .Append(',')
+                        .Append(FormatNumber(row * 360 + 195 - (point.z - low.y) * scale))
+                        .Append(' ');
+
+                svg
+                    .Append("\"/><polyline fill=\"none\" stroke=\"")
+                    .Append(color)
+                    .Append("\" stroke-width=\"2\" points=\"");
+
+                foreach (var point in item.Points)
+                    svg
+                        .Append(FormatNumber(40 + 820 * (math.dot(point.xz, axis) - xmin) / Math.Max(1, xmax - xmin)))
+                        .Append(',')
+                        .Append(FormatNumber(row * 360 + 330 - 90 * (point.y - ymin) / Math.Max(1, ymax - ymin)))
+                        .Append(' ');
+
                 svg.Append("\"/>");
             }
-            svg.Append("<text x=\"40\" y=\"").Append(row*360+350).Append("\" fill=\"#aebdc6\" font-size=\"11\">Elevation range ").Append(N(ymin)).Append("–").Append(N(ymax)).Append(" m; vertical scale exaggerated; amber = selected defect</text>");
+
+            svg
+                .Append("<text x=\"40\" y=\"")
+                .Append(row * 360 + 350)
+                .Append("\" fill=\"#aebdc6\" font-size=\"11\">Elevation range ")
+                .Append(FormatNumber(ymin))
+                .Append("–")
+                .Append(FormatNumber(ymax))
+                .Append(" m; vertical scale exaggerated; amber = selected defect</text>");
         }
-        svg.Append("</svg>");log.DiagnosticSvg("visual-quality-worst.svg",svg.ToString());
+
+        svg.Append("</svg>");
+        log.DiagnosticSvg("visual-quality-worst.svg", svg.ToString());
     }
 
-    private static void RouteVariation(IReadOnlyList<PreparedSegment> source,NetworkCurveObservations.Observation[] observations,ImportLog log,CancellationToken token)
+    private static void RouteVariation(
+        IReadOnlyList<PreparedSegment> source,
+        NetworkCurveObservations.Observation[] observations,
+        ImportLog log,
+        CancellationToken token)
     {
-        var incident=new Dictionary<SourceNodeKey,List<int>>();
-        for(var i=0;i<source.Count;i++)foreach(var id in new[]{source[i].StartNodeId,source[i].EndNodeId})
-        {var key=new SourceNodeKey(source[i].Kind,id);if(!incident.TryGetValue(key,out var arms))incident[key]=arms=new();arms.Add(i);}
-        var visited=new HashSet<int>();var checkedWindows=0;var failed=0;var worst=0d;
-        foreach(var seed in Enumerable.Range(0,source.Count).OrderBy(i=>source[i].WayId).ThenBy(i=>source[i].StartNodeId))
+        var incident = new Dictionary<SourceNodeKey, List<int>>();
+
+        for (var i = 0; i < source.Count; i++)
+            foreach (var id in new[] { source[i].StartNodeId, source[i].EndNodeId })
+            {
+                var key = new SourceNodeKey(source[i].Kind, id);
+
+                if (!incident.TryGetValue(key, out var arms))
+                    incident[key] = arms = new();
+
+                arms.Add(i);
+            }
+
+        var visited = new HashSet<int>();
+        var checkedWindows = 0;
+        var failed = 0;
+        var worst = 0d;
+
+        foreach (var seed in Enumerable
+            .Range(0, source.Count)
+            .OrderBy(i => source[i].WayId)
+            .ThenBy(i => source[i].StartNodeId))
         {
-            if(visited.Contains(seed))continue;token.ThrowIfCancellationRequested();
-            var s=source[seed];var path=new LinkedList<int>();path.AddLast(seed);visited.Add(seed);
+            if (visited.Contains(seed))
+                continue;
+
+            token.ThrowIfCancellationRequested();
+            var segment = source[seed];
+            var path = new LinkedList<int>();
+            path.AddLast(seed);
+            visited.Add(seed);
+
             void Extend(bool before)
             {
-                var edge=before?path.First!.Value:path.Last!.Value;var node=before?source[edge].StartNodeId:source[edge].EndNodeId;
-                while(true)
+                var edge = before ? path.First!.Value : path.Last!.Value;
+                var node = before ? source[edge].StartNodeId : source[edge].EndNodeId;
+
+                while (true)
                 {
-                    var arms=incident[new(s.Kind,node)];if(arms.Count!=2)break;var next=arms.First(i=>i!=edge);var n=source[next];
-                    if(visited.Contains(next)||n.OneWay!=s.OneWay||n.ProtectedLink!=s.ProtectedLink||n.Roundabout||
-                        (n.Kind==NetworkKind.Road&&n.Classification!=s.Classification)||(before?n.EndNodeId:n.StartNodeId)!=node)break;
-                    visited.Add(next);if(before)path.AddFirst(next);else path.AddLast(next);edge=next;node=before?n.StartNodeId:n.EndNodeId;
+                    var arms = incident[new(segment.Kind, node)];
+
+                    if (arms.Count != 2)
+                        break;
+
+                    var next = arms.First(i => i != edge);
+                    var otherSegment = source[next];
+
+                    if (visited.Contains(next)
+                        || otherSegment.OneWay != segment.OneWay
+                        || otherSegment.ProtectedLink != segment.ProtectedLink
+                        || otherSegment.Roundabout
+                        || (otherSegment.Kind == NetworkKind.Road
+                            && otherSegment.Classification != segment.Classification)
+                            || (before ? otherSegment.EndNodeId : otherSegment.StartNodeId) != node)
+                        break;
+
+                    visited.Add(next);
+
+                    if (before)
+                        path.AddFirst(next);
+                    else
+                        path.AddLast(next);
+
+                    edge = next;
+                    node = before ? otherSegment.StartNodeId : otherSegment.EndNodeId;
                 }
             }
-            Extend(true);Extend(false);var edges=path.ToArray();if(edges.Length<2)continue;
-            var window=s.Kind==NetworkKind.Rail||!s.ProtectedLink&&(s.Classification is "motorway" or "trunk")?500d:100d;
-            var left=0;var length=0d;var variation=0d;
-            for(var right=0;right<edges.Length;right++)
+
+            Extend(true);
+            Extend(false);
+            var edges = path.ToArray();
+
+            if (edges.Length < 2)
+                continue;
+
+            var window =
+                segment.Kind == NetworkKind.Rail
+                    || !segment.ProtectedLink && (segment.Classification is "motorway" or "trunk")
+                    ? 500d
+                    : 100d;
+
+            var left = 0;
+            var length = 0d;
+            var variation = 0d;
+
+            for (var right = 0; right < edges.Length; right++)
             {
-                var o=observations[edges[right]];length+=o.SampledLengthMeters;variation+=o.SampledSignedGradeVariation;
-                while(left<right&&length>2*window){var old=observations[edges[left++]];length-=old.SampledLengthMeters;variation-=old.SampledSignedGradeVariation;}
-                if(right==left)continue;checkedWindows++;worst=Math.Max(worst,variation);
-                if(variation>2*NetworkVerticalProfiles.DesiredGrade(s))failed++;
+                var otherObservation = observations[edges[right]];
+                length += otherObservation.SampledLengthMeters;
+                variation += otherObservation.SampledSignedGradeVariation;
+
+                while (left < right && length > 2 * window)
+                {
+                    var old = observations[edges[left++]];
+                    length -= old.SampledLengthMeters;
+                    variation -= old.SampledSignedGradeVariation;
+                }
+
+                if (right == left)
+                    continue;
+
+                checkedWindows++;
+                worst = Math.Max(worst, variation);
+
+                if (variation > 2 * NetworkVerticalProfiles.DesiredGrade(segment))
+                    failed++;
             }
         }
-        log.Quality(new("planned","visual-route-variation","across-emission-seams",checkedWindows,failed,0,worst,0,
+
+        log.Quality(
+            new("planned", "visual-route-variation", "across-emission-seams", checkedWindows, failed, 0, worst, 0,
             "Sliding <=2-window sampled total grade variation over compatible degree-two runs; reuses existing observations; no geometry rewrite or placement veto"));
     }
 }

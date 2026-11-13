@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using ImportEarthLocation.Core;
 using Unity.Mathematics;
@@ -23,161 +24,575 @@ public static class NetworkLaneRuns
 {
     private const double ShortRun = 300;
 
+    // The longest run that gives up its own width to a longer neighbouring run.
+    private const double WidthRun = 150;
+
     // Ordinary two-way streets are traced in either OSM digitisation direction.
     // Only short width bumps supported by a longer matching road are removed;
     // sustained changes and ambiguous junctions keep their source lane counts.
-    public static IReadOnlyList<PreparedSegment> NormalizeStreets(IReadOnlyList<PreparedSegment> source,ImportLog log)
+    public static IReadOnlyList<PreparedSegment> NormalizeStreets(IReadOnlyList<PreparedSegment> source, ImportLog log)
     {
-        bool Eligible(PreparedSegment s)=>s.Kind==NetworkKind.Road&&!s.OneWay&&!NativeAssetKeys.IsHighway(s)&&!s.ProtectedLink&&
-            !s.Roundabout&&!NetworkStructure.IsStructure(s)&&!NetworkBoundaryPolicy.EndpointMarker(s,true)&&!NetworkBoundaryPolicy.EndpointMarker(s,false);
-        var incident=new Dictionary<long,List<int>>();
-        for(var i=0;i<source.Count;i++)foreach(var node in new[]{source[i].StartNodeId,source[i].EndNodeId})
-        {if(!incident.TryGetValue(node,out var list))incident[node]=list=new();list.Add(i);}
-        bool SameRoad(PreparedSegment a,PreparedSegment b)=>a.Layer==b.Layer&&
-            (a.Reference.Length>0&&b.Reference.Length>0?string.Equals(a.Reference,b.Reference,StringComparison.OrdinalIgnoreCase):
-             a.Name.Length==0||b.Name.Length==0||string.Equals(a.Name,b.Name,StringComparison.OrdinalIgnoreCase));
-        double2 Away(int i,long node)=>math.normalizesafe((double2)(source[i].StartNodeId==node?source[i].End-source[i].Start:source[i].Start-source[i].End).xz);
-        bool Protected(long node)=>incident[node].Any(j=>source[j].Kind!=NetworkKind.Road||NativeAssetKeys.IsHighway(source[j])||source[j].ProtectedLink||source[j].Roundabout||NetworkStructure.IsStructure(source[j]));
-        int Next(int i,long node)
-        {
-            var arms=incident[node];
-            if(Protected(node))return -1;
-            var found=-1;
-            foreach(var j in arms)
+        bool Eligible(PreparedSegment segment)
+            => segment.Kind == NetworkKind.Road
+                && !segment.OneWay
+                && !NativeAssetKeys.IsHighway(segment)
+                && !segment.ProtectedLink
+                && !segment.Roundabout
+                && !NetworkStructure.IsStructure(segment)
+                && !NetworkBoundaryPolicy.EndpointMarker(segment, true)
+                && !NetworkBoundaryPolicy.EndpointMarker(segment, false);
+
+        var incident = new Dictionary<long, List<int>>();
+
+        for (var i = 0; i < source.Count; i++)
+            foreach (var node in new[] { source[i].StartNodeId, source[i].EndNodeId })
             {
-                if(i==j||!Eligible(source[j])||!SameRoad(source[i],source[j])||math.dot(Away(i,node),Away(j,node))>-.906307787)continue;
-                if(found>=0)return -1;found=j;
+                if (!incident.TryGetValue(node, out var list))
+                    incident[node] = list = new();
+
+                list.Add(i);
             }
+
+        bool SameRoad(PreparedSegment firstSegment, PreparedSegment secondSegment)
+            => firstSegment.Layer == secondSegment.Layer
+                && (firstSegment.Reference.Length > 0 && secondSegment.Reference.Length > 0
+                ? string.Equals(firstSegment.Reference, secondSegment.Reference, StringComparison.OrdinalIgnoreCase)
+                :
+             firstSegment.Name.Length == 0
+                 || secondSegment.Name.Length == 0
+                 || string.Equals(firstSegment.Name, secondSegment.Name, StringComparison.OrdinalIgnoreCase));
+
+        double2 Away(int i, long node)
+            => math.normalizesafe(
+                (double2)(source[i].StartNodeId == node
+                    ? source[i].End - source[i].Start
+                    : source[i].Start - source[i].End).xz);
+
+        bool Protected(long node)
+            => incident[node].Any(
+                j => source[j].Kind != NetworkKind.Road
+                    || NativeAssetKeys.IsHighway(source[j])
+                    || source[j].ProtectedLink
+                    || source[j].Roundabout
+                    || NetworkStructure.IsStructure(source[j]));
+
+        int Next(int i, long node)
+        {
+            var arms = incident[node];
+
+            if (Protected(node))
+                return -1;
+
+            var found = -1;
+
+            foreach (var j in arms)
+            {
+                if (i == j
+                    || !Eligible(source[j])
+                    || !SameRoad(source[i], source[j])
+                    || math.dot(Away(i, node), Away(j, node)) > -.906307787)
+                    continue;
+
+                if (found >= 0)
+                    return -1;
+
+                found = j;
+            }
+
             return found;
         }
-        var links=new Dictionary<(int,long),int>();
-        for(var i=0;i<source.Count;i++)if(Eligible(source[i]))foreach(var node in new[]{source[i].StartNodeId,source[i].EndNodeId})
-        {var j=Next(i,node);if(j>=0&&Next(j,node)==i)links[(i,node)]=j;}
-        var used=new bool[source.Count];PreparedSegment[]? result=null;var changed=0;
-        foreach(var first in Enumerable.Range(0,source.Count).OrderBy(i=>links.ContainsKey((i,source[i].StartNodeId))&&links.ContainsKey((i,source[i].EndNodeId))?1:0))
-        {
-            if(used[first]||!Eligible(source[first]))continue;
-            var chain=new List<(int Index,bool Forward)>();var node=links.ContainsKey((first,source[first].StartNodeId))?source[first].EndNodeId:source[first].StartNodeId;
-            var current=first;
-            while(!used[current])
-            {
-                used[current]=true;var s=source[current];var forward=s.StartNodeId==node;chain.Add((current,forward));node=forward?s.EndNodeId:s.StartNodeId;
-                if(!links.TryGetValue((current,node),out current)){current=-1;break;}
-            }
-            if(current>=0||chain.Count<2)continue; // Closed loops have no established road body.
-            var lanes=chain.Select(p=>source[p.Index].Lanes).ToArray();
-            var lengths=chain.Select(p=>(double)math.distance(source[p.Index].Start.xz,source[p.Index].End.xz)).ToArray();
-            while(true)
-            {
-                var runs=new List<(int From,int To,double Length)>();
-                for(var k=0;k<chain.Count;)
-                {var end=k;var length=lengths[k];while(end+1<chain.Count&&lanes[end+1]==lanes[k])length+=lengths[++end];runs.Add((k,end,length));k=end+1;}
-                var pick=-1;var donor=-1;
-                for(var r=0;r<runs.Count;r++)
+
+        var links = new Dictionary<(int, long), int>();
+
+        for (var i = 0; i < source.Count; i++)
+            if (Eligible(source[i]))
+                foreach (var node in new[] { source[i].StartNodeId, source[i].EndNodeId })
                 {
-                    var run=runs[r];var before=r>0?runs[r-1]:((int From,int To,double Length)?)null;
-                    var after=r+1<runs.Count?runs[r+1]:((int From,int To,double Length)?)null;
-                    var target=-1;
-                    if(before.HasValue&&after.HasValue&&run.Length<=180&&before.Value.Length>=30&&after.Value.Length>=30&&
-                        before.Value.Length+after.Value.Length>=Math.Max(120,run.Length*2)&&lanes[before.Value.To]==lanes[after.Value.From])target=before.Value.To;
-                    else if(!before.HasValue||!after.HasValue)
-                    {var neighbour=before??after;if(neighbour.HasValue&&run.Length<=60&&neighbour.Value.Length>=Math.Max(120,run.Length*3))target=neighbour.Value.From;}
+                    var j = Next(i, node);
+
+                    if (j >= 0 && Next(j, node) == i)
+                        links[(i, node)] = j;
+                }
+
+        var used = new bool[source.Count];
+        PreparedSegment[]? result = null;
+        var changed = 0;
+
+        foreach (var first in Enumerable
+            .Range(0, source.Count)
+            .OrderBy(
+                i => links.ContainsKey((i, source[i].StartNodeId)) && links.ContainsKey((i, source[i].EndNodeId))
+                    ? 1
+                    : 0))
+        {
+            if (used[first] || !Eligible(source[first]))
+                continue;
+
+            var chain = new List<(int Index, bool Forward)>();
+            var node =
+                links.ContainsKey((first, source[first].StartNodeId))
+                    ? source[first].EndNodeId
+                    : source[first].StartNodeId;
+
+            var current = first;
+
+            while (!used[current])
+            {
+                used[current] = true;
+                var segment = source[current];
+                var forward = segment.StartNodeId == node;
+                chain.Add((current, forward));
+                node = forward ? segment.EndNodeId : segment.StartNodeId;
+
+                if (!links.TryGetValue((current, node), out current))
+                {
+                    current = -1;
+                    break;
+                }
+            }
+
+            if (current >= 0 || chain.Count < 2)
+                continue; // Closed loops have no established road body.
+
+            var lanes = chain.Select(item => source[item.Index].Lanes).ToArray();
+            var lengths =
+                chain
+                    .Select(item => (double)math.distance(source[item.Index].Start.xz, source[item.Index].End.xz))
+                    .ToArray();
+
+            while (true)
+            {
+                var runs = new List<(int From, int To, double Length)>();
+
+                for (var k = 0; k < chain.Count;)
+                {
+                    var end = k;
+                    var length = lengths[k];
+
+                    while (end + 1 < chain.Count && lanes[end + 1] == lanes[k])
+                        length += lengths[++end];
+
+                    runs.Add((k, end, length));
+                    k = end + 1;
+                }
+
+                var pick = -1;
+                var donor = -1;
+
+                for (var r = 0; r < runs.Count; r++)
+                {
+                    var run = runs[r];
+                    var before = r > 0 ? runs[r - 1] : ((int From, int To, double Length)?)null;
+                    var after = r + 1 < runs.Count ? runs[r + 1] : ((int From, int To, double Length)?)null;
+                    var target = -1;
+
+                    if (before.HasValue
+                        && after.HasValue
+                        && run.Length <= 180
+                        && before.Value.Length >= 30
+                        && after.Value.Length >= 30
+                        && before.Value.Length + after.Value.Length >= Math.Max(120, run.Length * 2)
+                            && lanes[before.Value.To] == lanes[after.Value.From])
+                        target = before.Value.To;
+                    else if (!before.HasValue || !after.HasValue)
+                    {
+                        var neighbour = before ?? after;
+
+                        if (neighbour.HasValue
+                            && run.Length <= 60
+                            && neighbour.Value.Length >= Math.Max(120, run.Length * 3))
+                            target = neighbour.Value.From;
+                    }
+
                     // This pass removes widening; it does not expand a narrow street
                     // to match neighbouring avenues or reduce a persistent lane add.
-                    if(target<0||lanes[run.From]<=lanes[target]||pick>=0&&run.Length>=runs[pick].Length)continue;
-                    if(Enumerable.Range(run.From,run.To-run.From+1).Any(k=>Protected(source[chain[k].Index].StartNodeId)||Protected(source[chain[k].Index].EndNodeId)))continue;
-                    pick=r;donor=target;
+                    if (target < 0 || lanes[run.From] <= lanes[target] || pick >= 0 && run.Length >= runs[pick].Length)
+                        continue;
+
+                    if (Enumerable
+                        .Range(run.From, run.To - run.From + 1)
+                        .Any(
+                            k => Protected(source[chain[k].Index].StartNodeId)
+                                || Protected(source[chain[k].Index].EndNodeId)))
+                        continue;
+
+                    pick = r;
+                    donor = target;
                 }
-                if(pick<0)break;
-                var template=(result??source)[chain[donor].Index];var count=lanes[donor];
-                for(var k=runs[pick].From;k<=runs[pick].To;k++)
+
+                if (pick < 0)
+                    break;
+
+                var template = (result ?? source)[chain[donor].Index];
+                var count = lanes[donor];
+
+                for (var k = runs[pick].From; k <= runs[pick].To; k++)
                 {
-                    result??=source.ToArray();var index=chain[k].Index;var s=result[index];var aligned=chain[k].Forward==chain[donor].Forward;
-                    result[index]=s with{Lanes=count,ForwardLanes=aligned?template.ForwardLanes:template.BackwardLanes,
-                        BackwardLanes=aligned?template.BackwardLanes:template.ForwardLanes,BothWaysLanes=template.BothWaysLanes,
-                        ConsolidatedAvenue=count>2&&template.ConsolidatedAvenue};lanes[k]=count;changed++;
+                    result ??= source.ToArray();
+                    var index = chain[k].Index;
+                    var segment = result[index];
+                    var aligned = chain[k].Forward == chain[donor].Forward;
+                    result[index] = segment with
+                    {
+                        Lanes = count,
+                        ForwardLanes = aligned ? template.ForwardLanes : template.BackwardLanes,
+                        BackwardLanes = aligned ? template.BackwardLanes : template.ForwardLanes,
+                        BothWaysLanes = template.BothWaysLanes,
+                        ConsolidatedAvenue = count > 2 && template.ConsolidatedAvenue
+                    };
+
+                    lanes[k] = count;
+                    changed++;
                 }
             }
         }
-        log.Count("Street intersection width steps normalized",changed);
-        log.Evidence($"Street widths: {changed} short widening steps normalized; matching-body pockets up to 180 m, terminal pockets up to 60 m; junction identities and travel directions retained; major-road approaches protected.");
-        return result??source;
+
+        log.Count("Street intersection width steps normalized", changed);
+        log.Evidence(
+            $"Street widths: {changed} short widening steps normalized; matching-body pockets up to 180 m, terminal pockets up to 60 m; junction identities and travel directions retained; major-road approaches protected.");
+
+        return result ?? source;
     }
 
     public static IReadOnlyList<PreparedSegment> Smooth(IReadOnlyList<PreparedSegment> source, ImportLog log)
     {
         var result = source.ToArray();
-        var starts = new Dictionary<SourceNodeKey, List<int>>(); var ends = new Dictionary<SourceNodeKey, List<int>>();
+        var starts = new Dictionary<SourceNodeKey, List<int>>();
+        var ends = new Dictionary<SourceNodeKey, List<int>>();
+
         for (var i = 0; i < source.Count; i++)
         {
-            var s = source[i]; if (s.Kind != NetworkKind.Road) continue;
-            Add(starts, new(s.Kind, s.StartNodeId), i); Add(ends, new(s.Kind, s.EndNodeId), i);
+            var segment = source[i];
+
+            if (segment.Kind != NetworkKind.Road)
+                continue;
+
+            Add(starts, new(segment.Kind, segment.StartNodeId), i);
+            Add(ends, new(segment.Kind, segment.EndNodeId), i);
         }
-        static void Add(Dictionary<SourceNodeKey, List<int>> map, SourceNodeKey key, int i) { if (!map.TryGetValue(key, out var list)) map[key] = list = new(); list.Add(i); }
-        double2 Heading(PreparedSegment s) => math.normalizesafe((double2)(s.End - s.Start).xz);
-        bool Same(PreparedSegment a, PreparedSegment b) => a.Classification == b.Classification && a.OneWay == b.OneWay &&
-            (a.Name.Length > 0 ? a.Name == b.Name : a.Reference.Length > 0 ? a.Reference == b.Reference : b.Name.Length == 0 && b.Reference.Length == 0);
+
+        static void Add(Dictionary<SourceNodeKey, List<int>> map, SourceNodeKey key, int i)
+        {
+            if (!map.TryGetValue(key, out var list))
+                map[key] = list = new();
+
+            list.Add(i);
+        }
+
+        double2 Heading(PreparedSegment segment) => math.normalizesafe((double2)(segment.End - segment.Start).xz);
+
+        bool Same(PreparedSegment firstSegment, PreparedSegment secondSegment)
+            => firstSegment.Classification == secondSegment.Classification
+                && firstSegment.OneWay == secondSegment.OneWay
+                && (firstSegment.Name.Length > 0
+                ? firstSegment.Name == secondSegment.Name
+                : firstSegment.Reference.Length > 0
+                    ? firstSegment.Reference == secondSegment.Reference
+                    : secondSegment.Name.Length == 0 && secondSegment.Reference.Length == 0);
+
         // Forward continuation only (end node → a section starting there), so
         // two-way roads digitised against each other simply form shorter roads.
         int Next(int i)
         {
-            var s = source[i]; if (!starts.TryGetValue(new(s.Kind, s.EndNodeId), out var list)) return -1;
+            var segment = source[i];
+
+            if (!starts.TryGetValue(new(segment.Kind, segment.EndNodeId), out var list))
+                return -1;
+
             var found = -1;
+
             foreach (var j in list)
             {
-                if (j == i || !Same(s, source[j]) || math.dot(Heading(s), Heading(source[j])) < .7) continue;
-                if (found >= 0) return -1; found = j;
+                if (j == i || !Same(segment, source[j]) || math.dot(Heading(segment), Heading(source[j])) < .7)
+                    continue;
+
+                if (found >= 0)
+                    return -1;
+
+                found = j;
             }
+
             return found;
         }
-        var next = Enumerable.Range(0, source.Count).Select(i => source[i].Kind == NetworkKind.Road ? Next(i) : -1).ToArray();
-        var hasPrevious = new bool[source.Count]; foreach (var j in next) if (j >= 0) hasPrevious[j] = true;
-        var used = new bool[source.Count]; var changed = 0; var roads = 0;
+
+        var next =
+            Enumerable.Range(0, source.Count).Select(i => source[i].Kind == NetworkKind.Road ? Next(i) : -1).ToArray();
+
+        var hasPrevious = new bool[source.Count];
+
+        foreach (var j in next)
+            if (j >= 0)
+                hasPrevious[j] = true;
+
+        var used = new bool[source.Count];
+        var changed = 0;
+        var roads = 0;
+
         // Roads start where nothing continues into them; loops start anywhere.
         foreach (var first in Enumerable.Range(0, source.Count).OrderBy(i => hasPrevious[i] ? 1 : 0))
         {
-            if (used[first] || source[first].Kind != NetworkKind.Road) continue;
+            if (used[first] || source[first].Kind != NetworkKind.Road)
+                continue;
+
             var chain = new List<int>();
-            for (var i = first; i >= 0 && !used[i]; i = next[i]) { used[i] = true; chain.Add(i); }
-            if (chain.Count < 3) continue;
+
+            for (var i = first; i >= 0 && !used[i]; i = next[i])
+            {
+                used[i] = true;
+                chain.Add(i);
+            }
+
+            if (chain.Count < 3)
+                continue;
+
             var length = chain.Select(i => (double)math.distance(source[i].Start.xz, source[i].End.xz)).ToArray();
             var lanes = chain.Select(i => result[i].Lanes).ToArray();
             var touched = false;
+
             while (true)
             {
                 // Runs of equal lane count: (first index, last index, length).
                 var runs = new List<(int From, int To, double Length)>();
+
                 for (var k = 0; k < chain.Count;)
                 {
-                    var e = k; var sum = length[k]; while (e + 1 < chain.Count && lanes[e + 1] == lanes[k]) sum += length[++e];
-                    runs.Add((k, e, sum)); k = e + 1;
+                    var e = k;
+                    var sum = length[k];
+
+                    while (e + 1 < chain.Count && lanes[e + 1] == lanes[k])
+                        sum += length[++e];
+
+                    runs.Add((k, e, sum));
+                    k = e + 1;
                 }
-                var pick = -1; var target = 0;
+
+                var pick = -1;
+                var target = 0;
+
                 for (var r = 0; r < runs.Count; r++)
                 {
                     var (from, to, run) = runs[r];
-                    int? before = r > 0 ? lanes[runs[r - 1].To] : null; int? after = r + 1 < runs.Count ? lanes[runs[r + 1].From] : null;
-                    int? replacement = before.HasValue && after.HasValue ? before == after && run < ShortRun ? before : null :
+                    int? before = r > 0 ? lanes[runs[r - 1].To] : null;
+                    int? after = r + 1 < runs.Count ? lanes[runs[r + 1].From] : null;
+                    int? replacement =
+                        before.HasValue && after.HasValue ? before == after && run < ShortRun ? before : null :
                         (before ?? after).HasValue && run < ShortRun / 2 && runs.Count > 1 ? before ?? after : null;
-                    if (replacement.HasValue && (pick < 0 || run < runs[pick].Length)) { pick = r; target = replacement.Value; }
+
+                    if (replacement.HasValue && (pick < 0 || run < runs[pick].Length))
+                    {
+                        pick = r;
+                        target = replacement.Value;
+                    }
                 }
-                if (pick < 0) break;
-                for (var k = runs[pick].From; k <= runs[pick].To; k++) lanes[k] = target;
+
+                if (pick < 0)
+                    break;
+
+                for (var k = runs[pick].From; k <= runs[pick].To; k++)
+                    lanes[k] = target;
+
                 touched = true;
             }
-            if (!touched) continue;
+
+            if (!touched)
+                continue;
+
             roads++;
+
             for (var k = 0; k < chain.Count; k++)
             {
-                var s = result[chain[k]]; if (s.Lanes == lanes[k]) continue;
+                var segment = result[chain[k]];
+
+                if (segment.Lanes == lanes[k])
+                    continue;
+
                 // Take the whole lane description of a neighbour with that count.
-                var donor = chain.Select(i => source[i]).FirstOrDefault(d => d.Lanes == lanes[k]) ?? s;
-                result[chain[k]] = s with { Lanes = lanes[k], ForwardLanes = donor.ForwardLanes, BackwardLanes = donor.BackwardLanes, BothWaysLanes = donor.BothWaysLanes };
+                var donor =
+                    chain.Select(i => source[i]).FirstOrDefault(otherSegment => otherSegment.Lanes == lanes[k])
+                        ?? segment;
+
+                result[chain[k]] =
+                    segment with
+                    {
+                        Lanes = lanes[k],
+                        ForwardLanes = donor.ForwardLanes,
+                        BackwardLanes = donor.BackwardLanes,
+                        BothWaysLanes = donor.BothWaysLanes
+                    };
+
                 changed++;
             }
         }
+
         log.Count("Lane count steps smoothed", changed);
-        log.Evidence($"Lane counts: {changed:N0} sections on {roads:N0} roads took their neighbours' lane count (runs under {ShortRun:0} m between matching counts, or under {ShortRun / 2:0} m at a road's end).");
+        log.Evidence(
+            $"Lane counts: {changed:N0} sections on {roads:N0} roads took their neighbours' lane count (runs under {ShortRun:0} m between matching counts, or under {ShortRun / 2:0} m at a road's end).");
+
+        return changed == 0 ? source : result;
+    }
+
+    // A width change in the middle of a road shows as a bulge or a wall sliver, and
+    // is worst at a bridge or tunnel mouth. Where two sections of one class and one
+    // travel direction meet at a plain two-arm node with different lanes, the
+    // shorter run, when under WidthRun, takes the longer run's lane description.
+    // The change then sits at whatever ends the short run: a junction, a dead end
+    // or the next change. Shortest runs go first, and every step merges two runs, so
+    // the passes end. Only lanes are copied, never a bridge or tunnel flag.
+    public static IReadOnlyList<PreparedSegment> MoveWidthChanges(IReadOnlyList<PreparedSegment> source, ImportLog log)
+    {
+        var result = source.ToArray();
+        var incident = new Dictionary<long, List<int>>();
+
+        for (var i = 0; i < source.Count; i++)
+        {
+            if (source[i].Kind != NetworkKind.Road)
+                continue;
+
+            foreach (var node in new[] { source[i].StartNodeId, source[i].EndNodeId })
+            {
+                if (!incident.TryGetValue(node, out var list))
+                    incident[node] = list = new();
+
+                list.Add(i);
+            }
+        }
+
+        bool Eligible(PreparedSegment segment) => !segment.Roundabout && !segment.ProtectedLink;
+
+        bool SameBody(PreparedSegment firstSegment, PreparedSegment secondSegment)
+            => firstSegment.Lanes == secondSegment.Lanes
+                && firstSegment.ConsolidatedAvenue == secondSegment.ConsolidatedAvenue;
+
+        // The one section a road continues into through a node, or -1 at a junction,
+        // a dead end, a change of class or direction, or a ring.
+        int Through(int i, long node)
+        {
+            var arms = incident[node];
+
+            if (arms.Count != 2)
+                return -1;
+
+            var other = arms[0] == i ? arms[1] : arms[0];
+            var segment = result[i];
+            var next = result[other];
+
+            if (other == i
+                || !Eligible(segment)
+                || !Eligible(next)
+                || segment.Classification != next.Classification
+                || segment.OneWay != next.OneWay)
+                return -1;
+
+            // One-way sections must carry on the same way through the node.
+            if (segment.OneWay && (segment.EndNodeId == node) == (next.EndNodeId == node))
+                return -1;
+
+            return other;
+        }
+
+        double Length(int i) => math.distance(result[i].Start.xz, result[i].End.xz);
+
+        // The run of one lane description that leaves a node through a section.
+        double RunLength(int first, long node, List<(int Index, bool Forward)>? members)
+        {
+            var length = 0d;
+            var current = first;
+
+            while (true)
+            {
+                var forward = result[current].StartNodeId == node;
+                length += Length(current);
+                members?.Add((current, forward));
+                node = forward ? result[current].EndNodeId : result[current].StartNodeId;
+                var next = Through(current, node);
+
+                if (next < 0 || next == first || !SameBody(result[current], result[next]))
+                    return length;
+
+                current = next;
+            }
+        }
+
+        var changed = 0;
+        var moved = 0;
+        var members = new List<(int Index, bool Forward)>();
+
+        while (true)
+        {
+            var steps = new List<(double Length, long Node, int Short, int Long)>();
+
+            foreach (var item in incident)
+            {
+                if (item.Value.Count != 2)
+                    continue;
+
+                var first = item.Value[0];
+                var second = item.Value[1];
+
+                if (Through(first, item.Key) != second || SameBody(result[first], result[second]))
+                    continue;
+
+                var firstLength = RunLength(first, item.Key, null);
+                var secondLength = RunLength(second, item.Key, null);
+
+                if (Math.Min(firstLength, secondLength) >= WidthRun || firstLength == secondLength)
+                    continue;
+
+                steps.Add(
+                    firstLength < secondLength
+                        ? (firstLength, item.Key, first, second)
+                        : (secondLength, item.Key, second, first));
+            }
+
+            var before = moved;
+
+            foreach (var step in steps.OrderBy(step => step.Length).ThenBy(step => step.Node))
+            {
+                var donor = result[step.Long];
+
+                // An earlier step in this pass may have settled or lengthened this one.
+                if (SameBody(result[step.Short], donor)
+                    || RunLength(step.Short, step.Node, null) >= RunLength(step.Long, step.Node, null))
+                    continue;
+
+                members.Clear();
+                RunLength(step.Short, step.Node, members);
+
+                // A paired carriageway's width limit keeps it clear of its twin.
+                if (members.Any(
+                    member => donor.Lanes > result[member.Index].Lanes
+                        && !float.IsPositiveInfinity(result[member.Index].MaximumNativeWidth)))
+                    continue;
+
+                // Seen walking away from the node, the donor runs the other way.
+                var donorForward = donor.EndNodeId == step.Node;
+
+                foreach (var member in members)
+                {
+                    var aligned = member.Forward == donorForward;
+                    result[member.Index] = result[member.Index] with
+                    {
+                        Lanes = donor.Lanes,
+                        ForwardLanes = aligned ? donor.ForwardLanes : donor.BackwardLanes,
+                        BackwardLanes = aligned ? donor.BackwardLanes : donor.ForwardLanes,
+                        BothWaysLanes = donor.BothWaysLanes,
+                        ConsolidatedAvenue = donor.ConsolidatedAvenue
+                    };
+
+                    changed++;
+                }
+
+                moved++;
+            }
+
+            if (moved == before)
+                break;
+        }
+
+        log.Count("Width changes moved to a junction", moved);
+        log.Evidence(
+            $"Width changes: {moved:N0} mid-road changes removed; {changed:N0} sections in runs under {WidthRun:0} m took the longer neighbouring run's lanes.");
+
         return changed == 0 ? source : result;
     }
 }

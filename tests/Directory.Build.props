@@ -3,4 +3,7 @@
     <GameManagedPath Condition="'$(GameManagedPath)' == ''">$(CSII_MANAGEDPATH)</GameManagedPath>
     <GameManagedPath Condition="'$(GameManagedPath)' == ''">$(MSBuildProgramFiles32)\Steam\steamapps\common\Cities Skylines II\Cities2_Data\Managed</GameManagedPath>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)shared/TestChecks.cs" Link="TestChecks.cs" />
+  </ItemGroup>
 </Project>

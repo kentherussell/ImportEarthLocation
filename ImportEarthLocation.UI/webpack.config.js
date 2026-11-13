@@ -26,7 +26,7 @@ module.exports = {
   mode: "production",
   stats: "none",
   entry: {
-    [MOD.id]: "./src/index.tsx",
+    [MOD.id]: "./src/index.tsx"
   },
   externalsType: "window",
   externals: {
@@ -39,14 +39,14 @@ module.exports = {
     "cs2/ui": "cs2/ui",
     "cs2/input": "cs2/input",
     "cs2/utils": "cs2/utils",
-    "cohtml/cohtml": "cohtml/cohtml",
+    "cohtml/cohtml": "cohtml/cohtml"
   },
   module: {
     rules: [
       {
         test: /\.tsx?$/,
         use: "ts-loader",
-        exclude: /node_modules/,
+        exclude: /node_modules/
       },
       {
         test: /\.s?css$/,
@@ -61,48 +61,48 @@ module.exports = {
               modules: {
                 auto: true,
                 exportLocalsConvention: "camelCase",
-                localIdentName: "[local]_[hash:base64:3]",
-              },
-            },
+                localIdentName: "[local]_[hash:base64:3]"
+              }
+            }
           },
-          "sass-loader",
-        ],
+          "sass-loader"
+        ]
       },
       {
         test: /\.(png|jpe?g|gif|svg)$/i,
         type: "asset/resource",
         generator: {
-          filename: "images/[name][ext][query]",
-        },
-      },
-    ],
+          filename: "images/[name][ext][query]"
+        }
+      }
+    ]
   },
   resolve: {
     extensions: [".tsx", ".ts", ".js"],
     modules: ["node_modules", path.join(__dirname, "src")],
     alias: {
-      "mod.json": path.resolve(__dirname, "mod.json"),
-    },
+      "mod.json": path.resolve(__dirname, "mod.json")
+    }
   },
   output: {
     path: path.resolve(__dirname, OUTPUT_DIR),
     library: {
-      type: "module",
+      type: "module"
     },
-    publicPath: `coui://ui-mods/`,
+    publicPath: `coui://ui-mods/`
   },
   optimization: {
     minimize: true,
     minimizer: [
       new TerserPlugin({
         extractComments: {
-          banner: () => banner,
-        },
-      }),
-    ],
+          banner: () => banner
+        }
+      })
+    ]
   },
   experiments: {
-    outputModule: true,
+    outputModule: true
   },
   plugins: [
     new MiniCssExtractPlugin(),
@@ -115,7 +115,7 @@ module.exports = {
           console.log(`\n🔨 ${!runCount++ ? "Built" : "Updated"} ${MOD.id}`);
           console.log("   " + gray(OUTPUT_DIR) + "\n");
         });
-      },
-    },
-  ],
+      }
+    }
+  ]
 };

@@ -10,7 +10,7 @@ The goal is simple: take any location in the world and turn it into a realistic 
 2. Select your map size, road groups and whether to include rail. **Highways** includes motorways, trunk roads and their ramps. **Main Roads** includes primary, secondary and tertiary roads.
 3. Prepare the import, review the results, then confirm replacement.
 
-Save a backup first: importing replaces the current map contents.
+Importing replaces the current map contents.
 
 ## Current status
 

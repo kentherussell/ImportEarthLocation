@@ -1,0 +1,435 @@
+{
+  "schema": 1,
+  "plan": {
+    "roadKm": 2463.7,
+    "edges": 33941,
+    "junctions": 4660,
+    "junctionsInClosePairShare": 0.2474,
+    "edgesUnder10mPer100Km": 84.14,
+    "throughNodesPer100Km": 1069.17,
+    "closeJunctionPairs": {
+      "apart-level": 50,
+      "apart-stacked": 15,
+      "joined-level": 578,
+      "joined-stacked": 8,
+      "twoSteps-level": 153,
+      "twoSteps-stacked": 4
+    },
+    "terrain": {
+      "steps": {
+        "count": 11348,
+        "design": 3634,
+        "source": 7714
+      },
+      "designStepsAt": {
+        "deckToDeck": 1359,
+        "deckToGround": 1397,
+        "awayFromRoads": 878
+      },
+      "spikes": {
+        "count": 48,
+        "design": 27,
+        "source": 21
+      },
+      "groundRoadKm": 2259.5,
+      "groundKmNeedingOver12m": 15.56,
+      "groundKmStoppedShort": 16.86,
+      "fillMillionM3": 131.6,
+      "cutMillionM3": 124.3,
+      "Terrain spikes and pits removed": 0.0,
+      "High fills built as bridge": 0.0,
+      "Deep cuttings built as tunnel": 0.0
+    }
+  },
+  "capture": "r-f4992aedcb9847b384a41d75be492d0d",
+  "Classes": [
+    {
+      "Class": "motorway",
+      "Sections": 3268,
+      "Kilometres": 447.0488868517803,
+      "LateralP50": 1.8359828085705199,
+      "LateralP95": 5.350678673250604,
+      "LateralMaximum": 17.12055482669552,
+      "KilometresOver10": 0.9249239230549297,
+      "Jogs": 1,
+      "KinksAtPlainNodes": 2,
+      "KinksThroughJunctions": 38,
+      "UnderRadiusFloor": 122,
+      "UnderRadius50": 10,
+      "UnderMinimumLength": 265,
+      "SectionsPerKilometre": 7.310162481365287,
+      "BridgeKilometres": 55.45770525791538,
+      "SourceBridgeKilometres": 22.270785221237112,
+      "BridgeRatio": 2.490154914027534,
+      "SourceKilometres": 446.67756891857755,
+      "MissingSourceKilometres": 0.0,
+      "MissingSourceWays": 0
+    },
+    {
+      "Class": "motorway_link",
+      "Sections": 1436,
+      "Kilometres": 117.41769208471018,
+      "LateralP50": 1.7496653629071162,
+      "LateralP95": 11.464722898105126,
+      "LateralMaximum": 68.70202336698026,
+      "KilometresOver10": 8.879827537164287,
+      "Jogs": 65,
+      "KinksAtPlainNodes": 14,
+      "KinksThroughJunctions": 30,
+      "UnderRadiusFloor": 167,
+      "UnderRadius50": 167,
+      "UnderMinimumLength": 89,
+      "SectionsPerKilometre": 12.229843514246625,
+      "BridgeKilometres": 12.185359684535467,
+      "SourceBridgeKilometres": 4.742473719247989,
+      "BridgeRatio": 2.569410060213827,
+      "SourceKilometres": 120.69331906851305,
+      "MissingSourceKilometres": 2.8432286916730622,
+      "MissingSourceWays": 19
+    },
+    {
+      "Class": "trunk",
+      "Sections": 808,
+      "Kilometres": 97.20808305588378,
+      "LateralP50": 1.9237938309072269,
+      "LateralP95": 4.827908010943707,
+      "LateralMaximum": 20.09453489311639,
+      "KilometresOver10": 0.024269380554161356,
+      "Jogs": 3,
+      "KinksAtPlainNodes": 0,
+      "KinksThroughJunctions": 15,
+      "UnderRadiusFloor": 24,
+      "UnderRadius50": 3,
+      "UnderMinimumLength": 70,
+      "SectionsPerKilometre": 8.312065978458708,
+      "BridgeKilometres": 3.2957089674671973,
+      "SourceBridgeKilometres": 2.5252440995395435,
+      "BridgeRatio": 1.3051051057076586,
+      "SourceKilometres": 112.46749812497187,
+      "MissingSourceKilometres": 0.02003677784089282,
+      "MissingSourceWays": 1
+    },
+    {
+      "Class": "trunk_link",
+      "Sections": 660,
+      "Kilometres": 49.26357329998816,
+      "LateralP50": 2.2564402446850482,
+      "LateralP95": 10.588476437921258,
+      "LateralMaximum": 20.496537922226196,
+      "KilometresOver10": 3.27236461849056,
+      "Jogs": 31,
+      "KinksAtPlainNodes": 27,
+      "KinksThroughJunctions": 20,
+      "UnderRadiusFloor": 91,
+      "UnderRadius50": 91,
+      "UnderMinimumLength": 43,
+      "SectionsPerKilometre": 13.397322926231148,
+      "BridgeKilometres": 1.6611920442338879,
+      "SourceBridgeKilometres": 0.37670609698574165,
+      "BridgeRatio": 4.409782739186099,
+      "SourceKilometres": 49.50809588351715,
+      "MissingSourceKilometres": 0.014659457132298215,
+      "MissingSourceWays": 1
+    },
+    {
+      "Class": "primary",
+      "Sections": 7696,
+      "Kilometres": 344.57699584683695,
+      "LateralP50": 0.5655862585233588,
+      "LateralP95": 4.668440095516083,
+      "LateralMaximum": 41.758266521444305,
+      "KilometresOver10": 4.876451973517433,
+      "Jogs": 169,
+      "KinksAtPlainNodes": 91,
+      "KinksThroughJunctions": 316,
+      "UnderRadiusFloor": 209,
+      "UnderRadius50": 169,
+      "UnderMinimumLength": 483,
+      "SectionsPerKilometre": 22.33463084523739,
+      "BridgeKilometres": 21.974752621452605,
+      "SourceBridgeKilometres": 5.212261717117469,
+      "BridgeRatio": 4.215972607301323,
+      "SourceKilometres": 356.3785852168815,
+      "MissingSourceKilometres": 1.3757372806313275,
+      "MissingSourceWays": 52
+    },
+    {
+      "Class": "secondary",
+      "Sections": 7853,
+      "Kilometres": 567.1345858830409,
+      "LateralP50": 0.6723968711012976,
+      "LateralP95": 4.230797698574563,
+      "LateralMaximum": 38.246358560995965,
+      "KilometresOver10": 4.411213947064204,
+      "Jogs": 270,
+      "KinksAtPlainNodes": 208,
+      "KinksThroughJunctions": 749,
+      "UnderRadiusFloor": 577,
+      "UnderRadius50": 721,
+      "UnderMinimumLength": 794,
+      "SectionsPerKilometre": 13.846801439155236,
+      "BridgeKilometres": 37.42672142302589,
+      "SourceBridgeKilometres": 8.627564747805739,
+      "BridgeRatio": 4.338040051515659,
+      "SourceKilometres": 730.2830485473746,
+      "MissingSourceKilometres": 3.4728267440406864,
+      "MissingSourceWays": 118
+    },
+    {
+      "Class": "tertiary",
+      "Sections": 12135,
+      "Kilometres": 841.3762339090978,
+      "LateralP50": 0.5040458282176754,
+      "LateralP95": 3.0135722442416806,
+      "LateralMaximum": 46.975555952402196,
+      "KilometresOver10": 4.358690582425585,
+      "Jogs": 266,
+      "KinksAtPlainNodes": 422,
+      "KinksThroughJunctions": 681,
+      "UnderRadiusFloor": 707,
+      "UnderRadius50": 1809,
+      "UnderMinimumLength": 931,
+      "SectionsPerKilometre": 14.422798637441742,
+      "BridgeKilometres": 25.76038369720761,
+      "SourceBridgeKilometres": 5.769787187550025,
+      "BridgeRatio": 4.464702572183779,
+      "SourceKilometres": 958.2087750346542,
+      "MissingSourceKilometres": 2.6564083595755448,
+      "MissingSourceWays": 178
+    },
+    {
+      "Class": "street",
+      "Sections": 0,
+      "Kilometres": 0.0,
+      "LateralP50": 0.0,
+      "LateralP95": 0.0,
+      "LateralMaximum": 0.0,
+      "KilometresOver10": 0.0,
+      "Jogs": 0,
+      "KinksAtPlainNodes": 0,
+      "KinksThroughJunctions": 0,
+      "UnderRadiusFloor": 0,
+      "UnderRadius50": 0,
+      "UnderMinimumLength": 0,
+      "SectionsPerKilometre": 0.0,
+      "BridgeKilometres": 0.0,
+      "SourceBridgeKilometres": 0.15458443852943715,
+      "BridgeRatio": 0.0,
+      "SourceKilometres": 2317.0912002784844,
+      "MissingSourceKilometres": 2273.2889789683004,
+      "MissingSourceWays": 16656
+    }
+  ],
+  "issues": {
+    "tight-radius": 1367,
+    "grade-change": 1602,
+    "terrain-mismatch": 1502,
+    "tangent-break": 649,
+    "short-segment": 1862,
+    "paired-height": 158,
+    "same-level-overlap": 1174,
+    "acute-junction": 311,
+    "crossing-clearance": 316,
+    "steep-grade": 102
+  },
+  "drawn": {
+    "TunnelKm": 36.49950464773178,
+    "OpenBoreKm": 9.234049329280854,
+    "LongestOpenBore": 199.7275848388672,
+    "DeepOpenBoreKm": 6.444848205566406,
+    "CutKm": 2.890325214385986,
+    "WallKm": 1.5805261788368226,
+    "ForcedShallowKm": 0.0
+  },
+  "topology": {
+    "raw": {
+      "ports": 317.0,
+      "routes": 962.0
+    },
+    "cleanup": {
+      "ports": 222.0,
+      "routes": 748.0
+    }
+  },
+  "recoveries": 0.0,
+  "predictedOmissions": 0,
+  "stages": [
+    {
+      "name": "limited-access",
+      "seconds": 0.0515416,
+      "sections": 131525,
+      "missingPorts": 0.0,
+      "unresolvedRoutes": 0.0,
+      "highwayWays": 2293
+    },
+    {
+      "name": "tunnel-intervals",
+      "seconds": 0.4249027,
+      "sections": 131525,
+      "missingPorts": 0.0,
+      "unresolvedRoutes": 0.0,
+      "highwayWays": 2293
+    },
+    {
+      "name": "stubs",
+      "seconds": 0.1452147,
+      "sections": 131452,
+      "missingPorts": 0.0,
+      "unresolvedRoutes": 0.0,
+      "highwayWays": 2293
+    },
+    {
+      "name": "lane-smoothing",
+      "seconds": 0.1597175,
+      "sections": 131452,
+      "missingPorts": 0.0,
+      "unresolvedRoutes": 0.0,
+      "highwayWays": 2293
+    },
+    {
+      "name": "median-links",
+      "seconds": 0.878216,
+      "sections": 131378,
+      "missingPorts": 0.0,
+      "unresolvedRoutes": 0.0,
+      "highwayWays": 2294
+    },
+    {
+      "name": "avenue-consolidation",
+      "seconds": 11.4859757,
+      "sections": 122455,
+      "missingPorts": 0.0,
+      "unresolvedRoutes": 0.0,
+      "highwayWays": 2291
+    },
+    {
+      "name": "street-widths",
+      "seconds": 0.1938089,
+      "sections": 122455,
+      "missingPorts": 0.0,
+      "unresolvedRoutes": 0.0,
+      "highwayWays": 2291
+    },
+    {
+      "name": "junction-clusters",
+      "seconds": 1.1050337,
+      "sections": 116313,
+      "missingPorts": 0.0,
+      "unresolvedRoutes": 0.0,
+      "highwayWays": 2291
+    },
+    {
+      "name": "split-roads",
+      "seconds": 1.4831131,
+      "sections": 114600,
+      "missingPorts": 0.0,
+      "unresolvedRoutes": 8.0,
+      "highwayWays": 2290
+    },
+    {
+      "name": "roundabouts",
+      "seconds": 0.6062683,
+      "sections": 103134,
+      "missingPorts": 0.0,
+      "unresolvedRoutes": 8.0,
+      "highwayWays": 2288
+    },
+    {
+      "name": "rail-consolidation",
+      "seconds": 1.7061909,
+      "sections": 99319,
+      "missingPorts": 0.0,
+      "unresolvedRoutes": 8.0,
+      "highwayWays": 2288
+    },
+    {
+      "name": "normalization",
+      "seconds": 6.1944631,
+      "sections": 42028,
+      "missingPorts": 7.0,
+      "unresolvedRoutes": 129.0,
+      "highwayWays": 2288
+    },
+    {
+      "name": "network-hardening",
+      "seconds": 0.2047866,
+      "sections": 42028,
+      "missingPorts": 7.0,
+      "unresolvedRoutes": 129.0,
+      "highwayWays": 2288
+    },
+    {
+      "name": "repair-geometry",
+      "seconds": 0.0324023,
+      "sections": 42027,
+      "missingPorts": 7.0,
+      "unresolvedRoutes": 129.0,
+      "highwayWays": 2288
+    },
+    {
+      "name": "native-metadata",
+      "seconds": 0.0240835,
+      "sections": 42027,
+      "missingPorts": 7.0,
+      "unresolvedRoutes": 129.0,
+      "highwayWays": 2288
+    },
+    {
+      "name": "native-junctions",
+      "seconds": 0.0586638,
+      "sections": 41759,
+      "missingPorts": 8.0,
+      "unresolvedRoutes": 132.0,
+      "highwayWays": 2288
+    },
+    {
+      "name": "coincident-courses",
+      "seconds": 0.0247763,
+      "sections": 41739,
+      "missingPorts": 8.0,
+      "unresolvedRoutes": 132.0,
+      "highwayWays": 2288
+    },
+    {
+      "name": "late-stubs",
+      "seconds": 0.3603058,
+      "sections": 41619,
+      "missingPorts": 8.0,
+      "unresolvedRoutes": 132.0,
+      "highwayWays": 2288
+    },
+    {
+      "name": "street-connectors",
+      "seconds": 0.065534,
+      "sections": 41815,
+      "missingPorts": 8.0,
+      "unresolvedRoutes": 132.0,
+      "highwayWays": 2288
+    },
+    {
+      "name": "dead-ends",
+      "seconds": 0.4219099,
+      "sections": 41828,
+      "missingPorts": 8.0,
+      "unresolvedRoutes": 132.0,
+      "highwayWays": 2288
+    },
+    {
+      "name": "map-edge",
+      "seconds": 0.0217429,
+      "sections": 41828,
+      "missingPorts": 8.0,
+      "unresolvedRoutes": 132.0,
+      "highwayWays": 2288
+    },
+    {
+      "name": "blind-one-ways",
+      "seconds": 0.1367701,
+      "sections": 41768,
+      "missingPorts": 8.0,
+      "unresolvedRoutes": 132.0,
+      "highwayWays": 2270
+    }
+  ],
+  "baselineReason": "Report 112 section 12: the replay now designs with the sea level the import logged, as the import does (it had omitted it, so Amsterdam lacked its polder fill); terrain gains designStepsAt and fill/cut volumes. Design code unchanged with every switch off. A change alarm only, not a quality reference."
+}

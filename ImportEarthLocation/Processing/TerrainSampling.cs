@@ -5,31 +5,78 @@ namespace ImportEarthLocation.Processing;
 // One corner-aligned interpolation convention for preparation and native uploads.
 public static class TerrainSampling
 {
-    public static int Resolution(ushort[] raster)
+    public static int Resolution(float[] heights)
     {
-        if (raster == null) throw new ArgumentNullException(nameof(raster));
-        var size = (int)Math.Sqrt(raster.Length);
-        if (size < 2 || size * size != raster.Length)
-            throw new ArgumentException("Heightmap must be a nonempty square raster.", nameof(raster));
+        if (heights == null)
+            throw new ArgumentNullException(nameof(heights));
+
+        var size = (int)Math.Sqrt(heights.Length);
+
+        if (size < 2 || size * size != heights.Length)
+            throw new ArgumentException("Heights must be a nonempty square grid.", nameof(heights));
+
         return size;
     }
 
-    // u/v are normalized x/z coordinates; the result is in encoded ushort
-    // height units, not metres. Raster indexing is row-major z, then x.
-    public static double Encoded(ushort[] raster, int size, double u, double v)
-        =>Encoded(raster,size,size,u,v);
+    // u/v are normalized x/z coordinates; the result is in the heights' metres.
+    // Indexing is row-major z, then x.
+    public static double Height(float[] heights, int size, double u, double v)
+        => Height(heights, size, size, u, v);
 
-    public static double Encoded(ushort[] raster,int width,int height,double u,double v)
+    public static double Height(float[] heights, int width, int height, double u, double v)
     {
         var x = Math.Max(0, Math.Min(1, u)) * (width - 1);
         var z = Math.Max(0, Math.Min(1, v)) * (height - 1);
-        var x0 = (int)x; var z0 = (int)z;
-        var x1 = Math.Min(x0 + 1, width - 1); var z1 = Math.Min(z0 + 1, height - 1);
-        var tx = x - x0; var tz = z - z0;
-        var a = raster[z0 * width + x0] * (1 - tx) + raster[z0 * width + x1] * tx;
-        var b = raster[z1 * width + x0] * (1 - tx) + raster[z1 * width + x1] * tx;
+        var x0 = (int)x;
+        var z0 = (int)z;
+        var x1 = Math.Min(x0 + 1, width - 1);
+        var z1 = Math.Min(z0 + 1, height - 1);
+        var tx = x - x0;
+        var tz = z - z0;
+        var a = heights[z0 * width + x0] * (1 - tx) + heights[z0 * width + x1] * tx;
+        var b = heights[z1 * width + x0] * (1 - tx) + heights[z1 * width + x1] * tx;
+
         return a * (1 - tz) + b * tz;
     }
+
+    // Bilinear, except that a sample touching a flood-defence cell keeps its crest.
+    // Bilinear sampling between grids averages a dyke two cells wide with the land
+    // beside it: Amsterdam's dykes lost up to 3 m and let the sea in. Where any of the
+    // four samples around (u, v) carries a crest (not NaN), the sample is at least the
+    // highest of those crests, so every defence cell lifts the samples around it to
+    // full height and a connected dyke stays connected at any offset.
+    public static double HeightKeepingCrests(float[] heights, float[]? crests, int size, double u, double v)
+        => HeightKeepingCrests(heights, crests, size, size, u, v);
+
+    public static double HeightKeepingCrests(
+        float[] heights,
+        float[]? crests,
+        int width,
+        int height,
+        double u,
+        double v)
+    {
+        var value = Height(heights, width, height, u, v);
+
+        if (crests == null)
+            return value;
+
+        var x0 = (int)(Math.Max(0, Math.Min(1, u)) * (width - 1));
+        var z0 = (int)(Math.Max(0, Math.Min(1, v)) * (height - 1));
+        var x1 = Math.Min(x0 + 1, width - 1);
+        var z1 = Math.Min(z0 + 1, height - 1);
+
+        // NaN (no crest) never compares greater, so it leaves the value alone.
+        var crest =
+            Math.Max(
+                Math.Max(Crest(crests[z0 * width + x0]), Crest(crests[z0 * width + x1])),
+                Math.Max(Crest(crests[z1 * width + x0]), Crest(crests[z1 * width + x1])));
+
+        return Math.Max(value, crest);
+    }
+
+    // A crest height, or nothing for NaN (no crest).
+    private static double Crest(float crest) => crest > 0 ? crest : double.NegativeInfinity;
 
     // Catmull-Rom weights for samples at -1, 0, 1 and 2 around fraction t: the
     // cubic through four samples whose slope at each sample is the central
@@ -39,7 +86,9 @@ public static class TerrainSampling
     // grid of facets.
     public static (float W0, float W1, float W2, float W3) CubicWeights(float t)
     {
-        var t2 = t * t; var t3 = t2 * t;
+        var t2 = t * t;
+        var t3 = t2 * t;
+
         return (.5f * (-t3 + 2 * t2 - t), .5f * (3 * t3 - 5 * t2 + 2), .5f * (-3 * t3 + 4 * t2 + t), .5f * (t3 - t2));
     }
 
@@ -50,27 +99,41 @@ public static class TerrainSampling
         (float W0, float W1, float W2, float W3) column, (float W0, float W1, float W2, float W3) row)
     {
         // Each of the 16 neighbours is read once; the clamp reuses the central four.
-        float Row(float r0, float r1, float r2, float r3) => column.W0 * r0 + column.W1 * r1 + column.W2 * r2 + column.W3 * r3;
+        float Row(float r0, float r1, float r2, float r3)
+            => column.W0 * r0 + column.W1 * r1 + column.W2 * r2 + column.W3 * r3;
+
         var top = Row(read(x - 1, y - 1), read(x, y - 1), read(x + 1, y - 1), read(x + 2, y - 1));
-        var a = read(x, y); var b = read(x + 1, y);
+        var a = read(x, y);
+        var b = read(x + 1, y);
         var upper = Row(read(x - 1, y), a, b, read(x + 2, y));
-        var c = read(x, y + 1); var d = read(x + 1, y + 1);
+        var c = read(x, y + 1);
+        var d = read(x + 1, y + 1);
         var lower = Row(read(x - 1, y + 1), c, d, read(x + 2, y + 1));
         var bottom = Row(read(x - 1, y + 2), read(x, y + 2), read(x + 1, y + 2), read(x + 2, y + 2));
         var value = row.W0 * top + row.W1 * upper + row.W2 * lower + row.W3 * bottom;
-        return Math.Min(Math.Max(value, Math.Min(Math.Min(a, b), Math.Min(c, d))), Math.Max(Math.Max(a, b), Math.Max(c, d)));
+
+        return Math.Min(
+            Math.Max(value, Math.Min(Math.Min(a, b), Math.Min(c, d))),
+            Math.Max(Math.Max(a, b), Math.Max(c, d)));
     }
 
-    public static ushort[] Resample(ushort[] raster, int width, int height)
+    public static float[] Resample(float[] heights, int width, int height)
     {
-        var size = Resolution(raster);
-        if (width < 1 || height < 1) throw new ArgumentOutOfRangeException(nameof(width));
-        if (width == size && height == size) return raster;
-        var result = new ushort[checked(width * height)];
+        var size = Resolution(heights);
+
+        if (width < 1 || height < 1)
+            throw new ArgumentOutOfRangeException(nameof(width));
+
+        if (width == size && height == size)
+            return heights;
+
+        var result = new float[checked(width * height)];
+
         for (var z = 0; z < height; z++)
             for (var x = 0; x < width; x++)
-                result[z * width + x] = (ushort)Math.Round(Encoded(raster, size,
-                    x / (double)Math.Max(1, width - 1), z / (double)Math.Max(1, height - 1)));
+                result[z * width + x] = (float)Height(heights, size,
+                    x / (double)Math.Max(1, width - 1), z / (double)Math.Max(1, height - 1));
+
         return result;
     }
 }

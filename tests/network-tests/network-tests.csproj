@@ -5,13 +5,14 @@
     <None Update="fixtures/ramp-dc-loop.json" CopyToOutputDirectory="PreserveNewest" />
     <Compile Include="../../ImportEarthLocation/Processing/StreetIntersectionConsolidator.cs" Link="StreetIntersectionConsolidator.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/StreetJunctionClusters.cs" Link="StreetJunctionClusters.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkSourcePipeline.cs" Link="NetworkSourcePipeline.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/RoadQualityReport.cs" Link="RoadQualityReport.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/HighwayAlignment.cs" Link="HighwayAlignment.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/RoadAlignment.cs" Link="RoadAlignment.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkStructureIntervals.cs" Link="NetworkStructureIntervals.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/MedianLinks.cs" Link="MedianLinks.cs" />    <Compile Include="../../ImportEarthLocation/Processing/NativeJunctionSimplifier.cs" Link="NativeJunctionSimplifier.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/ProfileStarCoordinates.cs" Link="ProfileStarCoordinates.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkProfileParents.cs" Link="NetworkProfileParents.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkBoundaryPolicy.cs" Link="NetworkBoundaryPolicy.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkWorkingPolyline.cs" Link="NetworkWorkingPolyline.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/ProfileIntentQuadrature.cs" Link="ProfileIntentQuadrature.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/PairedEmissionCompaction.cs" Link="PairedEmissionCompaction.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/WaterBodyPlanner.cs" Link="WaterBodyPlanner.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/WaterCutSmoothing.cs" Link="WaterCutSmoothing.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/WaterContainment.cs" Link="WaterContainment.cs" />
@@ -22,28 +23,27 @@
     <Compile Include="../../ImportEarthLocation/Processing/ClimateMath.cs" Link="ClimateMath.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/RockPlanner.cs" Link="RockPlanner.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkStubs.cs" Link="NetworkStubs.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkDeadEnds.cs" Link="NetworkDeadEnds.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkDrawnStructures.cs" Link="NetworkDrawnStructures.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkSplitRoads.cs" Link="NetworkSplitRoads.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkLimitedAccess.cs" Link="NetworkLimitedAccess.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkLaneRuns.cs" Link="NetworkLaneRuns.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/BeachTerrain.cs" Link="BeachTerrain.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/RiverBedSurface.cs" Link="RiverBedSurface.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/TerrainArtifactRepair.cs" Link="TerrainArtifactRepair.cs" />
     <Compile Include="../../ImportEarthLocation/Core/WaterLevels.cs" Link="WaterLevels.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkJunctionQuality.cs" Link="NetworkJunctionQuality.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkRailTerminalFormations.cs" Link="NetworkRailTerminalFormations.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkVisualDesign.cs" Link="NetworkVisualDesign.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkVisualQuality.cs" Link="NetworkVisualQuality.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkObservedQuality.cs" Link="NetworkObservedQuality.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/CoordinatedNetworkDesign.cs" Link="CoordinatedNetworkDesign.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkEmissionStations.cs" Link="NetworkEmissionStations.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkSourceFit.cs" Link="NetworkSourceFit.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkApproachFrames.cs" Link="NetworkApproachFrames.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkPhysicalReconstruction.cs" Link="NetworkPhysicalReconstruction.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkQualityAudit.cs" Link="NetworkQualityAudit.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkTerrainSupport.cs" Link="NetworkTerrainSupport.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkGroundFeasibility.cs" Link="NetworkGroundFeasibility.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NetworkQualityFinding.cs" Link="NetworkQualityFinding.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkCurveObservations.cs" Link="NetworkCurveObservations.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/VisualCompilerMetrics.cs" Link="VisualCompilerMetrics.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/VisualCompilerTable.cs" Link="VisualCompilerTable.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/ShortUnderpasses.cs" Link="ShortUnderpasses.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/ShortBridges.cs" Link="ShortBridges.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/VisualNetworkCompiler.cs" Link="VisualNetworkCompiler.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/StreetGridAlignment.cs" Link="StreetGridAlignment.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkLaneSlots.cs" Link="NetworkLaneSlots.cs" />
@@ -52,10 +52,6 @@
     <Compile Include="../../ImportEarthLocation/Processing/NativeDesignUnits.cs" Link="NativeDesignUnits.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/StarterNetworkPolicy.cs" Link="StarterNetworkPolicy.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NativeJunctionReconciliation.cs" Link="NativeJunctionReconciliation.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/CarriagewaySeparation.cs" Link="CarriagewaySeparation.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkReferenceSpline.cs" Link="NetworkReferenceSpline.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkPairedCorridors.cs" Link="NetworkPairedCorridors.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkFormationProtection.cs" Link="NetworkFormationProtection.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NativeEntityOwnership.cs" Link="NativeEntityOwnership.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NativeOwnerLineage.cs" Link="NativeOwnerLineage.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NativeBatchDisposition.cs" Link="NativeBatchDisposition.cs" />
@@ -68,45 +64,36 @@
     <Compile Include="../../ImportEarthLocation/Core/SourceTopologyObligations.cs" Link="SourceTopologyObligations.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkDesignChecks.cs" Link="NetworkDesignChecks.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkFootprintMath.cs" Link="NetworkFootprintMath.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkFootprintIndex.cs" Link="NetworkFootprintIndex.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkPhysicalContacts.cs" Link="NetworkPhysicalContacts.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkContactTopology.cs" Link="NetworkContactTopology.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkHorizontalRegularity.cs" Link="NetworkHorizontalRegularity.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkTunnelContacts.cs" Link="NetworkTunnelContacts.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkTerrainPolynomial.cs" Link="NetworkTerrainPolynomial.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkProfileGraph.cs" Link="NetworkProfileGraph.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkTunnelProfile.cs" Link="NetworkTunnelProfile.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkProfileSolve.cs" Link="NetworkProfileSolve.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/ProfileHardProjector.cs" Link="ProfileHardProjector.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/TerrainSampling.cs" Link="TerrainSampling.cs" />
     <Compile Include="../../ImportEarthLocation/Data/ServicePreferences.cs" Link="ServicePreferences.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkEvidence.cs" Link="NetworkEvidence.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkSourceManifest.cs" Link="NetworkSourceManifest.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkOverlapConsolidator.cs" Link="NetworkOverlapConsolidator.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/TerrainConditioner.cs" Link="TerrainConditioner.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/CoastalTerrain.cs" Link="CoastalTerrain.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/TerrainGeographyGuard.cs" Link="TerrainGeographyGuard.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkContactPolicy.cs" Link="NetworkContactPolicy.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/CorridorProfiles.cs" Link="CorridorProfiles.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/TunnelCorridorPlanner.cs" Link="TunnelCorridorPlanner.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkFinishing.cs" Link="NetworkFinishing.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/RailJunctionRepair.cs" Link="RailJunctionRepair.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkLaneAlignment.cs" Link="NetworkLaneAlignment.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkApproachTapers.cs" Link="NetworkApproachTapers.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkGeometrySafety.cs" Link="NetworkGeometrySafety.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NativeEndpointPolicy.cs" Link="NativeEndpointPolicy.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NativeBatchBindings.cs" Link="NativeBatchBindings.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NativePreviewRecovery.cs" Link="NativePreviewRecovery.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NativeSubmissionPlan.cs" Link="NativeSubmissionPlan.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NativeChainCompactor.cs" Link="NativeChainCompactor.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/ConnectedRoadGrades.cs" Link="ConnectedRoadGrades.cs" />
     <Compile Include="../../ImportEarthLocation/Core/ImportModels.cs" Link="ImportModels.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/TerrainEncoding.cs" Link="TerrainEncoding.cs" />
     <Compile Include="../../ImportEarthLocation/Core/RunArchive.cs" Link="RunArchive.cs" />
     <Compile Include="../../ImportEarthLocation/Core/DiagnosticArtifacts.cs" Link="DiagnosticArtifacts.cs" />
     <Compile Include="../../ImportEarthLocation/Core/Numeric.cs" Link="Numeric.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NetworkSelection.cs" Link="NetworkSelection.cs" />
     <Compile Include="../../ImportEarthLocation/Core/NetworkStructure.cs" Link="NetworkStructure.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/NetworkWidthRepair.cs" Link="NetworkWidthRepair.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkRoadbed.cs" Link="NetworkRoadbed.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/RailVerticalProfiles.cs" Link="RailVerticalProfiles.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/TerrainCleaning.cs" Link="TerrainCleaning.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/TerrainExtremes.cs" Link="TerrainExtremes.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/FloodDefences.cs" Link="FloodDefences.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/FloodDefenceData.cs" Link="FloodDefenceData.cs" />
+    <Compile Include="../../ImportEarthLocation/Processing/NetworkTerrainExtremes.cs" Link="NetworkTerrainExtremes.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/DesignSwitches.cs" Link="DesignSwitches.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkContinuity.cs" Link="NetworkContinuity.cs" />
     <Compile Include="../../ImportEarthLocation/Core/ImportSession.cs" Link="ImportSession.cs" />
     <Compile Include="../../ImportEarthLocation/Geo/GeoMath.cs" Link="GeoMath.cs" />

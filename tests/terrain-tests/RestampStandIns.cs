@@ -5,20 +5,21 @@ namespace ImportEarthLocation.Processing
 {
     public static class NetworkRoadbed
     {
-        public sealed record Patch(Unity.Mathematics.float2 Minimum,Unity.Mathematics.float2 Maximum)
+        public sealed record Patch(Unity.Mathematics.float2 Minimum, Unity.Mathematics.float2 Maximum)
         {
-            public double Encoded(double x,double z)=>throw new NotSupportedException("Roadbed publication is not simulated");
+            public double HeightAt(double x, double z)
+                => throw new NotSupportedException("Roadbed publication is not simulated");
         }
     }
 }
 namespace Colossal.Mathematics
 {
-    public readonly record struct Bounds2(Unity.Mathematics.float2 min,Unity.Mathematics.float2 max);
+    public readonly record struct Bounds2(Unity.Mathematics.float2 min, Unity.Mathematics.float2 max);
 }
 namespace Unity.Jobs
 {
     public struct JobHandle
     {
-        public void Complete()=>throw new NotSupportedException("Native jobs are not simulated");
+        public void Complete() => throw new NotSupportedException("Native jobs are not simulated");
     }
 }

@@ -15,6 +15,7 @@ public static class GeoMath
         var latDelta = RadiansToDegrees(half / EarthRadius);
         var cosLat = Math.Cos(DegreesToRadians(latitude));
         var lonDelta = RadiansToDegrees(half / (EarthRadius * Math.Max(0.01d, cosLat)));
+
         return new GeoBounds(latitude - latDelta, longitude - lonDelta, latitude + latDelta, longitude + lonDelta);
     }
 
@@ -23,24 +24,31 @@ public static class GeoMath
         var result = new List<GeoBounds>(16);
         var latStep = (bounds.North - bounds.South) / 4d;
         var lonStep = (bounds.East - bounds.West) / 4d;
+
         for (var row = 0; row < 4; row++)
-        for (var column = 0; column < 4; column++)
-        {
-            var south = bounds.South + row * latStep;
-            var west = bounds.West + column * lonStep;
-            result.Add(new GeoBounds(south, west, south + latStep, west + lonStep));
-        }
+            for (var column = 0; column < 4; column++)
+            {
+                var south = bounds.South + row * latStep;
+                var west = bounds.West + column * lonStep;
+                result.Add(new GeoBounds(south, west, south + latStep, west + lonStep));
+            }
+
         return result;
     }
 
     public static float3 ToLocalMeters(double latitude, double longitude, double centerLatitude, double centerLongitude)
         => (float3)ToLocalMetersDouble(latitude, longitude, centerLatitude, centerLongitude);
 
-    public static double3 ToLocalMetersDouble(double latitude, double longitude, double centerLatitude, double centerLongitude)
+    public static double3 ToLocalMetersDouble(
+        double latitude,
+        double longitude,
+        double centerLatitude,
+        double centerLongitude)
     {
         var lat0 = DegreesToRadians(centerLatitude);
         var x = EarthRadius * DegreesToRadians(longitude - centerLongitude) * Math.Cos(lat0);
         var z = EarthRadius * DegreesToRadians(latitude - centerLatitude);
+
         return new double3(x, 0d, z);
     }
 
@@ -52,6 +60,7 @@ public static class GeoMath
         var lat = DegreesToRadians(Numeric.Clamp(latitude, -85.05112878d, 85.05112878d));
         var tangent = Math.Tan(lat);
         var asinh = Math.Log(tangent + Math.Sqrt(tangent * tangent + 1d));
+
         return (1d - asinh / Math.PI) / 2d * (1 << zoom);
     }
 
@@ -63,5 +72,6 @@ public static class GeoMath
     };
 
     private static double DegreesToRadians(double value) => value * Math.PI / 180d;
+
     private static double RadiansToDegrees(double value) => value * 180d / Math.PI;
 }

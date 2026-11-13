@@ -6,12 +6,10 @@ exports.CSSPresencePlugin = class CSSPresencePlugin {
       compilation.hooks.processAssets.tap(
         {
           name: "CSSPresencePlugin",
-          stage: compilation.PROCESS_ASSETS_STAGE_ADDITIONS,
+          stage: compilation.PROCESS_ASSETS_STAGE_ADDITIONS
         },
         () => {
-          const cssFiles = Object.keys(compilation.assets).filter((asset) =>
-            asset.endsWith(".css")
-          );
+          const cssFiles = Object.keys(compilation.assets).filter((asset) => asset.endsWith(".css"));
           const hasCSS = cssFiles.length > 0;
 
           // Inject the `hasCSS` export into the main module source
@@ -20,10 +18,7 @@ exports.CSSPresencePlugin = class CSSPresencePlugin {
               if (file.endsWith(".mjs")) {
                 const asset = compilation.getAsset(file);
                 const source = asset.source.source();
-                const updatedSource = source.replace(
-                  "export {",
-                  `const hasCSS = ${hasCSS}; export { hasCSS, `
-                );
+                const updatedSource = source.replace("export {", `const hasCSS = ${hasCSS}; export { hasCSS, `);
 
                 // Generate a new source map for the modified source
                 const newSourceAndMap = {
@@ -31,13 +26,10 @@ exports.CSSPresencePlugin = class CSSPresencePlugin {
                   mappings: "",
                   file,
                   sourceRoot: "",
-                  sourcesContent: [updatedSource],
+                  sourcesContent: [updatedSource]
                 };
 
-                compilation.updateAsset(
-                  file,
-                  new RawSource(updatedSource, newSourceAndMap)
-                );
+                compilation.updateAsset(file, new RawSource(updatedSource, newSourceAndMap));
               }
             }
           }

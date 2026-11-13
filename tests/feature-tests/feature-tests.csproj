@@ -29,10 +29,10 @@
     <Compile Include="../../ImportEarthLocation/Processing/WaterCutSmoothing.cs" Link="WaterCutSmoothing.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/WaterContainment.cs" Link="WaterContainment.cs" />
     <Compile Include="../../ImportEarthLocation/Processing/NetworkVerticalProfiles.cs" Link="NetworkVerticalProfiles.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/ConnectedRoadGrades.cs" Link="ConnectedRoadGrades.cs" />
-    <Compile Include="../../ImportEarthLocation/Processing/RiverBedSurface.cs" Link="RiverBedSurface.cs" />
     <Compile Include="../../ImportEarthLocation/Core/RailPrefabPolicy.cs" Link="RailPrefabPolicy.cs" />
     <Compile Include="../../ImportEarthLocation/Core/ImportModels.cs" Link="ImportModels.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/TerrainEncoding.cs" Link="TerrainEncoding.cs" />
+    <Compile Include="../../ImportEarthLocation/Core/DesignSwitches.cs" Link="DesignSwitches.cs" />
     <Compile Include="../../ImportEarthLocation/Core/UiPackageDiscovery.cs" Link="UiPackageDiscovery.cs" />
     <Compile Include="../../ImportEarthLocation/Core/DiagnosticEvidence.cs" Link="DiagnosticEvidence.cs" />
     <Compile Include="../../ImportEarthLocation/Core/RunArchive.cs" Link="RunArchive.cs" />
@@ -64,14 +64,10 @@
   <ItemGroup Condition="'$(SurfaceSmokeOnly)' == 'true'">
     <Compile Remove="../../ImportEarthLocation/Processing/RiverBedSurface.cs" />
     <Compile Remove="../../ImportEarthLocation/Processing/WaterPlanner.cs" />
-    <Compile Remove="../../ImportEarthLocation/Processing/NetworkProcessor.cs" />
     <Compile Remove="../../ImportEarthLocation/Processing/NetworkVerticalProfiles.cs" />
-    <Compile Remove="../../ImportEarthLocation/Processing/ConnectedRoadGrades.cs" />
     <Compile Remove="../../ImportEarthLocation/Processing/WaterBodyPlanner.cs" />
     <Compile Remove="../../ImportEarthLocation/Processing/WaterContainment.cs" />
     <Compile Remove="../../ImportEarthLocation/Processing/VegetationPlanner.cs" />
-    <Compile Remove="../../ImportEarthLocation/Processing/ForestProcessor.cs" />
-    <Compile Remove="../../ImportEarthLocation/Processing/NetworkNormalizer.cs" />
     <Compile Remove="WaterTests.cs" />
     <Compile Remove="EnvironmentChecks.cs" />
   </ItemGroup>

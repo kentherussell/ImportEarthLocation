@@ -12,13 +12,18 @@ public static class NetworkPersistenceHash
     // Callers supply semantic geometry/incidence, never transient entity IDs.
     public static string Digest(IEnumerable<string> records)
     {
-        using var hash=SHA256.Create();
-        foreach(var record in records.OrderBy(s=>s,StringComparer.Ordinal))
+        using var hash = SHA256.Create();
+
+        foreach (var record in records.OrderBy(text => text, StringComparer.Ordinal))
         {
-            var data=Encoding.UTF8.GetBytes(record);var length=BitConverter.GetBytes(data.Length);
-            hash.TransformBlock(length,0,length.Length,length,0);hash.TransformBlock(data,0,data.Length,data,0);
+            var data = Encoding.UTF8.GetBytes(record);
+            var length = BitConverter.GetBytes(data.Length);
+            hash.TransformBlock(length, 0, length.Length, length, 0);
+            hash.TransformBlock(data, 0, data.Length, data, 0);
         }
-        hash.TransformFinalBlock(Array.Empty<byte>(),0,0);
-        return BitConverter.ToString(hash.Hash!).Replace("-","");
+
+        hash.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+
+        return BitConverter.ToString(hash.Hash!).Replace("-", "");
     }
 }

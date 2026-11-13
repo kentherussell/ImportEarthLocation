@@ -1,6 +1,6 @@
 using System;
-using System.Net.Http;
 using System.Net;
+using System.Net.Http;
 using System.Threading;
 
 namespace ImportEarthLocation.Data;
@@ -9,9 +9,12 @@ public static class PublicHttpClient
 {
     private static readonly Lazy<HttpClient> LazyClient = new(() =>
     {
-        var handler = new HttpClientHandler { AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate };
+        var handler =
+            new HttpClientHandler { AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate };
+
         var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(90) };
         client.DefaultRequestHeaders.UserAgent.ParseAdd($"{Mod.Id}/{Mod.Version} (Cities Skylines II editor mod)");
+
         return client;
     });
 

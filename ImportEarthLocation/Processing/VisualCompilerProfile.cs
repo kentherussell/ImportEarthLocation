@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using ImportEarthLocation.Core;
@@ -23,229 +24,495 @@ namespace ImportEarthLocation.Processing;
 //     pinned at its coupled points, with grade and junction-plateau penalties.
 public static partial class VisualCompilerProfile
 {
-    public const double Spacing=10;
+    public const double Spacing = 10;
     // Leave interpolation headroom below the emitted curve's hard grade limit.
-    private const double GradeShare=.85;
+    private const double GradeShare = .85;
     // Likewise for the vertical-curve rate between coupled points; the most a
     // curve row may cost per metre it is missed by; and the ascent's sweep limit.
-    private const double BendShare=.9,CurveCap=5;
-    private const int CurveSweeps=2000;
+    private const double BendShare = .9, CurveCap = 5;
+    private const int CurveSweeps = 2000;
 
     public sealed class Stroke
     {
-        public NetworkKind Kind;public VisualCompilerClass Class;public bool OneWay;public string Classification="";
-        public double[] Station=Array.Empty<double>();public double2[] Point=Array.Empty<double2>();public double2[] Direction=Array.Empty<double2>();
+        public NetworkKind Kind;
+        public VisualCompilerClass Class;
+        public bool OneWay;
+        public string Classification = "";
+        public double[] Station = Array.Empty<double>();
+        public double2[] Point = Array.Empty<double2>();
+        public double2[] Direction = Array.Empty<double2>();
         // Per sample: 1 bridge, −1 tunnel, 0 ground; layer; half width; hard grade; cut/fill budget.
-        public sbyte[] Mode=Array.Empty<sbyte>();public int[] Layer=Array.Empty<int>();public float[] HalfWidth=Array.Empty<float>();
-        public float[] Grade=Array.Empty<float>();public float[] CutFill=Array.Empty<float>();
-        public string[] SampleClass=Array.Empty<string>();public float[] PairBand=Array.Empty<float>();
+        public sbyte[] Mode = Array.Empty<sbyte>();
+        public int[] Layer = Array.Empty<int>();
+        public float[] HalfWidth = Array.Empty<float>();
+        public float[] Grade = Array.Empty<float>();
+        public float[] CutFill = Array.Empty<float>();
+        public string[] SampleClass = Array.Empty<string>();
+        public float[] PairBand = Array.Empty<float>();
         // Water surface across non-tunnel road samples and bridge samples.
-        public float[] Water=Array.Empty<float>();
+        public float[] Water = Array.Empty<float>();
         // Reachable water floors on dry ground leading to a wet road sample.
-        internal double[] WaterApproachFloor=Array.Empty<double>();
+        internal double[] WaterApproachFloor = Array.Empty<double>();
         // A wet junction keeps its accepted floor through reconciliation and emission.
-        internal Dictionary<SourceNodeKey,double>? WaterNodeFloors;
+        internal Dictionary<SourceNodeKey, double>? WaterNodeFloors;
         // Structure samples whose target a cover or water rule moved: only these
         // get a hard bound, so other tunnels and bridges still smooth freely.
-        internal bool[] Constrained=Array.Empty<bool>();
-        public List<(double Station,SourceNodeKey Node,bool Junction)> Pins=new();
-        internal List<(double Station,double Reach)> LevelCrossings=new();
-        internal HashSet<long> LevelCrossingNodes=new();
-        public double[] Height=Array.Empty<double>();
+        internal bool[] Constrained = Array.Empty<bool>();
+        public List<(double Station, SourceNodeKey Node, bool Junction)> Pins = new();
+        internal List<(double Station, double Reach)> LevelCrossings = new();
+        internal HashSet<long> LevelCrossingNodes = new();
+        public double[] Height = Array.Empty<double>();
+
         public double HeightAt(double s)
         {
-            var k=Array.BinarySearch(Station,s);if(k>=0)return Height[k];k=~k;if(k<=0)return Height[0];if(k>=Station.Length)return Height[Height.Length-1];
-            return math.lerp(Height[k-1],Height[k],(s-Station[k-1])/Math.Max(1e-9,Station[k]-Station[k-1]));
+            var k = Array.BinarySearch(Station, s);
+
+            if (k >= 0)
+                return Height[k];
+
+            k = ~k;
+
+            if (k <= 0)
+                return Height[0];
+
+            if (k >= Station.Length)
+                return Height[Height.Length - 1];
+
+            return math.lerp(
+                Height[k - 1],
+                Height[k],
+                (s - Station[k - 1]) / Math.Max(1e-9, Station[k] - Station[k - 1]));
         }
+
         // Centred over one sample spacing so both cubics meeting at a joint read
         // the same grade there.
         public double GradeAt(double s)
         {
-            var end=Station[Station.Length-1];var a=Math.Max(0,s-Spacing/2);var b=Math.Min(end,s+Spacing/2);
-            return b-a<1e-6?0:(HeightAt(b)-HeightAt(a))/(b-a);
+            var end = Station[Station.Length - 1];
+            var a = Math.Max(0, s - Spacing / 2);
+            var b = Math.Min(end, s + Spacing / 2);
+
+            return b - a < 1e-6 ? 0 : (HeightAt(b) - HeightAt(a)) / (b - a);
         }
+
         // Steepest change of grade per metre between the samples spanning s0..s1.
-        public double GradeChangeRate(double s0,double s1)
+        public double GradeChangeRate(double s0, double s1)
         {
-            var worst=0d;
-            for(var k=1;k<Station.Length-1;k++)
+            var worst = 0d;
+
+            for (var k = 1; k < Station.Length - 1; k++)
             {
-                if(Station[k+1]<s0||Station[k-1]>s1)continue;
-                var g0=(Height[k]-Height[k-1])/Math.Max(1e-9,Station[k]-Station[k-1]);var g1=(Height[k+1]-Height[k])/Math.Max(1e-9,Station[k+1]-Station[k]);
-                worst=Math.Max(worst,Math.Abs(g1-g0)/Math.Max(1e-9,(Station[k+1]-Station[k-1])/2));
+                if (Station[k + 1] < s0 || Station[k - 1] > s1)
+                    continue;
+
+                var g0 = (Height[k] - Height[k - 1]) / Math.Max(1e-9, Station[k] - Station[k - 1]);
+                var g1 = (Height[k + 1] - Height[k]) / Math.Max(1e-9, Station[k + 1] - Station[k]);
+                worst = Math.Max(worst, Math.Abs(g1 - g0) / Math.Max(1e-9, (Station[k + 1] - Station[k - 1]) / 2));
             }
+
             return worst;
         }
-        public bool AllTunnel(double s0,double s1)
+
+        public bool AllTunnel(double s0, double s1)
         {
-            for(var k=0;k<Station.Length;k++)if(Station[k]>=s0-Spacing&&Station[k]<=s1+Spacing&&Mode[k]>=0)return false;
+            for (var k = 0; k < Station.Length; k++)
+                if (Station[k] >= s0 - Spacing && Station[k] <= s1 + Spacing && Mode[k] >= 0)
+                    return false;
+
             return true;
         }
     }
 
-    public static void Solve(IReadOnlyList<Stroke> strokes,ushort[] terrain,float scale,double width,ImportLog log,CancellationToken token,
-        IReadOnlyDictionary<SourceNodeKey,double>? requiredNodeFloors=null)
+    public static void Solve(
+        IReadOnlyList<Stroke> strokes,
+        float[] terrain,
+        double width,
+        ImportLog log,
+        CancellationToken token,
+        IReadOnlyDictionary<SourceNodeKey, double>? requiredNodeFloors = null,
+        IReadOnlyDictionary<SourceNodeKey, SourceNodeKey>? sharedHeights = null)
     {
-        float Ground(double2 p)=>NetworkProcessor.Sample((float)p.x,(float)p.y,terrain,scale,width);
+        float Ground(double2 point) => NetworkProcessor.Sample((float)point.x, (float)point.y, terrain, width);
+
         // 1. Corridor-robust targets.
-        var tau=strokes.Select(s=>s.Point.Select((p,k)=>
+        var tau = strokes.Select(stroke => stroke.Point.Select((point, k) =>
         {
-            var n=new double2(-s.Direction[k].y,s.Direction[k].x)*s.HalfWidth[k];
-            var v=new[]{Ground(p),Ground(p+n),Ground(p-n)};Array.Sort(v);return (double)v[1];
+            var n = new double2(-stroke.Direction[k].y, stroke.Direction[k].x) * stroke.HalfWidth[k];
+            var v = new[] { Ground(point), Ground(point + n), Ground(point - n) };
+            Array.Sort(v);
+
+            return (double)v[1];
         }).ToArray()).ToArray();
+
         // Track follows the ground only at long wavelengths: rail targets are the
         // terrain averaged over RailSmoothing either side along the stroke. At
         // Saint-Charles the station tracks followed the 14 m elevation data over
         // terraces and walls, 4–5% within 40 m and 7 m apart across the throat.
-        for(var i=0;i<strokes.Count;i++)if(strokes[i].Kind==NetworkKind.Rail)tau[i]=Average(strokes[i],tau[i],RailSmoothing);
-        var partner=Pair(strokes,tau,token);var shared=partner.Sum(p=>p.Count(q=>q.Stroke>=0));
+        for (var i = 0; i < strokes.Count; i++)
+            if (strokes[i].Kind == NetworkKind.Rail)
+                tau[i] = Average(strokes[i], tau[i], RailSmoothing);
+
+        var partner = Pair(strokes, tau, token);
+        var shared = partner.Sum(items => items.Count(item => item.Stroke >= 0));
+
         // A water edge can fall beneath only one carriageway's sampled width.
         // Keep the conservative surface evidence common to the paired corridor,
         // before either bridge's whole-deck lift is computed.
-        for(var i=0;i<strokes.Count;i++)for(var k=0;k<partner[i].Length;k++)
+        for (var i = 0; i < strokes.Count; i++)
+            for (var k = 0; k < partner[i].Length; k++)
+            {
+                var stroke = strokes[i];
+                var (j, q, _) = partner[i][k];
+
+                if (j < 0
+                    || stroke.Kind != NetworkKind.Road
+                    || strokes[j].Kind != NetworkKind.Road
+                    || stroke.Mode[k] < 0
+                    || strokes[j].Mode[q] < 0
+                    || k >= stroke.Water.Length
+                    || q >= strokes[j].Water.Length)
+                    continue;
+
+                var a = stroke.Water[k];
+                var b = strokes[j].Water[q];
+
+                if (float.IsNaN(a) && float.IsNaN(b))
+                    continue;
+
+                var level = float.IsNaN(a) ? b : float.IsNaN(b) ? a : Math.Max(a, b);
+                stroke.Water[k] = level;
+                strokes[j].Water[q] = level;
+            }
+
+        for (var i = 0; i < strokes.Count; i++)
         {
-            var s=strokes[i];var (j,q,_)=partner[i][k];
-            if(j<0||s.Kind!=NetworkKind.Road||strokes[j].Kind!=NetworkKind.Road||s.Mode[k]<0||strokes[j].Mode[q]<0||k>=s.Water.Length||q>=strokes[j].Water.Length)continue;
-            var a=s.Water[k];var b=strokes[j].Water[q];if(float.IsNaN(a)&&float.IsNaN(b))continue;
-            var level=float.IsNaN(a)?b:float.IsNaN(b)?a:Math.Max(a,b);s.Water[k]=level;strokes[j].Water[q]=level;
+            Chord(strokes[i], tau[i]);
+            Structures(strokes[i], tau[i], Ground);
         }
-        for(var i=0;i<strokes.Count;i++){Chord(strokes[i],tau[i]);Structures(strokes[i],tau[i],Ground);}
-        WaterApproaches(strokes,tau,partner,requiredNodeFloors);
+
+        WaterApproaches(strokes, tau, partner, requiredNodeFloors);
 
         // 2. Coupled points.
-        var vars=new List<(double Tau,double Lo,double Hi)>();var nodeVar=new Dictionary<SourceNodeKey,int>();
-        var strokeVars=strokes.Select(_=>new List<(double Station,int Var)>()).ToArray();
-        (double,double) Bounds(Stroke s,int k,double t)
+        var vars = new List<(double Tau, double Lo, double Hi)>();
+        var nodeVar = new Dictionary<SourceNodeKey, int>();
+        var strokeVars = strokes.Select(_ => new List<(double Station, int Var)>()).ToArray();
+
+        (double, double) Bounds(Stroke stroke, int k, double t)
         {
-            var bounds=s.Mode[k]>0?(t,t+60):s.Mode[k]<0?(t-80,t-4):(t-s.CutFill[k],t+s.CutFill[k]);
-            var floor=WaterFloor(s,k);
-            if(!double.IsNegativeInfinity(floor))bounds=(Math.Max(bounds.Item1,floor),Math.Max(bounds.Item2,floor));
+            var bounds =
+                stroke.Mode[k] > 0
+                    ? (t, t + 60)
+                    : stroke.Mode[k] < 0 ? (t - 80, t - 4) : (t - stroke.CutFill[k], t + stroke.CutFill[k]);
+
+            var floor = WaterFloor(stroke, k);
+
+            if (!double.IsNegativeInfinity(floor))
+                bounds = (Math.Max(bounds.Item1, floor), Math.Max(bounds.Item2, floor));
+
             return bounds;
         }
-        int Sample(Stroke s,double station){var k=Array.BinarySearch(s.Station,station);if(k<0)k=Math.Min(s.Station.Length-1,~k);return k;}
-        var levelVars=new HashSet<int>();
-        foreach(var s in strokes)s.LevelCrossings.Clear();
-        var ports=strokes.SelectMany((s,i)=>s.Pins.Select(p=>(Stroke:i,Pin:p,Sample:Sample(s,p.Station))));
-        foreach(var group in ports.GroupBy(p=>p.Pin.Node.Id))
+
+        int Sample(Stroke stroke, double station)
         {
-            var at=group.ToArray();
-            if(!at.Any(p=>strokes[p.Stroke].Kind==NetworkKind.Road)||!at.Any(p=>strokes[p.Stroke].Kind==NetworkKind.Rail))continue;
-            var rail=at.First(p=>strokes[p.Stroke].Kind==NetworkKind.Rail);var r=strokes[rail.Stroke];
-            if(at.Any(p=>!strokes[p.Stroke].LevelCrossingNodes.Contains(group.Key)||strokes[p.Stroke].Mode[p.Sample]!=0||
-                strokes[p.Stroke].Layer[p.Sample]!=r.Layer[rail.Sample]))continue;
-            var v=vars.Count;var t=tau[rail.Stroke][rail.Sample];var (lo,hi)=Bounds(r,rail.Sample,t);vars.Add((t,lo,hi));levelVars.Add(v);
-            foreach(var p in at)
+            var k = Array.BinarySearch(stroke.Station, station);
+
+            if (k < 0)
+                k = Math.Min(stroke.Station.Length - 1, ~k);
+
+            return k;
+        }
+
+        var levelVars = new HashSet<int>();
+
+        foreach (var stroke in strokes)
+            stroke.LevelCrossings.Clear();
+
+        var ports =
+            strokes.SelectMany(
+                (
+                    stroke,
+                    i) => stroke.Pins.Select(item => (Stroke: i, Pin: item, Sample: Sample(stroke, item.Station))));
+
+        foreach (var group in ports.GroupBy(item => item.Pin.Node.Id))
+        {
+            var at = group.ToArray();
+
+            if (!at.Any(item => strokes[item.Stroke].Kind == NetworkKind.Road)
+                || !at.Any(item => strokes[item.Stroke].Kind == NetworkKind.Rail))
+                continue;
+
+            var rail = at.First(item => strokes[item.Stroke].Kind == NetworkKind.Rail);
+            var stroke = strokes[rail.Stroke];
+
+            if (at.Any(
+                item => !strokes[item.Stroke].LevelCrossingNodes.Contains(group.Key)
+                    || strokes[item.Stroke].Mode[item.Sample] != 0
+                    || strokes[item.Stroke].Layer[item.Sample] != stroke.Layer[rail.Sample]))
+                continue;
+
+            var v = vars.Count;
+            var t = tau[rail.Stroke][rail.Sample];
+            var (low, high) = Bounds(stroke, rail.Sample, t);
+            vars.Add((t, low, high));
+            levelVars.Add(v);
+
+            foreach (var item in at)
             {
-                nodeVar[p.Pin.Node]=v;var s=strokes[p.Stroke];
+                nodeVar[item.Pin.Node] = v;
+                var otherStroke = strokes[item.Stroke];
                 // Keep the complete opposing pavement/track footprint nearly
                 // level. At oblique crossings the footprint length is width/sinθ.
-                var reach=at.Where(q=>strokes[q.Stroke].Kind!=s.Kind).Select(q=>
-                    (strokes[q.Stroke].HalfWidth[q.Sample]+2)/Math.Max(.2,Math.Abs(NetworkDesignChecks.Cross(s.Direction[p.Sample],strokes[q.Stroke].Direction[q.Sample])))).Max();
-                s.LevelCrossings.Add((p.Pin.Station,reach));
+                var reach =
+                    at.Where(otherItem => strokes[otherItem.Stroke].Kind != otherStroke.Kind).Select(otherItem =>
+                    (strokes[otherItem.Stroke].HalfWidth[otherItem.Sample] + 2)
+                        / Math.Max(
+                            .2,
+                            Math.Abs(
+                                NetworkDesignChecks.Cross(
+                                    otherStroke.Direction[item.Sample],
+                                    strokes[otherItem.Stroke].Direction[otherItem.Sample]))))
+                        .Max();
+
+                otherStroke.LevelCrossings.Add((item.Pin.Station, reach));
             }
         }
-        log.Count("Visual compiler shared road rail crossing heights",levelVars.Count);
-        for(var i=0;i<strokes.Count;i++)foreach(var pin in strokes[i].Pins)
-        {
-            var s=strokes[i];var k=Sample(s,pin.Station);
-            if(!nodeVar.TryGetValue(pin.Node,out var v))
-            {var t=tau[i][k];var (lo,hi)=Bounds(s,k,t);nodeVar[pin.Node]=v=vars.Count;vars.Add((t,lo,hi));}
-            else{var old=vars[v];var (lo,hi)=Bounds(s,k,old.Tau);vars[v]=(old.Tau,Math.Min(old.Lo,lo),Math.Max(old.Hi,hi));}
-            strokeVars[i].Add((pin.Station,v));
-        }
-        var clearances=Crossings(strokes,token).ToList();var crossingBase=vars.Count;
-        var crossingConstraints=new List<(int Over,int Under,double Clearance)>();
+
+        log.Count("Visual compiler shared road rail crossing heights", levelVars.Count);
+
+        // A compact roundabout is one level: its nodes share a height variable. The target
+        // averages its ground arms, so a bridge arm doesn't set the height of the ring.
+        var sharedTau = new Dictionary<SourceNodeKey, (double Sum, int Count)>();
+
+        if (sharedHeights != null)
+            for (var i = 0; i < strokes.Count; i++)
+                foreach (var pin in strokes[i].Pins)
+                {
+                    var k = Sample(strokes[i], pin.Station);
+
+                    if (sharedHeights.TryGetValue(pin.Node, out var ring) && strokes[i].Mode[k] == 0)
+                    {
+                        sharedTau.TryGetValue(ring, out var sum);
+                        sharedTau[ring] = (sum.Sum + tau[i][k], sum.Count + 1);
+                    }
+                }
+
+        var sharedVar = new Dictionary<SourceNodeKey, int>();
+
+        for (var i = 0; i < strokes.Count; i++)
+            foreach (var pin in strokes[i].Pins)
+            {
+                var stroke = strokes[i];
+                var k = Sample(stroke, pin.Station);
+                var sharedRing = default(SourceNodeKey);
+                var isShared = sharedHeights != null && sharedHeights.TryGetValue(pin.Node, out sharedRing);
+
+                if (isShared && !nodeVar.ContainsKey(pin.Node) && sharedVar.TryGetValue(sharedRing, out var ringVar))
+                    nodeVar[pin.Node] = ringVar;
+
+                if (!nodeVar.TryGetValue(pin.Node, out var v))
+                {
+                    var t = isShared && sharedTau.TryGetValue(sharedRing, out var average)
+                        ? average.Sum / average.Count
+                        : tau[i][k];
+
+                    var (low, high) = Bounds(stroke, k, t);
+                    nodeVar[pin.Node] = v = vars.Count;
+                    vars.Add((t, low, high));
+
+                    if (isShared)
+                        sharedVar[sharedRing] = v;
+                }
+                else
+                {
+                    var old = vars[v];
+                    var (low, high) = Bounds(stroke, k, old.Tau);
+                    vars[v] = (old.Tau, Math.Min(old.Lo, low), Math.Max(old.Hi, high));
+                }
+
+                strokeVars[i].Add((pin.Station, v));
+            }
+
+        var clearances = Crossings(strokes, token).ToList();
+        var crossingBase = vars.Count;
+        var crossingConstraints = new List<(int Over, int Under, double Clearance)>();
         // Under a tunnel, the lower bore goes deeper; the upper keeps its cover.
-        var stacked=new HashSet<int>();
-        foreach(var c in clearances)
+        var stacked = new HashSet<int>();
+
+        foreach (var item in clearances)
         {
-            int Add(int stroke,int k){var s=strokes[stroke];var (lo,hi)=Bounds(s,k,tau[stroke][k]);var v=vars.Count;vars.Add((tau[stroke][k],lo,hi));strokeVars[stroke].Add((s.Station[k],v));return v;}
-            var constraint=(Add(c.Over,c.OverSample),Add(c.Under,c.UnderSample),c.Clearance);crossingConstraints.Add(constraint);
-            if(strokes[c.Over].Mode[c.OverSample]<0)stacked.Add(constraint.Item2);
+            int Add(int stroke, int k)
+            {
+                var otherStroke = strokes[stroke];
+                var (low, high) = Bounds(otherStroke, k, tau[stroke][k]);
+                var v = vars.Count;
+                vars.Add((tau[stroke][k], low, high));
+                strokeVars[stroke].Add((otherStroke.Station[k], v));
+
+                return v;
+            }
+
+            var constraint = (Add(item.Over, item.OverSample), Add(item.Under, item.UnderSample), item.Clearance);
+            crossingConstraints.Add(constraint);
+
+            if (strokes[item.Over].Mode[item.OverSample] < 0)
+                stacked.Add(constraint.Item2);
         }
-        var crossingEnd=vars.Count;
-        var edges=new List<(int From,int To,double Bound)>();// h[To] ≤ h[From] + Bound
+
+        var crossingEnd = vars.Count;
+        var edges = new List<(int From, int To, double Bound)>();// h[To] ≤ h[From] + Bound
         // A pin on one carriageway gets a twin on the opposite carriageway, held
         // equal within 0.1 m, so both sides are pinned to one height at one place.
-        var twins=0;var twinPairs=new List<(int Pin,int Twin)>();
-        for(var i=0;i<strokes.Count;i++)foreach(var (station,v) in strokeVars[i].ToArray())
-        {
-            // The twin stays on the partner's sample: placed exactly across from the
-            // pin it added grade-change and terrain issues (DC +50, Marseille +8).
-            var k=Sample(strokes[i],station);var (j,q,_)=partner[i][k];if(j<0)continue;
-            var (lo,hi)=Bounds(strokes[j],q,tau[j][q]);var w=vars.Count;vars.Add((tau[j][q],lo,hi));strokeVars[j].Add((strokes[j].Station[q],w));
-            edges.Add((v,w,.1));edges.Add((w,v,.1));twinPairs.Add((v,w));twins++;
-        }
-        for(var i=0;i<strokes.Count;i++)
-        {
-            var list=strokeVars[i].OrderBy(p=>p.Station).ToList();
-            for(var j=1;j<list.Count;j++)
+        var twins = 0;
+        var twinPairs = new List<(int Pin, int Twin)>();
+
+        for (var i = 0; i < strokes.Count; i++)
+            foreach (var (station, v) in strokeVars[i].ToArray())
             {
-                var d=list[j].Station-list[j-1].Station;var k=Sample(strokes[i],(list[j].Station+list[j-1].Station)/2);
-                var b=GradeShare*strokes[i].Grade[k]*Math.Max(d,1);edges.Add((list[j-1].Var,list[j].Var,b));edges.Add((list[j].Var,list[j-1].Var,b));
+                // The twin stays on the partner's sample: placed exactly across from the
+                // pin it added grade-change and terrain issues (DC +50, Marseille +8).
+                var k = Sample(strokes[i], station);
+                var (j, q, _) = partner[i][k];
+
+                if (j < 0)
+                    continue;
+
+                var (low, high) = Bounds(strokes[j], q, tau[j][q]);
+                var count = vars.Count;
+                vars.Add((tau[j][q], low, high));
+                strokeVars[j].Add((strokes[j].Station[q], count));
+                edges.Add((v, count, .1));
+                edges.Add((count, v, .1));
+                twinPairs.Add((v, count));
+                twins++;
+            }
+
+        for (var i = 0; i < strokes.Count; i++)
+        {
+            var list = strokeVars[i].OrderBy(item => item.Station).ToList();
+
+            for (var j = 1; j < list.Count; j++)
+            {
+                var d = list[j].Station - list[j - 1].Station;
+                var k = Sample(strokes[i], (list[j].Station + list[j - 1].Station) / 2);
+                var b = GradeShare * strokes[i].Grade[k] * Math.Max(d, 1);
+                edges.Add((list[j - 1].Var, list[j].Var, b));
+                edges.Add((list[j].Var, list[j - 1].Var, b));
             }
         }
+
         // A dry arm sharing a water-crossing node must not broaden away the
         // wet arm's floor. Apply it once to the shared variable before closure.
-        var waterFloors=new Dictionary<int,double>();
-        if(requiredNodeFloors!=null)foreach(var pair in requiredNodeFloors)if(nodeVar.TryGetValue(pair.Key,out var v))
+        var waterFloors = new Dictionary<int, double>();
+
+        if (requiredNodeFloors != null)
+            foreach (var pair in requiredNodeFloors)
+                if (nodeVar.TryGetValue(pair.Key, out var v))
+                {
+                    var old = vars[v];
+                    var floor = pair.Value;
+                    vars[v] = (Math.Max(old.Tau, floor), Math.Max(old.Lo, floor), Math.Max(old.Hi, floor));
+                    waterFloors[v] = floor;
+                }
+
+        for (var i = 0; i < strokes.Count; i++)
+            if (strokes[i].Kind == NetworkKind.Road)
+                foreach (var (station, v) in strokeVars[i])
+                {
+                    var stroke = strokes[i];
+                    var k = Sample(stroke, station);
+                    var floor = WaterFloor(stroke, k);
+
+                    if (double.IsNegativeInfinity(floor))
+                        continue;
+
+                    var old = vars[v];
+                    vars[v] = (Math.Max(old.Tau, floor), Math.Max(old.Lo, floor), Math.Max(old.Hi, floor));
+                    waterFloors[v] = Math.Max(waterFloors.GetValueOrDefault(v, double.NegativeInfinity), floor);
+                }
+
+        foreach (var stroke in strokes)
         {
-            var old=vars[v];var floor=pair.Value;
-            vars[v]=(Math.Max(old.Tau,floor),Math.Max(old.Lo,floor),Math.Max(old.Hi,floor));waterFloors[v]=floor;
+            stroke.WaterNodeFloors = null;
+
+            foreach (var pin in stroke.Pins)
+                if (waterFloors.TryGetValue(nodeVar[pin.Node], out var floor))
+                    (stroke.WaterNodeFloors ??= new())[pin.Node] = floor;
         }
-        for(var i=0;i<strokes.Count;i++)if(strokes[i].Kind==NetworkKind.Road)foreach(var (station,v) in strokeVars[i])
-        {
-            var s=strokes[i];var k=Sample(s,station);var floor=WaterFloor(s,k);if(double.IsNegativeInfinity(floor))continue;
-            var old=vars[v];
-            vars[v]=(Math.Max(old.Tau,floor),Math.Max(old.Lo,floor),Math.Max(old.Hi,floor));
-            waterFloors[v]=Math.Max(waterFloors.GetValueOrDefault(v,double.NegativeInfinity),floor);
-        }
-        foreach(var s in strokes)
-        {
-            s.WaterNodeFloors=null;
-            foreach(var pin in s.Pins)if(waterFloors.TryGetValue(nodeVar[pin.Node],out var floor))
-                (s.WaterNodeFloors??=new())[pin.Node]=floor;
-        }
-        var h=vars.Select(v=>Math.Min(Math.Max(v.Tau,v.Lo),v.Hi)).ToArray();var conflicts=0;
-        var upper=vars.Select(v=>v.Hi).ToArray();var lowerBound=vars.Select(v=>v.Lo).ToArray();
-        var down=Adjacency(h.Length,edges.Select(e=>(e.From,e.To,e.Bound)));var up=Adjacency(h.Length,edges.Select(e=>(e.To,e.From,e.Bound)));
+
+        var h = vars.Select(item => Math.Min(Math.Max(item.Tau, item.Lo), item.Hi)).ToArray();
+        var conflicts = 0;
+        var upper = vars.Select(item => item.Hi).ToArray();
+        var lowerBound = vars.Select(item => item.Lo).ToArray();
+        var down = Adjacency(h.Length, edges.Select(item => (item.From, item.To, item.Bound)));
+        var up = Adjacency(h.Length, edges.Select(item => (item.To, item.From, item.Bound)));
         // Grades and bounds alone have no negative cycle: both closures terminate.
-        Close(h,down,upper,lower:true,null);Close(h,up,lowerBound,lower:false,null);
+        Close(h, down, upper, lower: true, null);
+        Close(h, up, lowerBound, lower: false, null);
         // Each crossing is then added alone. One that cannot be met within its
         // relaxation budget closes a contradictory cycle (report 25's class): it
         // is dropped and counted, never smeared across neighbouring heights.
-        var budgetConflicts=0;var boundConflicts=0;var preexisting=h.Select((v,i)=>v>upper[i]+.5).Count(o=>o);
-        var floors=new HashSet<int>();var ceilings=new HashSet<int>();var recipes=0;
+        var budgetConflicts = 0;
+        var boundConflicts = 0;
+        var preexisting = h.Select((v, i) => v > upper[i] + .5).Count(o => o);
+        var floors = new HashSet<int>();
+        var ceilings = new HashSet<int>();
+        var recipes = 0;
         // A lowering closure (tunnel crossings, and the dip below) spreads through
         // grade, twin and junction edges with no lower bounds of its own. It must
         // not pull a var below its bound or an accepted crossing below its
         // clearance: at I-395 over the GW Parkway a ramp's dip dragged accepted
         // deck floors 9 m down to the parkway.
-        var accepted=new List<(int Over,int Under,double Clearance)>();var loweringRejected=0;
-        bool Lowered(double[] before)=>h.Where((v,i)=>v<lowerBound[i]-.5&&before[i]>=lowerBound[i]-.5).Any()||
-            accepted.Any(a=>h[a.Over]-h[a.Under]<a.Clearance-.05);
+        var accepted = new List<(int Over, int Under, double Clearance)>();
+        var loweringRejected = 0;
+
+        bool Lowered(double[] before)
+            => h.Where((v, i) => v < lowerBound[i] - .5 && before[i] >= lowerBound[i] - .5).Any()
+                || accepted.Any(item => h[item.Over] - h[item.Under] < item.Clearance - .05);
+
         // A crossing that cannot get its full clearance still takes the most it
         // can, at 60% and then 35%: roads left at one height intersect, and the
         // game joins them (a stray roundabout under I-495 at VA-267).
-        var partial=0;var snapshot=new double[h.Length];
-        foreach(var full in crossingConstraints)
+        var partial = 0;
+        var snapshot = new double[h.Length];
+
+        foreach (var full in crossingConstraints)
         {
-            var met=false;
-            foreach(var share in new[]{1,.6,.35})
+            var met = false;
+
+            foreach (var share in new[] { 1, .6, .35 })
             {
-                var c=full with{Clearance=full.Clearance*share};
-                if(!Attempt(c,out var failed))
+                var item = full with { Clearance = full.Clearance * share };
+
+                if (!Attempt(item, out var failed))
                 {
-                    if(share==1){if(failed)budgetConflicts++;else boundConflicts++;}
+                    if (share == 1)
+                    {
+                        if (failed)
+                            budgetConflicts++;
+                        else
+                            boundConflicts++;
+                    }
+
                     continue;
                 }
-                met=true;if(share<1)partial++;break;
+
+                met = true;
+
+                if (share < 1)
+                    partial++;
+
+                break;
             }
-            if(!met)conflicts++;
+
+            if (!met)
+                conflicts++;
         }
-        var (curveMoved,curveBefore,curveAfter,curveSweeps)=CurveFeasibleHeights();
-        log.Count("Visual compiler coupled points moved for vertical curves",curveMoved);
-        log.Diagnostic($"VISUAL COMPILER profile coupled curvature moved={curveMoved}; violationsBefore={curveBefore}; violationsAfter={curveAfter}; sweeps={curveSweeps}");
+
+        var (curveMoved, curveBefore, curveAfter, curveSweeps) = CurveFeasibleHeights();
+        log.Count("Visual compiler coupled points moved for vertical curves", curveMoved);
+        log.Diagnostic(
+            $"VISUAL COMPILER profile coupled curvature moved={curveMoved}; violationsBefore={curveBefore}; violationsAfter={curveAfter}; sweeps={curveSweeps}");
+
         // Grade edges bound how far coupled points may differ, not how sharply the
         // profile must bend between them: a DC motorway junction 200 m before a
         // deck that must clear a road 8.6 m higher (way 124891268) left the
@@ -260,91 +527,236 @@ public static partial class VisualCompilerProfile
         // without limit. A crossing floor only bounds a hump and a ceiling only a
         // sag. Moving points one at a time instead cascaded: raising a road under
         // a deck raised the deck, and that deck ended 5 m higher.
-        (int Moved,int Before,int After,int Sweeps) CurveFeasibleHeights()
+        (int Moved, int Before, int After, int Sweeps) CurveFeasibleHeights()
         {
-            var rows=new List<(int A,int B,int C,double Ca,double Cb,double Cc,double Bound,double Cap)>();
-            foreach(var e in edges)rows.Add((e.To,e.From,-1,1,-1,0,e.Bound,double.PositiveInfinity));
-            foreach(var c in accepted)rows.Add((c.Under,c.Over,-1,1,-1,0,-c.Clearance,double.PositiveInfinity));
-            for(var v=0;v<h.Length;v++)
+            var rows = new List<(int A, int B, int C, double Ca, double Cb, double Cc, double Bound, double Cap)>();
+
+            foreach (var item in edges)
+                rows.Add((item.To, item.From, -1, 1, -1, 0, item.Bound, double.PositiveInfinity));
+
+            foreach (var item in accepted)
+                rows.Add((item.Under, item.Over, -1, 1, -1, 0, -item.Clearance, double.PositiveInfinity));
+
+            for (var v = 0; v < h.Length; v++)
             {
-                rows.Add((v,-1,-1,1,0,0,Math.Max(upper[v],h[v]),double.PositiveInfinity));
-                rows.Add((v,-1,-1,-1,0,0,-Math.Min(lowerBound[v],h[v]),double.PositiveInfinity));
+                rows.Add((v, -1, -1, 1, 0, 0, Math.Max(upper[v], h[v]), double.PositiveInfinity));
+                rows.Add((v, -1, -1, -1, 0, 0, -Math.Min(lowerBound[v], h[v]), double.PositiveInfinity));
             }
-            var curveRows=rows.Count;
-            for(var i=0;i<strokes.Count;i++)
+
+            var curveRows = rows.Count;
+
+            for (var i = 0; i < strokes.Count; i++)
             {
                 // Track keeps the grade-only heights: its rows raised Marseille's
                 // rail crossing-clearance failures from 4 to 11.
-                if(strokes[i].Kind!=NetworkKind.Road)continue;
-                var list=strokeVars[i].Where(p=>!Crossing(p.Var)||floors.Contains(p.Var)||ceilings.Contains(p.Var)).OrderBy(p=>p.Station).ToArray();
-                var kappa=BendShare*.01/strokes[i].Class.K;
-                for(var j=1;j<list.Length-1;j++)
+                if (strokes[i].Kind != NetworkKind.Road)
+                    continue;
+
+                var list =
+                    strokeVars[i]
+                        .Where(item => !Crossing(item.Var) || floors.Contains(item.Var) || ceilings.Contains(item.Var))
+                        .OrderBy(item => item.Station)
+                        .ToArray();
+
+                var kappa = BendShare * .01 / strokes[i].Class.K;
+
+                for (var j = 1; j < list.Length - 1; j++)
                 {
-                    var (sa,a)=list[j-1];var (sb,b)=list[j];var (sc,c)=list[j+1];
-                    var d1=sb-sa;var d2=sc-sb;if(d1<1||d2<1||a==b||b==c||a==c)continue;
-                    var wa=d2/(d1+d2);var wc=d1/(d1+d2);var reach=kappa*d1*d2/2;
-                    if(!ceilings.Contains(b))rows.Add((b,a,c,1,-wa,-wc,reach,CurveCap));
-                    if(!floors.Contains(b))rows.Add((b,a,c,-1,wa,wc,reach,CurveCap));
+                    var (sa, a) = list[j - 1];
+                    var (builder, b) = list[j];
+                    var (sc, c) = list[j + 1];
+                    var d1 = builder - sa;
+                    var d2 = sc - builder;
+
+                    if (d1 < 1 || d2 < 1 || a == b || b == c || a == c)
+                        continue;
+
+                    var wa = d2 / (d1 + d2);
+                    var wc = d1 / (d1 + d2);
+                    var reach = kappa * d1 * d2 / 2;
+
+                    if (!ceilings.Contains(b))
+                        rows.Add((b, a, c, 1, -wa, -wc, reach, CurveCap));
+
+                    if (!floors.Contains(b))
+                        rows.Add((b, a, c, -1, wa, wc, reach, CurveCap));
                 }
             }
+
             // A shared road–rail crossing height barely moves.
-            var inverse=new double[h.Length];for(var v=0;v<h.Length;v++)inverse[v]=levelVars.Contains(v)?1e-3:1;
-            double Value(int r,double[] x){var row=rows[r];return row.Ca*x[row.A]+(row.B>=0?row.Cb*x[row.B]:0)+(row.C>=0?row.Cc*x[row.C]:0);}
-            int Bent(double[] x){var n=0;for(var r=curveRows;r<rows.Count;r++)if(Value(r,x)>rows[r].Bound/BendShare+.05)n++;return n;}
-            var y=(double[])h.Clone();var before=Bent(y);if(before==0)return (0,0,0,0);
-            var norm=rows.Select(row=>row.Ca*row.Ca*inverse[row.A]+(row.B>=0?row.Cb*row.Cb*inverse[row.B]:0)+(row.C>=0?row.Cc*row.Cc*inverse[row.C]:0)).ToArray();
-            var lambda=new double[rows.Count];var sweeps=0;
-            for(;sweeps<CurveSweeps;sweeps++)
+            var inverse = new double[h.Length];
+
+            for (var v = 0; v < h.Length; v++)
+                inverse[v] = levelVars.Contains(v) ? 1e-3 : 1;
+
+            double Value(int r, double[] x)
             {
-                token.ThrowIfCancellationRequested();var largest=0d;
-                for(var r=0;r<rows.Count;r++)
-                {
-                    var row=rows[r];var next=Math.Min(row.Cap,Math.Max(0,lambda[r]+(Value(r,y)-row.Bound)/norm[r]));var delta=next-lambda[r];
-                    if(delta==0)continue;lambda[r]=next;
-                    y[row.A]-=delta*row.Ca*inverse[row.A];if(row.B>=0)y[row.B]-=delta*row.Cb*inverse[row.B];if(row.C>=0)y[row.C]-=delta*row.Cc*inverse[row.C];
-                    largest=Math.Max(largest,Math.Abs(delta)*Math.Sqrt(norm[r]));
-                }
-                if(largest<1e-4)break;
+                var row = rows[r];
+                return row.Ca * x[row.A] + (row.B >= 0 ? row.Cb * x[row.B] : 0) + (row.C >= 0 ? row.Cc * x[row.C] : 0);
             }
+
+            int Bent(double[] x)
+            {
+                var n = 0;
+
+                for (var r = curveRows; r < rows.Count; r++)
+                    if (Value(r, x) > rows[r].Bound / BendShare + .05)
+                        n++;
+
+                return n;
+            }
+
+            var y = (double[])h.Clone();
+            var before = Bent(y);
+
+            if (before == 0)
+                return (0, 0, 0, 0);
+
+            var norm =
+                rows
+                    .Select(
+                        row => row.Ca * row.Ca * inverse[row.A]
+                            + (row.B >= 0 ? row.Cb * row.Cb * inverse[row.B] : 0)
+                            + (row.C >= 0 ? row.Cc * row.Cc * inverse[row.C] : 0))
+                    .ToArray();
+
+            var lambda = new double[rows.Count];
+            var sweeps = 0;
+
+            for (; sweeps < CurveSweeps; sweeps++)
+            {
+                token.ThrowIfCancellationRequested();
+                var largest = 0d;
+
+                for (var r = 0; r < rows.Count; r++)
+                {
+                    var row = rows[r];
+                    var next = Math.Min(row.Cap, Math.Max(0, lambda[r] + (Value(r, y) - row.Bound) / norm[r]));
+                    var delta = next - lambda[r];
+
+                    if (delta == 0)
+                        continue;
+
+                    lambda[r] = next;
+                    y[row.A] -= delta * row.Ca * inverse[row.A];
+
+                    if (row.B >= 0)
+                        y[row.B] -= delta * row.Cb * inverse[row.B];
+
+                    if (row.C >= 0)
+                        y[row.C] -= delta * row.Cc * inverse[row.C];
+
+                    largest = Math.Max(largest, Math.Abs(delta) * Math.Sqrt(norm[r]));
+                }
+
+                if (largest < 1e-4)
+                    break;
+            }
+
             // The hard rows hold to within the ascent's tolerance; an accepted
             // crossing or a bound that does not leaves the coupled heights as they were.
-            for(var r=0;r<curveRows;r++)if(Value(r,y)>rows[r].Bound+.02)return (0,before,before,sweeps);
-            var moved=0;for(var v=0;v<h.Length;v++)if(Math.Abs(y[v]-h[v])>.01)moved++;
-            Array.Copy(y,h,h.Length);
-            return (moved,before,Bent(h),sweeps);
+            for (var r = 0; r < curveRows; r++)
+                if (Value(r, y) > rows[r].Bound + .02)
+                    return (0, before, before, sweeps);
+
+            var moved = 0;
+
+            for (var v = 0; v < h.Length; v++)
+                if (Math.Abs(y[v] - h[v]) > .01)
+                    moved++;
+
+            Array.Copy(y, h, h.Length);
+
+            return (moved, before, Bent(h), sweeps);
         }
+
         // One backup buffer serves every attempt; it holds the heights before the
         // current one until the next begins.
-        int Overshoot(){var n=0;for(var i=0;i<h.Length;i++)if(h[i]>upper[i]+.5&&snapshot[i]<=upper[i]+.5)n++;return n;}
-        bool Attempt((int Over,int Under,double Clearance) c,out bool failedBudget)
+        int Overshoot()
+        {
+            var n = 0;
+
+            for (var i = 0; i < h.Length; i++)
+                if (h[i] > upper[i] + .5 && snapshot[i] <= upper[i] + .5)
+                    n++;
+
+            return n;
+        }
+
+        bool Attempt((int Over, int Under, double Clearance) item, out bool failedBudget)
         {
             // Only the new constraint can be violated, so relaxation starts from
             // its endpoints alone; the snapshot restores a rejected attempt.
-            Array.Copy(h,snapshot,h.Length);var tunnel=vars[c.Under].Hi<vars[c.Under].Tau||stacked.Contains(c.Under);
-            if(tunnel)down[c.Over].Add((c.Under,-c.Clearance));up[c.Under].Add((c.Over,-c.Clearance));
-            var failed=(tunnel?Close(h,down,upper,lower:true,new[]{c.Over}):0)+Close(h,up,lowerBound,lower:false,new[]{c.Under});
-            failedBudget=failed>0;
-            var overshoot=Overshoot();
-            if(failed==0&&overshoot==0&&tunnel&&Lowered(snapshot)){overshoot=1;loweringRejected++;}
-            if(failed==0&&overshoot==0){floors.Add(c.Over);ceilings.Add(c.Under);accepted.Add(c);return true;}
-            Array.Copy(snapshot,h,h.Length);
+            Array.Copy(h, snapshot, h.Length);
+            var tunnel = vars[item.Under].Hi < vars[item.Under].Tau || stacked.Contains(item.Under);
+
+            if (tunnel)
+                down[item.Over].Add((item.Under, -item.Clearance));
+
+            up[item.Under].Add((item.Over, -item.Clearance));
+            var failed =
+                (tunnel ? Close(h, down, upper, lower: true, new[] { item.Over }) : 0)
+                    + Close(h, up, lowerBound, lower: false, new[] { item.Under });
+
+            failedBudget = failed > 0;
+            var overshoot = Overshoot();
+
+            if (failed == 0 && overshoot == 0 && tunnel && Lowered(snapshot))
+            {
+                overshoot = 1;
+                loweringRejected++;
+            }
+
+            if (failed == 0 && overshoot == 0)
+            {
+                floors.Add(item.Over);
+                ceilings.Add(item.Under);
+                accepted.Add(item);
+
+                return true;
+            }
+
+            Array.Copy(snapshot, h, h.Length);
             // Recipe before rejection (report 64 V3 step 2b): a ground road beneath
             // may dip into a cutting up to twice its cut budget, taking the whole
             // shortfall, so the bridge need not climb more than its grades allow.
-            var under=vars[c.Under];
-            if(!tunnel&&under.Lo<under.Tau)
+            var under = vars[item.Under];
+
+            if (!tunnel && under.Lo < under.Tau)
             {
-                var originalLow=lowerBound[c.Under];var relaxed=under.Lo-(under.Tau-under.Lo);lowerBound[c.Under]=relaxed;
-                h[c.Under]=Math.Max(relaxed,h[c.Under]-(c.Clearance-(h[c.Over]-h[c.Under])));
-                var retry=Close(h,down,upper,lower:true,new[]{c.Under})+Close(h,up,lowerBound,lower:false,new[]{c.Under});
-                if(retry==0&&Overshoot()==0)
+                var originalLow = lowerBound[item.Under];
+                var relaxed = under.Lo - (under.Tau - under.Lo);
+                lowerBound[item.Under] = relaxed;
+                h[item.Under] = Math.Max(relaxed, h[item.Under] - (item.Clearance - (h[item.Over] - h[item.Under])));
+                var retry =
+                    Close(h, down, upper, lower: true, new[] { item.Under })
+                        + Close(h, up, lowerBound, lower: false, new[] { item.Under });
+
+                if (retry == 0 && Overshoot() == 0)
                 {
-                    if(!Lowered(snapshot)){floors.Add(c.Over);ceilings.Add(c.Under);accepted.Add(c);recipes++;return true;}
+                    if (!Lowered(snapshot))
+                    {
+                        floors.Add(item.Over);
+                        ceilings.Add(item.Under);
+                        accepted.Add(item);
+                        recipes++;
+
+                        return true;
+                    }
+
                     loweringRejected++;
                 }
-                lowerBound[c.Under]=originalLow;
+
+                lowerBound[item.Under] = originalLow;
             }
-            Array.Copy(snapshot,h,h.Length);if(tunnel)down[c.Over].RemoveAt(down[c.Over].Count-1);up[c.Under].RemoveAt(up[c.Under].Count-1);
+
+            Array.Copy(snapshot, h, h.Length);
+
+            if (tunnel)
+                down[item.Over].RemoveAt(down[item.Over].Count - 1);
+
+            up[item.Under].RemoveAt(up[item.Under].Count - 1);
+
             return false;
         }
 
@@ -355,7 +767,8 @@ public static partial class VisualCompilerProfile
         // bounds its strokes: the bridge stays at or above its clearance height
         // and the road beneath at or below, so smoothing rounds the hump instead
         // of being forced through a cone's apex. Rejected crossings bind nothing.
-        bool Crossing(int v)=>v>=crossingBase&&v<crossingEnd;
+        bool Crossing(int v) => v >= crossingBase && v < crossingEnd;
+
         // A long water deck (WaterDeck) takes one straight line between the
         // heights of its end pins. Pins and crossings inside it move onto the
         // line; where a crossing floor or the water clearance lies above it, the
@@ -363,52 +776,132 @@ public static partial class VisualCompilerProfile
         // spreads through the grade edges like any floor. Held at several
         // heights, a stiff deck bowed into an arch (14th Street bridges, 12 m).
         // A deck with a crossing over it keeps its solved heights.
-        var straightDecks=0;var crestDecks=0;
-        for(var i=0;i<strokes.Count;i++)
+        var straightDecks = 0;
+        var crestDecks = 0;
+
+        for (var i = 0; i < strokes.Count; i++)
         {
-            var s=strokes[i];
-            foreach(var (a,b) in DeckRuns(s))
+            var stroke = strokes[i];
+
+            foreach (var (a, b) in DeckRuns(stroke))
             {
                 // Pins up to DeckReach past either end (a bridge pier node, the
                 // approach's last port) belong to the same line.
-                var lo=Math.Max(0,a-DeckReach);var hi=Math.Min(s.Mode.Length-1,b+DeckReach);var deck=WaterDeck(s,a,b);var length=s.Station[b]-s.Station[a];
-                if(!deck&&length<=LevelDeck)continue;
-                var run=strokeVars[i].Select(p=>(K:Sample(s,p.Station),p.Var,p.Station)).Where(p=>p.K>=lo&&p.K<=hi).OrderBy(p=>p.Station).ToList();
-                if(run.Count<2||run.Any(p=>ceilings.Contains(p.Var)))continue;
-                if(!deck)
+                var low = Math.Max(0, a - DeckReach);
+                var high = Math.Min(stroke.Mode.Length - 1, b + DeckReach);
+                var deck = WaterDeck(stroke, a, b);
+                var length = stroke.Station[b] - stroke.Station[a];
+
+                if (!deck && length <= LevelDeck)
+                    continue;
+
+                var run =
+                    strokeVars[i]
+                        .Select(item => (K: Sample(stroke, item.Station), item.Var, item.Station))
+                        .Where(item => item.K >= low && item.K <= high)
+                        .OrderBy(item => item.Station)
+                        .ToList();
+
+                if (run.Count < 2 || run.Any(item => ceilings.Contains(item.Var)))
+                    continue;
+
+                if (!deck)
                 {
-                    if(CrestDeck(s,tau[i],run,h,floors,lo,hi))crestDecks++;
+                    if (CrestDeck(stroke, tau[i], run, h, floors, low, high))
+                        crestDecks++;
+
                     continue;
                 }
-                var startPin=run[0];var endPin=run[run.Count-1];var span=endPin.Station-startPin.Station;if(span<LevelDeck)continue;
-                double W(double station)=>(station-startPin.Station)/span;
-                var ya=h[startPin.Var];var yb=h[endPin.Var];
-                var needs=run.Where(p=>floors.Contains(p.Var)).Select(p=>(p.Station,Height:h[p.Var]))
-                    .Concat(Enumerable.Range(lo,hi-lo+1).Where(k=>k<s.Water.Length&&!float.IsNaN(s.Water[k])).Select(k=>(Station:s.Station[k],Height:(double)s.Water[k]+WaterClearance)));
-                foreach(var (station,height) in needs)
+
+                var startPin = run[0];
+                var endPin = run[run.Count - 1];
+                var span = endPin.Station - startPin.Station;
+
+                if (span < LevelDeck)
+                    continue;
+
+                double Fraction(double station) => (station - startPin.Station) / span;
+
+                var ya = h[startPin.Var];
+                var yb = h[endPin.Var];
+                var needs =
+                    run.Where(item => floors.Contains(item.Var)).Select(item => (item.Station, Height: h[item.Var]))
+                    .Concat(
+                        Enumerable
+                            .Range(low, high - low + 1)
+                            .Where(k => k < stroke.Water.Length && !float.IsNaN(stroke.Water[k]))
+                            .Select(
+                                k => (Station: stroke.Station[k], Height: (double)stroke.Water[k] + WaterClearance)));
+
+                foreach (var (station, height) in needs)
                 {
-                    var w=W(station);if(w<=0||w>=1||height<=ya+(yb-ya)*w)continue;
-                    if(w<.5)ya=height-(yb-height)*w/(1-w);else yb=ya+(height-ya)/w;
+                    var fraction = Fraction(station);
+
+                    if (fraction <= 0 || fraction >= 1 || height <= ya + (yb - ya) * fraction)
+                        continue;
+
+                    if (fraction < .5)
+                        ya = height - (yb - height) * fraction / (1 - fraction);
+                    else
+                        yb = ya + (height - ya) / fraction;
                 }
-                foreach(var (pin,height) in new[]{(startPin.Var,ya),(endPin.Var,yb)})
-                    if(height>h[pin]+1e-6){lowerBound[pin]=Math.Max(lowerBound[pin],height);Close(h,up,lowerBound,lower:false,new[]{pin});}
-                ya=h[startPin.Var];yb=h[endPin.Var];
-                for(var k=1;k<run.Count-1;k++)h[run[k].Var]=ya+(yb-ya)*W(run[k].Station);
-                for(var k=lo;k<=hi;k++)tau[i][k]=ya+(yb-ya)*W(s.Station[k]);
+
+                foreach (var (pin, height) in new[] { (startPin.Var, ya), (endPin.Var, yb) })
+                    if (height > h[pin] + 1e-6)
+                    {
+                        lowerBound[pin] = Math.Max(lowerBound[pin], height);
+                        Close(h, up, lowerBound, lower: false, new[] { pin });
+                    }
+
+                ya = h[startPin.Var];
+                yb = h[endPin.Var];
+
+                for (var k = 1; k < run.Count - 1; k++)
+                    h[run[k].Var] = ya + (yb - ya) * Fraction(run[k].Station);
+
+                for (var k = low; k <= high; k++)
+                    tau[i][k] = ya + (yb - ya) * Fraction(stroke.Station[k]);
+
                 straightDecks++;
             }
         }
-        log.Count("Visual compiler straight water decks",straightDecks);log.Count("Visual compiler crested land decks",crestDecks);
-        var bounds=strokes.Select((s,i)=>strokeVars[i].Where(p=>floors.Contains(p.Var)||ceilings.Contains(p.Var))
-            .Select(p=>(Sample(s,p.Station),h[p.Var],floors.Contains(p.Var))).ToList()).ToArray();
+
+        log.Count("Visual compiler straight water decks", straightDecks);
+        log.Count("Visual compiler crested land decks", crestDecks);
+        var bounds =
+            strokes
+                .Select(
+                    (stroke, i) => strokeVars[i].Where(item => floors.Contains(item.Var) || ceilings.Contains(item.Var))
+            .Select(item => (Sample(stroke, item.Station), h[item.Var], floors.Contains(item.Var))).ToList()).ToArray();
+
         // The junction plateau levels an arm where it ends at a junction, so arms
         // of different grades meet on a level node. A stroke running through the
         // junction keeps one continuous grade there already; levelling it fought
         // its pin on hillsides (Marseille motorway and trunk junctions: arms 2–4 m
         // off the node).
-        var plateaus=strokes.Select(s=>s.Pins.Where(p=>p.Junction&&(p.Station<1||p.Station>s.Station[s.Station.Length-1]-1)).Select(p=>p.Station).ToArray()).ToArray();
-        var throughJunctions=MainlineJunctions();
-        var pinned=strokes.Select((s,i)=>strokeVars[i].Where(p=>!Crossing(p.Var)).Select(p=>(p.Station,h[p.Var])).ToList()).ToArray();
+        var plateaus =
+            strokes
+                .Select(
+                    stroke => stroke.Pins
+                        .Where(
+                            item => item.Junction
+                                && (item.Station < 1 || item.Station > stroke.Station[stroke.Station.Length - 1] - 1))
+                        .Select(item => item.Station)
+                        .ToArray())
+                .ToArray();
+
+        var throughJunctions = MainlineJunctions();
+        var pinned =
+            strokes
+                .Select(
+                    (
+                        stroke,
+                        i) => strokeVars[i]
+                            .Where(item => !Crossing(item.Var))
+                            .Select(item => (item.Station, h[item.Var]))
+                            .ToList())
+                .ToArray();
+
         // A junction takes its height from the most important road running
         // through it, smoothed as if the junction were not there; the roads that
         // end there are pinned to it. Starting from the ground at the node pinned
@@ -419,405 +912,896 @@ public static partial class VisualCompilerProfile
         // opposite carriageway follow, and the bounds above still hold.
         int MainlineJunctions()
         {
-            double Rank(Stroke s)=>(s.Classification.Replace("_link","") switch{"motorway"=>0,"trunk"=>1,"primary"=>2,"secondary"=>3,"tertiary"=>4,_=>5})+(s.Classification.EndsWith("_link",StringComparison.Ordinal)?.5:0);
-            var junctionVars=new HashSet<int>(nodeVar.Values);var twinVars=new HashSet<int>(twinPairs.Select(p=>p.Twin));
-            var owner=new Dictionary<int,(int Stroke,double Station,double Rank)>();
-            for(var i=0;i<strokes.Count;i++)
+            double Rank(Stroke stroke) => (stroke.Classification.Replace("_link", "") switch
             {
-                var s=strokes[i];var end=s.Station[s.Station.Length-1];var rank=Rank(s);
-                foreach(var (station,v) in strokeVars[i])
+                "motorway" => 0,
+                "trunk" => 1,
+                "primary" => 2,
+                "secondary" => 3,
+                "tertiary" => 4,
+                _ => 5
+            }) + (stroke.Classification.EndsWith("_link", StringComparison.Ordinal) ? .5 : 0);
+
+            var junctionVars = new HashSet<int>(nodeVar.Values);
+            var twinVars = new HashSet<int>(twinPairs.Select(item => item.Twin));
+            var owner = new Dictionary<int, (int Stroke, double Station, double Rank)>();
+
+            for (var i = 0; i < strokes.Count; i++)
+            {
+                var stroke = strokes[i];
+                var end = stroke.Station[stroke.Station.Length - 1];
+                var rank = Rank(stroke);
+
+                foreach (var (station, v) in strokeVars[i])
                 {
-                    if(!junctionVars.Contains(v)||levelVars.Contains(v)||station<1||station>end-1)continue;
-                    if(!owner.TryGetValue(v,out var o)||rank<o.Rank)owner[v]=(i,station,rank);
+                    if (!junctionVars.Contains(v) || levelVars.Contains(v) || station < 1 || station > end - 1)
+                        continue;
+
+                    if (!owner.TryGetValue(v, out var otherItem) || rank < otherItem.Rank)
+                        owner[v] = (i, station, rank);
                 }
             }
+
             // Opposite carriageways are smoothed together, as in the final pass:
             // each alone, then both pulled to the mean of the two.
-            var groups=owner.GroupBy(o=>o.Value.Stroke).ToDictionary(g=>g.Key,g=>g.ToArray());
-            var involved=new HashSet<int>(groups.Keys);
-            foreach(var i in groups.Keys.ToArray())foreach(var p in partner[i])if(p.Stroke>=0)involved.Add(p.Stroke);
-            var free=new Dictionary<int,List<(double,double)>>();var stiff=new Dictionary<int,double[]>();var first=new Dictionary<int,double[]>();
-            foreach(var i in involved)
+            var groups =
+                owner
+                    .GroupBy(otherEntry => otherEntry.Value.Stroke)
+                    .ToDictionary(group => group.Key, group => group.ToArray());
+
+            var involved = new HashSet<int>(groups.Keys);
+
+            foreach (var i in groups.Keys.ToArray())
+                foreach (var item in partner[i])
+                    if (item.Stroke >= 0)
+                        involved.Add(item.Stroke);
+
+            var free = new Dictionary<int, List<(double, double)>>();
+            var stiff = new Dictionary<int, double[]>();
+            var first = new Dictionary<int, double[]>();
+
+            foreach (var i in involved)
             {
-                token.ThrowIfCancellationRequested();var s=strokes[i];
-                var owned=groups.TryGetValue(i,out var mine)?new HashSet<int>(mine.Select(o=>o.Key)):new HashSet<int>();
-                free[i]=strokeVars[i].Where(p=>!Crossing(p.Var)&&!owned.Contains(p.Var)&&!twinVars.Contains(p.Var)).Select(p=>(p.Station,h[p.Var])).ToList();
-                stiff[i]=Enumerable.Repeat(1d,s.Station.Length).ToArray();
-                foreach(var (a,b) in DeckRuns(s))if(WaterDeck(s,a,b))for(var k=a;k<=b;k++)stiff[i][k]=DeckStiffness;
-                first[i]=Smooth(s,tau[i],null,free[i],bounds[i],plateaus[i],stiff[i]);
+                token.ThrowIfCancellationRequested();
+                var stroke = strokes[i];
+                var owned =
+                    groups.TryGetValue(i, out var mine)
+                        ? new HashSet<int>(mine.Select(otherEntry => otherEntry.Key))
+                        : new HashSet<int>();
+
+                free[i] =
+                    strokeVars[i]
+                        .Where(item => !Crossing(item.Var) && !owned.Contains(item.Var) && !twinVars.Contains(item.Var))
+                        .Select(item => (item.Station, h[item.Var]))
+                        .ToList();
+
+                stiff[i] = Enumerable.Repeat(1d, stroke.Station.Length).ToArray();
+
+                foreach (var (a, b) in DeckRuns(stroke))
+                    if (WaterDeck(stroke, a, b))
+                        for (var k = a; k <= b; k++)
+                            stiff[i][k] = DeckStiffness;
+
+                first[i] = Smooth(stroke, tau[i], null, free[i], bounds[i], plateaus[i], stiff[i]);
             }
-            var set=0;
-            foreach(var (i,group) in groups)
+
+            var set = 0;
+
+            foreach (var (i, group) in groups)
             {
-                token.ThrowIfCancellationRequested();var s=strokes[i];var y=first[i];
-                if(partner[i].Any(p=>p.Stroke>=0))
+                token.ThrowIfCancellationRequested();
+                var stroke = strokes[i];
+                var y = first[i];
+
+                if (partner[i].Any(item => item.Stroke >= 0))
                 {
-                    var pull=partner[i].Select((p,k)=>p.Stroke<0?double.NaN:(first[i][k]+At(strokes[p.Stroke],first[p.Stroke],p.Station))/2).ToArray();
-                    y=Smooth(s,tau[i],pull,free[i],bounds[i],plateaus[i],stiff[i]);
+                    var pull =
+                        partner[i]
+                            .Select(
+                                (
+                                    item,
+                                    k) => item.Stroke < 0
+                                        ? double.NaN
+                                        : (first[i][k] + At(strokes[item.Stroke], first[item.Stroke], item.Station))
+                                            / 2)
+                            .ToArray();
+
+                    y = Smooth(stroke, tau[i], pull, free[i], bounds[i], plateaus[i], stiff[i]);
                 }
-                foreach(var (v,(_,station,_)) in group)
+
+                foreach (var (v, (_, station, _)) in group)
                 {
-                    var (k,t)=Bracket(s,station);var height=t>0?math.lerp(y[k],y[k+1],t):y[k];
-                    h[v]=math.clamp(height,lowerBound[v],upper[v]);set++;
+                    var (k, t) = Bracket(stroke, station);
+                    var height = t > 0 ? math.lerp(y[k], y[k + 1], t) : y[k];
+                    h[v] = math.clamp(height, lowerBound[v], upper[v]);
+                    set++;
                 }
             }
-            foreach(var (v,w) in twinPairs)if(owner.ContainsKey(v))h[w]=h[v];
+
+            foreach (var (v, w) in twinPairs)
+                if (owner.ContainsKey(v))
+                    h[w] = h[v];
+
             return set;
         }
-        log.Count("Visual compiler junction heights from the road through them",throughJunctions);
-        for(var i=0;i<strokes.Count;i++)LiftDecks(strokes[i],tau[i],bounds[i]);
-        for(var i=0;i<strokes.Count;i++)CapDecks(strokes[i],tau[i],pinned[i],bounds[i]);
-        var stiffness=new double[strokes.Count][];
+
+        log.Count("Visual compiler junction heights from the road through them", throughJunctions);
+
+        for (var i = 0; i < strokes.Count; i++)
+            LiftDecks(strokes[i], tau[i], bounds[i]);
+
+        for (var i = 0; i < strokes.Count; i++)
+            CapDecks(strokes[i], tau[i], pinned[i], bounds[i]);
+
+        var stiffness = new double[strokes.Count][];
+
         void SmoothAll(IReadOnlyCollection<int> which)
         {
-            foreach(var i in which)
+            foreach (var i in which)
             {
-                var s=strokes[i];stiffness[i]=Enumerable.Repeat(1d,s.Station.Length).ToArray();
-                foreach(var (a,b) in DeckRuns(s))if(WaterDeck(s,a,b))for(var k=a;k<=b;k++)stiffness[i][k]=DeckStiffness;
+                var stroke = strokes[i];
+                stiffness[i] = Enumerable.Repeat(1d, stroke.Station.Length).ToArray();
+
+                foreach (var (a, b) in DeckRuns(stroke))
+                    if (WaterDeck(stroke, a, b))
+                        for (var k = a; k <= b; k++)
+                            stiffness[i][k] = DeckStiffness;
             }
-            foreach(var i in which){token.ThrowIfCancellationRequested();strokes[i].Height=Smooth(strokes[i],tau[i],null,pinned[i],bounds[i],plateaus[i],stiffness[i]);}
-            var first=strokes.Select(s=>s.Height).ToArray();var firstStiffness=stiffness.Select(a=>a==null?null:(double[])a.Clone()).ToArray();
-            foreach(var i in which)
+
+            foreach (var i in which)
             {
-                if(partner[i].All(p=>p.Stroke<0))continue;token.ThrowIfCancellationRequested();
-                var pull=partner[i].Select((p,k)=>p.Stroke<0?double.NaN:(first[i][k]+At(strokes[p.Stroke],first[p.Stroke],p.Station))/2).ToArray();
+                token.ThrowIfCancellationRequested();
+                strokes[i].Height = Smooth(strokes[i], tau[i], null, pinned[i], bounds[i], plateaus[i], stiffness[i]);
+            }
+
+            var first = strokes.Select(stroke => stroke.Height).ToArray();
+            var firstStiffness = stiffness.Select(a => a == null ? null : (double[])a.Clone()).ToArray();
+
+            foreach (var i in which)
+            {
+                if (partner[i].All(item => item.Stroke < 0))
+                    continue;
+
+                token.ThrowIfCancellationRequested();
+                var pull =
+                    partner[i]
+                        .Select(
+                            (
+                                item,
+                                k) => item.Stroke < 0
+                                    ? double.NaN
+                                    : (first[i][k] + At(strokes[item.Stroke], first[item.Stroke], item.Station)) / 2)
+                        .ToArray();
+
                 // Both carriageways bend with the stiffer side's local stiffness, so
                 // the pull to one mean profile is not undone by different humps.
-                for(var k=0;k<pull.Length;k++)
+                for (var k = 0; k < pull.Length; k++)
                 {
-                    var (j,_,station)=partner[i][k];if(j<0||firstStiffness[j]==null)continue;var (q,t)=Bracket(strokes[j],station);
-                    stiffness[i][k]=Math.Max(firstStiffness[i]![k],Math.Max(firstStiffness[j]![q],t>0?firstStiffness[j]![q+1]:0));
+                    var (j, _, station) = partner[i][k];
+
+                    if (j < 0 || firstStiffness[j] == null)
+                        continue;
+
+                    var (q, t) = Bracket(strokes[j], station);
+                    stiffness[i][k] =
+                        Math.Max(
+                            firstStiffness[i]![k],
+                            Math.Max(firstStiffness[j]![q], t > 0 ? firstStiffness[j]![q + 1] : 0));
                 }
-                strokes[i].Height=Smooth(strokes[i],tau[i],pull,pinned[i],bounds[i],plateaus[i],stiffness[i]);
+
+                strokes[i].Height = Smooth(strokes[i], tau[i], pull, pinned[i], bounds[i], plateaus[i], stiffness[i]);
             }
         }
-        SmoothAll(Enumerable.Range(0,strokes.Count).ToArray());
+
+        SmoothAll(Enumerable.Range(0, strokes.Count).ToArray());
         // 4. A pin that a stroke cannot reach (a deck lifted for a crossing beside
         // a junction, held by its curvature limit) left the other arms meeting the
         // node at another height: a step at the junction. The node takes the
         // height its least compliant stroke reached, the twin across the road
         // follows, and the strokes holding them smooth again to meet it.
-        var reconciled=0;var reconciliationConflicts=0;
-        var wetVariables=new HashSet<int>(Enumerable.Range(0,strokes.Count).Where(i=>strokes[i].Kind==NetworkKind.Road&&strokes[i].Water.Any(v=>!float.IsNaN(v)))
-            .SelectMany(i=>strokeVars[i].Select(p=>p.Var)));
-        var incoming=new List<int>[h.Length];for(var v=0;v<h.Length;v++)incoming[v]=new();
-        for(var v=0;v<h.Length;v++)foreach(var edge in up[v])incoming[edge.To].Add(v);
-        for(var round=0;round<ReconcileRounds;round++)
+        var reconciled = 0;
+        var reconciliationConflicts = 0;
+        var wetVariables =
+            new HashSet<int>(
+                Enumerable
+                    .Range(0, strokes.Count)
+                    .Where(i => strokes[i].Kind == NetworkKind.Road && strokes[i].Water.Any(v => !float.IsNaN(v)))
+            .SelectMany(i => strokeVars[i].Select(item => item.Var)));
+
+        var incoming = new List<int>[h.Length];
+
+        for (var v = 0; v < h.Length; v++)
+            incoming[v] = new();
+
+        for (var v = 0; v < h.Length; v++)
+            foreach (var edge in up[v])
+                incoming[edge.To].Add(v);
+
+        for (var round = 0; round < ReconcileRounds; round++)
         {
-            Array.Copy(h,snapshot,h.Length);
-            var reached=new Dictionary<int,(int Priority,double Residual,double Height)>();
-            for(var i=0;i<strokes.Count;i++)foreach(var (station,v) in strokeVars[i])
-            {
-                if(Crossing(v))continue;var y=strokes[i].HeightAt(station);var residual=Math.Abs(y-h[v]);
-                var s=strokes[i];var k=Sample(s,station);var classification=s.SampleClass[k];
-                var priority=s.Kind!=NetworkKind.Road?4:classification=="motorway"?0:classification=="trunk"?1:
-                    classification.StartsWith("motorway",StringComparison.Ordinal)?2:classification.StartsWith("trunk",StringComparison.Ordinal)?3:4;
-                if(wetVariables.Contains(v))priority=4;
-                if(!reached.TryGetValue(v,out var r)||priority<r.Priority||priority==r.Priority&&residual>r.Residual)reached[v]=(priority,residual,y);
-            }
+            Array.Copy(h, snapshot, h.Length);
+            var reached = new Dictionary<int, (int Priority, double Residual, double Height)>();
+
+            for (var i = 0; i < strokes.Count; i++)
+                foreach (var (station, v) in strokeVars[i])
+                {
+                    if (Crossing(v))
+                        continue;
+
+                    var y = strokes[i].HeightAt(station);
+                    var residual = Math.Abs(y - h[v]);
+                    var stroke = strokes[i];
+                    var k = Sample(stroke, station);
+                    var classification = stroke.SampleClass[k];
+                    var priority =
+                        stroke.Kind != NetworkKind.Road
+                            ? 4
+                            : classification == "motorway" ? 0 : classification == "trunk" ? 1 :
+                        classification.StartsWith("motorway", StringComparison.Ordinal)
+                            ? 2
+                            : classification.StartsWith("trunk", StringComparison.Ordinal) ? 3 : 4;
+
+                    if (wetVariables.Contains(v))
+                        priority = 4;
+
+                    if (!reached.TryGetValue(v, out var item)
+                        || priority < item.Priority
+                        || priority == item.Priority && residual > item.Residual)
+                        reached[v] = (priority, residual, y);
+                }
+
             // Revise one pin at a time. A crowded or infeasible junction must
             // not discard independent corrections elsewhere in the network.
-            foreach(var candidate in reached.OrderBy(p=>p.Value.Priority).ThenByDescending(p=>p.Value.Residual).ThenBy(p=>p.Key))
+            foreach (var candidate in reached
+                .OrderBy(entry => entry.Value.Priority)
+                .ThenByDescending(entry => entry.Value.Residual)
+                .ThenBy(entry => entry.Key))
             {
-                var (v,(_,residual,y))=candidate;if(residual<=ReconcileTolerance)continue;
-                var target=waterFloors.TryGetValue(v,out var floor)?Math.Max(y,floor):y;
-                if(Math.Abs(target-h[v])<1e-6)continue;
-                var prior=new Dictionary<int,double>{{v,h[v]}};h[v]=target;
-                var failed=Close(h,down,upper,lower:true,new[]{v},prior);
-                var seeds=new HashSet<int>{v};
-                foreach(var change in prior)
+                var (v, (_, residual, y)) = candidate;
+
+                if (residual <= ReconcileTolerance)
+                    continue;
+
+                var target = waterFloors.TryGetValue(v, out var floor) ? Math.Max(y, floor) : y;
+
+                if (Math.Abs(target - h[v]) < 1e-6)
+                    continue;
+
+                var prior = new Dictionary<int, double> { { v, h[v] } };
+                h[v] = target;
+                var failed = Close(h, down, upper, lower: true, new[] { v }, prior);
+                var seeds = new HashSet<int> { v };
+
+                foreach (var change in prior)
                 {
-                    if(h[change.Key]<lowerBound[change.Key])seeds.Add(change.Key);
+                    if (h[change.Key] < lowerBound[change.Key])
+                        seeds.Add(change.Key);
+
                     // A lowered destination can violate a constraint from an
                     // unchanged predecessor, including an accepted crossing.
-                    if(h[change.Key]<change.Value)foreach(var from in incoming[change.Key])seeds.Add(from);
+                    if (h[change.Key] < change.Value)
+                        foreach (var from in incoming[change.Key])
+                            seeds.Add(from);
                 }
-                failed+=Close(h,up,lowerBound,lower:false,seeds.ToArray(),prior);
-                var outside=false;
-                foreach(var change in prior)if(h[change.Key]>Math.Max(upper[change.Key]+.5,snapshot[change.Key])+1e-6){outside=true;break;}
-                if(failed>0||outside){foreach(var change in prior)h[change.Key]=change.Value;reconciliationConflicts++;}
+
+                failed += Close(h, up, lowerBound, lower: false, seeds.ToArray(), prior);
+                var outside = false;
+
+                foreach (var change in prior)
+                    if (h[change.Key] > Math.Max(upper[change.Key] + .5, snapshot[change.Key]) + 1e-6)
+                    {
+                        outside = true;
+                        break;
+                    }
+
+                if (failed > 0 || outside)
+                {
+                    foreach (var change in prior)
+                        h[change.Key] = change.Value;
+
+                    reconciliationConflicts++;
+                }
             }
-            var moved=new HashSet<int>();
-            for(var v=0;v<h.Length;v++)if(Math.Abs(h[v]-snapshot[v])>1e-6)moved.Add(v);
-            var again=new HashSet<int>();
-            for(var i=0;i<strokes.Count;i++)if(strokeVars[i].Any(p=>moved.Contains(p.Var)))
-            {
-                again.Add(i);pinned[i]=strokeVars[i].Where(p=>!Crossing(p.Var)).Select(p=>(p.Station,h[p.Var])).ToList();
-                foreach(var p in partner[i])if(p.Stroke>=0)again.Add(p.Stroke);
-            }
-            if(again.Count>0)SmoothAll(again.OrderBy(i=>i).ToArray());
-            reconciled+=moved.Count;if(again.Count==0)break;
+
+            var moved = new HashSet<int>();
+
+            for (var v = 0; v < h.Length; v++)
+                if (Math.Abs(h[v] - snapshot[v]) > 1e-6)
+                    moved.Add(v);
+
+            var again = new HashSet<int>();
+
+            for (var i = 0; i < strokes.Count; i++)
+                if (strokeVars[i].Any(item => moved.Contains(item.Var)))
+                {
+                    again.Add(i);
+                    pinned[i] =
+                        strokeVars[i]
+                            .Where(item => !Crossing(item.Var))
+                            .Select(item => (item.Station, h[item.Var]))
+                            .ToList();
+
+                    foreach (var item in partner[i])
+                        if (item.Stroke >= 0)
+                            again.Add(item.Stroke);
+                }
+
+            if (again.Count > 0)
+                SmoothAll(again.OrderBy(i => i).ToArray());
+
+            reconciled += moved.Count;
+
+            if (again.Count == 0)
+                break;
         }
-        log.Count("Visual compiler junction pins reconciled",reconciled);
-        log.Count("Visual compiler junction reconciliation constraint conflicts",reconciliationConflicts);
-        log.Diagnostic($"VISUAL COMPILER junction reconciliation revisedPins={reconciled}; correctionsWithheld={reconciliationConflicts}; protectedWetVariables={wetVariables.Count}; perJunctionConstraintClosure=true; failedCorrectionsRolledBack=true; highwayPriorityAtDryJunctions=true");
+
+        log.Count("Visual compiler junction pins reconciled", reconciled);
+        log.Count("Visual compiler junction reconciliation constraint conflicts", reconciliationConflicts);
+        log.Diagnostic(
+            $"VISUAL COMPILER junction reconciliation revisedPins={reconciled}; correctionsWithheld={reconciliationConflicts}; protectedWetVariables={wetVariables.Count}; perJunctionConstraintClosure=true; failedCorrectionsRolledBack=true; highwayPriorityAtDryJunctions=true");
+
         // 5. Interchanges: what is still bent or split is solved jointly
         // (VisualCompilerInterchanges.cs). A second pass seeds from the first
         // pass's result. Shared road–rail heights and water floors stay fixed.
-        for(var pass=0;pass<InterchangePasses;pass++)
+        for (var pass = 0; pass < InterchangePasses; pass++)
         {
-            var interchangeClock=System.Diagnostics.Stopwatch.StartNew();
-            var interchanges=Interchanges(strokes,tau,partner,strokeVars,h,v=>!Crossing(v)&&!levelVars.Contains(v)&&!waterFloors.ContainsKey(v),
-                Crossing,twinPairs,bounds,plateaus,stiffness,lowerBound,upper,token);
-            log.Count("Visual compiler interchange windows solved jointly",interchanges.Accepted);
-            log.Diagnostic($"VISUAL COMPILER profile interchanges pass={pass}; clusters={interchanges.Clusters}; accepted={interchanges.Accepted}; skipped={interchanges.Skipped}; unknowns={interchanges.Unknowns}; scoreBefore={interchanges.Before}; scoreAfter={interchanges.After}; ms={interchangeClock.ElapsedMilliseconds}");
+            var interchangeClock = System.Diagnostics.Stopwatch.StartNew();
+            var interchanges =
+                Interchanges(
+                    strokes,
+                    tau,
+                    partner,
+                    strokeVars,
+                    h,
+                    v => !Crossing(v) && !levelVars.Contains(v) && !waterFloors.ContainsKey(v),
+                Crossing, twinPairs, bounds, plateaus, stiffness, lowerBound, upper, token);
+
+            log.Count("Visual compiler interchange windows solved jointly", interchanges.Accepted);
+            log.Diagnostic(
+                $"VISUAL COMPILER profile interchanges pass={pass}; clusters={interchanges.Clusters}; accepted={interchanges.Accepted}; skipped={interchanges.Skipped}; unknowns={interchanges.Unknowns}; scoreBefore={interchanges.Before}; scoreAfter={interchanges.After}; ms={interchangeClock.ElapsedMilliseconds}");
         }
-        if(Environment.GetEnvironmentVariable("VISUAL_DEBUG_PINS")=="1")
+
+        if (Environment.GetEnvironmentVariable("VISUAL_DEBUG_PINS") == "1")
         {
-            var worst=new List<(double Residual,string Line)>();
-            for(var i=0;i<strokes.Count;i++)foreach(var (station,v) in strokeVars[i])
-            {
-                if(Crossing(v))continue;var s=strokes[i];var y=s.HeightAt(station);var res=Math.Abs(y-h[v]);if(res<.3)continue;
-                var (k,_)=Bracket(s,station);var near=strokeVars[i].Count(p=>Math.Abs(p.Station-station)<30)-1;
-                var spread=strokeVars[i].Where(p=>Math.Abs(p.Station-station)<60&&!Crossing(p.Var)).Select(p=>h[p.Var]).DefaultIfEmpty(h[v]);
-                worst.Add((res,$"res={res:F2} paired={partner[i][k].Stroke>=0} class={s.Classification} kind={s.Kind} mode={s.Mode[k]} station={station:F0}/{s.Station[s.Station.Length-1]:F0} n={s.Station.Length} pinH={h[v]:F2} solved={y:F2} tau={tau[i][k]:F2} pinsWithin30={near} pinSpan60={spread.Max()-spread.Min():F2} grade={s.Grade[Math.Min(k,s.Grade.Length-1)]:F3} plateauGrade={s.Class.PlateauGrade:F3} plateau={s.Class.PlateauLength} floor={floors.Contains(v)} ceiling={ceilings.Contains(v)} lo={lowerBound[v]:F1} at=({s.Point[k].x:F0},{s.Point[k].y:F0})"));
-            }
+            var worst = new List<(double Residual, string Line)>();
+
+            for (var i = 0; i < strokes.Count; i++)
+                foreach (var (station, v) in strokeVars[i])
+                {
+                    if (Crossing(v))
+                        continue;
+
+                    var stroke = strokes[i];
+                    var y = stroke.HeightAt(station);
+                    var result = Math.Abs(y - h[v]);
+
+                    if (result < .3)
+                        continue;
+
+                    var (k, _) = Bracket(stroke, station);
+                    var near = strokeVars[i].Count(item => Math.Abs(item.Station - station) < 30) - 1;
+                    var spread =
+                        strokeVars[i]
+                            .Where(item => Math.Abs(item.Station - station) < 60 && !Crossing(item.Var))
+                            .Select(item => h[item.Var])
+                            .DefaultIfEmpty(h[v]);
+
+                    worst.Add(
+                        (
+                            result,
+                            $"res={result:F2} paired={partner[i][k].Stroke >= 0} class={stroke.Classification} kind={stroke.Kind} mode={stroke.Mode[k]} station={station:F0}/{stroke.Station[stroke.Station.Length - 1]:F0} n={stroke.Station.Length} pinH={h[v]:F2} solved={y:F2} tau={tau[i][k]:F2} pinsWithin30={near} pinSpan60={spread.Max() - spread.Min():F2} grade={stroke.Grade[Math.Min(k, stroke.Grade.Length - 1)]:F3} plateauGrade={stroke.Class.PlateauGrade:F3} plateau={stroke.Class.PlateauLength} floor={floors.Contains(v)} ceiling={ceilings.Contains(v)} lo={lowerBound[v]:F1} at=({stroke.Point[k].x:F0},{stroke.Point[k].y:F0})"));
+                }
+
             log.Diagnostic($"VISUAL DEBUG pins over 0.3 m: {worst.Count}");
-            foreach(var (_,line) in worst.OrderByDescending(w=>w.Residual).Take(40))log.Diagnostic("VISUAL DEBUG pin "+line);
+
+            foreach (var (_, line) in worst.OrderByDescending(item => item.Residual).Take(40))
+                log.Diagnostic("VISUAL DEBUG pin " + line);
         }
+
         // Where does the solved profile itself exceed the class grade-change rate?
-        int nearPin=0,nearCrossing=0,nearStructure=0,elsewhere=0;
-        var crossingStations=strokes.Select(_=>new List<double>()).ToArray();
-        for(var i=0;i<strokes.Count;i++)foreach(var (station,v) in strokeVars[i])if(v>=crossingBase&&v<crossingEnd)crossingStations[i].Add(station);
-        for(var i=0;i<strokes.Count;i++)
+        int nearPin = 0, nearCrossing = 0, nearStructure = 0, elsewhere = 0;
+        var crossingStations = strokes.Select(_ => new List<double>()).ToArray();
+
+        for (var i = 0; i < strokes.Count; i++)
+            foreach (var (station, v) in strokeVars[i])
+                if (v >= crossingBase && v < crossingEnd)
+                    crossingStations[i].Add(station);
+
+        for (var i = 0; i < strokes.Count; i++)
         {
-            var s=strokes[i];
-            for(var k=1;k<s.Height.Length-1;k++)
+            var stroke = strokes[i];
+
+            for (var k = 1; k < stroke.Height.Length - 1; k++)
             {
-                var g0=(s.Height[k]-s.Height[k-1])/(s.Station[k]-s.Station[k-1]);var g1=(s.Height[k+1]-s.Height[k])/(s.Station[k+1]-s.Station[k]);
-                if(Math.Abs(g1-g0)*100<=10/s.Class.K*(s.Station[k+1]-s.Station[k-1])/2/10)continue;
-                if(crossingStations[i].Any(c=>Math.Abs(c-s.Station[k])<200))nearCrossing++;
-                else if(s.Pins.Any(p=>Math.Abs(p.Station-s.Station[k])<30))nearPin++;
-                else if(s.Mode[k]!=0||s.Mode[Math.Max(0,k-3)]!=0||s.Mode[Math.Min(s.Mode.Length-1,k+3)]!=0)nearStructure++;
-                else elsewhere++;
+                var g0 = (stroke.Height[k] - stroke.Height[k - 1]) / (stroke.Station[k] - stroke.Station[k - 1]);
+                var g1 = (stroke.Height[k + 1] - stroke.Height[k]) / (stroke.Station[k + 1] - stroke.Station[k]);
+
+                if (Math.Abs(g1 - g0) * 100
+                    <= 10 / stroke.Class.K * (stroke.Station[k + 1] - stroke.Station[k - 1]) / 2 / 10)
+                    continue;
+
+                if (crossingStations[i].Any(c => Math.Abs(c - stroke.Station[k]) < 200))
+                    nearCrossing++;
+                else if (stroke.Pins.Any(item => Math.Abs(item.Station - stroke.Station[k]) < 30))
+                    nearPin++;
+                else if (stroke.Mode[k] != 0
+                    || stroke.Mode[Math.Max(0, k - 3)] != 0
+                    || stroke.Mode[Math.Min(stroke.Mode.Length - 1, k + 3)] != 0)
+                    nearStructure++;
+                else
+                    elsewhere++;
             }
         }
-        log.Diagnostic($"VISUAL COMPILER profile grade-change samples nearCrossings={nearCrossing}; nearPins={nearPin}; nearStructureEnds={nearStructure}; elsewhere={elsewhere}");
-        var gaps=strokes.SelectMany((s,i)=>partner[i].Select((p,k)=>p.Stroke<0?double.NaN:Math.Abs(s.Height[k]-strokes[p.Stroke].HeightAt(p.Station)))).Where(g=>!double.IsNaN(g)).OrderBy(g=>g).ToArray();
-        double Quantile(double q)=>gaps.Length==0?0:gaps[(int)(q*(gaps.Length-1))];
-        log.Diagnostic($"VISUAL COMPILER vertical strokes={strokes.Count}; coupledPoints={vars.Count}; junctionPoints={nodeVar.Count}; crossings={crossingConstraints.Count}; pairTwins={twins}; sharedPairSamples={shared}; conflicts={conflicts}; pairGapP50={Quantile(.5):F2}; pairGapP90={Quantile(.9):F2}; pairGapP99={Quantile(.99):F2}; pairGapOver03={gaps.Count(g=>g>.3)}");
-        log.Count("Visual compiler vertical conflicts",conflicts);
-        log.Diagnostic($"VISUAL COMPILER crossing conflicts budget={budgetConflicts}; bound={boundConflicts}; overshootBeforeCrossings={preexisting}; repairedByDippingRoadBeneath={recipes}; loweringRejectedToKeepAcceptedFloors={loweringRejected}; metAtReducedClearance={partial}; stackedTunnels={stacked.Count}; stackedTunnelsAccepted={accepted.Count(a=>stacked.Contains(a.Under))}");
-        log.Count("Visual compiler crossings repaired",recipes);
+
+        log.Diagnostic(
+            $"VISUAL COMPILER profile grade-change samples nearCrossings={nearCrossing}; nearPins={nearPin}; nearStructureEnds={nearStructure}; elsewhere={elsewhere}");
+
+        var gaps =
+            strokes
+                .SelectMany(
+                    (
+                        stroke,
+                        i) => partner[i].Select(
+                            (
+                                item,
+                                k) => item.Stroke < 0
+                                    ? double.NaN
+                                    : Math.Abs(stroke.Height[k] - strokes[item.Stroke].HeightAt(item.Station))))
+                .Where(g => !double.IsNaN(g))
+                .OrderBy(g => g)
+                .ToArray();
+
+        double Quantile(double q) => gaps.Length == 0 ? 0 : gaps[(int)(q * (gaps.Length - 1))];
+
+        log.Diagnostic(
+            $"VISUAL COMPILER vertical strokes={strokes.Count}; coupledPoints={vars.Count}; junctionPoints={nodeVar.Count}; crossings={crossingConstraints.Count}; pairTwins={twins}; sharedPairSamples={shared}; conflicts={conflicts}; pairGapP50={Quantile(.5):F2}; pairGapP90={Quantile(.9):F2}; pairGapP99={Quantile(.99):F2}; pairGapOver03={gaps.Count(g => g > .3)}");
+
+        log.Count("Visual compiler vertical conflicts", conflicts);
+        log.Diagnostic(
+            $"VISUAL COMPILER crossing conflicts budget={budgetConflicts}; bound={boundConflicts}; overshootBeforeCrossings={preexisting}; repairedByDippingRoadBeneath={recipes}; loweringRejectedToKeepAcceptedFloors={loweringRejected}; metAtReducedClearance={partial}; stackedTunnels={stacked.Count}; stackedTunnelsAccepted={accepted.Count(item => stacked.Contains(item.Under))}");
+
+        log.Count("Visual compiler crossings repaired", recipes);
     }
 
     // Monotone label-correcting closure. Lower: h[to] = min(h[to], h[from]+b) and
     // h ≤ bound; raise: h[to] = max(h[to], h[from]−b) and h ≥ bound. Returns 1 when
     // the relaxation budget is exhausted, which indicates a contradictory cycle.
-    private static List<(int To,double Bound)>[] Adjacency(int count,IEnumerable<(int From,int To,double Bound)> constraints)
+    private static List<(int To, double Bound)>[] Adjacency(
+        int count,
+        IEnumerable<(int From, int To, double Bound)> constraints)
     {
-        var outgoing=Enumerable.Range(0,count).Select(_=>new List<(int To,double Bound)>()).ToArray();
-        foreach(var c in constraints)outgoing[c.From].Add((c.To,c.Bound));
+        var outgoing = Enumerable.Range(0, count).Select(_ => new List<(int To, double Bound)>()).ToArray();
+
+        foreach (var item in constraints)
+            outgoing[item.From].Add((item.To, item.Bound));
+
         return outgoing;
     }
-    private static int Close(double[] h,List<(int To,double Bound)>[] outgoing,double[] bounds,bool lower,int[]? start,Dictionary<int,double>? prior=null)
+
+    private static int Close(
+        double[] h,
+        List<(int To, double Bound)>[] outgoing,
+        double[] bounds,
+        bool lower,
+        int[]? start,
+        Dictionary<int, double>? prior = null)
     {
         // FIFO worklist as a list with a moving head; the game's references define
         // Queue<T> twice, so the generic queue type is avoided here.
-        var queue=new List<int>();var head=0;var queued=new bool[h.Length];
-        foreach(var v in start??Enumerable.Range(0,h.Length))
+        var queue = new List<int>();
+        var head = 0;
+        var queued = new bool[h.Length];
+
+        foreach (var v in start ?? Enumerable.Range(0, h.Length))
         {
-            var value=lower?Math.Min(h[v],bounds[v]):Math.Max(h[v],bounds[v]);
-            if(prior!=null&&value!=h[v]&&!prior.ContainsKey(v))prior[v]=h[v];
-            h[v]=value;queue.Add(v);queued[v]=true;
+            var value = lower ? Math.Min(h[v], bounds[v]) : Math.Max(h[v], bounds[v]);
+
+            if (prior != null && value != h[v] && !prior.ContainsKey(v))
+                prior[v] = h[v];
+
+            h[v] = value;
+            queue.Add(v);
+            queued[v] = true;
         }
+
         // A whole-network closure may touch everything; one added crossing only
         // ever raises a local cone, so its contradiction is found quickly.
-        long budget=start==null?200L*(h.Length+1):20000;
-        while(head<queue.Count)
+        long budget = start == null ? 200L * (h.Length + 1) : 20000;
+
+        while (head < queue.Count)
         {
-            if(--budget<0)return 1;
-            var v=queue[head++];queued[v]=false;if(head>4096&&head*2>queue.Count){queue.RemoveRange(0,head);head=0;}
-            foreach(var (to,bound) in outgoing[v])
+            if (--budget < 0)
+                return 1;
+
+            var v = queue[head++];
+            queued[v] = false;
+
+            if (head > 4096 && head * 2 > queue.Count)
             {
-                var candidate=lower?h[v]+bound:h[v]-bound;
-                if(lower?candidate<h[to]-1e-6:candidate>h[to]+1e-6)
-                {if(prior!=null&&!prior.ContainsKey(to))prior[to]=h[to];h[to]=candidate;if(!queued[to]){queued[to]=true;queue.Add(to);}}
+                queue.RemoveRange(0, head);
+                head = 0;
+            }
+
+            foreach (var (to, bound) in outgoing[v])
+            {
+                var candidate = lower ? h[v] + bound : h[v] - bound;
+
+                if (lower ? candidate < h[to] - 1e-6 : candidate > h[to] + 1e-6)
+                {
+                    if (prior != null && !prior.ContainsKey(to))
+                        prior[to] = h[to];
+
+                    h[to] = candidate;
+
+                    if (!queued[to])
+                    {
+                        queued[to] = true;
+                        queue.Add(to);
+                    }
+                }
             }
         }
+
         return 0;
     }
 
     // Opposite one-way carriageways of one class within the class separation band
     // see one corridor target: the mean of both sides' targets.
-    private static (int Stroke,int Sample,double Station)[][] Pair(IReadOnlyList<Stroke> strokes,double[][] tau,CancellationToken token)
+    private static (int Stroke, int Sample, double Station)[][] Pair(
+        IReadOnlyList<Stroke> strokes,
+        double[][] tau,
+        CancellationToken token)
     {
-        var partners=strokes.Select(s=>Enumerable.Repeat((-1,-1,0d),s.Point.Length).ToArray()).ToArray();
-        var grid=new Dictionary<(int,int),List<(int S,int K)>>();
-        (int,int) Cell(double2 p)=>((int)Math.Floor(p.x/64),(int)Math.Floor(p.y/64));
-        for(var i=0;i<strokes.Count;i++)if(strokes[i].OneWay)
-            for(var k=0;k<strokes[i].Point.Length;k++)if(strokes[i].PairBand[k]>0){var c=Cell(strokes[i].Point[k]);if(!grid.TryGetValue(c,out var l))grid[c]=l=new();l.Add((i,k));}
-        var result=tau.Select(t=>(double[])t.Clone()).ToArray();
-        foreach(var cell in grid)foreach(var (i,k) in cell.Value)
-        {
-            token.ThrowIfCancellationRequested();var s=strokes[i];var p=s.Point[k];var band=s.PairBand[k];var best=double.PositiveInfinity;var partner=(-1,-1);
-            for(var x=cell.Key.Item1-1;x<=cell.Key.Item1+1;x++)for(var z=cell.Key.Item2-1;z<=cell.Key.Item2+1;z++)if(grid.TryGetValue((x,z),out var list))
-                foreach(var (j,q) in list)
-                {
-                    var o=strokes[j];if(j==i||o.SampleClass[q]!=s.SampleClass[k]||o.Layer[q]!=s.Layer[k]||math.dot(o.Direction[q],s.Direction[k])>-.966)continue;
-                    var offset=o.Point[q]-p;var along=Math.Abs(math.dot(offset,s.Direction[k]));var lateral=Math.Abs(NetworkDesignChecks.Cross(s.Direction[k],offset));
-                    if(along>Spacing||lateral<5||lateral>band||lateral>=best)continue;best=lateral;partner=(j,q);
-                }
-            if(partner.Item1<0)continue;
-            // The partner sample can lie up to Spacing ahead or behind; on a 4%
-            // grade 8 m apart is 0.32 m of height that is not a pair gap. The
-            // partner is read where it crosses this sample's cross-section: its
-            // stations run against this stroke's, so a sample `a` metres ahead
-            // along D is `a` metres past that crossing along its own direction.
-            var (pj,pq)=partner;var other=strokes[pj];
-            var a=math.dot(other.Point[pq]-p,s.Direction[k])/Math.Max(.966,-math.dot(other.Direction[pq],s.Direction[k]));
-            var station=Math.Clamp(other.Station[pq]+a,other.Station[0],other.Station[other.Station.Length-1]);
-            var (bi,bt)=Bracket(other,station);if(bt>0&&other.Mode[bi]!=other.Mode[bi+1])station=other.Station[pq];
-            result[i][k]=(tau[i][k]+At(other,tau[pj],station))/2;partners[i][k]=(pj,pq,station);
-        }
-        for(var i=0;i<tau.Length;i++)tau[i]=result[i];
+        var partners =
+            strokes.Select(stroke => Enumerable.Repeat((-1, -1, 0d), stroke.Point.Length).ToArray()).ToArray();
+
+        var grid = new Dictionary<(int, int), List<(int S, int K)>>();
+
+        for (var i = 0; i < strokes.Count; i++)
+            if (strokes[i].OneWay)
+                for (var k = 0; k < strokes[i].Point.Length; k++)
+                    if (strokes[i].PairBand[k] > 0)
+                    {
+                        var item = VisualNetworkCompiler.PairCell(strokes[i].Point[k]);
+
+                        if (!grid.TryGetValue(item, out var items))
+                            grid[item] = items = new();
+
+                        items.Add((i, k));
+                    }
+
+        var result = tau.Select(t => (double[])t.Clone()).ToArray();
+
+        foreach (var cell in grid)
+            foreach (var (i, k) in cell.Value)
+            {
+                token.ThrowIfCancellationRequested();
+                var stroke = strokes[i];
+                var point = stroke.Point[k];
+                var band = stroke.PairBand[k];
+                var best = double.PositiveInfinity;
+                var partner = (-1, -1);
+
+                for (var x = cell.Key.Item1 - 1; x <= cell.Key.Item1 + 1; x++)
+                    for (var z = cell.Key.Item2 - 1; z <= cell.Key.Item2 + 1; z++)
+                        if (grid.TryGetValue((x, z), out var list))
+                            foreach (var (j, q) in list)
+                            {
+                                var otherStroke = strokes[j];
+
+                                if (j == i
+                                    || otherStroke.SampleClass[q] != stroke.SampleClass[k]
+                                    || otherStroke.Layer[q] != stroke.Layer[k]
+                                    || math.dot(otherStroke.Direction[q], stroke.Direction[k]) > -.966)
+                                    continue;
+
+                                var offset = otherStroke.Point[q] - point;
+                                var along = Math.Abs(math.dot(offset, stroke.Direction[k]));
+                                var lateral = Math.Abs(NetworkDesignChecks.Cross(stroke.Direction[k], offset));
+
+                                if (along > Spacing || lateral < 5 || lateral > band || lateral >= best)
+                                    continue;
+
+                                best = lateral;
+                                partner = (j, q);
+                            }
+
+                if (partner.Item1 < 0)
+                    continue;
+
+                // The partner sample can lie up to Spacing ahead or behind; on a 4%
+                // grade 8 m apart is 0.32 m of height that is not a pair gap. The
+                // partner is read where it crosses this sample's cross-section: its
+                // stations run against this stroke's, so a sample `a` metres ahead
+                // along D is `a` metres past that crossing along its own direction.
+                var (pj, pq) = partner;
+                var other = strokes[pj];
+                var a =
+                    math.dot(other.Point[pq] - point, stroke.Direction[k])
+                        / Math.Max(.966, -math.dot(other.Direction[pq], stroke.Direction[k]));
+
+                var station =
+                    Math.Clamp(other.Station[pq] + a, other.Station[0], other.Station[other.Station.Length - 1]);
+
+                var (bi, bt) = Bracket(other, station);
+
+                if (bt > 0 && other.Mode[bi] != other.Mode[bi + 1])
+                    station = other.Station[pq];
+
+                result[i][k] = (tau[i][k] + At(other, tau[pj], station)) / 2;
+                partners[i][k] = (pj, pq, station);
+            }
+
+        for (var i = 0; i < tau.Length; i++)
+            tau[i] = result[i];
+
         return partners;
     }
 
     // A per-sample value read at a station by linear interpolation.
-    private static double At(Stroke s,double[] value,double station){var (i,t)=Bracket(s,station);return t<=0?value[i]:value[i]+(value[i+1]-value[i])*t;}
+    private static double At(Stroke stroke, double[] value, double station)
+    {
+        var (i, t) = Bracket(stroke, station);
+        return t <= 0 ? value[i] : value[i] + (value[i + 1] - value[i]) * t;
+    }
 
     // Half width (metres) of the moving average under rail targets.
-    private const double RailSmoothing=150;
+    private const double RailSmoothing = 150;
+
     // A centred moving average by station over ground samples, in linear time.
     // Bridge and tunnel samples take their targets from Chord and Structures and
     // are left out: averaged in, the river under DC's Long Bridge pulled its bank
     // targets 7 m down and the deck sank with them, 6 m below the switches at
     // its west end. A structure sample keeps its own value.
-    private static double[] Average(Stroke s,double[] values,double half)
+    private static double[] Average(Stroke stroke, double[] values, double half)
     {
-        var n=values.Length;var result=new double[n];var prefix=new double[n+1];var count=new int[n+1];
-        for(var k=0;k<n;k++){var ground=s.Mode[k]==0;prefix[k+1]=prefix[k]+(ground?values[k]:0);count[k+1]=count[k]+(ground?1:0);}
-        for(int k=0,a=0,b=0;k<n;k++)
+        var length = values.Length;
+        var result = new double[length];
+        var prefix = new double[length + 1];
+        var count = new int[length + 1];
+
+        for (var k = 0; k < length; k++)
         {
-            while(s.Station[k]-s.Station[a]>half)a++;
-            while(b+1<n&&s.Station[b+1]-s.Station[k]<=half)b++;
-            var samples=count[b+1]-count[a];
-            result[k]=s.Mode[k]!=0||samples==0?values[k]:(prefix[b+1]-prefix[a])/samples;
+            var ground = stroke.Mode[k] == 0;
+            prefix[k + 1] = prefix[k] + (ground ? values[k] : 0);
+            count[k + 1] = count[k] + (ground ? 1 : 0);
         }
+
+        for (int k = 0, a = 0, b = 0; k < length; k++)
+        {
+            while (stroke.Station[k] - stroke.Station[a] > half)
+                a++;
+
+            while (b + 1 < length && stroke.Station[b + 1] - stroke.Station[k] <= half)
+                b++;
+
+            var samples = count[b + 1] - count[a];
+            result[k] = stroke.Mode[k] != 0 || samples == 0 ? values[k] : (prefix[b + 1] - prefix[a]) / samples;
+        }
+
         return result;
     }
 
     // Structure interiors follow the straight chord between their end targets, so
     // a bridge is not pulled into the valley nor a tunnel up the hill it avoids.
-    private static void Chord(Stroke s,double[] tau)
+    private static void Chord(Stroke stroke, double[] tau)
     {
-        for(var a=0;a<s.Mode.Length;)
+        for (var a = 0; a < stroke.Mode.Length;)
         {
-            if(s.Mode[a]==0){a++;continue;}
-            var b=a;while(b+1<s.Mode.Length&&s.Mode[b+1]==s.Mode[a])b++;
-            var lo=Math.Max(0,a-1);var hi=Math.Min(s.Mode.Length-1,b+1);
-            for(var k=a;k<=b;k++)tau[k]=math.lerp(tau[lo],tau[hi],(s.Station[k]-s.Station[lo])/Math.Max(1e-9,s.Station[hi]-s.Station[lo]));
-            a=b+1;
+            if (stroke.Mode[a] == 0)
+            {
+                a++;
+                continue;
+            }
+
+            var b = a;
+
+            while (b + 1 < stroke.Mode.Length && stroke.Mode[b + 1] == stroke.Mode[a])
+                b++;
+
+            var low = Math.Max(0, a - 1);
+            var high = Math.Min(stroke.Mode.Length - 1, b + 1);
+
+            for (var k = a; k <= b; k++)
+                tau[k] =
+                    math.lerp(
+                        tau[low],
+                        tau[high],
+                        (stroke.Station[k] - stroke.Station[low])
+                            / Math.Max(1e-9, stroke.Station[high] - stroke.Station[low]));
+
+            a = b + 1;
         }
     }
 
     // Metres a bridge deck keeps above the water it crosses.
-    private const double WaterClearance=WaterLevels.RoadBridgeClearanceMeters;
+    private const double WaterClearance = WaterLevels.RoadBridgeClearanceMeters;
     // Grade of the land ramp that carries a deck's water lift back to the ground.
-    private const double ApproachGrade=.04;
+    private const double ApproachGrade = .04;
     // Track ramps off a lifted deck at 1.5%: at 4% the change from level track
     // to the ramp was itself 2.4 times the rail grade-change limit, against a 5%
     // hard grade.
-    private const double RailApproachGrade=.015;
-    private static double Approach(Stroke s)=>s.Kind==NetworkKind.Rail?RailApproachGrade:ApproachGrade;
+    private const double RailApproachGrade = .015;
 
-    private static double WaterFloor(Stroke s,int k)
+    private static double Approach(Stroke stroke)
+        => stroke.Kind == NetworkKind.Rail ? RailApproachGrade : ApproachGrade;
+
+    private static double WaterFloor(Stroke stroke, int k)
     {
-        if(s.Kind!=NetworkKind.Road||s.Mode[k]<0)return double.NegativeInfinity;
-        var floor=k<s.Water.Length&&!float.IsNaN(s.Water[k])
-            ?s.Water[k]+(double)(s.Mode[k]>0?WaterClearance:WaterLevels.RoadFreeboardMeters):double.NegativeInfinity;
-        return k<s.WaterApproachFloor.Length?Math.Max(floor,s.WaterApproachFloor[k]):floor;
+        if (stroke.Kind != NetworkKind.Road || stroke.Mode[k] < 0)
+            return double.NegativeInfinity;
+
+        var floor = k < stroke.Water.Length && !float.IsNaN(stroke.Water[k])
+            ? stroke.Water[k] + (double)(stroke.Mode[k] > 0 ? WaterClearance : WaterLevels.RoadFreeboardMeters)
+                : double.NegativeInfinity;
+
+        return k < stroke.WaterApproachFloor.Length ? Math.Max(floor, stroke.WaterApproachFloor[k]) : floor;
     }
 
     // Carry a shallow-water lift back onto dry ground before smoothing. Paired
     // ground carriageways share the higher floor; otherwise one bank lifts only
     // one side and the pair pull fights two incompatible terrain targets.
-    private static void WaterApproaches(IReadOnlyList<Stroke> strokes,double[][] tau,
-        (int Stroke,int Sample,double Station)[][] partner,IReadOnlyDictionary<SourceNodeKey,double>? requiredNodeFloors)
+    private static void WaterApproaches(IReadOnlyList<Stroke> strokes, double[][] tau,
+        (int Stroke, int Sample, double Station)[][] partner,
+            IReadOnlyDictionary<SourceNodeKey, double>? requiredNodeFloors)
     {
-        foreach(var s in strokes)s.WaterApproachFloor=Array.Empty<double>();
-        if((requiredNodeFloors==null||requiredNodeFloors.Count==0)&&!strokes.Any(s=>s.Kind==NetworkKind.Road&&s.Water.Any(v=>!float.IsNaN(v))))return;
-        var floors=strokes.Select(s=>Enumerable.Range(0,s.Mode.Length).Select(k=>
-            s.Kind==NetworkKind.Road&&s.Mode[k]==0&&k<s.Water.Length&&!float.IsNaN(s.Water[k])
-                ?s.Water[k]+(double)WaterLevels.RoadFreeboardMeters:double.NegativeInfinity).ToArray()).ToArray();
-        if(requiredNodeFloors!=null)for(var i=0;i<strokes.Count;i++)foreach(var pin in strokes[i].Pins)
+        foreach (var stroke in strokes)
+            stroke.WaterApproachFloor = Array.Empty<double>();
+
+        if ((requiredNodeFloors == null || requiredNodeFloors.Count == 0)
+            && !strokes.Any(stroke => stroke.Kind == NetworkKind.Road && stroke.Water.Any(v => !float.IsNaN(v))))
+            return;
+
+        var floors = strokes.Select(stroke => Enumerable.Range(0, stroke.Mode.Length).Select(k =>
+            stroke.Kind == NetworkKind.Road
+                && stroke.Mode[k] == 0
+                && k < stroke.Water.Length
+                && !float.IsNaN(stroke.Water[k])
+                ? stroke.Water[k] + (double)WaterLevels.RoadFreeboardMeters : double.NegativeInfinity).ToArray())
+                    .ToArray();
+
+        if (requiredNodeFloors != null)
+            for (var i = 0; i < strokes.Count; i++)
+                foreach (var pin in strokes[i].Pins)
+                {
+                    var stroke = strokes[i];
+
+                    if (stroke.Kind != NetworkKind.Road || !requiredNodeFloors.TryGetValue(pin.Node, out var floor))
+                        continue;
+
+                    var k = Array.BinarySearch(stroke.Station, pin.Station);
+
+                    if (k < 0)
+                        k = Math.Min(stroke.Station.Length - 1, ~k);
+
+                    if (stroke.Mode[k] >= 0)
+                        floors[i][k] = Math.Max(floors[i][k], floor);
+                }
+
+        for (var i = 0; i < strokes.Count; i++)
+            for (var k = 0; k < floors[i].Length; k++)
+            {
+                var (j, q, _) = partner[i][k];
+
+                if (j < 0 || strokes[i].Mode[k] != 0 || strokes[j].Mode[q] != 0)
+                    continue;
+
+                var floor = Math.Max(floors[i][k], floors[j][q]);
+                floors[i][k] = floor;
+                floors[j][q] = floor;
+            }
+
+        for (var i = 0; i < strokes.Count; i++)
         {
-            var s=strokes[i];if(s.Kind!=NetworkKind.Road||!requiredNodeFloors.TryGetValue(pin.Node,out var floor))continue;
-            var k=Array.BinarySearch(s.Station,pin.Station);if(k<0)k=Math.Min(s.Station.Length-1,~k);
-            if(s.Mode[k]>=0)floors[i][k]=Math.Max(floors[i][k],floor);
-        }
-        for(var i=0;i<strokes.Count;i++)for(var k=0;k<floors[i].Length;k++)
-        {
-            var (j,q,_)=partner[i][k];if(j<0||strokes[i].Mode[k]!=0||strokes[j].Mode[q]!=0)continue;
-            var floor=Math.Max(floors[i][k],floors[j][q]);floors[i][k]=floor;floors[j][q]=floor;
-        }
-        for(var i=0;i<strokes.Count;i++)
-        {
-            var s=strokes[i];var floor=floors[i];
-            for(var k=1;k<floor.Length;k++)if(s.Mode[k]==0&&s.Mode[k-1]==0)
-                floor[k]=Math.Max(floor[k],floor[k-1]-ApproachGrade*(s.Station[k]-s.Station[k-1]));
-            for(var k=floor.Length-2;k>=0;k--)if(s.Mode[k]==0&&s.Mode[k+1]==0)
-                floor[k]=Math.Max(floor[k],floor[k+1]-ApproachGrade*(s.Station[k+1]-s.Station[k]));
-            for(var k=0;k<floor.Length;k++)tau[i][k]=Math.Max(tau[i][k],floor[k]);
+            var stroke = strokes[i];
+            var floor = floors[i];
+
+            for (var k = 1; k < floor.Length; k++)
+                if (stroke.Mode[k] == 0 && stroke.Mode[k - 1] == 0)
+                    floor[k] =
+                        Math.Max(floor[k], floor[k - 1] - ApproachGrade * (stroke.Station[k] - stroke.Station[k - 1]));
+
+            for (var k = floor.Length - 2; k >= 0; k--)
+                if (stroke.Mode[k] == 0 && stroke.Mode[k + 1] == 0)
+                    floor[k] =
+                        Math.Max(floor[k], floor[k + 1] - ApproachGrade * (stroke.Station[k + 1] - stroke.Station[k]));
+
+            for (var k = 0; k < floor.Length; k++)
+                tau[i][k] = Math.Max(tau[i][k], floor[k]);
+
             // A shared dry junction must retain the shallow approach floor
             // through emission. A bound based only on the maximum grade leaves
             // too little room for the emitted vertical curve at the wet edge.
-            s.WaterApproachFloor=floor;
+            stroke.WaterApproachFloor = floor;
         }
     }
+
     // Weight of a structure sample's target relative to open road (1), so a deck
     // keeps its planned line instead of sagging into the valley or humping.
-    private const double StructureWeight=10;
-    // Depth of a tunnel deck below the lowest ground across its width. The game
-    // draws a submitted tunnel as an open cut unless it lies deep enough: in the
-    // 21 October Marseille and DC readbacks every tunnel section under 10 m was
-    // drawn open, most at 10–12 m, and only 7 of 913 deeper than 12 m.
-    private const double TunnelDepth=13;
+    private const double StructureWeight = 10;
+    // Depth of a tunnel deck below the lowest ground across its width. The game draws
+    // a tunnel only with about 10.5 m of real ground at an edge's middle, whatever is
+    // submitted (NetworkDrawnStructures). 10 m left bores on that line and they drew as
+    // open cuts on 5 Nov; 13 m pulled approach roads 8 m down (E Street at 20th).
+    private const double TunnelDepth = 12;
     // Steepest descent of a rail tunnel from its portal (8% made sharp vertical
     // curves at the portals, three times the rail limit).
-    private const double RailTunnelDescent=.035;
+    private const double RailTunnelDescent = .035;
     // Metres inside a portal left to the game's open-cut portal, and the most a
     // portal is lowered so its bore reaches TunnelDepth beyond them. Track may
     // cut as deep as its cut/fill budget: a 75 m Marseille rail tunnel whose
     // portals stood on the ground (its targets no longer averaged with the low
     // ground over the bore) showed 1 m of roof over 65 m at 8 m.
-    private const double PortalOpen=40,PortalCut=8,RailPortalCut=12;
+    private const double PortalOpen = 40, PortalCut = 8, RailPortalCut = 12;
 
     // Bridges: a deck is level at its higher end when both ends are within 2 m,
     // otherwise the straight chord, and it rises as one piece to clear the
     // water under it. Tunnels keep cover below the actual ground, not just below
     // the chord between portals. An abrupt depth at the portal forced grades
     // steeper than the road allows.
-    private static void Structures(Stroke s,double[] tau,Func<double2,float> ground)
+    private static void Structures(Stroke stroke, double[] tau, Func<double2, float> ground)
     {
-        s.Constrained=new bool[s.Mode.Length];
-        for(var a=0;a<s.Mode.Length;)
+        stroke.Constrained = new bool[stroke.Mode.Length];
+
+        for (var a = 0; a < stroke.Mode.Length;)
         {
-            if(s.Mode[a]==0)
+            if (stroke.Mode[a] == 0)
             {
-                if(s.Kind==NetworkKind.Road&&a<s.Water.Length&&!float.IsNaN(s.Water[a]))tau[a]=Math.Max(tau[a],s.Water[a]+WaterLevels.RoadFreeboardMeters);
-                a++;continue;
+                if (stroke.Kind == NetworkKind.Road && a < stroke.Water.Length && !float.IsNaN(stroke.Water[a]))
+                    tau[a] = Math.Max(tau[a], stroke.Water[a] + WaterLevels.RoadFreeboardMeters);
+
+                a++;
+                continue;
             }
-            var b=a;while(b+1<s.Mode.Length&&s.Mode[b+1]==s.Mode[a])b++;
-            var lo=Math.Max(0,a-1);var hi=Math.Min(s.Mode.Length-1,b+1);
-            if(s.Mode[a]>0)
+
+            var b = a;
+
+            while (b + 1 < stroke.Mode.Length && stroke.Mode[b + 1] == stroke.Mode[a])
+                b++;
+
+            var low = Math.Max(0, a - 1);
+            var high = Math.Min(stroke.Mode.Length - 1, b + 1);
+
+            if (stroke.Mode[a] > 0)
             {
-                if(Math.Abs(tau[lo]-tau[hi])<=2){var level=(tau[lo]+tau[hi])/2;for(var k=a;k<=b;k++)tau[k]=level;}
-                var lift=0d;for(var k=a;k<=b;k++)if(k<s.Water.Length&&!float.IsNaN(s.Water[k]))lift=Math.Max(lift,s.Water[k]+WaterClearance-tau[k]);
-                if(lift>0)
+                if (Math.Abs(tau[low] - tau[high]) <= 2)
                 {
-                    for(var k=a;k<=b;k++){tau[k]+=lift;s.Constrained[k]=k<s.Water.Length&&!float.IsNaN(s.Water[k]);}
+                    var level = (tau[low] + tau[high]) / 2;
+
+                    for (var k = a; k <= b; k++)
+                        tau[k] = level;
+                }
+
+                var lift = 0d;
+
+                for (var k = a; k <= b; k++)
+                    if (k < stroke.Water.Length && !float.IsNaN(stroke.Water[k]))
+                        lift = Math.Max(lift, stroke.Water[k] + WaterClearance - tau[k]);
+
+                if (lift > 0)
+                {
+                    for (var k = a; k <= b; k++)
+                    {
+                        tau[k] += lift;
+                        stroke.Constrained[k] = k < stroke.Water.Length && !float.IsNaN(stroke.Water[k]);
+                    }
+
                     // The lift continues onto the land approach as a ramp at
                     // ApproachGrade, so the deck stays straight instead of bowing
                     // up from banks left at ground level (14th Street bridges).
-                    for(var side=-1;side<=1;side+=2)
+                    for (var side = -1; side <= 1; side += 2)
                     {
-                        var end=side<0?a:b;
-                        for(var k=end+side;k>=0&&k<s.Mode.Length&&s.Mode[k]==0;k+=side)
+                        var end = side < 0 ? a : b;
+
+                        for (var k = end + side; k >= 0 && k < stroke.Mode.Length && stroke.Mode[k] == 0; k += side)
                         {
-                            var raised=tau[end]-Approach(s)*Math.Abs(s.Station[k]-s.Station[end]);
-                            if(raised<=tau[k])break;tau[k]=raised;
+                            var raised =
+                                tau[end] - Approach(stroke) * Math.Abs(stroke.Station[k] - stroke.Station[end]);
+
+                            if (raised <= tau[k])
+                                break;
+
+                            tau[k] = raised;
                         }
                     }
                 }
@@ -828,13 +1812,24 @@ public static partial class VisualCompilerProfile
                 // edge stood 10 m below the centreline and the bore's side showed.
                 // Track descends no faster than RailTunnelDescent; its portals sit
                 // in a longer cutting instead.
-                var desired=new double[b-a+1];var descent=new double[b-a+1];
-                for(var k=a;k<=b;k++)
+                var desired = new double[b - a + 1];
+                var descent = new double[b - a + 1];
+
+                for (var k = a; k <= b; k++)
                 {
-                    var side=new double2(-s.Direction[k].y,s.Direction[k].x)*s.HalfWidth[k];
-                    desired[k-a]=Math.Min(ground(s.Point[k]),Math.Min(ground(s.Point[k]+side),ground(s.Point[k]-side)))-TunnelDepth;
-                    descent[k-a]=s.Kind==NetworkKind.Rail?Math.Min(s.Grade[k],RailTunnelDescent):s.Grade[k];
+                    var side = new double2(-stroke.Direction[k].y, stroke.Direction[k].x) * stroke.HalfWidth[k];
+                    desired[k - a] =
+                        Math.Min(
+                            ground(stroke.Point[k]),
+                            Math.Min(ground(stroke.Point[k] + side), ground(stroke.Point[k] - side)))
+                            - TunnelDepth;
+
+                    descent[k - a] =
+                        stroke.Kind == NetworkKind.Rail
+                            ? Math.Min(stroke.Grade[k], RailTunnelDescent)
+                            : stroke.Grade[k];
                 }
+
                 // A portal too high for its bore to reach TunnelDepth beyond the
                 // first PortalOpen metres (which the game draws open at every
                 // portal) is lowered by up to PortalCut, the approach descending
@@ -842,34 +1837,59 @@ public static partial class VisualCompilerProfile
                 // stood at the quay 66 m behind the southbound one, and its bore
                 // could not dive deep enough before the harbour: the tube showed
                 // under the water, stacked 11 m above the other carriageway.
-                foreach(var (portal,step) in new[]{(lo,-1),(hi,1)})
+                foreach (var (portal, step) in new[] { (low, -1), (high, 1) })
                 {
-                    if(s.Mode[portal]!=0)continue;
-                    var need=double.PositiveInfinity;
-                    for(var k=a;k<=b;k++)
+                    if (stroke.Mode[portal] != 0)
+                        continue;
+
+                    var need = double.PositiveInfinity;
+
+                    for (var k = a; k <= b; k++)
                     {
-                        var from=Math.Abs(s.Station[k]-s.Station[portal]);
-                        if(from>=PortalOpen)need=Math.Min(need,desired[k-a]+descent[k-a]*from);
+                        var from = Math.Abs(stroke.Station[k] - stroke.Station[portal]);
+
+                        if (from >= PortalOpen)
+                            need = Math.Min(need, desired[k - a] + descent[k - a] * from);
                     }
-                    if(!(need<tau[portal]))continue;
-                    var target=Math.Max(need,tau[portal]-(s.Kind==NetworkKind.Rail?RailPortalCut:PortalCut));
-                    for(var j=portal;j>=0&&j<s.Mode.Length&&s.Mode[j]==0;j+=step)
+
+                    if (!(need < tau[portal]))
+                        continue;
+
+                    var target =
+                        Math.Max(need, tau[portal] - (stroke.Kind == NetworkKind.Rail ? RailPortalCut : PortalCut));
+
+                    for (var j = portal; j >= 0 && j < stroke.Mode.Length && stroke.Mode[j] == 0; j += step)
                     {
-                        var v=target+.8*s.Grade[j]*Math.Abs(s.Station[portal]-s.Station[j]);
-                        if(v>=tau[j])break;tau[j]=v;
+                        var v = target + .8 * stroke.Grade[j] * Math.Abs(stroke.Station[portal] - stroke.Station[j]);
+
+                        if (v >= tau[j])
+                            break;
+
+                        tau[j] = v;
                     }
                 }
-                for(var k=a;k<=b;k++)
+
+                for (var k = a; k <= b; k++)
                 {
                     // As deep as the bore's own grade allows from both portals: the
                     // descent is out of sight, and every metre short of TunnelDepth is
                     // drawn as an open cut.
-                    var reachable=Math.Max(tau[lo]-descent[k-a]*(s.Station[k]-s.Station[lo]),tau[hi]-descent[k-a]*(s.Station[hi]-s.Station[k]));
-                    var covered=Math.Max(desired[k-a],reachable);
-                    if(covered<tau[k]){tau[k]=covered;s.Constrained[k]=true;}
+                    var reachable =
+                        Math.Max(
+                            tau[low] - descent[k - a] * (stroke.Station[k] - stroke.Station[low]),
+                            tau[high] - descent[k - a] * (stroke.Station[high] - stroke.Station[k]));
+
+                    var covered = Math.Max(desired[k - a], reachable);
+
+                    if (covered < tau[k])
+                    {
+                        tau[k] = covered;
+                        stroke.Constrained[k] = true;
+                    }
                 }
             }
-            a=b+1;
+
+            a = b + 1;
         }
     }
 
@@ -880,39 +1900,73 @@ public static partial class VisualCompilerProfile
     // beyond: lifting a whole river bridge for an overpass at its far end bowed
     // the 14th Street bridges 13 m up mid-river. Each tunnel sample gets a
     // ceiling at its covered target.
-    private const double LevelDeck=200;
-    private static void LiftDecks(Stroke s,double[] tau,List<(int Sample,double Height,bool Floor)> bounds)
+    private const double LevelDeck = 200;
+
+    private static void LiftDecks(Stroke stroke, double[] tau, List<(int Sample, double Height, bool Floor)> bounds)
     {
-        for(var a=0;a<s.Mode.Length;)
+        for (var a = 0; a < stroke.Mode.Length;)
         {
-            if(s.Mode[a]==0)
+            if (stroke.Mode[a] == 0)
             {
-                var floor=WaterFloor(s,a);if(!double.IsNegativeInfinity(floor))bounds.Add((a,floor,true));
-                a++;continue;
+                var floor = WaterFloor(stroke, a);
+
+                if (!double.IsNegativeInfinity(floor))
+                    bounds.Add((a, floor, true));
+
+                a++;
+                continue;
             }
-            var b=a;while(b+1<s.Mode.Length&&s.Mode[b+1]==s.Mode[a])b++;
-            if(s.Mode[a]>0)
+
+            var b = a;
+
+            while (b + 1 < stroke.Mode.Length && stroke.Mode[b + 1] == stroke.Mode[a])
+                b++;
+
+            if (stroke.Mode[a] > 0)
             {
-                if(s.Station[b]-s.Station[a]<=LevelDeck)
+                if (stroke.Station[b] - stroke.Station[a] <= LevelDeck)
                 {
-                    var lift=0d;foreach(var (k,height,floor) in bounds)if(floor&&k>=a&&k<=b)lift=Math.Max(lift,height-tau[k]);
-                    if(lift>0)for(var k=a;k<=b;k++)tau[k]+=lift;
+                    var lift = 0d;
+
+                    foreach (var (k, height, floor) in bounds)
+                        if (floor && k >= a && k <= b)
+                            lift = Math.Max(lift, height - tau[k]);
+
+                    if (lift > 0)
+                        for (var k = a; k <= b; k++)
+                            tau[k] += lift;
                 }
-                else if(WaterDeck(s,a,b))StraightDeck(s,tau,bounds,a,b);
-                else foreach(var (k,height,floor) in bounds.ToArray())
-                {
-                    if(!floor||k<a||k>b||height<=tau[k])continue;
-                    for(var side=-1;side<=1;side+=2)
-                        for(var m=k;m>=0&&m<s.Mode.Length&&s.Mode[m]>=0;m+=side)
-                        {
-                            var raised=height-Approach(s)*Math.Abs(s.Station[m]-s.Station[k]);
-                            if(raised<=tau[m])break;tau[m]=raised;
-                        }
-                }
-                for(var k=a;k<=b;k++)if(s.Constrained[k])bounds.Add((k,s.Water[k]+WaterClearance,true));
+                else if (WaterDeck(stroke, a, b))
+                    StraightDeck(stroke, tau, bounds, a, b);
+                else
+                    foreach (var (k, height, floor) in bounds.ToArray())
+                    {
+                        if (!floor || k < a || k > b || height <= tau[k])
+                            continue;
+
+                        for (var side = -1; side <= 1; side += 2)
+                            for (var m = k; m >= 0 && m < stroke.Mode.Length && stroke.Mode[m] >= 0; m += side)
+                            {
+                                var raised =
+                                    height - Approach(stroke) * Math.Abs(stroke.Station[m] - stroke.Station[k]);
+
+                                if (raised <= tau[m])
+                                    break;
+
+                                tau[m] = raised;
+                            }
+                    }
+
+                for (var k = a; k <= b; k++)
+                    if (stroke.Constrained[k])
+                        bounds.Add((k, stroke.Water[k] + WaterClearance, true));
             }
-            else for(var k=a;k<=b;k++)if(s.Constrained[k])bounds.Add((k,tau[k],false));
-            a=b+1;
+            else
+                for (var k = a; k <= b; k++)
+                    if (stroke.Constrained[k])
+                        bounds.Add((k, tau[k], false));
+
+            a = b + 1;
         }
     }
 
@@ -923,81 +1977,171 @@ public static partial class VisualCompilerProfile
     // any crossing floor above it (so an end rises at most twice the
     // shortfall); a raised end ramps onto the land at ApproachGrade. Land
     // viaducts keep following the terrain.
-    private const double WaterDeckLength=1500;
+    private const double WaterDeckLength = 1500;
     // Samples (Spacing apart) past a water deck's ends whose pins join its line.
-    private const int DeckReach=10;
+    private const int DeckReach = 10;
     // Curvature stiffness of a straight water deck, against 1 for open road.
-    private const double DeckStiffness=1e4;
+    private const double DeckStiffness = 1e4;
+
     // Maximal runs of bridge samples in a stroke. Joining runs across an island
     // (George Mason Bridge) was tried: it drew approach viaducts into one line
     // and bowed the 14th Street Express spans 4–5 m, so each run stands alone.
-    internal static IEnumerable<(int A,int B)> DeckRuns(Stroke s)
+    internal static IEnumerable<(int A, int B)> DeckRuns(Stroke stroke)
     {
-        for(var a=0;a<s.Mode.Length;)
+        for (var a = 0; a < stroke.Mode.Length;)
         {
-            if(s.Mode[a]<=0){a++;continue;}
-            var b=a;while(b+1<s.Mode.Length&&s.Mode[b+1]>0)b++;
-            yield return (a,b);a=b+1;
+            if (stroke.Mode[a] <= 0)
+            {
+                a++;
+                continue;
+            }
+
+            var b = a;
+
+            while (b + 1 < stroke.Mode.Length && stroke.Mode[b + 1] > 0)
+                b++;
+
+            yield return (a, b);
+            a = b + 1;
         }
     }
 
-    internal static bool WaterDeck(Stroke s,int a,int b)
+    internal static bool WaterDeck(Stroke stroke, int a, int b)
     {
-        if(s.Station[b]-s.Station[a]<=LevelDeck||s.Station[b]-s.Station[a]>WaterDeckLength)return false;
-        for(var k=a;k<=b&&k<s.Water.Length;k++)if(!float.IsNaN(s.Water[k]))return true;
+        if (stroke.Station[b] - stroke.Station[a] <= LevelDeck
+            || stroke.Station[b] - stroke.Station[a] > WaterDeckLength)
+            return false;
+
+        for (var k = a; k <= b && k < stroke.Water.Length; k++)
+            if (!float.IsNaN(stroke.Water[k]))
+                return true;
+
         return false;
     }
+
     // A long land deck with a crossing floor on it: pins fixed by the coupled
     // solve before the floor was lifted left a tent, a 6 m rise within 40 m
     // over the road beneath (I-395 by its south portal). Its pins and targets
     // move onto the taut string over its pins and floors (their upper concave
     // hull), a crest that clears every floor with the gentlest grades the end
     // pins allow. Land viaducts without a crossing keep following the terrain.
-    private static bool CrestDeck(Stroke s,double[] tau,List<(int K,int Var,double Station)> run,double[] h,HashSet<int> floors,int lo,int hi)
+    private static bool CrestDeck(
+        Stroke stroke,
+        double[] tau,
+        List<(int K, int Var, double Station)> run,
+        double[] h,
+        HashSet<int> floors,
+        int low,
+        int high)
     {
-        if(!run.Any(p=>floors.Contains(p.Var)))return false;
-        var hull=new List<(double S,double Y)>();
-        foreach(var p in run)
+        if (!run.Any(item => floors.Contains(item.Var)))
+            return false;
+
+        var hull = new List<(double S, double Y)>();
+
+        foreach (var item in run)
         {
-            var point=(S:p.Station,Y:h[p.Var]);
+            var point = (S: item.Station, Y: h[item.Var]);
+
             // Pop while the last two points and the new one turn upward (convex).
-            while(hull.Count>=2)
+            while (hull.Count >= 2)
             {
-                var (s1,y1)=hull[hull.Count-2];var (s2,y2)=hull[hull.Count-1];
-                if((s2-s1)*(point.Y-y1)-(y2-y1)*(point.S-s1)>=0)hull.RemoveAt(hull.Count-1);else break;
+                var (s1, y1) = hull[hull.Count - 2];
+                var (s2, y2) = hull[hull.Count - 1];
+
+                if ((s2 - s1) * (point.Y - y1) - (y2 - y1) * (point.S - s1) >= 0)
+                    hull.RemoveAt(hull.Count - 1);
+                else
+                    break;
             }
-            if(hull.Count>0&&point.S-hull[hull.Count-1].S<1e-6){if(point.Y>hull[hull.Count-1].Y)hull[hull.Count-1]=point;continue;}
+
+            if (hull.Count > 0 && point.S - hull[hull.Count - 1].S < 1e-6)
+            {
+                if (point.Y > hull[hull.Count - 1].Y)
+                    hull[hull.Count - 1] = point;
+
+                continue;
+            }
+
             hull.Add(point);
         }
+
         double At(double station)
         {
-            if(station<=hull[0].S)return hull[0].Y;if(station>=hull[hull.Count-1].S)return hull[hull.Count-1].Y;
-            var k=1;while(hull[k].S<station)k++;
-            return math.lerp(hull[k-1].Y,hull[k].Y,(station-hull[k-1].S)/Math.Max(1e-9,hull[k].S-hull[k-1].S));
+            if (station <= hull[0].S)
+                return hull[0].Y;
+
+            if (station >= hull[hull.Count - 1].S)
+                return hull[hull.Count - 1].Y;
+
+            var k = 1;
+
+            while (hull[k].S < station)
+                k++;
+
+            return math.lerp(
+                hull[k - 1].Y,
+                hull[k].Y,
+                (station - hull[k - 1].S) / Math.Max(1e-9, hull[k].S - hull[k - 1].S));
         }
-        foreach(var p in run)h[p.Var]=Math.Max(h[p.Var],At(p.Station));
-        for(var k=lo;k<=hi;k++)if(s.Station[k]>=run[0].Station&&s.Station[k]<=run[run.Count-1].Station)tau[k]=Math.Max(tau[k],At(s.Station[k]));
+
+        foreach (var item in run)
+            h[item.Var] = Math.Max(h[item.Var], At(item.Station));
+
+        for (var k = low; k <= high; k++)
+            if (stroke.Station[k] >= run[0].Station && stroke.Station[k] <= run[run.Count - 1].Station)
+                tau[k] = Math.Max(tau[k], At(stroke.Station[k]));
+
         return true;
     }
 
-    private static void StraightDeck(Stroke s,double[] tau,List<(int Sample,double Height,bool Floor)> bounds,int a,int b)
+    private static void StraightDeck(
+        Stroke stroke,
+        double[] tau,
+        List<(int Sample, double Height, bool Floor)> bounds,
+        int a,
+        int b)
     {
-        var lo=Math.Max(0,a-1);var hi=Math.Min(s.Mode.Length-1,b+1);var span=Math.Max(1e-9,s.Station[hi]-s.Station[lo]);
-        double W(int k)=>(s.Station[k]-s.Station[lo])/span;
-        var ya=tau[lo];var yb=tau[hi];
-        foreach(var (k,height,floor) in bounds)
+        var low = Math.Max(0, a - 1);
+        var high = Math.Min(stroke.Mode.Length - 1, b + 1);
+        var span = Math.Max(1e-9, stroke.Station[high] - stroke.Station[low]);
+
+        double Fraction(int k) => (stroke.Station[k] - stroke.Station[low]) / span;
+
+        var ya = tau[low];
+        var yb = tau[high];
+
+        foreach (var (k, height, floor) in bounds)
         {
-            if(!floor||k<a||k>b)continue;var w=W(k);if(height<=ya+(yb-ya)*w)continue;
-            if(w<.5)ya=height-(yb-height)*w/(1-w);else yb=ya+(height-ya)/w;
+            if (!floor || k < a || k > b)
+                continue;
+
+            var fraction = Fraction(k);
+
+            if (height <= ya + (yb - ya) * fraction)
+                continue;
+
+            if (fraction < .5)
+                ya = height - (yb - height) * fraction / (1 - fraction);
+            else
+                yb = ya + (height - ya) / fraction;
         }
-        for(var k=lo;k<=hi;k++)tau[k]=Math.Max(k==lo||k==hi?tau[k]:double.NegativeInfinity,ya+(yb-ya)*W(k));
-        for(var side=-1;side<=1;side+=2)
+
+        for (var k = low; k <= high; k++)
+            tau[k] = Math.Max(k == low || k == high ? tau[k] : double.NegativeInfinity, ya + (yb - ya) * Fraction(k));
+
+        for (var side = -1; side <= 1; side += 2)
         {
-            var end=side<0?lo:hi;
-            for(var k=end+side;k>=0&&k<s.Mode.Length&&s.Mode[k]==0;k+=side)
+            var end = side < 0 ? low : high;
+
+            for (var k = end + side; k >= 0 && k < stroke.Mode.Length && stroke.Mode[k] == 0; k += side)
             {
-                var raised=tau[end]-Approach(s)*Math.Abs(s.Station[k]-s.Station[end]);
-                if(raised<=tau[k])break;tau[k]=raised;
+                var raised = tau[end] - Approach(stroke) * Math.Abs(stroke.Station[k] - stroke.Station[end]);
+
+                if (raised <= tau[k])
+                    break;
+
+                tau[k] = raised;
             }
         }
     }
@@ -1008,20 +2152,48 @@ public static partial class VisualCompilerProfile
     // no such bound, and the curvature-stiff smoothing overshot between nearby
     // junction pins like a stiff beam (George Mason Bridge: 12 m above its own
     // targets mid-river).
-    private const double DeckCapMargin=2;
-    private static void CapDecks(Stroke s,double[] tau,List<(double Station,double Height)> pins,List<(int Sample,double Height,bool Floor)> bounds)
+    private const double DeckCapMargin = 2;
+
+    private static void CapDecks(
+        Stroke stroke,
+        double[] tau,
+        List<(double Station, double Height)> pins,
+        List<(int Sample, double Height, bool Floor)> bounds)
     {
-        var floors=bounds.Where(x=>x.Floor).ToArray();
-        for(var a=0;a<s.Mode.Length;)
+        var floors = bounds.Where(item => item.Floor).ToArray();
+
+        for (var a = 0; a < stroke.Mode.Length;)
         {
-            if(s.Mode[a]<=0){a++;continue;}
-            var b=a;while(b+1<s.Mode.Length&&s.Mode[b+1]>0)b++;
-            var lo=Math.Max(0,a-1);var hi=Math.Min(s.Mode.Length-1,b+1);
-            var cap=double.NegativeInfinity;for(var k=lo;k<=hi;k++)cap=Math.Max(cap,tau[k]);
-            foreach(var (station,height) in pins)if(station>=s.Station[lo]&&station<=s.Station[hi])cap=Math.Max(cap,height);
-            foreach(var (k,height,_) in floors)if(k>=lo&&k<=hi)cap=Math.Max(cap,height);
-            for(var k=a;k<=b;k++)bounds.Add((k,cap+DeckCapMargin,false));
-            a=b+1;
+            if (stroke.Mode[a] <= 0)
+            {
+                a++;
+                continue;
+            }
+
+            var b = a;
+
+            while (b + 1 < stroke.Mode.Length && stroke.Mode[b + 1] > 0)
+                b++;
+
+            var low = Math.Max(0, a - 1);
+            var high = Math.Min(stroke.Mode.Length - 1, b + 1);
+            var cap = double.NegativeInfinity;
+
+            for (var k = low; k <= high; k++)
+                cap = Math.Max(cap, tau[k]);
+
+            foreach (var (station, height) in pins)
+                if (station >= stroke.Station[low] && station <= stroke.Station[high])
+                    cap = Math.Max(cap, height);
+
+            foreach (var (k, height, _) in floors)
+                if (k >= low && k <= high)
+                    cap = Math.Max(cap, height);
+
+            for (var k = a; k <= b; k++)
+                bounds.Add((k, cap + DeckCapMargin, false));
+
+            a = b + 1;
         }
     }
 
@@ -1029,48 +2201,105 @@ public static partial class VisualCompilerProfile
     // whose footprints overlap: one crossing per stroke pair, at the closest pair.
     // A tunnel is over another only when both are tunnels on different layers
     // (stacked or braided bores); the lower one is then pushed down.
-    private const double LongOverlap=40;
-    private static IEnumerable<(int Over,int OverSample,int Under,int UnderSample,double Clearance)> Crossings(IReadOnlyList<Stroke> strokes,CancellationToken token)
+    private const double LongOverlap = 40;
+
+    private static IEnumerable<(int Over, int OverSample, int Under, int UnderSample, double Clearance)> Crossings(
+        IReadOnlyList<Stroke> strokes,
+        CancellationToken token)
     {
-        var grid=new Dictionary<(int,int),List<(int S,int K)>>();
-        (int,int) Cell(double2 p)=>((int)Math.Floor(p.x/32),(int)Math.Floor(p.y/32));
-        for(var i=0;i<strokes.Count;i++)for(var k=0;k<strokes[i].Point.Length;k++){var c=Cell(strokes[i].Point[k]);if(!grid.TryGetValue(c,out var l))grid[c]=l=new();l.Add((i,k));}
-        var hits=new Dictionary<(int,int),List<(double Distance,int A,int B)>>();
-        for(var i=0;i<strokes.Count;i++)
-        {
-            token.ThrowIfCancellationRequested();var s=strokes[i];
-            for(var k=0;k<s.Point.Length;k++)
+        var grid = new Dictionary<(int, int), List<(int S, int K)>>();
+
+        (int, int) Cell(double2 point) => ((int)Math.Floor(point.x / 32), (int)Math.Floor(point.y / 32));
+
+        for (var i = 0; i < strokes.Count; i++)
+            for (var k = 0; k < strokes[i].Point.Length; k++)
             {
-                var c=Cell(s.Point[k]);
-                for(var x=c.Item1-1;x<=c.Item1+1;x++)for(var z=c.Item2-1;z<=c.Item2+1;z++)if(grid.TryGetValue((x,z),out var list))
-                    foreach(var (j,q) in list)
-                    {
-                        var o=strokes[j];if(j==i)continue;
-                        var above=s.Mode[k]<0?o.Mode[q]<0&&s.Layer[k]>o.Layer[q]:s.Layer[k]>o.Layer[q]||o.Mode[q]<0&&s.Layer[k]>=o.Layer[q];if(!above)continue;
-                        var d=math.distance(s.Point[k],o.Point[q]);if(d>s.HalfWidth[k]+o.HalfWidth[q])continue;
-                        // Arms of one junction overlap near their shared node; not a crossing.
-                        if(s.Pins.Any(p=>Math.Abs(p.Station-s.Station[k])<80&&o.Pins.Any(r=>r.Node==p.Node)))continue;
-                        if(!hits.TryGetValue((i,j),out var list2))hits[(i,j)]=list2=new();list2.Add((d,k,q));
-                    }
+                var item = Cell(strokes[i].Point[k]);
+
+                if (!grid.TryGetValue(item, out var items))
+                    grid[item] = items = new();
+
+                items.Add((i, k));
+            }
+
+        var hits = new Dictionary<(int, int), List<(double Distance, int A, int B)>>();
+
+        for (var i = 0; i < strokes.Count; i++)
+        {
+            token.ThrowIfCancellationRequested();
+            var stroke = strokes[i];
+
+            for (var k = 0; k < stroke.Point.Length; k++)
+            {
+                var item = Cell(stroke.Point[k]);
+
+                for (var x = item.Item1 - 1; x <= item.Item1 + 1; x++)
+                    for (var z = item.Item2 - 1; z <= item.Item2 + 1; z++)
+                        if (grid.TryGetValue((x, z), out var list))
+                            foreach (var (j, q) in list)
+                            {
+                                var otherStroke = strokes[j];
+
+                                if (j == i)
+                                    continue;
+
+                                var above =
+                                    stroke.Mode[k] < 0
+                                        ? otherStroke.Mode[q] < 0 && stroke.Layer[k] > otherStroke.Layer[q]
+                                        : stroke.Layer[k] > otherStroke.Layer[q]
+                                            || otherStroke.Mode[q] < 0 && stroke.Layer[k] >= otherStroke.Layer[q];
+
+                                if (!above)
+                                    continue;
+
+                                var otherDistance = math.distance(stroke.Point[k], otherStroke.Point[q]);
+
+                                if (otherDistance > stroke.HalfWidth[k] + otherStroke.HalfWidth[q])
+                                    continue;
+
+                                // Arms of one junction overlap near their shared node; not a crossing.
+                                if (stroke.Pins.Any(
+                                    otherItem => Math.Abs(otherItem.Station - stroke.Station[k]) < 80
+                                        && otherStroke.Pins.Any(secondItem => secondItem.Node == otherItem.Node)))
+                                    continue;
+
+                                if (!hits.TryGetValue((i, j), out var list2))
+                                    hits[(i, j)] = list2 = new();
+
+                                list2.Add((otherDistance, k, q));
+                            }
             }
         }
+
         // Overlaps of one stroke pair more than 60 m apart along the upper stroke
         // are separate crossings; each is constrained at its closest sample pair.
         // A long overlap (one road running over the other, stacked bores) is
         // constrained every LongOverlap metres, not only at one point.
-        foreach(var pair in hits.OrderBy(p=>p.Key.Item1).ThenBy(p=>p.Key.Item2))
+        foreach (var pair in hits.OrderBy(entry => entry.Key.Item1).ThenBy(entry => entry.Key.Item2))
         {
-            var over=strokes[pair.Key.Item1];var group=new List<(double Distance,int A,int B)>();
-            foreach(var hit in pair.Value.OrderBy(h=>h.A).Append((0,int.MaxValue,0)))
+            var over = strokes[pair.Key.Item1];
+            var group = new List<(double Distance, int A, int B)>();
+
+            foreach (var hit in pair.Value.OrderBy(item => item.A).Append((0, int.MaxValue, 0)))
             {
-                if(group.Count>0&&(hit.A==int.MaxValue||over.Station[hit.A]-over.Station[group[group.Count-1].A]>60||
-                    over.Station[hit.A]-over.Station[group[0].A]>LongOverlap))
+                if (group.Count > 0
+                    && (hit.A == int.MaxValue || over.Station[hit.A] - over.Station[group[group.Count - 1].A] > 60
+                        || over.Station[hit.A] - over.Station[group[0].A] > LongOverlap))
                 {
-                    var best=group.OrderBy(h=>h.Distance).First();
+                    var best = group.OrderBy(item => item.Distance).First();
                     // Deck to deck: 5 m vehicle clearance (6 m over rail) plus about 1.5 m of structure.
-                    yield return (pair.Key.Item1,best.A,pair.Key.Item2,best.B,strokes[pair.Key.Item2].Kind==NetworkKind.Rail?7.5:6.5);group.Clear();
+                    yield return (
+                        pair.Key.Item1,
+                        best.A,
+                        pair.Key.Item2,
+                        best.B,
+                        strokes[pair.Key.Item2].Kind == NetworkKind.Rail ? 7.5 : 6.5);
+
+                    group.Clear();
                 }
-                if(hit.A!=int.MaxValue)group.Add(hit);
+
+                if (hit.A != int.MaxValue)
+                    group.Add(hit);
             }
         }
     }
@@ -1087,13 +2316,13 @@ public static partial class VisualCompilerProfile
     // third of DC's sharpest samples), and stiffness past 256 gained nothing.
     // Decoupled, 16384 cut grade-change issues 6–8% on all three maps for 1–4%
     // more paired-height and terrain issues; a pull cap of 1600 undid the gain.
-    private const double StiffnessCap=6.4e3,RailStiffnessCap=1e2,PullStiffnessCap=4e2,PinStiffnessCap=4e2;
-    private const int PinReach=3;
+    private const double StiffnessCap = 6.4e3, RailStiffnessCap = 1e2, PullStiffnessCap = 4e2, PinStiffnessCap = 4e2;
+    private const int PinReach = 3;
 
     // A pin missed by more than this (metres) moves to the height its stroke reached.
-    private const double ReconcileTolerance=.3;
+    private const double ReconcileTolerance = .3;
     // A second round settles arms the first round moved (DC: 130 → 89 arms over 0.3 m).
-    private const int ReconcileRounds=2;
+    private const int ReconcileRounds = 2;
     // A profile never swings above (or below) everything near it: each sample
     // stays within EnvelopeMargin of the highest (lowest) target, pin, crossing
     // floor (ceiling) within EnvelopeReach either side. Hills keep their shape,
@@ -1101,160 +2330,376 @@ public static partial class VisualCompilerProfile
     // curvature-stiffened smoothing can no longer swing like a beam: it lifted
     // I-395 by the Pentagon 30 m above its own terrain and bowed the George
     // Mason Bridge 12 m above its ends.
-    private const double EnvelopeReach=300,EnvelopeMargin=2;
-    private static (double[] Low,double[] High) Envelope(Stroke s,double[] tau,List<(double Station,double Height)> pins,List<(int Sample,double Height,bool Floor)> bounds)
+    private const double EnvelopeReach = 300, EnvelopeMargin = 2;
+
+    private static (double[] Low, double[] High) Envelope(
+        Stroke stroke,
+        double[] tau,
+        List<(double Station, double Height)> pins,
+        List<(int Sample, double Height, bool Floor)> bounds)
     {
-        var n=tau.Length;var high=(double[])tau.Clone();var low=(double[])tau.Clone();
-        foreach(var (station,height) in pins)
+        var length = tau.Length;
+        var high = (double[])tau.Clone();
+        var low = (double[])tau.Clone();
+
+        foreach (var (station, height) in pins)
         {
-            var (i,t)=Bracket(s,station);
-            foreach(var k in t>0?new[]{i,i+1}:new[]{i}){high[k]=Math.Max(high[k],height);low[k]=Math.Min(low[k],height);}
+            var (i, t) = Bracket(stroke, station);
+
+            foreach (var k in t > 0 ? new[] { i, i + 1 } : new[] { i })
+            {
+                high[k] = Math.Max(high[k], height);
+                low[k] = Math.Min(low[k], height);
+            }
         }
-        foreach(var (k,height,floor) in bounds)if(floor)high[k]=Math.Max(high[k],height);else low[k]=Math.Min(low[k],height);
-        var resultHigh=new double[n];var resultLow=new double[n];
-        for(int k=0,a=0,b=0;k<n;k++)
+
+        foreach (var (k, height, floor) in bounds)
+            if (floor)
+                high[k] = Math.Max(high[k], height);
+            else
+                low[k] = Math.Min(low[k], height);
+
+        var resultHigh = new double[length];
+        var resultLow = new double[length];
+
+        for (int k = 0, a = 0, b = 0; k < length; k++)
         {
-            while(s.Station[k]-s.Station[a]>EnvelopeReach)a++;
-            while(b+1<n&&s.Station[b+1]-s.Station[k]<=EnvelopeReach)b++;
-            var hi=double.NegativeInfinity;var lo=double.PositiveInfinity;
-            for(var j=a;j<=b;j++){hi=Math.Max(hi,high[j]);lo=Math.Min(lo,low[j]);}
-            resultHigh[k]=hi+EnvelopeMargin;resultLow[k]=lo-EnvelopeMargin;
+            while (stroke.Station[k] - stroke.Station[a] > EnvelopeReach)
+                a++;
+
+            while (b + 1 < length && stroke.Station[b + 1] - stroke.Station[k] <= EnvelopeReach)
+                b++;
+
+            var otherHigh = double.NegativeInfinity;
+            var otherLow = double.PositiveInfinity;
+
+            for (var j = a; j <= b; j++)
+            {
+                otherHigh = Math.Max(otherHigh, high[j]);
+                otherLow = Math.Min(otherLow, low[j]);
+            }
+
+            resultHigh[k] = otherHigh + EnvelopeMargin;
+            resultLow[k] = otherLow - EnvelopeMargin;
         }
-        return (resultLow,resultHigh);
-    }
-    // The sample interval holding a station: Station[I] ≤ station < Station[I+1]
-    // at fraction T, or T = 0 on a sample and at either end of the stroke.
-    private static (int I,double T) Bracket(Stroke s,double station)
-    {
-        var k=Array.BinarySearch(s.Station,station);if(k>=0)return (k,0);k=~k;
-        if(k<=0)return (0,0);if(k>=s.Station.Length)return (s.Station.Length-1,0);
-        return (k-1,(station-s.Station[k-1])/Math.Max(1e-9,s.Station[k]-s.Station[k-1]));
+
+        return (resultLow, resultHigh);
     }
 
-    private static double[] Smooth(Stroke s,double[] tau,double[]? pull,List<(double Station,double Height)> pins,
-        List<(int Sample,double Height,bool Floor)> bounds,double[] plateau,double[] stiff)
+    // The sample interval holding a station: Station[I] ≤ station < Station[I+1]
+    // at fraction T, or T = 0 on a sample and at either end of the stroke.
+    private static (int I, double T) Bracket(Stroke stroke, double station)
     {
-        var envelope=Envelope(s,tau,pins,bounds);
-        var boundWeight=new double[bounds.Count];
-        var n=s.Station.Length;if(n==1)return new[]{pins.Count>0?pins[0].Height:tau[0]};
+        var k = Array.BinarySearch(stroke.Station, station);
+
+        if (k >= 0)
+            return (k, 0);
+
+        k = ~k;
+
+        if (k <= 0)
+            return (0, 0);
+
+        if (k >= stroke.Station.Length)
+            return (stroke.Station.Length - 1, 0);
+
+        return (k - 1, (station - stroke.Station[k - 1]) / Math.Max(1e-9, stroke.Station[k] - stroke.Station[k - 1]));
+    }
+
+    private static double[] Smooth(
+        Stroke stroke,
+        double[] tau,
+        double[]? pull,
+        List<(double Station, double Height)> pins,
+        List<(int Sample, double Height, bool Floor)> bounds, double[] plateau, double[] stiff)
+    {
+        var envelope = Envelope(stroke, tau, pins, bounds);
+        var boundWeight = new double[bounds.Count];
+        var length = stroke.Station.Length;
+
+        if (length == 1)
+            return new[] { pins.Count > 0 ? pins[0].Height : tau[0] };
+
         // Every sample stays inside its local envelope (Envelope), enforced like
         // a bound on each sample.
-        var bandWeight=new double[n];var bandTarget=new double[n];
-        var h=Spacing;var alpha=Math.Pow(s.Class.Wavelength/(2*Math.PI),4)/Math.Pow(h,4);
-        var limit=GradeLimits(s,plateau);
-        var penalty=new double[n-1];var target=new double[n-1];double[] y=tau;
+        var bandWeight = new double[length];
+        var bandTarget = new double[length];
+        var h = Spacing;
+        var alpha = Math.Pow(stroke.Class.Wavelength / (2 * Math.PI), 4) / Math.Pow(h, 4);
+        var limit = GradeLimits(stroke, plateau);
+        var penalty = new double[length - 1];
+        var target = new double[length - 1];
+        double[] y = tau;
         // Where a vertical curve is sharper than the class K allows, the local
         // stiffness rises fourfold per round, up to StiffnessCap, so a forced hump
         // widens only where it must. A grade change of 1% per K metres is a second difference of
         // 0.01·h²/K over samples h apart. The caller's stiffness array is updated
         // in place.
-        var bend=.01*h*h/s.Class.K;var cap=s.Kind==NetworkKind.Rail?RailStiffnessCap:StiffnessCap;
+        var bend = .01 * h * h / stroke.Class.K;
+        var cap = stroke.Kind == NetworkKind.Rail ? RailStiffnessCap : StiffnessCap;
         // Beside a pin the stiffness stops at PinStiffnessCap: stiffer, it
         // outweighed the pin, and a ramp met its node 1.6 m off (JunctionBesideBridge);
         // pins made heavy enough to hold instead forced the bends back (DC +45%).
-        var localCap=Enumerable.Repeat(cap,n).ToArray();
-        foreach(var (station,_) in pins){var (i,_)=Bracket(s,station);for(var k=Math.Max(0,i-PinReach);k<=Math.Min(n-1,i+1+PinReach);k++)localCap[k]=Math.Min(localCap[k],PinStiffnessCap);}
-        for(var round=0;round<8;round++)
+        var localCap = Enumerable.Repeat(cap, length).ToArray();
+
+        foreach (var (station, _) in pins)
         {
-            var d0=new double[n];var d1=new double[n];var d2=new double[n];var r=new double[n];
+            var (i, _) = Bracket(stroke, station);
+
+            for (var k = Math.Max(0, i - PinReach); k <= Math.Min(length - 1, i + 1 + PinReach); k++)
+                localCap[k] = Math.Min(localCap[k], PinStiffnessCap);
+        }
+
+        for (var round = 0; round < 8; round++)
+        {
+            var d0 = new double[length];
+            var d1 = new double[length];
+            var d2 = new double[length];
+            var r = new double[length];
+
             // The pull to the pair's mean profile scales with the local stiffness,
             // so a stiffened hump still follows the mean instead of its own pins.
             // Weight 1000 cut paired-height failing length 10–14% against 500 with
             // neutral totals; 2000 cut it further but added grade-change issues.
             // A straight water deck's own stiffness (DeckStiffness) would make the
             // pull outweigh its pins, so the pull stops at PullStiffnessCap.
-            for(var k=0;k<n;k++){var weight=s.Mode[k]!=0?StructureWeight:1;d0[k]+=weight;r[k]+=weight*tau[k];if(pull!=null&&!double.IsNaN(pull[k])){var w=1000*Math.Min(stiff[k],PullStiffnessCap);d0[k]+=w;r[k]+=w*pull[k];}}
+            for (var k = 0; k < length; k++)
+            {
+                var weight = stroke.Mode[k] != 0 ? StructureWeight : 1;
+                d0[k] += weight;
+                r[k] += weight * tau[k];
+
+                if (pull != null && !double.IsNaN(pull[k]))
+                {
+                    var w = 1000 * Math.Min(stiff[k], PullStiffnessCap);
+                    d0[k] += w;
+                    r[k] += w * pull[k];
+                }
+            }
+
             // A pin holds the profile at its own station, where HeightAt reads the
             // emitted node: w(a·y[i] + b·y[i+1] − H)², a = 1 − t, b = t, couples only
             // neighbouring samples, so the system stays pentadiagonal. Rounded to the
             // next sample, it left arms up to 10 m off the node at another height.
-            foreach(var (station,value) in pins)
+            foreach (var (station, value) in pins)
             {
                 // Rail curvature stiffness can outweigh the old pin weight.
                 // Its shared junction must remain at
                 // the coupled height; otherwise the neighbouring rail arm gets
                 // an artificial grade when both are emitted at one node.
-                var w=s.Kind==NetworkKind.Rail?1e8:1e6;var (i,t)=Bracket(s,station);
-                if(t<=0){d0[i]+=w;r[i]+=w*value;continue;}
-                var a=1-t;d0[i]+=w*a*a;d0[i+1]+=w*t*t;d1[i]+=w*a*t;r[i]+=w*a*value;r[i+1]+=w*t*value;
+                var w = stroke.Kind == NetworkKind.Rail ? 1e8 : 1e6;
+                var (i, t) = Bracket(stroke, station);
+
+                if (t <= 0)
+                {
+                    d0[i] += w;
+                    r[i] += w * value;
+                    continue;
+                }
+
+                var a = 1 - t;
+                d0[i] += w * a * a;
+                d0[i + 1] += w * t * t;
+                d1[i] += w * a * t;
+                r[i] += w * a * value;
+                r[i + 1] += w * t * value;
             }
-            for(var b=0;b<bounds.Count;b++)if(boundWeight[b]>0){d0[bounds[b].Sample]+=boundWeight[b];r[bounds[b].Sample]+=boundWeight[b]*bounds[b].Height;}
-            for(var k=0;k<n;k++)if(bandWeight[k]>0){d0[k]+=bandWeight[k];r[k]+=bandWeight[k]*bandTarget[k];}
-            for(var k=1;k<n-1;k++)
+
+            for (var b = 0; b < bounds.Count; b++)
+                if (boundWeight[b] > 0)
+                {
+                    d0[bounds[b].Sample] += boundWeight[b];
+                    r[bounds[b].Sample] += boundWeight[b] * bounds[b].Height;
+                }
+
+            for (var k = 0; k < length; k++)
+                if (bandWeight[k] > 0)
+                {
+                    d0[k] += bandWeight[k];
+                    r[k] += bandWeight[k] * bandTarget[k];
+                }
+
+            for (var k = 1; k < length - 1; k++)
             {
                 // α(y[k-1] − 2y[k] + y[k+1])² contributes the stencil (1,−2,1)ᵀ(1,−2,1).
-                var a=alpha*stiff[k];
-                d0[k-1]+=a;d0[k]+=4*a;d0[k+1]+=a;d1[k-1]+=-2*a;d1[k]+=-2*a;d2[k-1]+=a;
+                var a = alpha * stiff[k];
+                d0[k - 1] += a;
+                d0[k] += 4 * a;
+                d0[k + 1] += a;
+                d1[k - 1] += -2 * a;
+                d1[k] += -2 * a;
+                d2[k - 1] += a;
             }
-            for(var k=0;k<n-1;k++)if(penalty[k]>0)
+
+            for (var k = 0; k < length - 1; k++)
+                if (penalty[k] > 0)
+                {
+                    // μ(y[k+1] − y[k] − t)²
+                    var mu = penalty[k];
+                    d0[k] += mu;
+                    d0[k + 1] += mu;
+                    d1[k] += -mu;
+                    r[k] -= mu * target[k];
+                    r[k + 1] += mu * target[k];
+                }
+
+            y = Pentadiagonal(d0, d1, d2, r);
+            var violated = false;
+
+            for (var k = 0; k < length - 1; k++)
             {
-                // μ(y[k+1] − y[k] − t)²
-                var mu=penalty[k];d0[k]+=mu;d0[k+1]+=mu;d1[k]+=-mu;r[k]-=mu*target[k];r[k+1]+=mu*target[k];
+                var step = stroke.Station[k + 1] - stroke.Station[k];
+                var rise = y[k + 1] - y[k];
+                var allowed = limit[k] * step;
+
+                if (Math.Abs(rise) > allowed + 1e-3)
+                {
+                    penalty[k] = penalty[k] == 0 ? 100 * alpha : penalty[k] * 10;
+                    target[k] = Math.Sign(rise) * allowed;
+                    violated = true;
+                }
             }
-            y=Pentadiagonal(d0,d1,d2,r);
-            var violated=false;
-            for(var k=0;k<n-1;k++)
+
+            for (var b = 0; b < bounds.Count; b++)
             {
-                var step=s.Station[k+1]-s.Station[k];var rise=y[k+1]-y[k];var allowed=limit[k]*step;
-                if(Math.Abs(rise)>allowed+1e-3){penalty[k]=penalty[k]==0?100*alpha:penalty[k]*10;target[k]=Math.Sign(rise)*allowed;violated=true;}
+                var (k, height, floor) = bounds[b];
+
+                if (floor ? y[k] < height - .05 : y[k] > height + .05)
+                {
+                    boundWeight[b] = boundWeight[b] == 0 ? 10 * (1 + alpha) : boundWeight[b] * 10;
+                    violated = true;
+                }
             }
-            for(var b=0;b<bounds.Count;b++)
+
+            for (var k = 0; k < length; k++)
             {
-                var (k,height,floor)=bounds[b];
-                if(floor?y[k]<height-.05:y[k]>height+.05){boundWeight[b]=boundWeight[b]==0?10*(1+alpha):boundWeight[b]*10;violated=true;}
+                var edge =
+                    y[k] > envelope.High[k] + .05
+                        ? envelope.High[k]
+                        : y[k] < envelope.Low[k] - .05 ? envelope.Low[k] : double.NaN;
+
+                if (double.IsNaN(edge))
+                    continue;
+
+                bandTarget[k] = edge;
+                bandWeight[k] = bandWeight[k] == 0 ? 10 * (1 + alpha) : bandWeight[k] * 10;
+                violated = true;
             }
-            for(var k=0;k<n;k++)
-            {
-                var edge=y[k]>envelope.High[k]+.05?envelope.High[k]:y[k]<envelope.Low[k]-.05?envelope.Low[k]:double.NaN;
-                if(double.IsNaN(edge))continue;
-                bandTarget[k]=edge;bandWeight[k]=bandWeight[k]==0?10*(1+alpha):bandWeight[k]*10;violated=true;
-            }
-            var raised=(double[])stiff.Clone();
-            for(var k=1;k<n-1;k++)
-                if(Math.Abs(y[k-1]-2*y[k]+y[k+1])>(s.Mode[k-1]<0&&s.Mode[k]<0&&s.Mode[k+1]<0?bend/VisualCompilerTable.TunnelKShare:bend)&&stiff[k]<localCap[k]){for(var j=Math.Max(1,k-2);j<=Math.Min(n-2,k+2);j++)raised[j]=Math.Max(raised[j],stiff[k]*4);violated=true;}
-            Array.Copy(raised,stiff,n);
-            if(!violated)break;
+
+            var raised = (double[])stiff.Clone();
+
+            for (var k = 1; k < length - 1; k++)
+                if (Math.Abs(y[k - 1] - 2 * y[k] + y[k + 1])
+                    > (stroke.Mode[k - 1] < 0 && stroke.Mode[k] < 0 && stroke.Mode[k + 1] < 0
+                        ? bend / VisualCompilerTable.TunnelKShare
+                        : bend)
+                    && stiff[k] < localCap[k])
+                {
+                    for (var j = Math.Max(1, k - 2); j <= Math.Min(length - 2, k + 2); j++)
+                        raised[j] = Math.Max(raised[j], stiff[k] * 4);
+
+                    violated = true;
+                }
+
+            Array.Copy(raised, stiff, length);
+
+            if (!violated)
+                break;
         }
+
         return y;
     }
 
     // Largest grade allowed over each sample interval.
-    private static double[] GradeLimits(Stroke s,double[] plateau)
+    private static double[] GradeLimits(Stroke stroke, double[] plateau)
     {
-        var n=s.Station.Length;var limit=new double[Math.Max(0,n-1)];
+        var length = stroke.Station.Length;
+        var limit = new double[Math.Max(0, length - 1)];
         // Water approaches retain their full existing grade allowance so the
         // smoothing target can reach the accepted deck/shore clearance.
-        var waterApproach=s.Kind==NetworkKind.Road&&s.Water.Any(v=>!float.IsNaN(v));
-        for(var k=0;k<n-1;k++)
+        var waterApproach = stroke.Kind == NetworkKind.Road && stroke.Water.Any(v => !float.IsNaN(v));
+
+        for (var k = 0; k < length - 1; k++)
         {
             // Match the coupled grade's 15% headroom: cubic emission
             // interpolates between samples and can be steeper than their chord.
-            var mid=(s.Station[k]+s.Station[k+1])/2;limit[k]=s.Grade[k]*(waterApproach?1:GradeShare);
-            if(plateau.Any(p=>Math.Abs(p-mid)<=s.Class.PlateauLength))limit[k]=Math.Min(limit[k],s.Class.PlateauGrade);
-            if(s.LevelCrossings.Any(p=>Math.Abs(p.Station-mid)<=p.Reach))limit[k]=Math.Min(limit[k],.001);
+            var middle = (stroke.Station[k] + stroke.Station[k + 1]) / 2;
+            limit[k] = stroke.Grade[k] * (waterApproach ? 1 : GradeShare);
+
+            if (plateau.Any(p => Math.Abs(p - middle) <= stroke.Class.PlateauLength))
+                limit[k] = Math.Min(limit[k], stroke.Class.PlateauGrade);
+
+            if (stroke.LevelCrossings.Any(item => Math.Abs(item.Station - middle) <= item.Reach))
+                limit[k] = Math.Min(limit[k], .001);
         }
+
         return limit;
     }
 
     // Solves A·x = r for symmetric positive-definite pentadiagonal A with main
     // diagonal d0 and super-diagonals d1, d2, by banded LDLᵀ in O(n).
-    private static double[] Pentadiagonal(double[] d0,double[] d1,double[] d2,double[] r)
+    private static double[] Pentadiagonal(double[] d0, double[] d1, double[] d2, double[] r)
     {
-        var n=d0.Length;var d=new double[n];var l1=new double[n];var l2=new double[n];
-        for(var i=0;i<n;i++)
+        var length = d0.Length;
+        var d = new double[length];
+        var l1 = new double[length];
+        var l2 = new double[length];
+
+        for (var i = 0; i < length; i++)
         {
-            var a=d0[i];
-            if(i>=1)a-=l1[i-1]*l1[i-1]*d[i-1];
-            if(i>=2)a-=l2[i-2]*l2[i-2]*d[i-2];
-            d[i]=a;
-            if(i+1<n){var b=d1[i];if(i>=1)b-=l1[i-1]*l2[i-1]*d[i-1];l1[i]=b/d[i];}
-            if(i+2<n)l2[i]=d2[i]/d[i];
+            var a = d0[i];
+
+            if (i >= 1)
+                a -= l1[i - 1] * l1[i - 1] * d[i - 1];
+
+            if (i >= 2)
+                a -= l2[i - 2] * l2[i - 2] * d[i - 2];
+
+            d[i] = a;
+
+            if (i + 1 < length)
+            {
+                var b = d1[i];
+
+                if (i >= 1)
+                    b -= l1[i - 1] * l2[i - 1] * d[i - 1];
+
+                l1[i] = b / d[i];
+            }
+
+            if (i + 2 < length)
+                l2[i] = d2[i] / d[i];
         }
-        var z=new double[n];
-        for(var i=0;i<n;i++){z[i]=r[i];if(i>=1)z[i]-=l1[i-1]*z[i-1];if(i>=2)z[i]-=l2[i-2]*z[i-2];}
-        for(var i=0;i<n;i++)z[i]/=d[i];
-        var x=new double[n];
-        for(var i=n-1;i>=0;i--){x[i]=z[i];if(i+1<n)x[i]-=l1[i]*x[i+1];if(i+2<n)x[i]-=l2[i]*x[i+2];}
+
+        var z = new double[length];
+
+        for (var i = 0; i < length; i++)
+        {
+            z[i] = r[i];
+
+            if (i >= 1)
+                z[i] -= l1[i - 1] * z[i - 1];
+
+            if (i >= 2)
+                z[i] -= l2[i - 2] * z[i - 2];
+        }
+
+        for (var i = 0; i < length; i++)
+            z[i] /= d[i];
+
+        var x = new double[length];
+
+        for (var i = length - 1; i >= 0; i--)
+        {
+            x[i] = z[i];
+
+            if (i + 1 < length)
+                x[i] -= l1[i] * x[i + 1];
+
+            if (i + 2 < length)
+                x[i] -= l2[i] * x[i + 2];
+        }
+
         return x;
     }
 }

@@ -5,31 +5,91 @@ using Unity.Mathematics;
 
 static partial class VisualMetricsReplay
 {
-    public static void RailCrossings(string folder,string output)
+    public static void RailCrossings(string folder, string output)
     {
-        var c=Load(folder);var log=new ImportLog();
-        var expected=NativeEndpointPolicy.LevelCrossings(c.Source);
-        var compiled=VisualNetworkCompiler.Prepare(c.Source,c.Terrain,c.Scale,c.Width,log,default,c.Water);
-        var sections=NativeEndpointPolicy.PrepareLevelCrossings(compiled,log);
-        var actual=NativeEndpointPolicy.LevelCrossings(sections);
-        var rows=sections.SelectMany(s=>new[]{(Section:s,Node:s.StartNodeId,Point:s.CourseStart),(Section:s,Node:s.EndNodeId,Point:s.CourseEnd)})
-            .Where(p=>expected.Contains(p.Node)).GroupBy(p=>p.Node).Select(g=>
+        var otherCapture = Load(folder);
+        var log = new ImportLog();
+        var expected = NativeEndpointPolicy.LevelCrossings(otherCapture.Source);
+        var compiled =
+            VisualNetworkCompiler.Prepare(
+                otherCapture.Source,
+                otherCapture.Terrain,
+                otherCapture.Width,
+                log,
+                default,
+                otherCapture.Water);
+
+        var sections = NativeEndpointPolicy.PrepareLevelCrossings(compiled, log);
+        var actual = NativeEndpointPolicy.LevelCrossings(sections);
+        var rows =
+            sections
+                .SelectMany(
+                    segment => new[] {
+                        (Section: segment, Node: segment.StartNodeId, Point: segment.CourseStart),
+                        (Section: segment, Node: segment.EndNodeId, Point: segment.CourseEnd)
+                        })
+            .Where(item => expected.Contains(item.Node)).GroupBy(item => item.Node).Select(group =>
             {
-                var ports=g.ToArray();var road=ports.Where(p=>p.Section.Kind==NetworkKind.Road).ToArray();var rail=ports.Where(p=>p.Section.Kind==NetworkKind.Rail).ToArray();
-                var horizontal=road.Length==0||rail.Length==0?double.PositiveInfinity:road.Max(a=>rail.Max(b=>(double)math.distance(a.Point.xz,b.Point.xz)));
-                var vertical=road.Length==0||rail.Length==0?double.PositiveInfinity:road.Max(a=>rail.Max(b=>(double)Math.Abs(a.Point.y-b.Point.y)));
-                var grades=ports.Select(p=>
+                var ports = group.ToArray();
+                var road = ports.Where(item => item.Section.Kind == NetworkKind.Road).ToArray();
+                var rail = ports.Where(item => item.Section.Kind == NetworkKind.Rail).ToArray();
+                var horizontal =
+                    road.Length == 0 || rail.Length == 0
+                        ? double.PositiveInfinity
+                        : road.Max(
+                            firstItem => rail.Max(
+                                secondItem => (double)math.distance(firstItem.Point.xz, secondItem.Point.xz)));
+
+                var vertical =
+                    road.Length == 0 || rail.Length == 0
+                        ? double.PositiveInfinity
+                        : road.Max(
+                            firstItem => rail.Max(
+                                secondItem => (double)Math.Abs(firstItem.Point.y - secondItem.Point.y)));
+
+                var grades = ports.Select(item =>
                 {
-                    var s=p.Section;var d=p.Node==s.StartNodeId?s.CourseControl1-s.CourseStart:s.CourseEnd-s.CourseControl2;
-                    return Math.Abs(d.y)/Math.Max(.001,math.length(d.xz));
+                    var segment = item.Section;
+                    var d =
+                        item.Node == segment.StartNodeId
+                            ? segment.CourseControl1 - segment.CourseStart
+                            : segment.CourseEnd - segment.CourseControl2;
+
+                    return Math.Abs(d.y) / Math.Max(.001, math.length(d.xz));
                 }).ToArray();
-                return new{node=g.Key,roadPorts=road.Length,railPorts=rail.Length,horizontalGap=horizontal,verticalGap=vertical,
-                    maxEntryGrade=grades.Max(),sharedNativeOwner=ports.Select(p=>NativeEndpointPolicy.Identity(p.Section,p.Node)).Distinct().Count()==1,
-                    structures=ports.Count(p=>NetworkStructure.IsStructure(p.Section))};
+
+                return new
+                {
+                    node = group.Key,
+                    roadPorts = road.Length,
+                    railPorts = rail.Length,
+                    horizontalGap = horizontal,
+                    verticalGap = vertical,
+                    maxEntryGrade = grades.Max(),
+                    sharedNativeOwner = ports
+                        .Select(item => NativeEndpointPolicy.Identity(item.Section, item.Node))
+                        .Distinct()
+                        .Count()
+                        == 1,
+                    structures = ports.Count(item => NetworkStructure.IsStructure(item.Section))
+                };
             }).ToArray();
-        File.WriteAllText(output,JsonConvert.SerializeObject(new{capture=Path.GetFileName(folder),sourceCrossings=expected.Count,finalCrossings=actual.Count,
-            missingNodes=expected.Where(n=>!rows.Any(r=>r.node==n)).ToArray(),rows,
-            metrics=log.Lines.Where(l=>l.Contains("crossing",StringComparison.OrdinalIgnoreCase)||l.Contains("junction height mismatch",StringComparison.Ordinal)).ToArray()},Formatting.Indented));
-        Console.WriteLine($"Rail crossings: source={expected.Count}; final={actual.Count}; exactSharedNativeOwners={rows.Count(r=>r.sharedNativeOwner)}; report={output}");
+
+        File.WriteAllText(output, JsonConvert.SerializeObject(new
+        {
+            capture = Path.GetFileName(folder),
+            sourceCrossings = expected.Count,
+            finalCrossings = actual.Count,
+            missingNodes = expected.Where(nodeId => !rows.Any(r => r.node == nodeId)).ToArray(),
+            rows,
+            metrics = log.Lines
+                .Where(
+                    text => text.Contains("crossing", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("junction height mismatch", StringComparison.Ordinal))
+                .ToArray()
+        }, Formatting.Indented));
+
+        Console.WriteLine(
+            $"Rail crossings: source={expected.Count}; final={actual.Count}; exactSharedNativeOwners={rows.Count(r => r.sharedNativeOwner)}; report={output}");
     }
 }

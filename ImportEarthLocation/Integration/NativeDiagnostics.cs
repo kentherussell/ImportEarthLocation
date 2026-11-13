@@ -4,7 +4,6 @@ using System.Linq;
 using System.Security.Cryptography;
 using Game;
 using Game.Common;
-using Game.Objects;
 using Game.Prefabs;
 using Game.Prefabs.Climate;
 using Game.Rendering;
@@ -38,7 +37,15 @@ public static class NativeDiagnostics
     private static readonly System.Collections.Generic.List<float3> WaterSourcePositions = new();
     private static readonly System.Collections.Generic.List<RiverSourcePlan> WaterPlans = new();
     private static readonly System.Collections.Generic.List<RiverSourcePlan> PlannedWater = new();
-    private static readonly System.Collections.Generic.Dictionary<long,(int wet,int total,int flooded,float level)> WaterObservations = new();
+
+    private static readonly System.Collections.Generic.Dictionary<long, (int wet, int total, int flooded, float level)> WaterObservations =
+        new();
+
+    private static readonly System.Collections.Generic.HashSet<int> WaterSettledChunks = new();
+
+    private static System.Collections.Generic.IReadOnlyList<WaterReachStage> RiverReaches =
+        Array.Empty<WaterReachStage>();
+
     private static DateTime _waterStarted, _waterDue;
     private static long _waterMap, _waterGeneration;
     private static int _waterChecks;
@@ -47,404 +54,1241 @@ public static class NativeDiagnostics
     private static string? _expectedLocalSurface, _expectedWorldSurface;
     private static int _airPendingInitialization;
     private static System.Collections.Generic.IEnumerator<int>? _work;
-    private static int _lastWorkFrame=-1;
+    private static int _lastWorkFrame = -1;
     private static ImportLog? _workLog;
-    private static long _workMap,_workGeneration;
+    private static long _workMap, _workGeneration;
     private static bool _enabled;
     private static ImportLog? _sessionLog;
-    private static string Root => Path.Combine(Application.persistentDataPath,"ModsData",Mod.Id,"diagnostics");
+
+    private static string Root => Path.Combine(Application.persistentDataPath, "ModsData", Mod.Id, "diagnostics");
+
+    // True while a snapshot, a water check or a readback slice is still queued for this map.
+    public static bool Busy => _work != null || _waterLog != null || _phase != null;
 
     public static void ResetMap()
     {
-        _work?.Dispose();_work=null;_workLog=null;_phase=null;_log=null;_waterLog=null;
-        _expectedAir=new JArray();_expectedWater=new JArray();
-        WaterProbes.Clear();WaterSourcePositions.Clear();WaterPlans.Clear();PlannedWater.Clear();WaterObservations.Clear();
-        _expectedClimate=_expectedLocalSurface=_expectedWorldSurface=null;
-        _run="";_enabled=false;_airPendingInitialization=0;_waterChecks=0;
-        _sessionLog=null;
-        _map=_generation=_waterMap=_waterGeneration=_workMap=_workGeneration=0;
-        SurfaceApplied=AirApplied=ClimateApplied=WaterApplied=false;
-        NativeNetworkDiagnostics.Clear();NativeSeaBridge.Clear();
+        _work?.Dispose();
+        _work = null;
+        _workLog = null;
+        _phase = null;
+        _log = null;
+        _waterLog = null;
+        _expectedAir = new JArray();
+        _expectedWater = new JArray();
+        WaterProbes.Clear();
+        WaterSourcePositions.Clear();
+        WaterPlans.Clear();
+        PlannedWater.Clear();
+        WaterObservations.Clear();
+        WaterSettledChunks.Clear();
+        _expectedClimate = _expectedLocalSurface = _expectedWorldSurface = null;
+        _run = "";
+        _enabled = false;
+        _airPendingInitialization = 0;
+        _waterChecks = 0;
+        _sessionLog = null;
+        _map = _generation = _waterMap = _waterGeneration = _workMap = _workGeneration = 0;
+        SurfaceApplied = AirApplied = ClimateApplied = WaterApplied = false;
+        NativeNetworkDiagnostics.Clear();
+        NativeSeaBridge.Clear();
     }
 
     public static void Begin(PreparedImport prepared, ImportLog log)
     {
-        _work?.Dispose();_work=null;_workLog=null;_phase=null;
+        _work?.Dispose();
+        _work = null;
+        _workLog = null;
+        _phase = null;
+
         // Sea definitions are applied before this finish-phase Begin. Preserve
         // their expected endpoints for enabled readback; clear only absent sea work.
-        if(!prepared.Request.CreateSeaConnections)NativeSeaBridge.Clear();
-        _waterLog=null;
-        _enabled=log.DiagnosticsEnabled;
-        _sessionLog=_enabled?log:null;
-        SurfaceApplied=AirApplied=ClimateApplied=WaterApplied=false;
-        _expectedWater=new JArray(); WaterProbes.Clear();WaterSourcePositions.Clear();WaterPlans.Clear();PlannedWater.Clear();WaterObservations.Clear();
-        if(_enabled&&prepared.Water!=null)PlannedWater.AddRange(prepared.Water.Sources);
-        foreach(var plan in PlannedWater)WaterProbes.AddRange(plan.ChannelProbes.Count>0?plan.ChannelProbes:new[]{plan.DownstreamProbe});
-        _waterLog=null; _waterChecks=0;
-        _expectedAir=new JArray();_expectedClimate=_expectedLocalSurface=_expectedWorldSurface=null;
-        _run=Guid.NewGuid().ToString("N");
-        log.Diagnostic($"RUN id={_run}; modBuildMvid={typeof(NativeDiagnostics).Assembly.ManifestModule.ModuleVersionId}; gameAssemblyVersion={typeof(TerrainSystem).Assembly.GetName().Version}; mapSession={prepared.Request.MapSessionId}; generation={prepared.Request.Generation}; latitude={prepared.Request.Latitude:R}; longitude={prepared.Request.Longitude:R}; mapWidth={prepared.Request.MapSize.WidthMeters:R}; surfacesRequested={prepared.Request.ApplyGroundSurfaces}; airRequested={prepared.Request.CreateAirConnections}");
+        if (!prepared.Request.CreateSeaConnections)
+            NativeSeaBridge.Clear();
+
+        _waterLog = null;
+        _enabled = log.DiagnosticsEnabled;
+        _sessionLog = _enabled ? log : null;
+        SurfaceApplied = AirApplied = ClimateApplied = WaterApplied = false;
+        _expectedWater = new JArray();
+        WaterProbes.Clear();
+        WaterSourcePositions.Clear();
+        WaterPlans.Clear();
+        PlannedWater.Clear();
+        WaterObservations.Clear();
+        WaterSettledChunks.Clear();
+
+        if (_enabled && prepared.Water != null)
+            PlannedWater.AddRange(prepared.Water.Sources);
+
+        RiverReaches =
+            _enabled && prepared.Water != null
+                ? prepared.Water.ReachStages.Where(reach => reach.PolygonId == null).ToArray()
+                : Array.Empty<WaterReachStage>();
+
+        foreach (var plan in PlannedWater)
+            WaterProbes.AddRange(plan.ChannelProbes.Count > 0 ? plan.ChannelProbes : new[] { plan.DownstreamProbe });
+
+        _waterLog = null;
+        _waterChecks = 0;
+        _expectedAir = new JArray();
+        _expectedClimate = _expectedLocalSurface = _expectedWorldSurface = null;
+        _run = Guid.NewGuid().ToString("N");
+        log.Diagnostic(
+            $"RUN id={_run}; modBuildMvid={typeof(NativeDiagnostics).Assembly.ManifestModule.ModuleVersionId}; gameAssemblyVersion={typeof(TerrainSystem).Assembly.GetName().Version}; mapSession={prepared.Request.MapSessionId}; generation={prepared.Request.Generation}; latitude={prepared.Request.Latitude:R}; longitude={prepared.Request.Longitude:R}; mapWidth={prepared.Request.MapSize.WidthMeters:R}; surfacesRequested={prepared.Request.ApplyGroundSurfaces}; airRequested={prepared.Request.CreateAirConnections}");
     }
 
-    public static void RememberAir(string name,string prefab,float3 position)
-    { if(_enabled)_expectedAir.Add(AirRecord(name,prefab,position,true)); }
-    public static void RememberClimate(string name) => _expectedClimate=name;
-    public static void QueueAfterSave(){if(_sessionLog!=null)Queue("after-save",_sessionLog);}
+    public static void RememberAir(string name, string prefab, float3 position)
+    {
+        if (_enabled)
+            _expectedAir.Add(AirRecord(name, prefab, position, true));
+    }
+
+    public static void RememberClimate(string name) => _expectedClimate = name;
+
+    public static void QueueAfterSave()
+    {
+        if (_sessionLog != null)
+            Queue("after-save", _sessionLog);
+    }
+
     public static void RememberWater(float3 position, WaterSourceData source, RiverSourcePlan plan)
-    { if(!_enabled)return;_expectedWater.Add(WaterRecord(position,source)); WaterSourcePositions.Add(position);WaterPlans.Add(plan); }
-    public static void RememberSurface(string label,string hash)
-    { if(label=="local")_expectedLocalSurface=hash;else _expectedWorldSurface=hash; }
+    {
+        if (!_enabled)
+            return;
+
+        _expectedWater.Add(WaterRecord(position, source));
+        WaterSourcePositions.Add(position);
+        WaterPlans.Add(plan);
+    }
+
+    public static void RememberSurface(string label, string hash)
+    {
+        if (label == "local")
+            _expectedLocalSurface = hash;
+        else
+            _expectedWorldSurface = hash;
+    }
 
     public static void Queue(string phase, ImportLog log)
     {
-        if(!log.DiagnosticsEnabled){_work?.Dispose();_work=null;_phase=null;_log=null;_waterLog=null;if(phase=="after-apply")NativeNetworkDiagnostics.Release(ImportSession.Map,ImportSession.Generation);return;}
-        if(phase=="after-load"){_run="";_waterLog=null;NativeNetworkDiagnostics.Clear();}
-        if(phase=="after-apply"&&WaterProbes.Count>0)
-        { _waterStarted=DateTime.UtcNow; _waterDue=_waterStarted.AddSeconds(60); _waterMap=ImportSession.Map; _waterGeneration=ImportSession.Generation; _waterChecks=0; _waterLog=log; }
-        _phase=phase; _map=ImportSession.Map; _generation=ImportSession.Generation;
-        _due=DateTime.UtcNow.AddSeconds(5); _log=log;
+        if (!log.DiagnosticsEnabled)
+        {
+            _work?.Dispose();
+            _work = null;
+            _phase = null;
+            _log = null;
+            _waterLog = null;
+
+            if (phase == "after-apply")
+                NativeNetworkDiagnostics.Release(ImportSession.Map, ImportSession.Generation);
+
+            return;
+        }
+
+        if (phase == "after-load")
+        {
+            _run = "";
+            _waterLog = null;
+            NativeNetworkDiagnostics.Clear();
+        }
+
+        if (phase == "after-apply" && WaterProbes.Count > 0)
+        {
+            _waterStarted = DateTime.UtcNow;
+            _waterDue = _waterStarted.AddSeconds(60);
+            _waterMap = ImportSession.Map;
+            _waterGeneration = ImportSession.Generation;
+            _waterChecks = 0;
+            _waterLog = log;
+        }
+
+        _phase = phase;
+        _map = ImportSession.Map;
+        _generation = ImportSession.Generation;
+        _due = DateTime.UtcNow.AddSeconds(5);
+        _log = log;
         log.Diagnostic($"SNAPSHOT QUEUED phase={phase}; mapSession={_map}; delaySeconds=5; readOnly=true");
     }
 
     public static void Poll(World world, EntityManager manager)
     {
-        if(_work!=null)
+        if (_work != null)
         {
-            if(_workMap!=ImportSession.Map||_workGeneration!=ImportSession.Generation)
-            {_work.Dispose();_work=null;_workLog=null;return;}
-            if(_lastWorkFrame==Time.frameCount||!ImportSession.Ready||GameManager.instance.isGameLoading)return;
-            _lastWorkFrame=Time.frameCount;
-            var watch=System.Diagnostics.Stopwatch.StartNew();
-            try{if(!_work.MoveNext()){_work.Dispose();_work=null;}}
-            catch(Exception exception){_workLog?.Diagnostic("DEFERRED READBACK unavailable: "+exception);_work?.Dispose();_work=null;}
-            if(_work==null||watch.Elapsed.TotalMilliseconds>=100)
-                _workLog?.Diagnostic($"END WORK SLICE elapsedMilliseconds={watch.Elapsed.TotalMilliseconds:0.###}; morePending={_work!=null}; mainThread=true; generation={_workGeneration}");
+            if (_workMap != ImportSession.Map || _workGeneration != ImportSession.Generation)
+            {
+                _work.Dispose();
+                _work = null;
+                _workLog = null;
+
+                return;
+            }
+
+            if (_lastWorkFrame == Time.frameCount || !ImportSession.Ready || GameManager.instance.isGameLoading)
+                return;
+
+            _lastWorkFrame = Time.frameCount;
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+
+            try
+            {
+                if (!_work.MoveNext())
+                {
+                    _work.Dispose();
+                    _work = null;
+                }
+            }
+            catch (Exception exception)
+            {
+                _workLog?.Diagnostic("DEFERRED READBACK unavailable: " + exception);
+                _work?.Dispose();
+                _work = null;
+            }
+
+            if (_work == null || watch.Elapsed.TotalMilliseconds >= 100)
+                _workLog?.Diagnostic(
+                    $"END WORK SLICE elapsedMilliseconds={watch.Elapsed.TotalMilliseconds:0.###}; morePending={_work != null}; mainThread=true; generation={_workGeneration}");
+
             return;
         }
-        if(_waterLog!=null)
+
+        if (_waterLog != null)
         {
-            if(_waterMap!=ImportSession.Map||_waterGeneration!=ImportSession.Generation)_waterLog=null;
-            else if(DateTime.UtcNow>=_waterDue&&ImportSession.Ready&&!GameManager.instance.isGameLoading&&GameManager.instance.gameMode==GameMode.Editor)
+            if (_waterMap != ImportSession.Map || _waterGeneration != ImportSession.Generation)
+                _waterLog = null;
+            else if (DateTime.UtcNow >= _waterDue
+                && ImportSession.Ready
+                && !GameManager.instance.isGameLoading
+                && GameManager.instance.gameMode == GameMode.Editor)
             {
-                _work=ProbeWork(world,"flow-check",_waterLog,(DateTime.UtcNow-_waterStarted).TotalSeconds).GetEnumerator();
-                _workMap=ImportSession.Map;_workGeneration=ImportSession.Generation;_workLog=_waterLog;
-                if(++_waterChecks>=2)_waterLog=null; else _waterDue=_waterStarted.AddSeconds(180);
+                _work =
+                    ProbeWork(
+                        world,
+                        "flow-check",
+                        _waterLog,
+                        (DateTime.UtcNow - _waterStarted).TotalSeconds).GetEnumerator();
+
+                _workMap = ImportSession.Map;
+                _workGeneration = ImportSession.Generation;
+                _workLog = _waterLog;
+
+                if (++_waterChecks >= 2)
+                    _waterLog = null;
+                else
+                    _waterDue = _waterStarted.AddSeconds(180);
+
                 return;
             }
         }
-        if(_phase==null)return;
-        if(_map!=ImportSession.Map || _phase=="after-apply"&&_generation!=ImportSession.Generation){_log?.Diagnostic($"SNAPSHOT DISCARDED phase={_phase}; oldMapSession={_map}; activeMapSession={ImportSession.Map}; reason=stale-map-or-generation");_phase=null;_log=null;return;}
-        if(DateTime.UtcNow<_due||!ImportSession.Ready||GameManager.instance.isGameLoading||GameManager.instance.gameMode!=GameMode.Editor)return;
-        var phase=_phase;var log=_log!;_phase=null;_log=null;
-        _work=Snapshot(world,manager,phase,log).GetEnumerator();_workLog=log;
-        _workMap=ImportSession.Map;_workGeneration=ImportSession.Generation;_lastWorkFrame=-1;
+
+        if (_phase == null)
+            return;
+
+        if (_map != ImportSession.Map || _phase == "after-apply" && _generation != ImportSession.Generation)
+        {
+            _log?.Diagnostic(
+                $"SNAPSHOT DISCARDED phase={_phase}; oldMapSession={_map}; activeMapSession={ImportSession.Map}; reason=stale-map-or-generation");
+
+            _phase = null;
+            _log = null;
+
+            return;
+        }
+
+        if (DateTime.UtcNow < _due
+            || !ImportSession.Ready
+            || GameManager.instance.isGameLoading
+            || GameManager.instance.gameMode != GameMode.Editor)
+            return;
+
+        var phase = _phase;
+        var log = _log!;
+        _phase = null;
+        _log = null;
+        _work = Snapshot(world, manager, phase, log).GetEnumerator();
+        _workLog = log;
+        _workMap = ImportSession.Map;
+        _workGeneration = ImportSession.Generation;
+        _lastWorkFrame = -1;
     }
 
     public static string PixelHash(byte[] encodedPixels) => Hash(encodedPixels);
-    private static string Hash(byte[] bytes)
-    { using var hash=SHA256.Create();return BitConverter.ToString(hash.ComputeHash(bytes)).Replace("-","").ToLowerInvariant(); }
 
-    private static System.Collections.Generic.IEnumerable<int> Snapshot(World world,EntityManager manager,string phase,ImportLog log)
+    private static string Hash(byte[] bytes)
     {
-        var snapshotMap=ImportSession.Map;var snapshotGeneration=ImportSession.Generation;
-        var terrain=world.GetOrCreateSystemManaged<TerrainSystem>();
-        var data=terrain.GetHeightData(false);
-        if(!data.heights.IsCreated||data.heights.Length==0||data.heights.Length>16_777_216)throw new InvalidOperationException("Native height buffer unavailable/too large for bounded diagnostic fingerprint.");
-        var length=data.heights.Length;var resolution=data.resolution.ToString();var chunk=new byte[65536];
+        using var hash = SHA256.Create();
+        return BitConverter.ToString(hash.ComputeHash(bytes)).Replace("-", "").ToLowerInvariant();
+    }
+
+    private static System.Collections.Generic.IEnumerable<int> Snapshot(
+        World world,
+        EntityManager manager,
+        string phase,
+        ImportLog log)
+    {
+        var snapshotMap = ImportSession.Map;
+        var snapshotGeneration = ImportSession.Generation;
+        var terrain = world.GetOrCreateSystemManaged<TerrainSystem>();
+        var data = terrain.GetHeightData(false);
+
+        if (!data.heights.IsCreated || data.heights.Length == 0 || data.heights.Length > 16_777_216)
+            throw new InvalidOperationException(
+                "Native height buffer unavailable/too large for bounded diagnostic fingerprint.");
+
+        var length = data.heights.Length;
+        var resolution = data.resolution.ToString();
+        var chunk = new byte[65536];
         // A bounded plain-data copy is required for the final physical audit.
         // No native container is retained or accessed by the worker.
-        var physicalRaster=phase=="after-apply"?new ushort[length]:null;
-        using var fingerprint=SHA256.Create();
-        for(var offset=0;offset<length;offset+=chunk.Length/2)
+        var physicalRaster = phase == "after-apply" ? new ushort[length] : null;
+        using var fingerprint = SHA256.Create();
+
+        for (var offset = 0; offset < length; offset += chunk.Length / 2)
         {
             // Native buffers are reacquired each slice, never retained by the
             // worker. Only encoded scalar samples cross that boundary.
-            var live=terrain.GetHeightData(false);
-            if(!live.heights.IsCreated||live.heights.Length!=length||live.resolution.ToString()!=resolution)
-                throw new InvalidOperationException("Terrain changed during distributed fingerprint; baseline unavailable.");
-            var count=Math.Min(chunk.Length/2,length-offset);
-            for(var i=0;i<count;i++){var value=live.heights[offset+i];chunk[i*2]=(byte)value;chunk[i*2+1]=(byte)(value>>8);if(physicalRaster!=null)physicalRaster[offset+i]=value;}
-            fingerprint.TransformBlock(chunk,0,count*2,chunk,0);yield return 0;
+            var live = terrain.GetHeightData(false);
+
+            if (!live.heights.IsCreated || live.heights.Length != length || live.resolution.ToString() != resolution)
+                throw new InvalidOperationException(
+                    "Terrain changed during distributed fingerprint; baseline unavailable.");
+
+            var count = Math.Min(chunk.Length / 2, length - offset);
+
+            for (var i = 0; i < count; i++)
+            {
+                var value = live.heights[offset + i];
+                chunk[i * 2] = (byte)value;
+                chunk[i * 2 + 1] = (byte)(value >> 8);
+
+                if (physicalRaster != null)
+                    physicalRaster[offset + i] = value;
+            }
+
+            fingerprint.TransformBlock(chunk, 0, count * 2, chunk, 0);
+            yield return 0;
         }
-        fingerprint.TransformFinalBlock(Array.Empty<byte>(),0,0);
-        var identity=new JObject { ["heightHash"]=BitConverter.ToString(fingerprint.Hash!).Replace("-","").ToLowerInvariant(),["resolution"]=resolution,["area"]=terrain.playableArea.ToString(),["scaleOffset"]=terrain.heightScaleOffset.ToString() };
-        var key=Hash(System.Text.Encoding.UTF8.GetBytes(identity.ToString(Newtonsoft.Json.Formatting.None)));
-        var current=new JObject { ["version"]=1,["run"]=_run,["capturedUtc"]=DateTime.UtcNow.ToString("O"),["terrain"]=identity };
-        current["readbackDistributedAcrossFrames"]=true;
+
+        fingerprint.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+        var identity =
+            new JObject
+            {
+                ["heightHash"] = BitConverter.ToString(fingerprint.Hash!).Replace("-", "").ToLowerInvariant(),
+                ["resolution"] = resolution,
+                ["area"] = terrain.playableArea.ToString(),
+                ["scaleOffset"] = terrain.heightScaleOffset.ToString()
+            };
+
+        var key = Hash(System.Text.Encoding.UTF8.GetBytes(identity.ToString(Newtonsoft.Json.Formatting.None)));
+        var current =
+            new JObject
+            {
+                ["version"] = 1,
+                ["run"] = _run,
+                ["capturedUtc"] = DateTime.UtcNow.ToString("O"),
+                ["terrain"] = identity
+            };
+
+        current["readbackDistributedAcrossFrames"] = true;
         yield return 0;
-        try{current["terrainRuntime"]=TerrainRuntimeState(terrain);log.Diagnostic("TERRAIN LIVE CONTRACT "+current["terrainRuntime"]!.ToString(Newtonsoft.Json.Formatting.None));}
-        catch(Exception error){log.Diagnostic("TERRAIN LIVE CONTRACT unavailable; dirty-restamp publication not validated: "+error.Message);}
-        yield return 0;
-        var prefabs=world.GetOrCreateSystemManaged<PrefabSystem>();
-        var materials=world.GetOrCreateSystemManaged<TerrainMaterialSystem>();
-        var surface=new JObject();
-        Try("surface-local",()=>surface["local"]=TextureSignature(NativeSurfaceBridge.NativeTexture(materials,false)));yield return 0;
-        Try("surface-world",()=>surface["world"]=TextureSignature(NativeSurfaceBridge.NativeTexture(materials,true)));current["surface"]=surface;
-        current.Remove("surface-local");current.Remove("surface-world");yield return 0;
-        Try("air",()=>AirState(manager,prefabs,world.GetOrCreateSystemManaged<NameSystem>(),phase,log));
-        yield return 0;
-        try{NativeSeaBridge.Readback(manager,log);}catch(Exception exception){log.Diagnostic("SEA OUTSIDE READBACK unavailable: "+exception.Message);}yield return 0;
-        if(phase=="after-load"&&_airPendingInitialization>0){current.Remove("air");log.Diagnostic("AIR load readback initialization still pending; persistenceUnverified=true");}
-        Try("climate",()=>ClimateState(world.GetOrCreateSystemManaged<ClimateSystem>(),world.GetOrCreateSystemManaged<WindSimulationSystem>(),prefabs,phase,log));
-        yield return 0;
-        Try("water",()=>WaterState(manager));
-        yield return 0;
-        if(phase=="after-apply")foreach(var slice in NativeNetworkDiagnostics.CaptureOwnedCensus(manager,log))yield return slice;
-        if(physicalRaster!=null)
+
+        try
         {
-            var bounds=TerrainUtils.GetBounds(ref data);var width=(double)bounds.max.x-bounds.min.x;
-            var cell=width/Math.Max(1,data.resolution.x-1);
-            var registered=Math.Abs(bounds.min.x+width/2)<=cell&&Math.Abs(bounds.max.z-width/2)<=cell&&
-                Math.Abs(bounds.min.z+width/2)<=cell&&Math.Abs(terrain.heightScaleOffset.y)<1e-6;
-            foreach(var slice in NativeNetworkDiagnostics.CapturePhysicalQuality(manager,physicalRaster,terrain.heightScaleOffset.x,width,registered,log))yield return slice;
+            current["terrainRuntime"] = TerrainRuntimeState(terrain);
+            log.Diagnostic(
+                "TERRAIN LIVE CONTRACT " + current["terrainRuntime"]!.ToString(Newtonsoft.Json.Formatting.None));
         }
-        using(var network=NativeNetworkPersistence.Capture(manager,prefabs,value=>current["network"]=value,message=>log.Diagnostic(message)).GetEnumerator())
+        catch (Exception error)
         {
-            while(true)
+            log.Diagnostic(
+                "TERRAIN LIVE CONTRACT unavailable; dirty-restamp publication not validated: " + error.Message);
+        }
+
+        yield return 0;
+        var prefabs = world.GetOrCreateSystemManaged<PrefabSystem>();
+        var materials = world.GetOrCreateSystemManaged<TerrainMaterialSystem>();
+        var surface = new JObject();
+        Try(
+            "surface-local",
+            () => surface["local"] = TextureSignature(NativeSurfaceBridge.NativeTexture(materials, false)));
+
+        yield return 0;
+        Try(
+            "surface-world",
+            () => surface["world"] = TextureSignature(NativeSurfaceBridge.NativeTexture(materials, true)));
+
+        current["surface"] = surface;
+        current.Remove("surface-local");
+        current.Remove("surface-world");
+        yield return 0;
+        Try("air", () => AirState(manager, prefabs, world.GetOrCreateSystemManaged<NameSystem>(), phase, log));
+        yield return 0;
+
+        try
+        {
+            NativeSeaBridge.Readback(manager, log);
+        }
+        catch (Exception exception)
+        {
+            log.Diagnostic("SEA OUTSIDE READBACK unavailable: " + exception.Message);
+        }
+
+        yield return 0;
+
+        if (phase == "after-load" && _airPendingInitialization > 0)
+        {
+            current.Remove("air");
+            log.Diagnostic("AIR load readback initialization still pending; persistenceUnverified=true");
+        }
+
+        Try(
+            "climate",
+            () => ClimateState(
+                world.GetOrCreateSystemManaged<ClimateSystem>(),
+                world.GetOrCreateSystemManaged<WindSimulationSystem>(),
+                prefabs,
+                phase,
+                log));
+
+        yield return 0;
+        Try("water", () => WaterState(manager));
+        yield return 0;
+
+        if (phase == "after-apply")
+            foreach (var slice in NativeNetworkDiagnostics.CaptureOwnedCensus(manager, log))
+                yield return slice;
+
+        if (physicalRaster != null)
+        {
+            var bounds = TerrainUtils.GetBounds(ref data);
+            var width = (double)bounds.max.x - bounds.min.x;
+            var cell = width / Math.Max(1, data.resolution.x - 1);
+            var registered = Math.Abs(bounds.min.x + width / 2) <= cell && Math.Abs(bounds.max.z - width / 2) <= cell
+                && Math.Abs(bounds.min.z + width / 2) <= cell && Math.Abs(terrain.heightScaleOffset.y) < 1e-6;
+
+            foreach (var slice in NativeNetworkDiagnostics.CapturePhysicalQuality(
+                physicalRaster,
+                terrain.heightScaleOffset.x,
+                width,
+                registered,
+                log))
+                yield return slice;
+        }
+
+        using (var network =
+            NativeNetworkPersistence
+                .Capture(manager, prefabs, value => current["network"] = value, message => log.Diagnostic(message))
+                .GetEnumerator())
+        {
+            while (true)
             {
                 bool more;
-                try{more=network.MoveNext();}
-                catch(Exception error){log.Diagnostic("NETWORK PERSISTENCE unavailable; no hash acceptance claimed: "+error);break;}
-                if(!more)break;yield return 0;
+
+                try
+                {
+                    more = network.MoveNext();
+                }
+                catch (Exception error)
+                {
+                    log.Diagnostic("NETWORK PERSISTENCE unavailable; no hash acceptance claimed: " + error);
+                    break;
+                }
+
+                if (!more)
+                    break;
+
+                yield return 0;
             }
         }
-        if(phase=="after-apply")
-        {try{NativeNetworkDiagnostics.Check(manager,log,256);}catch(Exception exception){log.Diagnostic($"NATIVE CONNECTIVITY readback unavailable: {exception}");}finally{log.PublishQualityLedger();NativeNetworkDiagnostics.Release(snapshotMap,snapshotGeneration);}yield return 0;}
-        if(phase=="after-apply")
+
+        if (phase == "after-apply")
         {
-            WaterApplied=WaterApplied&&DiagnosticEvidence.AllExpectedPresent(_expectedWater,current["water"] as JArray);
-            log.Diagnostic($"WATER READBACK expectedSources={_expectedWater.Count}; nativeSourcesStillMatch={WaterApplied}; downstreamCoverageVerified=false");
-            foreach(var slice in ProbeWork(world,phase,log,(DateTime.UtcNow-_due).TotalSeconds+5))yield return slice;
+            try
+            {
+                NativeNetworkDiagnostics.Check(manager, log, 256);
+            }
+            catch (Exception exception)
+            {
+                log.Diagnostic($"NATIVE CONNECTIVITY readback unavailable: {exception}");
+            }
+            finally
+            {
+                log.PublishQualityLedger();
+                NativeNetworkDiagnostics.Release(snapshotMap, snapshotGeneration);
+            }
+
+            yield return 0;
         }
-        log.DiagnosticJson("native-snapshot-"+phase+".json",current);
-        log.Diagnostic($"SNAPSHOT phase={phase}; terrainSignature={key}; mapSession={ImportSession.Map}; artifact=native-snapshot-{phase}.json; distributedAcrossFrames=true; nativeAcceptanceNotImplied=true");
-        var path=Path.Combine(Root,key+".json");
-        if(phase=="after-apply"||phase=="after-save")
+
+        if (phase == "after-apply")
         {
-            var observedAir=current["air"] as JArray;
-            var airFound=observedAir==null?0:_expectedAir.Count(expected=>observedAir.Any(actual=>JToken.DeepEquals(expected,actual)));
-            AirApplied=AirApplied&&DiagnosticEvidence.AllExpectedPresent(_expectedAir,observedAir)&&_airPendingInitialization==0;
-            SurfaceApplied=SurfaceApplied&&_expectedLocalSurface!=null&&_expectedWorldSurface!=null&&(string?)current["surface"]?["local"]?["sha256"]==_expectedLocalSurface&&(string?)current["surface"]?["world"]?["sha256"]==_expectedWorldSurface;
-            ClimateApplied=ClimateApplied&&_expectedClimate!=null&&(string?)current["climate"]?["prefab"]==_expectedClimate;
-            log.Diagnostic($"DELAYED VERIFICATION expectedCreatedAir={_expectedAir.Count}; expectedAirFound={airFound}; airCreatedMarkersRemaining={_airPendingInitialization}; appliedSurfaceStillMatches={SurfaceApplied}; appliedClimateStillMatches={ClimateApplied}; initializedAirObserved={AirApplied}; functionalFlightsVerified=false");
-            current["applied"]=new JObject { ["surface"]=SurfaceApplied,["air"]=AirApplied,["climate"]=ClimateApplied,["water"]=WaterApplied };
+            WaterApplied =
+                WaterApplied && DiagnosticEvidence.AllExpectedPresent(_expectedWater, current["water"] as JArray);
+
+            log.Diagnostic(
+                $"WATER READBACK expectedSources={_expectedWater.Count}; nativeSourcesStillMatch={WaterApplied}; downstreamCoverageVerified=false");
+
+            foreach (var slice in ProbeWork(world, phase, log, (DateTime.UtcNow - _due).TotalSeconds + 5))
+                yield return slice;
+        }
+
+        log.DiagnosticJson("native-snapshot-" + phase + ".json", current);
+        log.Diagnostic(
+            $"SNAPSHOT phase={phase}; terrainSignature={key}; mapSession={ImportSession.Map}; artifact=native-snapshot-{phase}.json; distributedAcrossFrames=true; nativeAcceptanceNotImplied=true");
+
+        var path = Path.Combine(Root, key + ".json");
+
+        if (phase == "after-apply" || phase == "after-save")
+        {
+            var observedAir = current["air"] as JArray;
+            var airFound =
+                observedAir == null
+                    ? 0
+                    : _expectedAir.Count(expected => observedAir.Any(actual => JToken.DeepEquals(expected, actual)));
+
+            AirApplied =
+                AirApplied
+                    && DiagnosticEvidence.AllExpectedPresent(_expectedAir, observedAir)
+                    && _airPendingInitialization == 0;
+
+            SurfaceApplied =
+                SurfaceApplied
+                    && _expectedLocalSurface != null
+                    && _expectedWorldSurface != null
+                    && (string?)current["surface"]?["local"]?["sha256"] == _expectedLocalSurface
+                    && (string?)current["surface"]?["world"]?["sha256"] == _expectedWorldSurface;
+
+            ClimateApplied =
+                ClimateApplied
+                    && _expectedClimate != null
+                    && (string?)current["climate"]?["prefab"] == _expectedClimate;
+
+            log.Diagnostic(
+                $"DELAYED VERIFICATION expectedCreatedAir={_expectedAir.Count}; expectedAirFound={airFound}; airCreatedMarkersRemaining={_airPendingInitialization}; appliedSurfaceStillMatches={SurfaceApplied}; appliedClimateStillMatches={ClimateApplied}; initializedAirObserved={AirApplied}; functionalFlightsVerified=false");
+
+            current["applied"] =
+                new JObject
+                {
+                    ["surface"] = SurfaceApplied,
+                    ["air"] = AirApplied,
+                    ["climate"] = ClimateApplied,
+                    ["water"] = WaterApplied
+                };
+
             Directory.CreateDirectory(Root);
             // Small metadata only: no image/height buffer is written to the sidecar.
-            File.WriteAllText(path,current.ToString(Newtonsoft.Json.Formatting.None));
-            log.Diagnostic($"BASELINE stored run={_run}; terrainSignature={key}; appliedSurface={SurfaceApplied}; appliedAir={AirApplied}; appliedClimate={ClimateApplied}; thisIsNotASaveConfirmation=true");
+            File.WriteAllText(path, current.ToString(Newtonsoft.Json.Formatting.None));
+            log.Diagnostic(
+                $"BASELINE stored run={_run}; terrainSignature={key}; appliedSurface={SurfaceApplied}; appliedAir={AirApplied}; appliedClimate={ClimateApplied}; thisIsNotASaveConfirmation=true");
         }
         else
         {
-            if(!File.Exists(path)){log.Diagnostic($"RELOAD no-baseline terrainSignature={key}; persistenceUnverified=true");yield break;}
-            var info=new FileInfo(path);if(info.Length>262144)throw new InvalidOperationException("Diagnostic baseline exceeds metadata limit.");
-            var previous=JObject.Parse(File.ReadAllText(path));
-            if((int?)previous["version"]!=1){log.Diagnostic("RELOAD incompatible-baseline; persistenceUnverified=true");yield break;}
-            foreach(var feature in new[]{"surface","air","climate","water","network"})
+            if (!File.Exists(path))
             {
-                var applied=(bool?)previous["applied"]?[feature]==true;
-                var available=previous[feature]!=null&&current[feature]!=null;
-                if(feature=="network")available=available&&(bool?)previous[feature]?["stableAcrossTwoPasses"]==true&&(bool?)current[feature]?["stableAcrossTwoPasses"]==true&&
-                    (int?)previous[feature]?["unavailable"]==0&&(int?)current[feature]?["unavailable"]==0;
-                var match=available&&JToken.DeepEquals(previous[feature],current[feature]);
-                if(feature=="network")
+                log.Diagnostic($"RELOAD no-baseline terrainSignature={key}; persistenceUnverified=true");
+                yield break;
+            }
+
+            var info = new FileInfo(path);
+
+            if (info.Length > 262144)
+                throw new InvalidOperationException("Diagnostic baseline exceeds metadata limit.");
+
+            var previous = JObject.Parse(File.ReadAllText(path));
+
+            if ((int?)previous["version"] != 1)
+            {
+                log.Diagnostic("RELOAD incompatible-baseline; persistenceUnverified=true");
+                yield break;
+            }
+
+            foreach (var feature in new[] { "surface", "air", "climate", "water", "network" })
+            {
+                var applied = (bool?)previous["applied"]?[feature] == true;
+                var available = previous[feature] != null && current[feature] != null;
+
+                if (feature == "network")
+                    available =
+                        available
+                            && (bool?)previous[feature]?["stableAcrossTwoPasses"] == true
+                            && (bool?)current[feature]?["stableAcrossTwoPasses"] == true
+                            && (int?)previous[feature]?["unavailable"] == 0
+                                            && (int?)current[feature]?["unavailable"] == 0;
+
+                var match = available && JToken.DeepEquals(previous[feature], current[feature]);
+
+                if (feature == "network")
                 {
-                    log.Diagnostic($"NETWORK RELOAD baselineRun={previous["run"]}; stableCompleteReadbacks={available}; nativeContentAndIncidenceMatch={match}; entityIdsCompared=false; geometryAndTrafficAcceptanceProven=false; identity=terrain-content-not-unique-save-id");
+                    log.Diagnostic(
+                        $"NETWORK RELOAD baselineRun={previous["run"]}; stableCompleteReadbacks={available}; nativeContentAndIncidenceMatch={match}; entityIdsCompared=false; geometryAndTrafficAcceptanceProven=false; identity=terrain-content-not-unique-save-id");
+
                     continue;
                 }
-                log.Diagnostic($"RELOAD feature={feature}; baselineRun={previous["run"]}; baselineUtc={previous["capturedUtc"]}; appliedInBaseline={applied}; readbackAvailable={available}; nativePropertiesMatch={match}; evidence={DiagnosticEvidence.Compare(applied,previous[feature],current[feature])}; identity=terrain-content-not-unique-save-id; entityIdsCompared=false");
+
+                log.Diagnostic(
+                    $"RELOAD feature={feature}; baselineRun={previous["run"]}; baselineUtc={previous["capturedUtc"]}; appliedInBaseline={applied}; readbackAvailable={available}; nativePropertiesMatch={match}; evidence={DiagnosticEvidence.Compare(applied, previous[feature], current[feature])}; identity=terrain-content-not-unique-save-id; entityIdsCompared=false");
             }
         }
-        log.FlushArchive(force:true);
-        void Try(string feature,Func<JToken> read)
-        {try{current[feature]=read();}catch(Exception exception){log.Diagnostic($"READBACK UNAVAILABLE feature={feature}; phase={phase}: {exception}");}}
+
+        log.FlushArchive(force: true);
+
+        void Try(string feature, Func<JToken> read)
+        {
+            try
+            {
+                current[feature] = read();
+            }
+            catch (Exception exception)
+            {
+                log.Diagnostic($"READBACK UNAVAILABLE feature={feature}; phase={phase}: {exception}");
+            }
+        }
     }
 
-    private static JObject WaterRecord(float3 position,WaterSourceData source)
-        =>new() { ["x"]=Math.Round(position.x,2),["y"]=Math.Round(position.y,2),["z"]=Math.Round(position.z,2),
-            ["radius"]=Math.Round(source.m_Radius,2),["depth"]=Math.Round(source.m_Height,2),["modifier"]=source.m_Modifier,["polluted"]=source.m_Polluted,["legacyMode"]=source.m_ConstantDepth };
+    private static JObject WaterRecord(float3 position, WaterSourceData source)
+        => new()
+        {
+            ["x"] = Math.Round(position.x, 2),
+            ["y"] = Math.Round(position.y, 2),
+            ["z"] = Math.Round(position.z, 2),
+            ["radius"] = Math.Round(source.m_Radius, 2),
+            ["depth"] = Math.Round(source.m_Height, 2),
+            ["modifier"] = source.m_Modifier,
+            ["polluted"] = source.m_Polluted,
+            ["legacyMode"] = source.m_ConstantDepth
+        };
 
-    private static System.Collections.Generic.IEnumerable<int> ProbeWork(World world,string phase,ImportLog log,double elapsed)
+    private static System.Collections.Generic.IEnumerable<int> ProbeWork(
+        World world,
+        string phase,
+        ImportLog log,
+        double elapsed)
     {
-        var count=PlannedWater.Select(p=>p.BodyId).Distinct().Count();
-        for(var offset=0;offset<count;offset+=32){WaterProbeState(world,phase,log,elapsed,offset);yield return 0;}
+        var count = PlannedWater.Select(river => river.BodyId).Distinct().Count();
+
+        for (var offset = 0; offset < count; offset += 32)
+        {
+            WaterProbeState(world, phase, log, elapsed, offset);
+            yield return 0;
+        }
     }
 
-    private static void WaterProbeState(World world,string phase,ImportLog log,double elapsed,int bodyOffset)
+    private static void WaterProbeState(World world, string phase, ImportLog log, double elapsed, int bodyOffset)
     {
         try
         {
-            var water=world.GetOrCreateSystemManaged<WaterSystem>();
+            var water = world.GetOrCreateSystemManaged<WaterSystem>();
             world.EntityManager.CompleteAllTrackedJobs();
-            var native=WaterState(world.EntityManager);
-            var flags=System.Reflection.BindingFlags.Instance|System.Reflection.BindingFlags.Public|System.Reflection.BindingFlags.NonPublic;
-            var newMap=typeof(WaterSystem).GetProperty("IsNewMap",flags)?.GetValue(water);
-            using var collector=world.EntityManager.CreateEntityQuery(new EntityQueryDesc{All=new[]{ComponentType.ReadOnly<WaterSourceData>()},None=new[]{ComponentType.ReadOnly<Deleted>(),ComponentType.ReadOnly<Game.Tools.Temp>()}});
-            log.Diagnostic($"WATER SIMULATION phase={phase}; loaded={water.Loaded}; systemEnabled={water.Enabled}; waterSimSpeed={water.WaterSimSpeed}; legacy={water.UseLegacyWaterSources}; cellSize={water.CellSize:R}; newMapSourceStepBlocked={newMap??"unavailable"}; collectorQueryCount={collector.CalculateEntityCount()}; expectedSources={_expectedWater.Count}; allExpectedNativeSourcesPresent={DiagnosticEvidence.AllExpectedPresent(_expectedWater,native)}; elapsedWallSeconds={elapsed:0}");
+            var native = WaterState(world.EntityManager);
+            var flags =
+                System.Reflection.BindingFlags.Instance
+                    | System.Reflection.BindingFlags.Public
+                    | System.Reflection.BindingFlags.NonPublic;
+
+            var newMap = typeof(WaterSystem).GetProperty("IsNewMap", flags)?.GetValue(water);
+            using var collector =
+                world.EntityManager.CreateEntityQuery(
+                    new EntityQueryDesc
+                    {
+                        All = new[] { ComponentType.ReadOnly<WaterSourceData>() },
+                        None = new[] { ComponentType.ReadOnly<Deleted>(), ComponentType.ReadOnly<Game.Tools.Temp>() }
+                    });
+
+            log.Diagnostic(
+                $"WATER SIMULATION phase={phase}; loaded={water.Loaded}; systemEnabled={water.Enabled}; waterSimSpeed={water.WaterSimSpeed}; legacy={water.UseLegacyWaterSources}; cellSize={water.CellSize:R}; newMapSourceStepBlocked={newMap ?? "unavailable"}; collectorQueryCount={collector.CalculateEntityCount()}; expectedSources={_expectedWater.Count}; allExpectedNativeSourcesPresent={DiagnosticEvidence.AllExpectedPresent(_expectedWater, native)}; elapsedWallSeconds={elapsed:0}");
+
             // One dependency completion/readback per diagnostic interval, not
             // once per regulator. Probe all bodies; bound individual log examples.
-            var depths=water.GetSurfaceData(out var depthDependency);depthDependency.Complete();
-            var sampled=new System.Collections.Generic.Dictionary<(int,int),float>();
-            float Depth(float3 p)
+            var depths = water.GetSurfaceData(out var depthDependency);
+            depthDependency.Complete();
+            var sampled = new System.Collections.Generic.Dictionary<(int, int), float>();
+
+            float Depth(float3 point)
             {
-                var key=((int)Math.Round(p.x*4),(int)Math.Round(p.z*4));
-                if(!sampled.TryGetValue(key,out var d))sampled[key]=d=depths.isCreated&&depths.hasDepths?WaterUtils.SampleDepth(ref depths,p):float.NaN;
+                var key = ((int)Math.Round(point.x * 4), (int)Math.Round(point.z * 4));
+
+                if (!sampled.TryGetValue(key, out var d))
+                    sampled[key] =
+                        d =
+                            depths.isCreated && depths.hasDepths
+                                ? WaterUtils.SampleDepth(ref depths, point)
+                                : float.NaN;
+
                 return d;
             }
-            foreach(var position in WaterSourcePositions.Take(bodyOffset==0?32:0))
+
+            foreach (var position in WaterSourcePositions.Take(bodyOffset == 0 ? 32 : 0))
             {
-                var depth=Depth(position);
-                log.Diagnostic($"WATER SOURCE PROBE phase={phase}; position={position}; depthReadbackMeters={depth:R}; waterSurfaceLevel={(math.isfinite(depth)?position.y+depth:float.NaN):R}; sourcePersistenceAndFlowAreSeparate=true");
+                var depth = Depth(position);
+                log.Diagnostic(
+                    $"WATER SOURCE PROBE phase={phase}; position={position}; depthReadbackMeters={depth:R}; waterSurfaceLevel={(math.isfinite(depth) ? position.y + depth : float.NaN):R}; sourcePersistenceAndFlowAreSeparate=true");
             }
+
             try
             {
-                foreach(var cacheName in new[]{"LastFrameSourceCache","CurrentJobSourceCache"})
+                foreach (var cacheName in new[] { "LastFrameSourceCache", "CurrentJobSourceCache" })
                 {
-                var property=typeof(WaterSystem).GetProperty(cacheName,flags);
-                if(!(property?.GetValue(water) is NativeList<WaterSourceCache> cache)){log.Diagnostic($"WATER SIM CACHE phase={phase}; cache={cacheName}; unavailable=true");continue;}
-                log.Diagnostic($"WATER SIM CACHE phase={phase}; cache={cacheName}; created={cache.IsCreated}; entries={(cache.IsCreated?cache.Length:0)}; coordinateSpace=terrain-relative");
-                if(cache.IsCreated)for(var i=0;i<Math.Min(cache.Length,64);i++){var s=cache[i];log.Diagnostic($"WATER SIM CACHE SOURCE index={i}; position={s.m_Position}; radius={s.m_Radius:R}; depth={s.m_Height:R}; mode={s.m_ConstantDepth}; polluted={s.m_Polluted:R}");}
+                    var property = typeof(WaterSystem).GetProperty(cacheName, flags);
+
+                    if (!(property?.GetValue(water) is NativeList<WaterSourceCache> cache))
+                    {
+                        log.Diagnostic($"WATER SIM CACHE phase={phase}; cache={cacheName}; unavailable=true");
+                        continue;
+                    }
+
+                    log.Diagnostic(
+                        $"WATER SIM CACHE phase={phase}; cache={cacheName}; created={cache.IsCreated}; entries={(cache.IsCreated ? cache.Length : 0)}; coordinateSpace=terrain-relative");
+
+                    if (cache.IsCreated)
+                        for (var i = 0; i < Math.Min(cache.Length, 64); i++)
+                        {
+                            var otherCache = cache[i];
+                            log.Diagnostic(
+                                $"WATER SIM CACHE SOURCE index={i}; position={otherCache.m_Position}; radius={otherCache.m_Radius:R}; depth={otherCache.m_Height:R}; mode={otherCache.m_ConstantDepth}; polluted={otherCache.m_Polluted:R}");
+                        }
                 }
             }
-            catch(Exception exception){log.Diagnostic("WATER SIM CACHE unavailable: "+exception.GetBaseException().Message);}
-            var read=typeof(WaterSystem).GetMethod("HasWater",System.Reflection.BindingFlags.Instance|System.Reflection.BindingFlags.Public|System.Reflection.BindingFlags.NonPublic,null,new[]{typeof(float3)},null);
-            if(read==null)throw new InvalidOperationException("Native HasWater readback is unavailable.");
+            catch (Exception exception)
+            {
+                log.Diagnostic("WATER SIM CACHE unavailable: " + exception.GetBaseException().Message);
+            }
+
+            var read =
+                typeof(WaterSystem).GetMethod(
+                    "HasWater",
+                    System.Reflection.BindingFlags.Instance
+                        | System.Reflection.BindingFlags.Public
+                        | System.Reflection.BindingFlags.NonPublic,
+                    null,
+                    new[] { typeof(float3) },
+                    null);
+
+            if (read == null)
+                throw new InvalidOperationException("Native HasWater readback is unavailable.");
+
             // Wetness is separate from source persistence and is not a full-channel/flooding guarantee.
-            foreach(var probe in WaterProbes.Take(bodyOffset==0?32:0))log.Diagnostic($"WATER PROBE phase={phase}; position={probe}; hasNativeWater={read.Invoke(water,new object[]{probe})}; depthReadbackMeters={Depth(probe):R}; elapsedWallSeconds={elapsed:0}; waterSimSpeed={water.WaterSimSpeed}; fullRiverCoverageVerified=false");
-            var createdByBody=Enumerable.Range(0,WaterPlans.Count).GroupBy(i=>WaterPlans[i].BodyId).ToDictionary(g=>g.Key,g=>g.ToArray());
-            var bodyRecords=new System.Collections.Generic.List<object>();
-            var remainingProbeRecords=32768;
-            var plannedBodyCount=0;
-            foreach(var body in PlannedWater.GroupBy(p=>p.BodyId).Skip(bodyOffset).Take(32))
+            foreach (var probe in WaterProbes.Take(bodyOffset == 0 ? 32 : 0))
+                log.Diagnostic(
+                    $"WATER PROBE phase={phase}; position={probe}; hasNativeWater={read.Invoke(water, new object[] { probe })}; depthReadbackMeters={Depth(probe):R}; elapsedWallSeconds={elapsed:0}; waterSimSpeed={water.WaterSimSpeed}; fullRiverCoverageVerified=false");
+
+            var createdByBody =
+                Enumerable
+                    .Range(0, WaterPlans.Count)
+                    .GroupBy(i => WaterPlans[i].BodyId)
+                    .ToDictionary(group => group.Key, group => group.ToArray());
+
+            var bodyRecords = new System.Collections.Generic.List<object>();
+            var remainingProbeRecords = 32768;
+            var plannedBodyCount = 0;
+
+            foreach (var body in PlannedWater.GroupBy(river => river.BodyId).Skip(bodyOffset).Take(32))
             {
                 plannedBodyCount++;
-                var plans=body.ToArray();var plan=plans[0];
-                var indexes=createdByBody.TryGetValue(body.Key,out var created)?created:Array.Empty<int>();
-                var probes=plans.SelectMany(p=>p.ChannelProbes.Count>0?p.ChannelProbes:new[]{p.DownstreamProbe}).Take(512).GroupBy(p=>((int)Math.Round(p.x*4),(int)Math.Round(p.z*4))).Select(g=>g.First()).Take(128).ToArray();
-                var banks=plans.SelectMany(p=>p.BankProbes).Take(512).GroupBy(p=>((int)Math.Round(p.x*4),(int)Math.Round(p.z*4))).Select(g=>g.First()).Take(128).ToArray();
-                var wet=probes.Count(p=>Depth(p)>.05f);var flooded=banks.Count(p=>Depth(p)>.1f);
-                var sourceDepths=indexes.Select(i=>Depth(WaterSourcePositions[i])).Where(math.isfinite).ToArray();
-                var levels=indexes.Select(i=>WaterSourcePositions[i].y+Depth(WaterSourcePositions[i])).Where(math.isfinite).OrderBy(h=>h).ToArray();
-                var level=levels.Length>0?levels[levels.Length/2]:float.NaN;
-                var hadPrevious=WaterObservations.TryGetValue(body.Key,out var previous);
-                var dryGap=0f;foreach(var p in plans.Take(128)){var points=p.ChannelProbes;for(var j=1;j<Math.Min(32,points.Count);j++)if(Depth(points[j-1])<=.05f||Depth(points[j])<=.05f)dryGap=Math.Max(dryGap,math.distance(points[j-1].xz,points[j].xz));}
-                log.Diagnostic($"WATER BODY RESULT body={body.Key}; kind={plan.BodyKind}; controls={indexes.Length}/{plans.Length}; missingPlannedControls={plans.Length-indexes.Length}; minimumSourceDepth={(sourceDepths.Length>0?sourceDepths.Min():float.NaN):R}; wetDownstreamProbes={wet}/{probes.Length}; floodedBankProbes={flooded}/{banks.Length}; largestPotentialDryProbeGapMeters={dryGap:R}; medianObservedLevel={level:R}; previousWetProbes={(hadPrevious?previous.wet:-1)}; medianLevelChangeMeters={(hadPrevious?level-previous.level:float.NaN):R}; elapsedWallSeconds={elapsed:0}; singleSurfaceSnapshot=true; fullRiverCoverageVerified=false; simulationAdvanceVerified=false; sourceCausedWetnessVerified=false");
-                WaterObservations[body.Key]=(wet,probes.Length,flooded,level);
-                if(bodyRecords.Count<4096)
+                var plans = body.ToArray();
+                var plan = plans[0];
+                var indexes = createdByBody.TryGetValue(body.Key, out var created) ? created : Array.Empty<int>();
+                var probes =
+                    plans
+                        .SelectMany(
+                            river => river.ChannelProbes.Count > 0
+                                ? river.ChannelProbes
+                                : new[] { river.DownstreamProbe })
+                        .Take(512)
+                        .GroupBy(point => ((int)Math.Round(point.x * 4), (int)Math.Round(point.z * 4)))
+                        .Select(group => group.First())
+                        .Take(128)
+                        .ToArray();
+
+                var banks =
+                    plans
+                        .SelectMany(river => river.BankProbes)
+                        .Take(512)
+                        .GroupBy(point => ((int)Math.Round(point.x * 4), (int)Math.Round(point.z * 4)))
+                        .Select(group => group.First())
+                        .Take(128)
+                        .ToArray();
+
+                var wet = probes.Count(point => Depth(point) > .05f);
+                var flooded = banks.Count(point => Depth(point) > .1f);
+                var sourceDepths = indexes.Select(i => Depth(WaterSourcePositions[i])).Where(math.isfinite).ToArray();
+                var levels =
+                    indexes
+                        .Select(i => WaterSourcePositions[i].y + Depth(WaterSourcePositions[i]))
+                        .Where(math.isfinite)
+                        .OrderBy(h => h)
+                        .ToArray();
+
+                var level = levels.Length > 0 ? levels[levels.Length / 2] : float.NaN;
+                var hadPrevious = WaterObservations.TryGetValue(body.Key, out var previous);
+                var dryGap = 0f;
+
+                foreach (var river in plans.Take(128))
                 {
-                    var channelRecords=Math.Min(Math.Min(4096,probes.Length),remainingProbeRecords);remainingProbeRecords-=channelRecords;
-                    var bankRecords=Math.Min(Math.Min(4096,banks.Length),remainingProbeRecords);remainingProbeRecords-=bankRecords;
-                    bodyRecords.Add(new {
-                    body=body.Key,kind=plan.BodyKind,phase,elapsedWallSeconds=elapsed,waterSimSpeed=water.WaterSimSpeed,
-                    plannedControls=plans.Length,createdControls=indexes.Length,wetProbes=wet,floodedBankProbes=flooded,
-                    channel=probes.Take(channelRecords).Select(p=>new {position=DiagnosticArtifacts.Point(p),depthMeters=Depth(p)}).ToArray(),
-                    banks=banks.Take(bankRecords).Select(p=>new {position=DiagnosticArtifacts.Point(p),depthMeters=Depth(p)}).ToArray(),
-                    channelProbeCount=probes.Length,bankProbeCount=banks.Length,probesTruncated=probes.Length>channelRecords||banks.Length>bankRecords,
-                    sourceCausedWetnessVerified=false,simulationAdvanceVerified=false
+                    var points = river.ChannelProbes;
+
+                    for (var j = 1; j < Math.Min(32, points.Count); j++)
+                        if (Depth(points[j - 1]) <= .05f || Depth(points[j]) <= .05f)
+                            dryGap = Math.Max(dryGap, math.distance(points[j - 1].xz, points[j].xz));
+                }
+
+                log.Diagnostic(
+                    $"WATER BODY RESULT body={body.Key}; kind={plan.BodyKind}; controls={indexes.Length}/{plans.Length}; missingPlannedControls={plans.Length - indexes.Length}; minimumSourceDepth={(sourceDepths.Length > 0 ? sourceDepths.Min() : float.NaN):R}; wetDownstreamProbes={wet}/{probes.Length}; floodedBankProbes={flooded}/{banks.Length}; largestPotentialDryProbeGapMeters={dryGap:R}; medianObservedLevel={level:R}; previousWetProbes={(hadPrevious ? previous.wet : -1)}; medianLevelChangeMeters={(hadPrevious ? level - previous.level : float.NaN):R}; elapsedWallSeconds={elapsed:0}; singleSurfaceSnapshot=true; fullRiverCoverageVerified=false; simulationAdvanceVerified=false; sourceCausedWetnessVerified=false");
+
+                WaterObservations[body.Key] = (wet, probes.Length, flooded, level);
+
+                if (bodyRecords.Count < 4096)
+                {
+                    var channelRecords = Math.Min(Math.Min(4096, probes.Length), remainingProbeRecords);
+                    remainingProbeRecords -= channelRecords;
+                    var bankRecords = Math.Min(Math.Min(4096, banks.Length), remainingProbeRecords);
+                    remainingProbeRecords -= bankRecords;
+                    bodyRecords.Add(new
+                    {
+                        body = body.Key,
+                        kind = plan.BodyKind,
+                        phase,
+                        elapsedWallSeconds = elapsed,
+                        waterSimSpeed = water.WaterSimSpeed,
+                        plannedControls = plans.Length,
+                        createdControls = indexes.Length,
+                        wetProbes = wet,
+                        floodedBankProbes = flooded,
+                        channel = probes
+                            .Take(channelRecords)
+                            .Select(
+                                point => new
+                                {
+                                    position = DiagnosticArtifacts.Point(point),
+                                    depthMeters = Depth(point)
+                                })
+                            .ToArray(),
+                        banks = banks
+                            .Take(bankRecords)
+                            .Select(
+                                point => new
+                                {
+                                    position = DiagnosticArtifacts.Point(point),
+                                    depthMeters = Depth(point)
+                                })
+                            .ToArray(),
+                        channelProbeCount = probes.Length,
+                        bankProbeCount = banks.Length,
+                        probesTruncated = probes.Length > channelRecords || banks.Length > bankRecords,
+                        sourceCausedWetnessVerified = false,
+                        simulationAdvanceVerified = false
                     });
                 }
-                if(flooded>0)log.Warn($"Water containment not verified for body {body.Key}: {flooded} outer-bank probes are wet. No automatic source increase is permitted; check neighbouring bodies and sea level.");
-                if(elapsed>=179&&(sourceDepths.Length==0||sourceDepths.Min()<=.05f||wet<probes.Length))
-                    log.Warn($"Water coverage not verified for body {body.Key}: {wet}/{probes.Length} channel samples wet after {elapsed:0} seconds. Native source existence and wall time do not prove simulation advancement; inspect WATER SIMULATION/CACHE diagnostics.");
+
+                if (flooded > 0)
+                    log.Warn(
+                        $"Water containment not verified for body {body.Key}: {flooded} outer-bank probes are wet. No automatic source increase is permitted; check neighbouring bodies and sea level.");
+
+                if (elapsed >= 179 && (sourceDepths.Length == 0 || sourceDepths.Min() <= .05f || wet < probes.Length))
+                    log.Warn(
+                        $"Water coverage not verified for body {body.Key}: {wet}/{probes.Length} channel samples wet after {elapsed:0} seconds. Native source existence and wall time do not prove simulation advancement; inspect WATER SIMULATION/CACHE diagnostics.");
             }
-            log.DiagnosticRecords($"water-observations-{(int)elapsed}s-chunk-{bodyOffset}.ndjson",bodyRecords,final:true);
-            log.Diagnostic($"WATER OBSERVATION ARTIFACT bodiesRecorded={bodyRecords.Count}; chunkStart={bodyOffset}; perSliceBodyLimit=32; perBodyProbeLimit=128; sampledCoverageOnly=true; positionedDepths=true; readOnly=true");
+
+            // The first settled reading of each chunk is protected: by this point per-section
+            // details have used the final budget, and every observation file came out empty.
+            var settled = elapsed >= 179 && WaterSettledChunks.Add(bodyOffset);
+
+            // Sparse probes read rivers as wet while they look broken from above, so once,
+            // along every river: depth, and how wide the water really is at 28 m steps
+            // (the simulation's cell) out from the centre.
+            if (settled && bodyOffset == 0)
+            {
+                const int Stride = 5, Reach = 12;
+                const float Step = 28;
+
+                float Across(float3 point, float2 side)
+                {
+                    var wet = 0;
+
+                    for (var k = 1; k <= Reach; k++)
+                    {
+                        if (Depth(new float3(point.x + side.x * Step * k, point.y, point.z + side.y * Step * k))
+                            <= .05f)
+                            break;
+
+                        wet++;
+                    }
+
+                    return wet * Step;
+                }
+
+                var rows = RiverReaches.Where((_, i) => i % Stride == 0).Select(reach =>
+                {
+                    var point = (reach.Start + reach.End) * .5f;
+                    var d = math.normalizesafe((reach.End - reach.Start).xz);
+                    var side = new float2(-d.y, d.x);
+
+                    return (object)new
+                    {
+                        way = reach.WayId,
+                        body = reach.BodyId,
+                        x = point.x,
+                        z = point.z,
+                        half = reach.HalfWidth,
+                        level = (reach.StartLevel + reach.EndLevel) * .5f,
+                        depth = Depth(point),
+                        left = Across(point, side),
+                        right = Across(point, -side)
+                    };
+                }).ToArray();
+
+                log.DiagnosticRecords("water-river-widths.ndjson", rows, critical: true);
+                log.Diagnostic($"WATER RIVER WIDTHS samples={rows.Length}; everyReach={Stride}; cellMeters={Step}");
+
+                // The whole map's water, not just probes: where water stands and how deep,
+                // for offline checks against the settled-water model.
+                if (NativeWaterPlacement.DepthCentimetres(water, out var cells) is { } waterDepths)
+                {
+                    log.DiagnosticHeights("native-water-depth-cm.u16", waterDepths);
+                    log.DiagnosticJson(
+                        "native-water-depth.json",
+                        new
+                        {
+                            file = "native-water-depth-cm.u16",
+                            cells,
+                            cellMeters = water.CellSize,
+                            units = "centimetres",
+                            rowZero = "south",
+                            elapsedWallSeconds = elapsed,
+                            wetCells = waterDepths.Count(depth => depth > 5)
+                        });
+                }
+            }
+
+            log.DiagnosticRecords(
+                $"water-observations-{(int)elapsed}s-chunk-{bodyOffset}.ndjson",
+                bodyRecords,
+                critical: settled,
+                final: !settled);
+
+            log.Diagnostic(
+                $"WATER OBSERVATION ARTIFACT bodiesRecorded={bodyRecords.Count}; chunkStart={bodyOffset}; perSliceBodyLimit=32; perBodyProbeLimit=128; sampledCoverageOnly=true; positionedDepths=true; readOnly=true");
         }
-        catch(Exception exception){log.Diagnostic("WATER PROBE unavailable: "+exception.GetBaseException().Message);}
+        catch (Exception exception)
+        {
+            log.Diagnostic("WATER PROBE unavailable: " + exception.GetBaseException().Message);
+        }
     }
 
     private static JArray WaterState(EntityManager manager)
     {
-        using var query=manager.CreateEntityQuery(new EntityQueryDesc { All=new[]{ComponentType.ReadOnly<WaterSourceData>(),ComponentType.ReadOnly<Transform>()},None=new[]{ComponentType.ReadOnly<Deleted>(),ComponentType.ReadOnly<Game.Tools.Temp>()} });
-        using var entities=query.ToEntityArray(Allocator.Temp);
-        if(entities.Length>20000)throw new InvalidOperationException("More than 20,000 native water sources; bounded persistence readback unavailable.");
-        return new JArray(entities.Select(entity=>WaterRecord(manager.GetComponentData<Transform>(entity).m_Position,manager.GetComponentData<WaterSourceData>(entity))).OrderBy(v=>v.ToString(Newtonsoft.Json.Formatting.None),StringComparer.Ordinal));
+        using var query =
+            manager.CreateEntityQuery(
+                new EntityQueryDesc
+                {
+                    All = new[] { ComponentType.ReadOnly<WaterSourceData>(), ComponentType.ReadOnly<Transform>() },
+                    None = new[] { ComponentType.ReadOnly<Deleted>(), ComponentType.ReadOnly<Game.Tools.Temp>() }
+                });
+
+        using var entities = query.ToEntityArray(Allocator.Temp);
+
+        if (entities.Length > 20000)
+            throw new InvalidOperationException(
+                "More than 20,000 native water sources; bounded persistence readback unavailable.");
+
+        return new JArray(
+            entities
+                .Select(
+                    entity => WaterRecord(
+                        manager.GetComponentData<Transform>(entity).m_Position,
+                        manager.GetComponentData<WaterSourceData>(entity)))
+                .OrderBy(row => row.ToString(Newtonsoft.Json.Formatting.None), StringComparer.Ordinal));
     }
 
     private static JObject TerrainRuntimeState(TerrainSystem terrain)
     {
-        var source=terrain.heightmap;if(source==null||source.width<2||source.height<2)throw new InvalidOperationException("Playable GPU terrain unavailable.");
-        var data=terrain.GetHeightData(false);var bounds=TerrainUtils.GetBounds(ref data);var scale=terrain.heightScaleOffset;
-        var pixels=new JArray();var old=RenderTexture.active;RenderTexture? temporary=null;
-        var cpu=new Texture2D(1,1,TextureFormat.R16,false,true);
+        var source = terrain.heightmap;
+
+        if (source == null || source.width < 2 || source.height < 2)
+            throw new InvalidOperationException("Playable GPU terrain unavailable.");
+
+        var data = terrain.GetHeightData(false);
+        var bounds = TerrainUtils.GetBounds(ref data);
+        var scale = terrain.heightScaleOffset;
+        var pixels = new JArray();
+        var old = RenderTexture.active;
+        RenderTexture? temporary = null;
+        var cpu = new Texture2D(1, 1, TextureFormat.R16, false, true);
+
         try
         {
-            var render=source as RenderTexture;
-            if(render==null){temporary=RenderTexture.GetTemporary(source.width,source.height,0,RenderTextureFormat.R16,RenderTextureReadWrite.Linear);Graphics.Blit(source,temporary);render=temporary;}
-            if(!render.IsCreated())throw new InvalidOperationException("Playable GPU terrain is not created.");
-            RenderTexture.active=render;
-            foreach(var uv in new[]{new float2(0,0),new float2(.25f,.25f),new float2(.5f,.5f),new float2(.75f,.75f),new float2(1,1)})
+            var render = source as RenderTexture;
+
+            if (render == null)
             {
-                var x=(int)Math.Round(uv.x*(source.width-1));var z=(int)Math.Round(uv.y*(source.height-1));
-                cpu.ReadPixels(new Rect(x,z,1,1),0,0,false);cpu.Apply(false,false);var bytes=cpu.GetRawTextureData();
-                if(bytes.Length!=2)throw new InvalidOperationException("R16 diagnostic pixel conversion unavailable.");
-                var encoded=bytes[0]|bytes[1]<<8;var gpuHeight=encoded/65535f*scale.x+scale.y;
-                var normalized=new float2(x/(float)(source.width-1),z/(float)(source.height-1));
-                var playable=terrain.playableOffset+normalized*terrain.playableArea;
-                var cascade=math.lerp(bounds.min.xz,bounds.max.xz,normalized);
-                var a=new float3(playable.x,0,playable.y);var b=new float3(cascade.x,0,cascade.y);
-                pixels.Add(new JObject{["pixelX"]=x,["pixelZ"]=z,["gpuEncodedR16"]=encoded,["gpuHeightMeters"]=gpuHeight,
-                    ["playableCornerX"]=a.x,["playableCornerZ"]=a.z,["cpuAtPlayableCornerMeters"]=TerrainUtils.SampleHeight(ref data,a),
-                    ["cascadeCornerX"]=b.x,["cascadeCornerZ"]=b.z,["cpuAtCascadeCornerMeters"]=TerrainUtils.SampleHeight(ref data,b)});
+                temporary =
+                    RenderTexture.GetTemporary(
+                        source.width,
+                        source.height,
+                        0,
+                        RenderTextureFormat.R16,
+                        RenderTextureReadWrite.Linear);
+
+                Graphics.Blit(source, temporary);
+                render = temporary;
             }
-            return new JObject{["gpuType"]=source.GetType().Name,["gpuWidth"]=source.width,["gpuHeight"]=source.height,["gpuGraphicsFormat"]=source.graphicsFormat.ToString(),
-                ["cpuResolution"]=data.resolution.ToString(),["cpuSampleCount"]=data.heights.Length,["cpuBoundsMin"]=bounds.min.ToString(),["cpuBoundsMax"]=bounds.max.ToString(),
-                ["playableOffset"]=terrain.playableOffset.ToString(),["playableArea"]=terrain.playableArea.ToString(),["heightScaleOffset"]=scale.ToString(),["samples"]=pixels,
-                ["readOnly"]=true,["r16DiagnosticConversionNotNativeWriteContract"]=true,["dirtyRestampPublicationValidated"]=false};
+
+            if (!render.IsCreated())
+                throw new InvalidOperationException("Playable GPU terrain is not created.");
+
+            RenderTexture.active = render;
+
+            foreach (var uv in new[] {
+                new float2(0, 0),
+                new float2(.25f, .25f),
+                new float2(.5f, .5f),
+                new float2(.75f, .75f),
+                new float2(1, 1)
+                })
+            {
+                var x = (int)Math.Round(uv.x * (source.width - 1));
+                var z = (int)Math.Round(uv.y * (source.height - 1));
+                cpu.ReadPixels(new Rect(x, z, 1, 1), 0, 0, false);
+                cpu.Apply(false, false);
+                var bytes = cpu.GetRawTextureData();
+
+                if (bytes.Length != 2)
+                    throw new InvalidOperationException("R16 diagnostic pixel conversion unavailable.");
+
+                var encoded = bytes[0] | bytes[1] << 8;
+                var gpuHeight = encoded / 65535f * scale.x + scale.y;
+                var normalized = new float2(x / (float)(source.width - 1), z / (float)(source.height - 1));
+                var playable = terrain.playableOffset + normalized * terrain.playableArea;
+                var cascade = math.lerp(bounds.min.xz, bounds.max.xz, normalized);
+                var vectorA = new float3(playable.x, 0, playable.y);
+                var vectorB = new float3(cascade.x, 0, cascade.y);
+                pixels.Add(new JObject
+                {
+                    ["pixelX"] = x,
+                    ["pixelZ"] = z,
+                    ["gpuEncodedR16"] = encoded,
+                    ["gpuHeightMeters"] = gpuHeight,
+                    ["playableCornerX"] = vectorA.x,
+                    ["playableCornerZ"] = vectorA.z,
+                    ["cpuAtPlayableCornerMeters"] = TerrainUtils.SampleHeight(ref data, vectorA),
+                    ["cascadeCornerX"] = vectorB.x,
+                    ["cascadeCornerZ"] = vectorB.z,
+                    ["cpuAtCascadeCornerMeters"] = TerrainUtils.SampleHeight(ref data, vectorB)
+                });
+            }
+
+            return new JObject
+            {
+                ["gpuType"] = source.GetType().Name,
+                ["gpuWidth"] = source.width,
+                ["gpuHeight"] = source.height,
+                ["gpuGraphicsFormat"] = source.graphicsFormat.ToString(),
+                ["cpuResolution"] = data.resolution.ToString(),
+                ["cpuSampleCount"] = data.heights.Length,
+                ["cpuBoundsMin"] = bounds.min.ToString(),
+                ["cpuBoundsMax"] = bounds.max.ToString(),
+                ["playableOffset"] = terrain.playableOffset.ToString(),
+                ["playableArea"] = terrain.playableArea.ToString(),
+                ["heightScaleOffset"] = scale.ToString(),
+                ["samples"] = pixels,
+                ["readOnly"] = true,
+                ["r16DiagnosticConversionNotNativeWriteContract"] = true,
+                ["dirtyRestampPublicationValidated"] = false
+            };
         }
-        finally{RenderTexture.active=old;UnityEngine.Object.Destroy(cpu);if(temporary!=null)RenderTexture.ReleaseTemporary(temporary);}
+        finally
+        {
+            RenderTexture.active = old;
+            UnityEngine.Object.Destroy(cpu);
+
+            if (temporary != null)
+                RenderTexture.ReleaseTemporary(temporary);
+        }
     }
 
     private static JObject TextureSignature(Texture? target)
     {
-        if(target is RenderTexture uninitialized&&!uninitialized.IsCreated())return new JObject{["initialized"]=false,["width"]=uninitialized.width,["height"]=uninitialized.height,["format"]=uninitialized.format.ToString(),["meaning"]="Native editor paint texture has not been allocated; base terrain only."};
-        if(!(target is RenderTexture render)||!render.IsCreated()||render.graphicsFormat!=UnityEngine.Experimental.Rendering.GraphicsFormat.R8G8_UNorm||render.width<=0||render.height<=0||(long)render.width*render.height>16_777_216)
-            throw new InvalidOperationException($"Native paint texture unavailable or unsupported: type={target?.GetType().Name??"null"}; dimensions={target?.width}x{target?.height}; format={(target is RenderTexture rt?rt.format.ToString():"not-render-texture")}.");
-        var cpu=new Texture2D(render.width,render.height,TextureFormat.RG16,false,true);var old=RenderTexture.active;
+        if (target is RenderTexture uninitialized && !uninitialized.IsCreated())
+            return new JObject
+            {
+                ["initialized"] = false,
+                ["width"] = uninitialized.width,
+                ["height"] = uninitialized.height,
+                ["format"] = uninitialized.format.ToString(),
+                ["meaning"] = "Native editor paint texture has not been allocated; base terrain only."
+            };
+
+        if (!(target is RenderTexture render)
+            || !render.IsCreated()
+            || render.graphicsFormat != UnityEngine.Experimental.Rendering.GraphicsFormat.R8G8_UNorm
+            || render.width <= 0
+            || render.height <= 0
+            || (long)render.width * render.height > 16_777_216)
+            throw new InvalidOperationException(
+                $"Native paint texture unavailable or unsupported: type={target?.GetType().Name ?? "null"}; dimensions={target?.width}x{target?.height}; format={(target is RenderTexture rt ? rt.format.ToString() : "not-render-texture")}.");
+
+        var cpu = new Texture2D(render.width, render.height, TextureFormat.RG16, false, true);
+        var old = RenderTexture.active;
+
         try
         {
-            RenderTexture.active=render;cpu.ReadPixels(new Rect(0,0,render.width,render.height),0,0,false);var pixels=cpu.GetRawTextureData();
-            if(pixels.Length!=(long)render.width*render.height*2)throw new InvalidOperationException("Native RG16 diagnostic readback byte count changed.");
-            var counts=new long[2];for(var i=0;i<pixels.Length;i+=2){if(pixels[i]>0)counts[0]++;if(pixels[i+1]>0)counts[1]++;}
-            return new JObject { ["width"]=render.width,["height"]=render.height,["format"]=render.format.ToString(),["encoding"]="nativeRG16-not-four-brush-weights",["sha256"]=PixelHash(pixels),["nonzeroEncodedChannels"]=new JArray(counts) };
-        }
-        finally{RenderTexture.active=old;UnityEngine.Object.Destroy(cpu);}
-    }
+            RenderTexture.active = render;
+            cpu.ReadPixels(new Rect(0, 0, render.width, render.height), 0, 0, false);
+            var pixels = cpu.GetRawTextureData();
 
-    private static JArray AirState(EntityManager manager,PrefabSystem prefabs,NameSystem names,string phase,ImportLog log)
-    {
-        _airPendingInitialization=0;
-        using var query=manager.CreateEntityQuery(new EntityQueryDesc { All=new[]{ComponentType.ReadOnly<AirplaneStop>(),ComponentType.ReadOnly<Game.Objects.OutsideConnection>(),ComponentType.ReadOnly<Transform>(),ComponentType.ReadOnly<PrefabRef>()},None=new[]{ComponentType.ReadOnly<Deleted>(),ComponentType.ReadOnly<Game.Tools.Temp>()} });
-        using var entities=query.ToEntityArray(Allocator.Temp);
-        if(entities.Length>256)throw new InvalidOperationException("More than 256 airplane connections; refusing a truncated persistence claim.");
-        var result=new JArray();foreach(var entity in entities)
+            if (pixels.Length != (long)render.width * render.height * 2)
+                throw new InvalidOperationException("Native RG16 diagnostic readback byte count changed.");
+
+            var counts = new long[2];
+
+            for (var i = 0; i < pixels.Length; i += 2)
+            {
+                if (pixels[i] > 0)
+                    counts[0]++;
+
+                if (pixels[i + 1] > 0)
+                    counts[1]++;
+            }
+
+            return new JObject
+            {
+                ["width"] = render.width,
+                ["height"] = render.height,
+                ["format"] = render.format.ToString(),
+                ["encoding"] = "nativeRG16-not-four-brush-weights",
+                ["sha256"] = PixelHash(pixels),
+                ["nonzeroEncodedChannels"] = new JArray(counts)
+            };
+        }
+        finally
         {
-            var position=manager.GetComponentData<Transform>(entity).m_Position;
-            var prefab=manager.GetComponentData<PrefabRef>(entity).m_Prefab;
-            if(!prefabs.TryGetPrefab<PrefabBase>(prefab,out var resolved)||resolved==null)throw new InvalidOperationException("Native airplane prefab reference cannot be resolved; no persistence claim.");
-            var prefabName=resolved.name;
-            names.TryGetCustomName(entity,out var name);
-            var takeoff=manager.HasComponent<Game.Routes.TakeoffLocation>(entity);
-            var created=manager.HasComponent<Created>(entity);
-            if(created)_airPendingInitialization++;
-            log.Diagnostic($"AIR STATE phase={phase}; name={name}; prefab={prefabName}; position={position}; airplaneStop=true; outsideConnection=true; takeoffLocation={takeoff}; createdMarkerStillPresent={created}; takeoffFlags="+(takeoff?manager.GetComponentData<Game.Routes.TakeoffLocation>(entity).m_Flags.ToString():"missing")+"; flightsVerified=false");
-            result.Add(AirRecord(name??"",prefabName,position,takeoff));
+            RenderTexture.active = old;
+            UnityEngine.Object.Destroy(cpu);
         }
-        return new JArray(result.OrderBy(v=>v.ToString(Newtonsoft.Json.Formatting.None),StringComparer.Ordinal));
     }
 
-    private static JObject AirRecord(string name,string prefab,float3 position,bool takeoff)
-        =>new() { ["name"]=name,["prefab"]=prefab,["x"]=Math.Round(position.x,2),["y"]=Math.Round(position.y,2),["z"]=Math.Round(position.z,2),["airplaneStop"]=true,["outsideConnection"]=true,["takeoffLocation"]=takeoff };
-
-    public static JObject ClimateState(ClimateSystem climate,WindSimulationSystem wind,PrefabSystem prefabs,string phase,ImportLog log)
+    private static JArray AirState(
+        EntityManager manager,
+        PrefabSystem prefabs,
+        NameSystem names,
+        string phase,
+        ImportLog log)
     {
-        var entity=climate.currentClimate;
-        if(!prefabs.TryGetPrefab<ClimatePrefab>(entity,out var prefab)||prefab==null)throw new InvalidOperationException("Native climate prefab cannot be resolved; no persistence claim.");
-        var name=prefab.name;
-        var pressure=typeof(WindSimulationSystem).GetProperty("m_ConstantPressure",System.Reflection.BindingFlags.Instance|System.Reflection.BindingFlags.Public|System.Reflection.BindingFlags.NonPublic)?.GetValue(wind);
-        var flow=wind.constantWind;
-        if(!(pressure is float nativePressure)||!math.isfinite(nativePressure)||!math.all(math.isfinite(flow)))throw new InvalidOperationException("Native wind/pressure readback is unavailable or non-finite; no persistence claim.");
-        log.Diagnostic($"CLIMATE STATE phase={phase}; prefab={name}; windVector={flow}; nativeWindMagnitude={math.length(flow):R}; pressure={pressure}; temperature={climate.temperature.value:R}; precipitation={climate.precipitation.value:R}; cloudiness={climate.cloudiness.value:R}; seasonTemperature={climate.seasonTemperature:R}; seasonPrecipitation={climate.seasonPrecipitation:R}; seasonCloudiness={climate.seasonCloudiness:R}; weatherClassification={climate.classification}; weatherIsTimeDependent=true");
+        _airPendingInitialization = 0;
+
+        using (var border =
+            manager.CreateEntityQuery(
+                new EntityQueryDesc
+                {
+                    All =
+                        new[] {
+                            ComponentType.ReadOnly<Game.Net.OutsideConnection>(),
+                            ComponentType.ReadOnly<Game.Net.Node>()
+                            },
+                    None = new[] { ComponentType.ReadOnly<Deleted>(), ComponentType.ReadOnly<Game.Tools.Temp>() }
+                }))
+            log.Diagnostic($"OUTSIDE CONNECTIONS phase={phase}; nodes={border.CalculateEntityCount()}");
+
+        using var query =
+            manager.CreateEntityQuery(
+                new EntityQueryDesc
+                {
+                    All =
+                        new[] {
+                            ComponentType.ReadOnly<AirplaneStop>(),
+                            ComponentType.ReadOnly<Game.Objects.OutsideConnection>(),
+                            ComponentType.ReadOnly<Transform>(),
+                            ComponentType.ReadOnly<PrefabRef>()
+                            },
+                    None = new[] { ComponentType.ReadOnly<Deleted>(), ComponentType.ReadOnly<Game.Tools.Temp>() }
+                });
+
+        using var entities = query.ToEntityArray(Allocator.Temp);
+
+        if (entities.Length > 256)
+            throw new InvalidOperationException(
+                "More than 256 airplane connections; refusing a truncated persistence claim.");
+
+        var result = new JArray();
+
+        foreach (var entity in entities)
+        {
+            var position = manager.GetComponentData<Transform>(entity).m_Position;
+            var prefab = manager.GetComponentData<PrefabRef>(entity).m_Prefab;
+
+            if (!prefabs.TryGetPrefab<PrefabBase>(prefab, out var resolved) || resolved == null)
+                throw new InvalidOperationException(
+                    "Native airplane prefab reference cannot be resolved; no persistence claim.");
+
+            var prefabName = resolved.name;
+            names.TryGetCustomName(entity, out var name);
+            var takeoff = manager.HasComponent<Game.Routes.TakeoffLocation>(entity);
+            var created = manager.HasComponent<Created>(entity);
+
+            if (created)
+                _airPendingInitialization++;
+
+            log.Diagnostic(
+                $"AIR STATE phase={phase}; name={name}; prefab={prefabName}; position={position}; airplaneStop=true; outsideConnection=true; takeoffLocation={takeoff}; createdMarkerStillPresent={created}; takeoffFlags="
+                    + (takeoff
+                        ? manager.GetComponentData<Game.Routes.TakeoffLocation>(entity).m_Flags.ToString()
+                        : "missing")
+                    + "; flightsVerified=false");
+
+            result.Add(AirRecord(name ?? "", prefabName, position, takeoff));
+        }
+
+        return new JArray(
+            result.OrderBy(token => token.ToString(Newtonsoft.Json.Formatting.None), StringComparer.Ordinal));
+    }
+
+    private static JObject AirRecord(string name, string prefab, float3 position, bool takeoff)
+        => new()
+        {
+            ["name"] = name,
+            ["prefab"] = prefab,
+            ["x"] = Math.Round(position.x, 2),
+            ["y"] = Math.Round(position.y, 2),
+            ["z"] = Math.Round(position.z, 2),
+            ["airplaneStop"] = true,
+            ["outsideConnection"] = true,
+            ["takeoffLocation"] = takeoff
+        };
+
+    public static JObject ClimateState(
+        ClimateSystem climate,
+        WindSimulationSystem wind,
+        PrefabSystem prefabs,
+        string phase,
+        ImportLog log)
+    {
+        var entity = climate.currentClimate;
+
+        if (!prefabs.TryGetPrefab<ClimatePrefab>(entity, out var prefab) || prefab == null)
+            throw new InvalidOperationException("Native climate prefab cannot be resolved; no persistence claim.");
+
+        var name = prefab.name;
+        var pressure =
+            typeof(WindSimulationSystem).GetProperty(
+                "m_ConstantPressure",
+                System.Reflection.BindingFlags.Instance
+                    | System.Reflection.BindingFlags.Public
+                    | System.Reflection.BindingFlags.NonPublic)?.GetValue(wind);
+
+        var flow = wind.constantWind;
+
+        if (!(pressure is float nativePressure) || !math.isfinite(nativePressure) || !math.all(math.isfinite(flow)))
+            throw new InvalidOperationException(
+                "Native wind/pressure readback is unavailable or non-finite; no persistence claim.");
+
+        log.Diagnostic(
+            $"CLIMATE STATE phase={phase}; prefab={name}; windVector={flow}; nativeWindMagnitude={math.length(flow):R}; pressure={pressure}; temperature={climate.temperature.value:R}; precipitation={climate.precipitation.value:R}; cloudiness={climate.cloudiness.value:R}; seasonTemperature={climate.seasonTemperature:R}; seasonPrecipitation={climate.seasonPrecipitation:R}; seasonCloudiness={climate.seasonCloudiness:R}; weatherClassification={climate.classification}; weatherIsTimeDependent=true");
+
         // Dynamic weather is reported, not expected to remain identical across elapsed time.
-        return new JObject { ["prefab"]=name,["windX"]=Math.Round(flow.x,4),["windZ"]=Math.Round(flow.y,4),["pressure"]=pressure is float p?new JValue(Math.Round(p,3)):JValue.CreateNull() };
+        return new JObject
+        {
+            ["prefab"] = name,
+            ["windX"] = Math.Round(flow.x, 4),
+            ["windZ"] = Math.Round(flow.y, 4),
+            ["pressure"] = pressure is float p ? new JValue(Math.Round(p, 3)) : JValue.CreateNull()
+        };
     }
 }

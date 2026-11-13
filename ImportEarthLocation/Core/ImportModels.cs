@@ -17,13 +17,24 @@ public enum ImportStage
     Failed
 }
 
-public enum PreparationDataIssue { ElevationUnavailable, NetworkIncomplete, ResourceLimit, GeometryUnavailable }
+public enum PreparationDataIssue
+{
+    ElevationUnavailable,
+    NetworkIncomplete,
+    ResourceLimit,
+    GeometryUnavailable
+}
 
 /// <summary>An exhausted bounded data-recovery path, not user input or a software fault.</summary>
 public sealed class PreparationDataException : Exception
 {
     public PreparationDataIssue Issue { get; }
-    public PreparationDataException(PreparationDataIssue issue,string detail,Exception? inner=null) : base(detail,inner) => Issue=issue;
+
+    public PreparationDataException(
+        PreparationDataIssue issue,
+        string detail,
+        Exception? inner = null) : base(detail, inner) => Issue = issue;
+
     public string UserMessage => Issue switch
     {
         PreparationDataIssue.ElevationUnavailable => "Elevation data could not be recovered safely. Your map is unchanged; cached downloads are retained. Please retry preparation later.",
@@ -55,7 +66,7 @@ public sealed record ImportRequest(
     public bool DirectVegetation { get; init; }
     // Fast Road Design also lets native network batches grow past 32 sections
     // while they settle cleanly (report 64 Phase 6 batch ladder).
-    public bool VisualDesign { get; init; }
+
     // Vanilla rocks and boulders from OSM rock, scree, cliff and stone features
     // plus steep natural slopes (RockPlanner). Off by default until verified in game.
     public bool ImportRocks { get; init; }
@@ -67,13 +78,30 @@ public sealed record ImportRequest(
     // 2×2 block averaged into one sample, an area mean in place of the coarser
     // tile's own resampling. Four times the tile downloads; same output grid.
     public bool HdTerrain { get; init; }
+
+    // Design changes under trial, comma-separated (DesignSwitches). Empty for normal imports.
+    public string DesignSwitches { get; init; } = "";
 }
 
+// PlayableMeters is the game's map size. The game reads each of its 4,096 height
+// samples at a pixel centre, so the samples span PlayableMeters × 4,095/4,096
+// (57,330 m on a 57,344 m map). WidthMeters is that span: everything we place, and
+// our own grid with a sample on each map edge, uses it, so our samples are the
+// game's samples and handing the heightmap over needs no resampling. WidthMeters
+// is the stored value, so captured requests keep the span they ran with (runs
+// before 9 November recorded 57,344 m and replay on that grid).
 public sealed record MapSizeProfile(string Id, string Label, double WidthMeters, bool RequiresMapExt)
 {
-    public static readonly MapSizeProfile Vanilla = new("vanilla", "14.336 km (Vanilla)", 14_336d, false);
-    public static readonly MapSizeProfile MapExt28 = new("mapext28", "28.672 km (MapExt)", 28_672d, true);
-    public static readonly MapSizeProfile MapExt57 = new("mapext57", "57.344 km (MapExt)", 57_344d, true);
+    // The game's heightmap is 4,096 samples a side on every map size (TerrainBuilder.Resolution).
+    public const int HeightSamples = 4096;
+
+    public double PlayableMeters => WidthMeters * HeightSamples / (HeightSamples - 1);
+
+    private static double Span(double playableMeters) => playableMeters * (HeightSamples - 1) / HeightSamples;
+
+    public static readonly MapSizeProfile Vanilla = new("vanilla", "14.336 km (Vanilla)", Span(14_336d), false);
+    public static readonly MapSizeProfile MapExt28 = new("mapext28", "28.672 km (MapExt)", Span(28_672d), true);
+    public static readonly MapSizeProfile MapExt57 = new("mapext57", "57.344 km (MapExt)", Span(57_344d), true);
 
     public static MapSizeProfile FromId(string? id) => id switch
     {
@@ -91,8 +119,13 @@ public readonly record struct GeoBounds(double South, double West, double North,
 public readonly record struct OsmNode(long Id, double Latitude, double Longitude);
 
 public sealed record OsmWay(long Id, long[] NodeIds, IReadOnlyDictionary<string, string> Tags);
+
 public readonly record struct OsmMember(string Type, long Id, string Role);
-public sealed record OsmRelation(long Id, IReadOnlyList<(long wayId, bool inner)> Members, IReadOnlyDictionary<string, string> Tags)
+
+public sealed record OsmRelation(
+    long Id,
+    IReadOnlyList<(long wayId, bool inner)> Members,
+    IReadOnlyDictionary<string, string> Tags)
 {
     // Legacy polygon view remains available. Network consumers use exact ordered
     // members, including node-via restrictions and multi-way via paths.
@@ -106,7 +139,13 @@ public enum NetworkKind
 }
 
 [Flags]
-public enum NetworkSides { None = 0, Left = 1, Right = 2, Both = Left | Right }
+public enum NetworkSides
+{
+    None = 0,
+    Left = 1,
+    Right = 2,
+    Both = Left | Right
+}
 
 public sealed record PreparedSegment(
     long WayId,
@@ -134,8 +173,8 @@ public sealed record PreparedSegment(
     public IReadOnlyList<long> SourceWayIds { get; init; } = Array.Empty<long>();
     public IReadOnlyList<SourceNodeAlias> SourceNodeAliases { get; init; } = Array.Empty<SourceNodeAlias>();
     public IReadOnlyList<float3> OriginalGeometry { get; init; } = Array.Empty<float3>();
-    public IReadOnlyDictionary<string,string> SourceTags { get; init; } = new Dictionary<string,string>();
-    public IReadOnlyDictionary<string,string> RawSourceTags { get; init; } = new Dictionary<string,string>();
+    public IReadOnlyDictionary<string, string> SourceTags { get; init; } = new Dictionary<string, string>();
+    public IReadOnlyDictionary<string, string> RawSourceTags { get; init; } = new Dictionary<string, string>();
     public bool StartMiniRoundabout { get; init; }
     public bool EndMiniRoundabout { get; init; }
     public bool StartTerminal { get; init; }
@@ -191,17 +230,44 @@ public sealed record PreparedSegment(
     // Intended XZ controls before float emission. Y is not used: the profile
     // solver owns heights. Absent or stale reference means rounding is unknown.
     public Cubic3d? HorizontalEmissionReference { get; init; }
+
     public float3 CourseStart => FinalDeckCurve?.P0 ?? Start + StartCurveOffset;
+
     public float3 CourseEnd => FinalDeckCurve?.P3 ?? End + EndCurveOffset;
-    public float3 CourseControl1 => FinalDeckCurve?.P1 ?? (Control1 ?? Unity.Mathematics.math.lerp(Start,End,1f/3)) + StartCurveOffset;
-    public float3 CourseControl2 => FinalDeckCurve?.P2 ?? (Control2 ?? Unity.Mathematics.math.lerp(Start,End,2f/3)) + EndCurveOffset;
+
+    public float3 CourseControl1
+        => FinalDeckCurve?.P1 ?? (Control1 ?? Unity.Mathematics.math.lerp(Start, End, 1f / 3)) + StartCurveOffset;
+
+    public float3 CourseControl2
+        => FinalDeckCurve?.P2 ?? (Control2 ?? Unity.Mathematics.math.lerp(Start, End, 2f / 3)) + EndCurveOffset;
+
     public IReadOnlyList<float> NativeLaneOffsets { get; init; } = Array.Empty<float>();
     public float? StartElevation { get; init; }
     public float? EndElevation { get; init; }
     public PreparedSegment? HorizontalParent { get; init; }
     public float ParentStartT { get; init; }
     public float ParentEndT { get; init; } = 1;
-    public bool ProtectedLink => Kind == NetworkKind.Road && Classification.EndsWith("_link", StringComparison.OrdinalIgnoreCase);
+
+    public bool ProtectedLink
+        => Kind == NetworkKind.Road && Classification.EndsWith("_link", StringComparison.OrdinalIgnoreCase);
+
+    // Equality stays the record's own (every field), but the hash reads only the way, its
+    // nodes and its start: equal sections always share those, so this agrees with Equals.
+    // The generated hash read all ~80 fields, recursively through HorizontalParent, for
+    // every set lookup (report 114 S7). Sections that share these fields are rare, and
+    // only they fall back to the full field comparison.
+    public override int GetHashCode()
+    {
+        unchecked
+        {
+            var hash = WayId.GetHashCode();
+            hash = hash * 31 + StartNodeId.GetHashCode();
+            hash = hash * 31 + EndNodeId.GetHashCode();
+            hash = hash * 31 + Start.GetHashCode();
+
+            return hash * 31 + (int)Kind;
+        }
+    }
 }
 
 public sealed class TerrainTile
@@ -231,10 +297,17 @@ public sealed class PreparedImport
 {
     public ImportRequest Request { get; init; } = new(0, 0, MapSizeProfile.Vanilla, false);
     public GeoBounds Bounds { get; init; }
-    public ushort[] Heightmap { get; init; } = Array.Empty<ushort>();
-    public ushort[] RoadbedBaseline { get; init; } = Array.Empty<ushort>();
+    // Metres above the bottom of the height encoding (TerrainBuilder.Result.Heights).
+    public float[] Heights { get; init; } = Array.Empty<float>();
+    public float[] RoadbedBaseline { get; init; } = Array.Empty<float>();
+
+    // Flood-defence crests and other thin barriers holding water off lower land, in
+    // metres on the heights' grid (NaN where there is none); the terrain bridge keeps
+    // them at full height on the game's grid.
+    public float[]? DefenceCrests { get; init; }
+
     public TerrainEditSet? RoadbedLaterEdits { get; init; }
-    public Func<float3,float?>? NetworkWaterSurface { get; init; }
+    public Func<float3, float?>? NetworkWaterSurface { get; init; }
     public IReadOnlyList<float3[]> RoadbedProtectedAreas { get; init; } = Array.Empty<float3[]>();
     public IReadOnlyList<float3[]> RoadbedProtectedLines { get; init; } = Array.Empty<float3[]>();
     public float HeightScaleMeters { get; init; }
@@ -261,16 +334,41 @@ public sealed record ClimateNormals(float[] Temperatures, float[] Precipitation,
 
 // Rocks share the vegetation placement path; their size classes come from each
 // vanilla prefab's footprint (NativeVegetationPlacement.ResolveCatalog).
-public enum VegetationForm { Broadleaf, Conifer, Palm, Shrub, RockSmall, RockMedium, RockLarge }
+public enum VegetationForm
+{
+    Broadleaf,
+    Conifer,
+    Palm,
+    Shrub,
+    RockSmall,
+    RockMedium,
+    RockLarge
+}
 
-public enum GroundMaterial : byte { Base, Sand, DryGrass, Grass, Dirt }
-public enum SurfaceTransition : byte { Hard, Medium, Soft }
+public enum GroundMaterial : byte
+{
+    Base,
+    Sand,
+    DryGrass,
+    Grass,
+    Dirt
+}
+
+public enum SurfaceTransition : byte
+{
+    Hard,
+    Medium,
+    Soft
+}
+
 public sealed record SurfaceMask(int Resolution, double WidthMeters, byte[] Material, byte[] Intensity, string Report)
 {
     public byte[] Confidence { get; init; } = Array.Empty<byte>();
     public SurfaceTransition[] Transitions { get; init; } = Array.Empty<SurfaceTransition>();
 }
+
 public sealed record AirDestination(string Name, double DistanceKm, double Bearing, float3 Position);
+
 public sealed record RiverSourcePlan(long WayId, string Name, string Origin, float3 Position, float Radius,
     float Depth, float BankLevel, float3 DownstreamProbe)
 {
@@ -284,35 +382,38 @@ public sealed record RiverSourcePlan(long WayId, string Name, string Origin, flo
     // Accepted geographic mask on the immutable map raster, not a widened
     // circular approximation. Final earthworks recovery may edit only these cells.
     public IReadOnlyList<int> BedRepairCells { get; init; } = Array.Empty<int>();
+    // Placed on a node of the game's water grid (multiples of the water cell size) with a
+    // radius just under one cell. The game weights each grid node under a source by
+    // 1 − smoothstep(distance² / radius²) (WaterSystem.CalculateSourceMultiplier), so a
+    // smaller source between the 28 m nodes of a large map fills almost nothing. Its
+    // footprint is the grid nodes it reaches, not a circle of samples.
+    public bool GridSnapped { get; init; }
 }
+
 public sealed record WaterPlan(bool Coastal, int Rivers, int Lakes, int Skipped, string Report)
 {
     public IReadOnlyList<RiverSourcePlan> Sources { get; init; } = Array.Empty<RiverSourcePlan>();
     public float WaterCellSize { get; init; }
-    public ushort[]? ConditionedHeightmap { get; init; }
+    public float[]? ConditionedHeights { get; init; }
     // Geographic stage evidence is independent of whether a circular regulator fits.
     public IReadOnlyList<WaterAreaStage> AreaStages { get; init; } = Array.Empty<WaterAreaStage>();
     public IReadOnlyList<WaterReachStage> ReachStages { get; init; } = Array.Empty<WaterReachStage>();
     public TerrainEditSet? BedEdits { get; init; }
     public TerrainEditSet? FinalBedEdits { get; init; }
-    public ushort[]? PlannedBedHeightmap { get; init; }
+    public float[]? PlannedBedHeights { get; init; }
+
     public const string GeometryVersion = "geographic-stage-v3-rivers-only";
 }
 
 public sealed record WaterAreaStage(long BodyId, string Kind, float Level);
+
 public sealed record WaterReachStage(long BodyId, long WayId, float3 Start, float3 End,
     float StartLevel, float EndLevel, float HalfWidth, long? PolygonId)
 {
     public bool BlockedByBuriedInlet { get; init; }
 }
-public sealed record TerrainEditSet(string Producer, string Baseline, int Resolution, byte[] Mask);
-// 0 known land/barrier, 1 accepted directed ocean, 2 conflicting, 3 unseeded.
-public sealed record OceanMask(int Resolution,double WidthMeters,byte[] Classification,string Version);
 
-public sealed record ImportSummary(
-    int RoadSegments,
-    int RailSegments,
-    int SkippedSegments,
-    float MinimumElevation,
-    float MaximumElevation,
-    IReadOnlyList<string> Warnings);
+public sealed record TerrainEditSet(string Producer, string Baseline, int Resolution, byte[] Mask);
+
+// 0 known land/barrier, 1 accepted directed ocean, 2 conflicting, 3 unseeded.
+public sealed record OceanMask(int Resolution, double WidthMeters, byte[] Classification, string Version);

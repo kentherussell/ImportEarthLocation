@@ -34,6 +34,7 @@
     <Reference Include="Unity.Mathematics"><Private>false</Private></Reference>
     <Reference Include="UnityEngine.CoreModule"><Private>false</Private></Reference>
     <Reference Include="UnityEngine.ImageConversionModule"><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.ScreenCaptureModule"><Private>false</Private></Reference>
     <Reference Include="System.Net.Http"><Private>false</Private></Reference>
     <Reference Include="System.Xml.Linq"><Private>false</Private></Reference>
     <Reference Include="Newtonsoft.Json"><Private>false</Private></Reference>

@@ -18,10 +18,13 @@ public sealed class Mod : IMod
     {
         Log.Info($"Loading {Id} {Version}");
         Integration.NativeUiBootstrap.Initialize(this);
-        Core.ImportSession.ChangeMap(Game.SceneFlow.GameManager.instance.gameMode == GameMode.Editor && !Game.SceneFlow.GameManager.instance.isGameLoading);
+        Core.ImportSession.ChangeMap(
+            Game.SceneFlow.GameManager.instance.gameMode == GameMode.Editor
+                && !Game.SceneFlow.GameManager.instance.isGameLoading);
+
         updateSystem.UpdateAt<ImportEarthLocationUISystem>(SystemUpdatePhase.UIUpdate);
         updateSystem.UpdateAt<ImportApplySystem>(SystemUpdatePhase.PreTool);
-        updateSystem.UpdateAt<NetworkCommitSystem>(SystemUpdatePhase.ToolUpdate);
+        updateSystem.UpdateAt<NetworkCommitSystem>(SystemUpdatePhase.ToolUpdate);        Integration.AutoRun.Begin();
     }
 
     public void OnDispose()
