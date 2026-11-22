@@ -174,6 +174,44 @@ static partial class VisualMetricsReplay
         Console.WriteLine(
             $"{clock.Elapsed.TotalSeconds:F1} s; forest ways {bestScore}; trees {trees.Count}; hash {Convert.ToHexString(sha.ComputeHash(bytes))[..16]}");
 
+        // The full SHA-256 over the tree count and every tree's x, y and z bits in output
+        // order, plus the forest's counter lines (FOREST DISTRIBUTION, FOREST INFERENCE and the
+        // evidence summary; FOREST INDEX carries elapsed time), so neither order nor counts can drift.
+        using (var forestFingerprint = new MemoryStream())
+        using (var writer = new BinaryWriter(forestFingerprint))
+        {
+            writer.Write(trees.Count);
+
+            foreach (var tree in trees)
+            {
+                writer.Write(BitConverter.SingleToInt32Bits(tree.x));
+                writer.Write(BitConverter.SingleToInt32Bits(tree.y));
+                writer.Write(BitConverter.SingleToInt32Bits(tree.z));
+            }
+
+            var counterLines = 0;
+
+            foreach (var line in log.Lines)
+                if (line.StartsWith("FOREST DISTRIBUTION", StringComparison.Ordinal)
+                    || line.StartsWith("FOREST INFERENCE", StringComparison.Ordinal)
+                    || line.StartsWith("Trees prepared:", StringComparison.Ordinal))
+                {
+                    writer.Write(line);
+                    counterLines++;
+                }
+
+            writer.Flush();
+            Console.WriteLine(
+                "forest full fingerprint "
+                    + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(forestFingerprint.ToArray()))
+                    + $"; counter lines {counterLines}");
+        }
+
+        foreach (var metric in log.Metrics())
+            if (metric.Key.StartsWith("Forest ", StringComparison.Ordinal)
+                || metric.Key.StartsWith("Vegetation preparation", StringComparison.Ordinal))
+                Console.WriteLine($"  {metric.Key}: {metric.Value:F2}");
+
         // Vegetation planning on those trees with the capture's water. The capture has no
         // climate and only the water polygons, so the plan is not the game's, but the work
         // per tree and per bank sample is the same.
@@ -219,6 +257,34 @@ static partial class VisualMetricsReplay
         Buffer.BlockCopy(values, 0, planBytes, 0, planBytes.Length);
         Console.WriteLine(
             $"vegetation plan {planSeconds:F1} s; candidates {plan.Count}; hash {Convert.ToHexString(sha.ComputeHash(planBytes))[..16]}");
+
+        // Every field placement reads, in plan order, then the metadata table the
+        // candidates index into.
+        using (var fingerprint = new MemoryStream())
+        using (var writer = new BinaryWriter(fingerprint))
+        {
+            foreach (var candidate in plan)
+            {
+                writer.Write(BitConverter.SingleToInt32Bits(candidate.Position.x));
+                writer.Write(BitConverter.SingleToInt32Bits(candidate.Position.y));
+                writer.Write(BitConverter.SingleToInt32Bits(candidate.Position.z));
+                writer.Write((int)candidate.Form);
+                writer.Write(candidate.SourceId);
+                writer.Write(candidate.Seed);
+                writer.Write(candidate.MetadataIndex);
+            }
+
+            foreach (var entry in plan.Metadata)
+            {
+                writer.Write(entry.Evidence);
+                writer.Write(entry.Taxon);
+            }
+
+            writer.Flush();
+            Console.WriteLine(
+                $"vegetation fingerprint {Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fingerprint.ToArray()))}; "
+                    + $"metadata {plan.Metadata.Count}");
+        }
 
         foreach (var line in log.Lines.Where(line => line.Contains("VEGETATION PLAN TIMES")))
             Console.WriteLine(line);

@@ -63,7 +63,6 @@ public sealed class NativeNetworkPlacement
     private NativeBatchBindings.Batch<Entity>? _generatedBatch;
     private bool _advisoryBatch;
     private bool _advisoryPublished;
-    private readonly Dictionary<string, Entity> _advisoryOwners = new(StringComparer.Ordinal);
     private readonly Dictionary<string, EdgeStation> _edgeStations = new(StringComparer.Ordinal);
     private readonly HashSet<string> _mandatoryPorts = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _declaredAliases = new(StringComparer.Ordinal);
@@ -106,6 +105,44 @@ public sealed class NativeNetworkPlacement
     private readonly Dictionary<(NetworkKind Kind, long WayId, long Start, long End), PreparedSegment> _sourceRoutes =
         new();
 
+    // Indexes kept in step with every write of _committedNodes, _edgeStations and _verifiedPaths,
+    // so that a batch finds the keys it affects without walking the whole placed network. Rebuilding
+    // these maps per batch grew with the network (Paris: 63.8 s of settling against Marseille's 10.6).
+    private readonly Dictionary<Entity, List<string>> _ownerKeysByNode = new();
+    private readonly Dictionary<Entity, List<string>> _stationKeysByEdge = new();
+
+    private readonly Dictionary<Entity, HashSet<(NetworkKind Kind, long WayId, long Start, long End)>>
+        _verifiedPathsByEdge = new();
+
+    private readonly EnumerationOrder<string> _ownerOrder = new(StringComparer.Ordinal);
+
+    private readonly EnumerationOrder<(NetworkKind Kind, long WayId, long Start, long End)> _verifiedPathOrder =
+        new(EqualityComparer<(NetworkKind Kind, long WayId, long Start, long End)>.Default);
+
+    // Nodes that gained an owner key since the last advisory publish without going through
+    // ReconcileAdvisoryRoles (the strict path writes owners directly). The next advisory batch
+    // reconciles their groups; every other group is one the last reconciliation left as it is.
+    private readonly HashSet<Entity> _unreconciledNodes = new();
+
+    // This batch's advisory owners, held as changes to _committedNodes rather than a full copy:
+    // a key in _advisoryOverrides has that owner, a key in _advisoryAbsent has none, and every
+    // other key keeps its committed owner. _advisoryAppended lists, in order, the keys that were
+    // added while absent; the full map they replace put such keys after all retained ones.
+    private readonly Dictionary<string, Entity> _advisoryOverrides = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _advisoryAbsent = new(StringComparer.Ordinal);
+    private readonly List<string> _advisoryAppended = new();
+    private readonly Dictionary<string, int> _advisoryAppendIndex = new(StringComparer.Ordinal);
+
+    // Every key whose owner or anchor this batch can change, and every station key it wrote.
+    private readonly HashSet<string> _advisoryScope = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _stationScope = new(StringComparer.Ordinal);
+
+    // The batch's preview entities and their Originals, recorded while the preview still exists.
+    private readonly HashSet<Entity> _previewEntities = new();
+
+    // The strict path's node replacements (original -> preview), from which _stagedCommitted was mapped.
+    private Dictionary<Entity, Entity> _stagedReplacements = new();
+
     public void BeginBatch(int startIndex, int attempt, int count, bool preflight = false)
     {
         ArtifactStem = $"native-{(preflight ? "preflight" : "batch")}-{startIndex:D6}-{count:D3}-attempt-{attempt:D2}";
@@ -119,11 +156,13 @@ public sealed class NativeNetworkPlacement
         _stagedEdgeChanges.Clear();
         _advisoryBatch = false;
         _advisoryPublished = false;
-        _advisoryOwners.Clear();
+        ResetAdvisoryOwners();
         LastBatchSourceVerified = false;
         _pendingObservedEdges.Clear();
         _advisoryMutationEdges.Clear();
         _stagedPaths.Clear();
+        _previewEntities.Clear();
+        _stagedReplacements = new();
     }
 
     public NativeNetworkPlacement(EntityManager entityManager, PrefabSystem prefabSystem, ImportLog log)
@@ -176,9 +215,11 @@ public sealed class NativeNetworkPlacement
                     if (slotsChanged)
                         log.Count("Preflight change: ComposedLaneOffsets");
 
+                    // The section is reconciled and re-audited here, so this is a record, not a
+                    // warning: most differ only in asset key or lane offsets at equal width.
                     if (log.Metric("Native footprint sections reconciled") <= 25)
-                        log.Warn(
-                            $"Native {segment.Kind} way {segment.WayId}: prepared width={segment.NativeWidth:0.##} m; selected width={actual.NativeWidth:0.##} m; lanes={segment.Lanes}. Retained for complete-network repair/re-audit before confirmation.");
+                        log.Diagnostic(
+                            $"Native {segment.Kind} way {segment.WayId}: prepared width={segment.NativeWidth:0.##} m; selected width={actual.NativeWidth:0.##} m; lanes={segment.Lanes}; widthChanged={widthChanged}; assetKeyChanged={keyChanged}; laneOffsetsChanged={slotsChanged}. Retained for complete-network repair/re-audit before confirmation.");
                 }
 
                 supported.Add(actual with { NativeWidth = Math.Max(segment.NativeWidth, actual.NativeWidth) });
@@ -540,8 +581,8 @@ public sealed class NativeNetworkPlacement
         _observedEdges.Clear();
         _pendingObservedEdges.Clear();
         LastBatchSourceVerified = false;
-        _edgeStations.Clear();
-        _advisoryOwners.Clear();
+        ClearEdgeStations();
+        ResetAdvisoryOwners();
         _advisoryBatch = false;
         _mandatoryPorts.Clear();
         _declaredAliases.Clear();
@@ -603,17 +644,18 @@ public sealed class NativeNetworkPlacement
         _stagedPaths.Clear();
         _nodeElevations = NativeEndpointPolicy.Elevations(source);
         _isolatedEndpoints.Clear();
-        _committedNodes.Clear();
-        _committedAnchors.Clear();
+        ClearCommittedOwners();
         _plannedPositions.Clear();
         _centerBudgets.Clear();
         _verifiedEdges.Clear();
-        _verifiedPaths.Clear();
+        ClearVerifiedPaths();
         _stagedEdgeChanges.Clear();
         _stagedEdges = null;
         _touchedEdges = Array.Empty<NativeBatchBindings.Edge<Entity>>();
         _generatedBatch = null;
         _stagedCommitted = null;
+        _stagedReplacements = new();
+        _previewEntities.Clear();
         NativeNetworkDiagnostics.Remember(source, evidence);
         var positions = new Dictionary<float3, HashSet<string>>();
 
@@ -654,10 +696,13 @@ public sealed class NativeNetworkPlacement
             if (!_entityManager.HasComponent<Temp>(entity))
                 continue;
 
+            _previewEntities.Add(entity);
             var original = _entityManager.GetComponentData<Temp>(entity).m_Original;
 
             if (original == Entity.Null)
                 continue;
+
+            _previewEntities.Add(original);
 
             if (_entityManager.HasComponent<Edge>(original))
                 _advisoryMutationEdges.Add(original);
@@ -681,10 +726,14 @@ public sealed class NativeNetworkPlacement
                 _log.Warn(
                     $"Native source verification is advisory; applying generated preview for inspection. {error.GetBaseException().Message}");
 
-            _log.Diagnostic(
-                $"NATIVE QUALIFICATION ADVISORY artifact={ArtifactStem}; exception={error}; applied=false; sourceVerified=false; duplicateRetry=false");
+            // The exception text carries its stack trace: built only when it is written.
+            if (_log.DiagnosticsEnabled)
+                _log.Diagnostic(
+                    $"NATIVE QUALIFICATION ADVISORY artifact={ArtifactStem}; exception={error}; applied=false; sourceVerified=false; duplicateRetry=false");
 
+            var lineageClock = System.Diagnostics.Stopwatch.StartNew();
             CaptureAdvisoryLineage(temporary);
+            _log.AddDuration("Qualification advisory lineage", lineageClock.Elapsed.TotalSeconds);
         }
     }
 
@@ -707,6 +756,12 @@ public sealed class NativeNetworkPlacement
 
         var ports = new Dictionary<SourceNodeKey, Processing.NativeJunctionReconciliation.Port>();
         var moved = false;
+
+        // How far the game's nodes are from the plan, over the batch's ports, for the diagnostic
+        // line only: the refit thresholds below are judged from these. They decide nothing.
+        var largestPositionMeters = 0f;
+        var largestTangentDegrees = 0f;
+        var largestGradeDifference = 0f;
 
         foreach (var segment in batch)
             foreach (var start in new[] { true, false })
@@ -770,10 +825,19 @@ public sealed class NativeNetworkPlacement
 
                 var originalReach = math.length(originalDerivative.xz);
                 var originalGrade = originalReach > 1e-8 ? originalDerivative.y / originalReach : 0;
+                var positionMeters = math.distance(position, start ? segment.Start : segment.End);
+                var tangentDot = math.dot(desired, tangent.xz / reach);
+                var gradeDifference = Math.Abs(originalGrade - tangent.y / reach);
 
-                if (math.distance(position, start ? segment.Start : segment.End) > .1
-                    || math.dot(desired, tangent.xz / reach) < .999
-                    || Math.Abs(originalGrade - tangent.y / reach) > .001)
+                largestPositionMeters = Math.Max(largestPositionMeters, positionMeters);
+                largestTangentDegrees =
+                    Math.Max(largestTangentDegrees, math.degrees(math.acos(math.clamp(tangentDot, -1f, 1f))));
+
+                largestGradeDifference = Math.Max(largestGradeDifference, gradeDifference);
+
+                if (positionMeters > .1
+                    || tangentDot < .999
+                    || gradeDifference > .001)
                     moved = true;
             }
 
@@ -784,8 +848,10 @@ public sealed class NativeNetworkPlacement
             _locallyRefittedUnits.Add(segment.NativeUnitId);
 
         _pendingRefitPorts = ports;
-        _log.Diagnostic(
-            $"LOCAL REFIT requested unappliedSections={batch.Count}; exactBoundaryPoses={ports.Count}; structuralOnly=false; oldPreviewMustRetireBeforeWorker=true; oncePerUnit=true; appliedOwnersWillNotBeMutated=true");
+
+        if (_log.DiagnosticsEnabled)
+            _log.Diagnostic(
+                $"LOCAL REFIT requested unappliedSections={batch.Count}; exactBoundaryPoses={ports.Count}; structuralOnly=false; oldPreviewMustRetireBeforeWorker=true; oncePerUnit=true; appliedOwnersWillNotBeMutated=true; largestPositionMeters={largestPositionMeters:R}; largestTangentDegrees={largestTangentDegrees:R}; largestGradeDifference={largestGradeDifference:R}");
 
         return true;
     }
@@ -797,7 +863,8 @@ public sealed class NativeNetworkPlacement
         var captured = _generatedBatch;
         _advisoryBatch = true;
         _generatedBatch = null;
-        _advisoryOwners.Clear();
+        ResetAdvisoryOwners();
+        var partClock = Stopwatch.StartNew();
         var replacements = new Dictionary<Entity, Entity>();
         var removed = new HashSet<Entity>();
 
@@ -818,26 +885,27 @@ public sealed class NativeNetworkPlacement
                     (otherTemporary.m_Flags & TempFlags.Replace) != 0 ? entity : otherTemporary.m_Original;
         }
 
-        foreach (var pair in _committedNodes)
-            if (replacements.TryGetValue(pair.Value, out var replacement))
-                _advisoryOwners[pair.Key] = replacement;
-            else if (!removed.Contains(pair.Value))
-                _advisoryOwners[pair.Key] = pair.Value;
+        // Every committed owner starts as its own advisory owner. Only the keys of a node the
+        // preview replaces, updates or deletes can start otherwise: they take the replacement,
+        // or have no owner when the node is deleted without one.
+        foreach (var node in replacements.Keys)
+            foreach (var key in OwnerKeysOf(node))
+                SetAdvisoryOwner(key, replacements[node]);
+
+        foreach (var node in removed)
+            if (!replacements.ContainsKey(node))
+                foreach (var key in OwnerKeysOf(node))
+                    RemoveAdvisoryOwner(key);
+
+        AddPreviewOwnersToScope();
 
         if (captured != null)
             foreach (var pair in captured.Anchors)
                 if (!removed.Contains(pair.Value.Entity))
-                    _advisoryOwners[pair.Key] = pair.Value.Entity;
+                    SetAdvisoryOwner(pair.Key, pair.Value.Entity);
 
-        var ownersByNode = new Dictionary<Entity, List<string>>();
-
-        foreach (var owner in _committedNodes)
-        {
-            if (!ownersByNode.TryGetValue(owner.Value, out var keys))
-                ownersByNode[owner.Value] = keys = new();
-
-            keys.Add(owner.Key);
-        }
+        _log.AddDuration("Advisory lineage owners", partClock.Elapsed.TotalSeconds);
+        partClock.Restart();
 
         // Native Combine absorbs degree-two source boundaries into edge interiors.
         // Original edge incidence, never proximity alone, establishes the station.
@@ -861,11 +929,11 @@ public sealed class NativeNetworkPlacement
             var curve = _entityManager.GetComponentData<Curve>(entity).m_Bezier;
             var prefab = _entityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
 
-            foreach (var pair in new List<KeyValuePair<string, EdgeStation>>(_edgeStations))
-                if (pair.Value.Edge == otherTemporary.m_Original)
+            if (_stationKeysByEdge.TryGetValue(otherTemporary.m_Original, out var onOriginal))
+                foreach (var key in onOriginal.ToArray())
                 {
-                    var t = CurveParameter(curve, pair.Value.Position);
-                    _edgeStations[pair.Key] = new(target, prefab, t, CurvePoint(curve, t));
+                    var t = CurveParameter(curve, _edgeStations[key].Position);
+                    SetEdgeStation(key, new(target, prefab, t, CurvePoint(curve, t)));
                 }
 
             if ((otherTemporary.m_Flags & TempFlags.Combine) == 0
@@ -875,8 +943,12 @@ public sealed class NativeNetworkPlacement
 
             foreach (var node in new[] { prior.StartNode, prior.EndNode })
             {
-                if (!removed.Contains(node) || !ownersByNode.TryGetValue(node, out var owners))
+                if (!removed.Contains(node) || !_ownerKeysByNode.ContainsKey(node))
                     continue;
+
+                // In the committed map's order, as the owners were listed before.
+                var owners = new List<string>(OwnerKeysOf(node));
+                SortByOwnerOrder(owners);
 
                 foreach (var owner in owners)
                 {
@@ -886,12 +958,17 @@ public sealed class NativeNetworkPlacement
                     if (t <= 0 || t >= 1 || !math.all(math.isfinite(CurvePoint(curve, t))))
                         continue;
 
-                    _edgeStations[owner] = new(target, prefab, t, CurvePoint(curve, t));
-                    _log.Diagnostic(
-                        $"NATIVE COMBINE STATION source={owner}; originalEdge={otherTemporary.m_Original}; replacementEdge={target}; split={t:R}; sourcePosition={point}; nativePosition={CurvePoint(curve, t)}; originalIncidenceProven=true; proximityOwnerGuess=false");
+                    SetEdgeStation(owner, new(target, prefab, t, CurvePoint(curve, t)));
+
+                    if (_log.DiagnosticsEnabled)
+                        _log.Diagnostic(
+                            $"NATIVE COMBINE STATION source={owner}; originalEdge={otherTemporary.m_Original}; replacementEdge={target}; split={t:R}; sourcePosition={point}; nativePosition={CurvePoint(curve, t)}; originalIncidenceProven=true; proximityOwnerGuess=false");
                 }
             }
         }
+
+        _log.AddDuration("Advisory lineage stations", partClock.Elapsed.TotalSeconds);
+        partClock.Restart();
 
         Entity NodeTarget(Entity node)
         {
@@ -948,12 +1025,79 @@ public sealed class NativeNetworkPlacement
                 { CurveStart = curve.a, CurveEnd = curve.d, CurveControl1 = curve.b, CurveControl2 = curve.c };
         }
 
+        _log.AddDuration("Advisory lineage observed edges", partClock.Elapsed.TotalSeconds);
+        partClock.Restart();
+
         // Strict matching may have established some batch anchors before a prior
         // route audit disagreed. Retain their entity lineage, not guessed positions.
         if (_stagedCommitted != null)
-            foreach (var pair in _stagedCommitted)
-                if (!removed.Contains(pair.Value))
-                    _advisoryOwners[pair.Key] = pair.Value;
+        {
+            // A staged owner differs from the advisory owner set above only for a key of a node
+            // the preview touched or the strict path replaced, or a key a captured anchor set:
+            // every other key already holds its committed owner, which is also its staged one.
+            // The keys are taken in the committed map's order, the order they were staged in,
+            // so that a key added back lands where it did before.
+            foreach (var node in _stagedReplacements.Keys)
+                foreach (var key in OwnerKeysOf(node))
+                    _advisoryScope.Add(key);
+
+            var stagedKeys = new List<string>();
+
+            foreach (var key in _advisoryScope)
+                if (_stagedCommitted.ContainsKey(key))
+                    stagedKeys.Add(key);
+
+            SortByOwnerOrder(stagedKeys);
+
+            foreach (var key in stagedKeys)
+                if (!removed.Contains(_stagedCommitted[key]))
+                    SetAdvisoryOwner(key, _stagedCommitted[key]);
+        }
+
+        // The ends of the preview's live edges and the node each one resolves to, read once
+        // and grouped by asset. Every section end used to test every preview entity through
+        // the entity manager: 512 ends against the whole preview, for every batch (report 119).
+        var previewPorts = new Dictionary<Entity, List<(float3 Position, Entity Node)>>();
+
+        foreach (var entity in temporary)
+        {
+            if (!_entityManager.HasComponent<Edge>(entity)
+                || !_entityManager.HasComponent<Curve>(entity)
+                || !_entityManager.HasComponent<PrefabRef>(entity))
+                continue;
+
+            if ((_entityManager.GetComponentData<Temp>(entity).m_Flags & TempFlags.Delete) != 0)
+                continue;
+
+            var prefab = _entityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
+            var edge = _entityManager.GetComponentData<Edge>(entity);
+            var curve = _entityManager.GetComponentData<Curve>(entity).m_Bezier;
+
+            foreach (var port in new[] { (edge.m_Start, curve.a), (edge.m_End, curve.d) })
+            {
+                if (!_entityManager.HasComponent<Node>(port.Item1))
+                    continue;
+
+                var target = port.Item1;
+
+                if (_entityManager.HasComponent<Temp>(target))
+                {
+                    var otherTemporary = _entityManager.GetComponentData<Temp>(target);
+
+                    if ((otherTemporary.m_Flags & TempFlags.Delete) != 0)
+                        continue;
+
+                    if (otherTemporary.m_Original != Entity.Null
+                        && (otherTemporary.m_Flags & TempFlags.Replace) == 0)
+                        target = otherTemporary.m_Original;
+                }
+
+                if (!previewPorts.TryGetValue(prefab, out var ports))
+                    previewPorts[prefab] = ports = new();
+
+                ports.Add((port.Item2, target));
+            }
+        }
 
         foreach (var expected in _submittedCourses)
             foreach (var end in new[] {
@@ -968,55 +1112,35 @@ public sealed class NativeNetworkPlacement
 
                 var candidates = new HashSet<Entity>();
 
-                foreach (var entity in temporary)
-                {
-                    if (!_entityManager.HasComponent<Edge>(entity)
-                        || !_entityManager.HasComponent<Curve>(entity)
-                        || !_entityManager.HasComponent<PrefabRef>(entity))
-                        continue;
-
-                    if (_entityManager.GetComponentData<PrefabRef>(entity).m_Prefab != expected.Prefab)
-                        continue;
-
-                    if ((_entityManager.GetComponentData<Temp>(entity).m_Flags & TempFlags.Delete) != 0)
-                        continue;
-
-                    var edge = _entityManager.GetComponentData<Edge>(entity);
-                    var curve = _entityManager.GetComponentData<Curve>(entity).m_Bezier;
-
-                    foreach (var port in new[] { (edge.m_Start, curve.a), (edge.m_End, curve.d) })
-                    {
-                        if (!NativeBatchBindings.PlaybackHorizontal(end.Item2, port.Item2)
-                            || !_entityManager.HasComponent<Node>(port.Item1))
-                            continue;
-
-                        var target = port.Item1;
-
-                        if (_entityManager.HasComponent<Temp>(target))
-                        {
-                            var otherTemporary = _entityManager.GetComponentData<Temp>(target);
-
-                            if ((otherTemporary.m_Flags & TempFlags.Delete) != 0)
-                                continue;
-
-                            if (otherTemporary.m_Original != Entity.Null
-                                && (otherTemporary.m_Flags & TempFlags.Replace) == 0)
-                                target = otherTemporary.m_Original;
-                        }
-
-                        candidates.Add(target);
-                    }
-                }
+                if (previewPorts.TryGetValue(expected.Prefab, out var assetPorts))
+                    foreach (var port in assetPorts)
+                        if (NativeBatchBindings.PlaybackHorizontal(end.Item2, port.Position))
+                            candidates.Add(port.Node);
 
                 if (candidates.Count == 1)
-                    _advisoryOwners[key] = System.Linq.Enumerable.First(candidates);
-                else
+                    SetAdvisoryOwner(key, System.Linq.Enumerable.First(candidates));
+                else if (_log.DiagnosticsEnabled)
                     _log.Diagnostic(
-                        $"NATIVE ADVISORY ENDPOINT source={key}; exactPortCandidates={candidates.Count}; explicitAttachmentRetained={_advisoryOwners.ContainsKey(key)}; nearestOwnerGuess=false");
+                        $"NATIVE ADVISORY ENDPOINT source={key}; exactPortCandidates={candidates.Count}; explicitAttachmentRetained={TryGetAdvisoryOwner(key, out _)}; nearestOwnerGuess=false");
             }
 
-        _log.Diagnostic(
-            $"NATIVE ADVISORY LINEAGE artifact={ArtifactStem}; retainedOwners={_advisoryOwners.Count}; deletedOriginals={removed.Count}; replacements={replacements.Count}; sourceRouteVerification=false");
+        _log.AddDuration("Advisory lineage ports", partClock.Elapsed.TotalSeconds);
+
+        if (_log.DiagnosticsEnabled)
+            _log.Diagnostic(
+                $"NATIVE ADVISORY LINEAGE artifact={ArtifactStem}; retainedOwners={AdvisoryOwnerCount()}; deletedOriginals={removed.Count}; replacements={replacements.Count}; sourceRouteVerification=false");
+    }
+
+    // The advisory owners' count: the committed keys not dropped, and the keys added beside them.
+    private int AdvisoryOwnerCount()
+    {
+        var count = _committedNodes.Count - _advisoryAbsent.Count;
+
+        foreach (var key in _advisoryOverrides.Keys)
+            if (!_committedNodes.ContainsKey(key))
+                count++;
+
+        return count;
     }
 
     public void AcceptUnverifiedPlayback(string reason)
@@ -1027,15 +1151,24 @@ public sealed class NativeNetworkPlacement
         if (!_advisoryBatch)
         {
             _advisoryBatch = true;
-            _advisoryOwners.Clear();
+            ResetAdvisoryOwners();
 
+            // The advisory owners are the staged ones: each committed owner, or its strict
+            // replacement. Without a staged map no committed key keeps an owner.
             if (_stagedCommitted != null)
-                foreach (var pair in _stagedCommitted)
-                    _advisoryOwners[pair.Key] = pair.Value;
+            {
+                foreach (var node in _stagedReplacements.Keys)
+                    foreach (var key in OwnerKeysOf(node))
+                        SetAdvisoryOwner(key, _stagedCommitted[key]);
+
+                AddPreviewOwnersToScope();
+            }
+            else
+                RemoveAllAdvisoryOwners();
 
             if (_generatedBatch != null)
                 foreach (var pair in _generatedBatch.Anchors)
-                    _advisoryOwners[pair.Key] = pair.Value.Entity;
+                    SetAdvisoryOwner(pair.Key, pair.Value.Entity);
         }
 
         PublishAdvisoryOwners();
@@ -1095,51 +1228,25 @@ public sealed class NativeNetworkPlacement
         if (_advisoryPublished)
             return;
 
+        var partClock = Stopwatch.StartNew();
         ReconcileAdvisoryRoles();
+        _log.AddDuration("Settle reconcile roles", partClock.Elapsed.TotalSeconds);
+        partClock.Restart();
 
-        foreach (var key in new List<string>(_committedNodes.Keys))
-            if (!_advisoryOwners.ContainsKey(key))
-            {
-                _committedNodes.Remove(key);
-                _committedAnchors.Remove(key);
-            }
+        PublishOwnerChanges();
 
-        foreach (var pair in _advisoryOwners)
-        {
-            if (!_entityManager.HasComponent<Node>(pair.Value)
-                || _entityManager.HasComponent<Temp>(pair.Value)
-                || _entityManager.HasComponent<Deleted>(pair.Value))
-            {
-                _committedNodes.Remove(pair.Key);
-                _committedAnchors.Remove(pair.Key);
-                continue;
-            }
-
-            var point = _entityManager.GetComponentData<Node>(pair.Value).m_Position;
-
-            if (!math.all(math.isfinite(point)))
-            {
-                _committedNodes.Remove(pair.Key);
-                _committedAnchors.Remove(pair.Key);
-                continue;
-            }
-
-            _committedNodes[pair.Key] = pair.Value;
-            _committedAnchors[pair.Key] =
-                new(pair.Value, _plannedPositions[pair.Key], point) { CenterLimit = _centerBudgets[pair.Key] };
-        }
+        // Every node that gained a key was reconciled above, or holds no more than the keys its
+        // last reconciliation kept.
+        _unreconciledNodes.Clear();
+        _log.AddDuration("Settle publish owners", partClock.Elapsed.TotalSeconds);
+        partClock.Restart();
 
         // Paths touched by an unqualified Combine lose certification. Paths
         // outside the captured mutation/incidence closure keep their evidence;
         // this never certifies the newly applied advisory batch.
-        foreach (var pair in new List<KeyValuePair<string, EdgeStation>>(_edgeStations))
-            if (!_entityManager.HasComponent<Edge>(pair.Value.Edge)
-                || _entityManager.HasComponent<Temp>(pair.Value.Edge)
-                || _entityManager.HasComponent<Deleted>(pair.Value.Edge)
-                || !_entityManager.HasComponent<Curve>(pair.Value.Edge)
-                || !_entityManager.HasComponent<PrefabRef>(pair.Value.Edge)
-                || _entityManager.GetComponentData<PrefabRef>(pair.Value.Edge).m_Prefab != pair.Value.Prefab)
-                _edgeStations.Remove(pair.Key);
+        RevalidateEdgeStations();
+        _log.AddDuration("Settle edge stations", partClock.Elapsed.TotalSeconds);
+        partClock.Restart();
 
         foreach (var pair in _pendingObservedEdges)
             if (_entityManager.HasComponent<Edge>(pair.Key)
@@ -1147,118 +1254,576 @@ public sealed class NativeNetworkPlacement
                 && !_entityManager.HasComponent<Deleted>(pair.Key))
                 _observedEdges[pair.Key] = pair.Value;
 
-        var invalidated = new List<(NetworkKind Kind, long WayId, long Start, long End)>();
-
-        foreach (var path in _verifiedPaths)
-            if (path.Value.Exists(_advisoryMutationEdges.Contains))
-                invalidated.Add(path.Key);
+        var invalidated = InvalidatedVerifiedPaths();
 
         foreach (var path in invalidated)
-            _verifiedPaths.Remove(path);
+            RemoveVerifiedPath(path);
 
         foreach (var edge in _advisoryMutationEdges)
             _verifiedEdges.Remove(edge);
+
+        _log.AddDuration("Settle observed edges and paths", partClock.Elapsed.TotalSeconds);
+        partClock.Restart();
 
         _stagedPaths.Clear();
         NativeNetworkDiagnostics.BindVerified(_committedNodes, _verifiedPaths);
         NativeNetworkDiagnostics.BindObserved(_observedEdges, _edgeStations);
         CaptureSettledReadback(invalidated);
+        _log.AddDuration("Settle readback and bindings", partClock.Elapsed.TotalSeconds);
+
         _generatedBatch = null;
         _stagedCommitted = null;
         _stagedEdges = null;
         _touchedEdges = Array.Empty<NativeBatchBindings.Edge<Entity>>();
         _log.Count("Native batches applied without source certification");
         _advisoryPublished = true;
-        _log.Diagnostic(
-            $"NATIVE LIVE ADVISORY artifact={ArtifactStem}; liveOwners={_committedNodes.Count}; sourceVerified=false; invalidatedPriorPaths={invalidated.Count}; preservedPriorPaths={_verifiedPaths.Count}; mutationClosureEdges={_advisoryMutationEdges.Count}; newAdvisoryPathsCertified=0; applyReplayed=false");
+
+        if (_log.DiagnosticsEnabled)
+            _log.Diagnostic(
+                $"NATIVE LIVE ADVISORY artifact={ArtifactStem}; liveOwners={_committedNodes.Count}; sourceVerified=false; invalidatedPriorPaths={invalidated.Count}; preservedPriorPaths={_verifiedPaths.Count}; mutationClosureEdges={_advisoryMutationEdges.Count}; newAdvisoryPathsCertified=0; applyReplayed=false");
     }
 
+    // Writes the advisory owners into _committedNodes and _committedAnchors. The whole-map version
+    // removed every committed key without an advisory owner, in the committed map's order, then
+    // visited every advisory owner in the advisory map's order (the retained committed keys in the
+    // committed order, then the added keys in the order they were added): it removed an owner that
+    // is not a live node with a finite position and wrote a fresh anchor for every other.
+    //
+    // Only keys in _advisoryScope can come out differently from what is committed. Every other key
+    // keeps a committed owner the preview neither replaced, updated nor deleted, and this relies on:
+    // between two publishes a committed node changes (is deleted, becomes Temp, moves) only through
+    // a Temp of the batch's preview whose Original it is, so its anchor, read from the live node when
+    // it was last written, still holds. Checked against the whole-map version in 1,315 game
+    // batches with no difference (report 119, section 8).
+    // The scope is visited in that same order, so the maps' enumeration order, which reconciliation
+    // and strict qualification read, also stays what the whole-map version left.
+    private void PublishOwnerChanges()
+    {
+        var dropped = new List<string>();
+        var retained = new List<string>();
+
+        foreach (var key in _advisoryScope)
+        {
+            if (!_committedNodes.ContainsKey(key))
+                continue;
+
+            if (!TryGetAdvisoryOwner(key, out _))
+                dropped.Add(key);
+            else if (!_advisoryAppendIndex.ContainsKey(key))
+                retained.Add(key);
+        }
+
+        SortByOwnerOrder(dropped);
+        SortByOwnerOrder(retained);
+
+        foreach (var key in dropped)
+            RemoveCommittedOwner(key);
+
+        foreach (var key in retained)
+            PublishOwner(key);
+
+        foreach (var key in _advisoryAppended)
+            if (TryGetAdvisoryOwner(key, out _))
+                PublishOwner(key);
+    }
+
+    private void PublishOwner(string key)
+    {
+        TryGetAdvisoryOwner(key, out var node);
+
+        if (!_entityManager.HasComponent<Node>(node)
+            || _entityManager.HasComponent<Temp>(node)
+            || _entityManager.HasComponent<Deleted>(node))
+        {
+            RemoveCommittedOwner(key);
+            return;
+        }
+
+        var point = _entityManager.GetComponentData<Node>(node).m_Position;
+
+        if (!math.all(math.isfinite(point)))
+        {
+            RemoveCommittedOwner(key);
+            return;
+        }
+
+        SetCommittedOwner(
+            key,
+            node,
+            new(node, _plannedPositions[key], point) { CenterLimit = _centerBudgets[key] });
+    }
+
+    // Drops a station whose edge is no longer a live edge of its asset. Only a station this batch
+    // wrote, or one on an edge the preview held as a Temp or as the Original of a Temp, is checked:
+    // between two publishes an edge changes only through the batch's preview, so every other station
+    // keeps the edge it had when last checked (checked against all stations, report 119, section 8).
+    private void RevalidateEdgeStations()
+    {
+        var keys = new HashSet<string>(_stationScope, StringComparer.Ordinal);
+
+        foreach (var entity in _previewEntities)
+            if (_stationKeysByEdge.TryGetValue(entity, out var onEdge))
+                keys.UnionWith(onEdge);
+
+        foreach (var key in keys)
+        {
+            if (!_edgeStations.TryGetValue(key, out var station))
+                continue;
+
+            if (!_entityManager.HasComponent<Edge>(station.Edge)
+                || _entityManager.HasComponent<Temp>(station.Edge)
+                || _entityManager.HasComponent<Deleted>(station.Edge)
+                || !_entityManager.HasComponent<Curve>(station.Edge)
+                || !_entityManager.HasComponent<PrefabRef>(station.Edge)
+                || _entityManager.GetComponentData<PrefabRef>(station.Edge).m_Prefab != station.Prefab)
+                RemoveEdgeStation(key);
+        }
+    }
+
+    // The verified paths through an edge of the mutation closure, in the order of _verifiedPaths.
+    private List<(NetworkKind Kind, long WayId, long Start, long End)> InvalidatedVerifiedPaths()
+    {
+        var paths = new HashSet<(NetworkKind Kind, long WayId, long Start, long End)>();
+
+        foreach (var edge in _advisoryMutationEdges)
+            if (_verifiedPathsByEdge.TryGetValue(edge, out var throughEdge))
+                paths.UnionWith(throughEdge);
+
+        var invalidated = new List<(NetworkKind Kind, long WayId, long Start, long End)>(paths);
+        invalidated.Sort((first, second) => _verifiedPathOrder.Slot(first).CompareTo(_verifiedPathOrder.Slot(second)));
+
+        return invalidated;
+    }
+
+    // Groups of two or more advisory keys on one node. The whole-map version grouped every advisory
+    // owner, but only a node holding a key it did not hold when last reconciled can come out
+    // differently: one an advisory key now names (an override) or one the strict path gave a key
+    // (_unreconciledNodes). Any other group is a subset of the keys the last reconciliation kept:
+    // each was kept as mandatory, without a planned position, or on a node without incident edges,
+    // and none has its declared canonical key on the same node (a key whose canonical shares its
+    // node is dropped, whichever comes first). Visiting such a group again changes nothing, given
+    // that a node's ConnectedEdge buffer neither appears nor vanishes (report 119, section 8).
+    // Groups and keys are visited in the advisory map's order: within a group that order decides
+    // whether an alias key yields to its canonical key, as it did.
     private void ReconcileAdvisoryRoles()
     {
-        var groups = new Dictionary<Entity, List<string>>();
+        var overridesByNode = new Dictionary<Entity, List<string>>();
 
-        foreach (var pair in _advisoryOwners)
+        foreach (var pair in _advisoryOverrides)
+            AddIndexed(overridesByNode, pair.Value, pair.Key);
+
+        var nodes = new HashSet<Entity>(_unreconciledNodes);
+        nodes.UnionWith(overridesByNode.Keys);
+        var groups = new List<(Entity Node, List<string> Keys)>();
+
+        foreach (var node in nodes)
         {
-            if (!groups.TryGetValue(pair.Value, out var keys))
-                groups[pair.Value] = keys = new();
+            var keys = new HashSet<string>(StringComparer.Ordinal);
 
-            keys.Add(pair.Key);
+            foreach (var key in OwnerKeysOf(node))
+                if (TryGetAdvisoryOwner(key, out var owner) && owner == node)
+                    keys.Add(key);
+
+            if (overridesByNode.TryGetValue(node, out var overrides))
+                keys.UnionWith(overrides);
+
+            if (keys.Count < 2)
+                continue;
+
+            var ordered = new List<string>(keys);
+            ordered.Sort(CompareAdvisoryOrder);
+            groups.Add((node, ordered));
         }
+
+        groups.Sort((first, second) => CompareAdvisoryOrder(first.Keys[0], second.Keys[0]));
 
         foreach (var group in groups)
         {
-            if (group.Value.Count < 2)
-                continue;
-
-            foreach (var key in group.Value)
+            foreach (var key in group.Keys)
             {
                 if (_declaredAliases.TryGetValue(key, out var canonical)
                     && canonical != key
-                    && _advisoryOwners.TryGetValue(canonical, out var same)
-                    && same == group.Key)
+                    && TryGetAdvisoryOwner(canonical, out var same)
+                    && same == group.Node)
                 {
-                    _advisoryOwners.Remove(key);
+                    RemoveAdvisoryOwner(key);
                     continue;
                 }
 
                 if (_mandatoryPorts.Contains(key)
                     || !_plannedPositions.TryGetValue(key, out var planned)
-                    || !_entityManager.HasBuffer<ConnectedEdge>(group.Key))
+                    || !_entityManager.HasBuffer<ConnectedEdge>(group.Node))
                     continue;
 
-                EdgeStation? found = null;
-                var ambiguous = false;
-
-                foreach (var incident in _entityManager.GetBuffer<ConnectedEdge>(group.Key, true))
-                {
-                    var edge = incident.m_Edge;
-
-                    if (!_observedEdges.ContainsKey(edge)
-                        && !_pendingObservedEdges.ContainsKey(edge)
-                        && !_verifiedEdges.ContainsKey(edge))
-                        continue;
-
-                    if (!_entityManager.HasComponent<Curve>(edge)
-                        || !_entityManager.HasComponent<PrefabRef>(edge)
-                        || _entityManager.HasComponent<Deleted>(edge)
-                        || _entityManager.HasComponent<Temp>(edge))
-                        continue;
-
-                    var curve = _entityManager.GetComponentData<Curve>(edge).m_Bezier;
-                    var t = CurveParameter(curve, planned);
-                    var point = CurvePoint(curve, t);
-
-                    if (math.distance(point.xz, planned.xz) > .05f)
-                        continue;
-
-                    var station =
-                        new EdgeStation(edge, _entityManager.GetComponentData<PrefabRef>(edge).m_Prefab, t, point);
-
-                    if (found != null)
-                    {
-                        ambiguous = true;
-                        break;
-                    }
-
-                    found = station;
-                }
+                var found = FindOwnedStation(group.Node, planned, out var ambiguous);
 
                 // The exact original station and owned incidence, not a nearby
                 // node, authorize an absorbed optional station. Ambiguous ones
                 // remain unavailable and are never attached to a guessed owner.
-                _advisoryOwners.Remove(key);
+                RemoveAdvisoryOwner(key);
 
                 if (found != null && !ambiguous)
-                    _edgeStations[key] = found;
+                    SetEdgeStation(key, found);
 
-                _log.Diagnostic(
-                    $"NATIVE SOURCE ROLE source={key}; role={(found != null && !ambiguous ? "owned-edge-station" : "unavailable-optional-station")}; mandatory=false; proximityNodeAttachment=false");
+                if (_log.DiagnosticsEnabled)
+                    _log.Diagnostic(
+                        $"NATIVE SOURCE ROLE source={key}; role={(found != null && !ambiguous ? "owned-edge-station" : "unavailable-optional-station")}; mandatory=false; proximityNodeAttachment=false");
             }
+        }
+    }
+
+    // The one observed or verified live edge of the node passing through the planned position.
+    private EdgeStation? FindOwnedStation(Entity node, float3 planned, out bool ambiguous)
+    {
+        EdgeStation? found = null;
+        ambiguous = false;
+
+        foreach (var incident in _entityManager.GetBuffer<ConnectedEdge>(node, true))
+        {
+            var edge = incident.m_Edge;
+
+            if (!_observedEdges.ContainsKey(edge)
+                && !_pendingObservedEdges.ContainsKey(edge)
+                && !_verifiedEdges.ContainsKey(edge))
+                continue;
+
+            if (!_entityManager.HasComponent<Curve>(edge)
+                || !_entityManager.HasComponent<PrefabRef>(edge)
+                || _entityManager.HasComponent<Deleted>(edge)
+                || _entityManager.HasComponent<Temp>(edge))
+                continue;
+
+            var curve = _entityManager.GetComponentData<Curve>(edge).m_Bezier;
+            var t = CurveParameter(curve, planned);
+            var point = CurvePoint(curve, t);
+
+            if (math.distance(point.xz, planned.xz) > .05f)
+                continue;
+
+            var station =
+                new EdgeStation(edge, _entityManager.GetComponentData<PrefabRef>(edge).m_Prefab, t, point);
+
+            if (found != null)
+            {
+                ambiguous = true;
+                break;
+            }
+
+            found = station;
+        }
+
+        return found;
+    }
+
+    // A key's position in the whole advisory map: retained committed keys first, in the committed
+    // map's order, then the keys added while absent, in the order they were added.
+    private int CompareAdvisoryOrder(string first, string second)
+    {
+        var firstAdded = _advisoryAppendIndex.TryGetValue(first, out var firstIndex);
+        var secondAdded = _advisoryAppendIndex.TryGetValue(second, out var secondIndex);
+
+        if (firstAdded != secondAdded)
+            return firstAdded ? 1 : -1;
+
+        return firstAdded
+            ? firstIndex.CompareTo(secondIndex)
+            : _ownerOrder.Slot(first).CompareTo(_ownerOrder.Slot(second));
+    }
+
+    private void ResetAdvisoryOwners()
+    {
+        _advisoryOverrides.Clear();
+        _advisoryAbsent.Clear();
+        _advisoryAppended.Clear();
+        _advisoryAppendIndex.Clear();
+        _advisoryScope.Clear();
+        _stationScope.Clear();
+    }
+
+    private bool TryGetAdvisoryOwner(string key, out Entity node)
+    {
+        if (_advisoryOverrides.TryGetValue(key, out node))
+            return true;
+
+        if (_advisoryAbsent.Contains(key))
+        {
+            node = Entity.Null;
+            return false;
+        }
+
+        return _committedNodes.TryGetValue(key, out node);
+    }
+
+    private void SetAdvisoryOwner(string key, Entity node)
+    {
+        if (!TryGetAdvisoryOwner(key, out _))
+        {
+            _advisoryAppendIndex[key] = _advisoryAppended.Count;
+            _advisoryAppended.Add(key);
+        }
+
+        _advisoryOverrides[key] = node;
+        _advisoryAbsent.Remove(key);
+        _advisoryScope.Add(key);
+    }
+
+    private void RemoveAdvisoryOwner(string key)
+    {
+        _advisoryOverrides.Remove(key);
+
+        if (_committedNodes.ContainsKey(key))
+            _advisoryAbsent.Add(key);
+
+        _advisoryScope.Add(key);
+    }
+
+    // No committed key keeps an owner: the one case that touches the whole map, reached only when
+    // a batch is published without having been staged.
+    private void RemoveAllAdvisoryOwners()
+    {
+        foreach (var key in _committedNodes.Keys)
+            RemoveAdvisoryOwner(key);
+    }
+
+    // The keys of committed nodes the preview holds as a Temp or as the Original of a Temp: their
+    // anchors are read again from the live nodes when the batch is published.
+    private void AddPreviewOwnersToScope()
+    {
+        foreach (var entity in _previewEntities)
+            foreach (var key in OwnerKeysOf(entity))
+                _advisoryScope.Add(key);
+    }
+
+    private IReadOnlyList<string> OwnerKeysOf(Entity node)
+        => _ownerKeysByNode.TryGetValue(node, out var keys) ? keys : Array.Empty<string>();
+
+    private void SortByOwnerOrder(List<string> keys)
+        => keys.Sort((first, second) => _ownerOrder.Slot(first).CompareTo(_ownerOrder.Slot(second)));
+
+    // The only writers of _committedNodes and _committedAnchors (always together, so the two share
+    // their keys and their enumeration order), keeping _ownerKeysByNode and _ownerOrder in step.
+    private void SetCommittedOwner(string key, Entity node, NativeBatchBindings.Anchor<Entity> anchor)
+    {
+        if (_committedNodes.TryGetValue(key, out var previous))
+        {
+            if (previous != node)
+            {
+                RemoveIndexed(_ownerKeysByNode, previous, key);
+                AddOwnerKey(node, key);
+            }
+        }
+        else
+        {
+            _ownerOrder.Added(key);
+            AddOwnerKey(node, key);
+        }
+
+        _committedNodes[key] = node;
+        _committedAnchors[key] = anchor;
+    }
+
+    private void AddOwnerKey(Entity node, string key)
+    {
+        AddIndexed(_ownerKeysByNode, node, key);
+        _unreconciledNodes.Add(node);
+    }
+
+    private void RemoveCommittedOwner(string key)
+    {
+        if (!_committedNodes.TryGetValue(key, out var node))
+            return;
+
+        _committedNodes.Remove(key);
+        _committedAnchors.Remove(key);
+        _ownerOrder.Removed(key);
+        RemoveIndexed(_ownerKeysByNode, node, key);
+    }
+
+    private void ClearCommittedOwners()
+    {
+        _committedNodes.Clear();
+        _committedAnchors.Clear();
+        _ownerOrder.Clear();
+        _ownerKeysByNode.Clear();
+        _unreconciledNodes.Clear();
+    }
+
+    // The only writers of _edgeStations, keeping _stationKeysByEdge in step.
+    private void SetEdgeStation(string key, EdgeStation station)
+    {
+        if (_edgeStations.TryGetValue(key, out var old))
+            RemoveIndexed(_stationKeysByEdge, old.Edge, key);
+
+        _edgeStations[key] = station;
+        AddIndexed(_stationKeysByEdge, station.Edge, key);
+        _stationScope.Add(key);
+    }
+
+    private void RemoveEdgeStation(string key)
+    {
+        if (!_edgeStations.TryGetValue(key, out var station))
+            return;
+
+        _edgeStations.Remove(key);
+        RemoveIndexed(_stationKeysByEdge, station.Edge, key);
+    }
+
+    private void ClearEdgeStations()
+    {
+        _edgeStations.Clear();
+        _stationKeysByEdge.Clear();
+    }
+
+    // The only writers of _verifiedPaths, keeping _verifiedPathsByEdge and _verifiedPathOrder in
+    // step. A path's list is changed in place only through ReplaceVerifiedPathEdges.
+    private void SetVerifiedPath((NetworkKind Kind, long WayId, long Start, long End) key, List<Entity> edges)
+    {
+        if (_verifiedPaths.TryGetValue(key, out var previous))
+            UnindexVerifiedPath(key, previous);
+        else
+            _verifiedPathOrder.Added(key);
+
+        _verifiedPaths[key] = edges;
+        IndexVerifiedPath(key, edges);
+    }
+
+    private void RemoveVerifiedPath((NetworkKind Kind, long WayId, long Start, long End) key)
+    {
+        if (!_verifiedPaths.TryGetValue(key, out var edges))
+            return;
+
+        UnindexVerifiedPath(key, edges);
+        _verifiedPaths.Remove(key);
+        _verifiedPathOrder.Removed(key);
+    }
+
+    private void ClearVerifiedPaths()
+    {
+        _verifiedPaths.Clear();
+        _verifiedPathsByEdge.Clear();
+        _verifiedPathOrder.Clear();
+    }
+
+    // Applies the staged edge changes to the verified paths through a changed edge. Each element is
+    // looked up once, by its value before the change, as the walk over every path did; paths through
+    // no changed edge are left as they are, which that walk also did.
+    private void ReplaceVerifiedPathEdges()
+    {
+        var paths = new HashSet<(NetworkKind Kind, long WayId, long Start, long End)>();
+
+        foreach (var edge in _stagedEdgeChanges.Keys)
+            if (_verifiedPathsByEdge.TryGetValue(edge, out var throughEdge))
+                paths.UnionWith(throughEdge);
+
+        foreach (var key in paths)
+        {
+            var path = _verifiedPaths[key];
+            UnindexVerifiedPath(key, path);
+
+            for (var i = 0; i < path.Count; i++)
+                if (_stagedEdgeChanges.TryGetValue(path[i], out var replacement))
+                    path[i] = replacement;
+
+            IndexVerifiedPath(key, path);
+        }
+    }
+
+    private void IndexVerifiedPath((NetworkKind Kind, long WayId, long Start, long End) key, List<Entity> edges)
+    {
+        foreach (var edge in edges)
+        {
+            if (!_verifiedPathsByEdge.TryGetValue(edge, out var paths))
+                _verifiedPathsByEdge[edge] = paths = new();
+
+            paths.Add(key);
+        }
+    }
+
+    private void UnindexVerifiedPath((NetworkKind Kind, long WayId, long Start, long End) key, List<Entity> edges)
+    {
+        foreach (var edge in edges)
+        {
+            if (!_verifiedPathsByEdge.TryGetValue(edge, out var paths))
+                continue;
+
+            paths.Remove(key);
+
+            if (paths.Count == 0)
+                _verifiedPathsByEdge.Remove(edge);
+        }
+    }
+
+    private static void AddIndexed(Dictionary<Entity, List<string>> index, Entity entity, string key)
+    {
+        if (!index.TryGetValue(entity, out var keys))
+            index[entity] = keys = new();
+
+        keys.Add(key);
+    }
+
+    private static void RemoveIndexed(Dictionary<Entity, List<string>> index, Entity entity, string key)
+    {
+        if (!index.TryGetValue(entity, out var keys))
+            return;
+
+        keys.Remove(key);
+
+        if (keys.Count == 0)
+            index.Remove(entity);
+    }
+
+    // The enumeration order of a Dictionary that this mirror follows add for add and remove for
+    // remove. The framework's Dictionary enumerates its entry slots in index order; an add takes the
+    // most recently freed slot, else the next unused one; Clear frees them all. The owner and path
+    // maps are read in that order where it decides a result (the first owner reported, the order of
+    // an alias and its canonical key within a group), so the incremental updates make the same adds
+    // and removes in the same order, sorting the keys they touch by these slots. The mirror matched
+    // the dictionaries' own enumeration in every game batch checked (report 119, section 8).
+    private sealed class EnumerationOrder<TKey> where TKey : notnull
+    {
+        private readonly Dictionary<TKey, int> _slots;
+        // Freed slots, the most recently freed last. (Stack<T> is defined twice in the game's assemblies.)
+        private readonly List<int> _freeSlots = new();
+        private int _usedSlots;
+
+        public EnumerationOrder(IEqualityComparer<TKey> comparer) => _slots = new(comparer);
+
+        public int Slot(TKey key) => _slots[key];
+
+        // Only for a key the dictionary did not hold.
+        public void Added(TKey key)
+        {
+            if (_freeSlots.Count == 0)
+            {
+                _slots[key] = _usedSlots++;
+                return;
+            }
+
+            _slots[key] = _freeSlots[_freeSlots.Count - 1];
+            _freeSlots.RemoveAt(_freeSlots.Count - 1);
+        }
+
+        public void Removed(TKey key)
+        {
+            if (!_slots.TryGetValue(key, out var slot))
+                return;
+
+            _slots.Remove(key);
+            _freeSlots.Add(slot);
+        }
+
+        public void Clear()
+        {
+            _slots.Clear();
+            _freeSlots.Clear();
+            _usedSlots = 0;
         }
     }
 
     private void CaptureQualifiedNodes(IReadOnlyList<PreparedSegment> batch, IReadOnlyList<Entity> temporary)
     {
+        // Qualification's parts are timed: it took 191 s of Paris's placement (report 118).
+        var qualificationClock = System.Diagnostics.Stopwatch.StartNew();
         _entityManager.CompleteAllTrackedJobs();
         var actual = new List<NativeBatchBindings.Edge<Entity>>();
 
@@ -1343,7 +1908,9 @@ public sealed class NativeNetworkPlacement
         if (_submittedCourses.Count != batch.Count)
             throw new InvalidOperationException("Submitted native course manifest is incomplete.");
 
+        // Matching reads every committed owner, so the full remapped map is still made here.
         _stagedCommitted = NativeBatchBindings.RemapCommitted(_committedNodes, replacements);
+        _stagedReplacements = replacements;
 
         // Reconcile only an already-owned node, never a nearby candidate. Native
         // generation may adjust that node again while extending its road.
@@ -1382,7 +1949,7 @@ public sealed class NativeNetworkPlacement
                     start == null ? 0 : math.distance(section.Start.xz, start.Generated.xz),
                     end == null ? 0 : math.distance(section.End.xz, end.Generated.xz));
 
-            if (movement > 0)
+            if (movement > 0 && _log.DiagnosticsEnabled)
                 _log.Diagnostic(
                     $"NATIVE OWNED MOVEMENT way={section.WayId}; centerMovementMeters={movement:R}; submittedCoursePreserved=true; artifact={ArtifactStem}; sourceFootprintChecked=true; unrelatedAttachmentAllowed=false");
         }
@@ -1403,27 +1970,40 @@ public sealed class NativeNetworkPlacement
         _log.DiagnosticRecords(ArtifactStem + "-owners.ndjson", OwnerRecords(relevant));
         _log.DiagnosticRecords(ArtifactStem + "-graph.ndjson", GraphRecords(actual));
 
+        _log.AddDuration("Qualification before match", qualificationClock.Elapsed.TotalSeconds);
+        qualificationClock.Restart();
+
         try
         {
             _generatedBatch = NativeBatchBindings.Match(_submittedCourses, actual, _stagedCommitted, MatchRejection);
+            _log.AddDuration("Qualification match", qualificationClock.Elapsed.TotalSeconds);
+            qualificationClock.Restart();
         }
         catch (Exception error)
         {
+            _log.AddDuration("Qualification match", qualificationClock.Elapsed.TotalSeconds);
+            _log.Count("Qualification batches rejected by match");
+            qualificationClock.Restart();
             CapturePlacementEvidence(Array.Empty<Entity>(), "rejected");
             _log.DiagnosticRecords(ArtifactStem + "-rejection-endpoints.ndjson", RejectionEndpoints(actual));
-            _log.Checkpoint("native-batch/preview-rejected", new
-            {
-                artifactStem = ArtifactStem,
-                sections = batch.Count,
-                committedOwners = _committedNodes.Count,
-                exception = error.ToString(),
-                recoverable = error is NativePreviewException,
-                applied = false,
-                way = (error as NativePreviewException)?.WayId,
-                sources = (error as NativePreviewException)?.Sources,
-                endpointEvidence = ArtifactStem + "-rejection-endpoints.ndjson",
-                subElevationStructuresOnly = true
-            });
+
+            // Most batches are rejected here; the exception text is built only when it is written.
+            if (_log.DiagnosticsEnabled)
+                _log.Checkpoint("native-batch/preview-rejected", new
+                {
+                    artifactStem = ArtifactStem,
+                    sections = batch.Count,
+                    committedOwners = _committedNodes.Count,
+                    exception = error.ToString(),
+                    recoverable = error is NativePreviewException,
+                    applied = false,
+                    way = (error as NativePreviewException)?.WayId,
+                    sources = (error as NativePreviewException)?.Sources,
+                    endpointEvidence = ArtifactStem + "-rejection-endpoints.ndjson",
+                    subElevationStructuresOnly = true
+                });
+
+            _log.AddDuration("Qualification rejection evidence", qualificationClock.Elapsed.TotalSeconds);
 
             throw;
         }
@@ -1457,6 +2037,11 @@ public sealed class NativeNetworkPlacement
             actualByEntity[edge.Entity] = edge;
         }
 
+        // The verified junction entities, built once when a deleted node needs them: scanning
+        // every committed node for every deleted one grew with the whole placed network, batch
+        // after batch (report 118). The first owner found is the same as before.
+        HashSet<Entity>? committedEntities = null;
+
         foreach (var entity in temporary)
         {
             var otherTemporary = _entityManager.GetComponentData<Temp>(entity);
@@ -1465,12 +2050,18 @@ public sealed class NativeNetworkPlacement
             {
                 var original = otherTemporary.m_Original != Entity.Null ? otherTemporary.m_Original : entity;
 
-                foreach (var owner in _committedNodes)
-                    if (owner.Value == original && !replacements.ContainsKey(original))
-                        throw new NativePreviewException(
-                            $"Preview would delete previously verified junction {owner.Key} without replacement lineage.",
-                            0,
-                            owner.Key);
+                if (!replacements.ContainsKey(original))
+                {
+                    committedEntities ??= new HashSet<Entity>(_committedNodes.Values);
+
+                    if (committedEntities.Contains(original))
+                        foreach (var owner in _committedNodes)
+                            if (owner.Value == original)
+                                throw new NativePreviewException(
+                                    $"Preview would delete previously verified junction {owner.Key} without replacement lineage.",
+                                    0,
+                                    owner.Key);
+                }
             }
 
             if (!_entityManager.HasComponent<Edge>(entity)
@@ -1719,29 +2310,56 @@ public sealed class NativeNetworkPlacement
             retainedNodes.Add(edge.EndNode);
         }
 
+        // A set of the staged junction entities, built only if a node needs it, rather than
+        // a scan of all of them per node.
+        HashSet<Entity>? stagedEntities = null;
+
         foreach (var node in new List<Entity>(required.Keys))
-            if (!retainedNodes.Contains(node) && !System.Linq.Enumerable.Contains(_stagedCommitted.Values, node))
+        {
+            if (retainedNodes.Contains(node))
+                continue;
+
+            stagedEntities ??= new HashSet<Entity>(_stagedCommitted.Values);
+
+            if (!stagedEntities.Contains(node))
                 required.Remove(node);
+        }
 
         _stagedEdges = stagedEdges;
         _touchedEdges = touched;
+        _log.AddDuration("Qualification after match", qualificationClock.Elapsed.TotalSeconds);
+        qualificationClock.Restart();
 
         // A preview can regenerate nodes from earlier verified batches. Retain
         // their center evidence too, not just anchors present in this batch.
-        foreach (var pair in _stagedCommitted)
+        // The staged owners with a preview position: the keys of a previewed node the strict path
+        // did not replace, and of a node replaced by a previewed one. They are visited in the staged
+        // map's order (the committed map's), so the first one out of bounds is the one reported.
+        var previewedOwners = new List<string>();
+
+        foreach (var node in previewPositions.Keys)
+            if (!replacements.ContainsKey(node))
+                previewedOwners.AddRange(OwnerKeysOf(node));
+
+        foreach (var pair in replacements)
+            if (previewPositions.ContainsKey(pair.Value))
+                previewedOwners.AddRange(OwnerKeysOf(pair.Key));
+
+        SortByOwnerOrder(previewedOwners);
+
+        foreach (var key in previewedOwners)
         {
-            if (!previewPositions.TryGetValue(pair.Value, out var point))
-                continue;
+            var owner = _stagedCommitted[key];
+            var point = previewPositions[owner];
+            var prior = _committedAnchors[key];
 
-            var prior = _committedAnchors[pair.Key];
-
-            if (!math.all(math.isfinite(point)) || math.distance(point.xz, prior.Planned.xz) > _centerBudgets[pair.Key])
+            if (!math.all(math.isfinite(point)) || math.distance(point.xz, prior.Planned.xz) > _centerBudgets[key])
                 throw new NativePreviewException(
-                    $"Previously bound junction {pair.Key} moved outside bounded native footprint.",
+                    $"Previously bound junction {key} moved outside bounded native footprint.",
                     0,
-                    pair.Key);
+                    key);
 
-            required[pair.Value] = point;
+            required[owner] = point;
         }
 
         _generatedBatch = _generatedBatch with { Anchors = anchors, Nodes = required };
@@ -1967,17 +2585,25 @@ public sealed class NativeNetworkPlacement
         if (_generatedBatch == null)
             throw new InvalidOperationException("Native source bindings were not captured before Apply.");
 
-        foreach (var pair in _stagedCommitted!)
-        {
-            if (_committedNodes[pair.Key] == pair.Value)
-                continue;
+        // Only the keys of a node the strict path replaced have a staged owner other than their
+        // committed one; they are checked in the staged map's order, so the first not ready is reported.
+        var replacedOwners = new List<string>();
 
-            if (!_entityManager.HasComponent<Node>(pair.Value)
-                || _entityManager.HasComponent<Temp>(pair.Value)
-                || _entityManager.HasComponent<Deleted>(pair.Value)
-                || !_entityManager.HasBuffer<ConnectedEdge>(pair.Value))
+        foreach (var node in _stagedReplacements.Keys)
+            replacedOwners.AddRange(OwnerKeysOf(node));
+
+        SortByOwnerOrder(replacedOwners);
+
+        foreach (var key in replacedOwners)
+        {
+            var replacement = _stagedCommitted![key];
+
+            if (!_entityManager.HasComponent<Node>(replacement)
+                || _entityManager.HasComponent<Temp>(replacement)
+                || _entityManager.HasComponent<Deleted>(replacement)
+                || !_entityManager.HasBuffer<ConnectedEdge>(replacement))
             {
-                pending = $"source={pair.Key}; replacement node not ready";
+                pending = $"source={key}; replacement node not ready";
                 return false;
             }
         }
@@ -2160,13 +2786,10 @@ public sealed class NativeNetworkPlacement
         LastBatchSourceVerified = true;
 
         foreach (var path in _stagedPaths)
-            _verifiedPaths[path.Key] = path.Value;
+            SetVerifiedPath(path.Key, path.Value);
 
         if (_stagedEdgeChanges.Count > 0)
-            foreach (var path in _verifiedPaths.Values)
-                for (var i = 0; i < path.Count; i++)
-                    if (_stagedEdgeChanges.TryGetValue(path[i], out var replacement))
-                        path[i] = replacement;
+            ReplaceVerifiedPathEdges();
 
         foreach (var group in System.Linq.Enumerable.GroupBy(
             _generatedBatch.Edges,
@@ -2175,30 +2798,30 @@ public sealed class NativeNetworkPlacement
                 binding.Section.WayId,
                 binding.Section.StartNodeId,
                 binding.Section.EndNodeId)))
-            _verifiedPaths[group.Key] =
-                new List<Entity>(System.Linq.Enumerable.Select(group, binding => binding.Generated.Entity));
+            SetVerifiedPath(
+                group.Key,
+                new List<Entity>(System.Linq.Enumerable.Select(group, binding => binding.Generated.Entity)));
 
         NativeNetworkDiagnostics.BindVerified(_committedNodes, _verifiedPaths);
         NativeNetworkDiagnostics.BindObserved(_observedEdges, _edgeStations);
 
+        // Every staged anchor is read again from its live node: this strict publish still walks the
+        // whole owner map (it runs only for a batch whose every section qualified).
         foreach (var pair in _stagedCommitted!)
-        {
-            _committedNodes[pair.Key] = pair.Value;
-            var prior = _committedAnchors[pair.Key];
-            _committedAnchors[pair.Key] =
-                prior with
+            SetCommittedOwner(
+                pair.Key,
+                pair.Value,
+                _committedAnchors[pair.Key] with
                 {
                     Entity = pair.Value,
                     Generated = _entityManager.GetComponentData<Node>(pair.Value).m_Position
-                };
-        }
+                });
 
         foreach (var pair in _generatedBatch.Anchors)
-        {
-            _committedNodes[pair.Key] = pair.Value.Entity;
-            _committedAnchors[pair.Key] =
-                pair.Value with { Generated = _entityManager.GetComponentData<Node>(pair.Value.Entity).m_Position };
-        }
+            SetCommittedOwner(
+                pair.Key,
+                pair.Value.Entity,
+                pair.Value with { Generated = _entityManager.GetComponentData<Node>(pair.Value.Entity).m_Position });
 
         foreach (var section in System.Linq.Enumerable.Distinct(
             System.Linq.Enumerable.Select(_generatedBatch.Edges, binding => binding.Section)))
@@ -2225,6 +2848,7 @@ public sealed class NativeNetworkPlacement
         _stagedCommitted = null;
         _stagedEdges = null;
         _touchedEdges = Array.Empty<NativeBatchBindings.Edge<Entity>>();
+
         pending = "";
 
         return true;
@@ -2290,8 +2914,12 @@ public sealed class NativeNetworkPlacement
             _log.Diagnostic(
                 $"NATIVE SETTLED SCOPE artifact={ArtifactStem}; sourceSections={sections.Count}; scopedEdges={scope.Count}; incidentNodes={nodes.Count}; affectedPriorRoutesIncluded=true; worldEdgeScan=false; worldLaneScan=false; nearestSourceMatching=false; completeWholeJunctionAcceptance=false; qualityOutcome=RequiresReview");
 
+            // Each batch's check covers every road settled so far, so its warning repeated the
+            // same counts about 170 times per city (Montreal, 11-19). Its records stay in the
+            // diagnostics; the final full-map check reports once.
             NativeNetworkReadback.Check(_entityManager, new List<PreparedSegment>(sections.Values), _evidence, _log,
-                includeMovements: true, scope: new List<Entity>(scope), artifactStem: ArtifactStem + "-settled");
+                includeMovements: true, scope: new List<Entity>(scope), artifactStem: ArtifactStem + "-settled",
+                reportWarnings: false);
         }
         catch (Exception error) when (error is not OutOfMemoryException && error is not OperationCanceledException)
         {
@@ -2660,8 +3288,7 @@ public sealed class NativeNetworkPlacement
                 || _entityManager.HasComponent<Temp>(node)
                 || _entityManager.HasComponent<Deleted>(node))
             {
-                _committedNodes.Remove(NativeEndpointPolicy.Identity(segment, id));
-                _committedAnchors.Remove(NativeEndpointPolicy.Identity(segment, id));
+                RemoveCommittedOwner(NativeEndpointPolicy.Identity(segment, id));
                 _log.Count("Retired native anchors detached");
 
                 return null;
@@ -2672,8 +3299,7 @@ public sealed class NativeNetworkPlacement
 
             if (!math.all(math.isfinite(position)))
             {
-                _committedNodes.Remove(NativeEndpointPolicy.Identity(segment, id));
-                _committedAnchors.Remove(NativeEndpointPolicy.Identity(segment, id));
+                RemoveCommittedOwner(NativeEndpointPolicy.Identity(segment, id));
 
                 return null;
             }
@@ -2713,7 +3339,7 @@ public sealed class NativeNetworkPlacement
                     || _entityManager.HasComponent<Temp>(station.Edge)
                     || _entityManager.HasComponent<Deleted>(station.Edge))
             {
-                _edgeStations.Remove(key);
+                RemoveEdgeStation(key);
                 return null;
             }
 
@@ -2725,7 +3351,7 @@ public sealed class NativeNetworkPlacement
                 || !math.all(math.isfinite(curve.d))
                 || !math.all(math.isfinite(station.Position)))
             {
-                _edgeStations.Remove(key);
+                RemoveEdgeStation(key);
                 return null;
             }
 

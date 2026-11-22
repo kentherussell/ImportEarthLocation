@@ -494,6 +494,10 @@ public static class TerrainBuilder
             Array.Copy(source, (row + cropTop) * mosaicWidth + cropLeft, required, row * requiredWidth, requiredWidth);
 
         TerrainArtifactRepair.Trace(required, requiredWidth, "source-raw", message => log?.Diagnostic(message));
+        var crops =
+            new TerrainStageCrops(log, requiredWidth, requiredHeight, minX * 256 + cropLeft, minY * 256 + cropTop, zoom);
+
+        crops.Capture("source-raw", required);
         TerrainOutliers.Outcome outliers;
 
         try
@@ -559,6 +563,8 @@ public static class TerrainBuilder
             "source-before-coastal",
             message => log?.Diagnostic(message));
 
+        crops.Capture("after-outliers", required);
+
         if (log != null)
             CoastInput.Capture(
                 log,
@@ -575,6 +581,7 @@ public static class TerrainBuilder
             sourceSpacing, geography, token, message => log?.Diagnostic(message), coverage => coastCoverage = coverage);
 
         TerrainArtifactRepair.Trace(required, requiredWidth, "after-coastal", message => log?.Diagnostic(message));
+        crops.Capture("after-coastal", required);
         TerrainArtifactRepair.Repair(
             required,
             requiredWidth,
@@ -612,6 +619,8 @@ public static class TerrainBuilder
             "after-artifact-repair",
             message => log?.Diagnostic(message));
 
+        crops.Capture("after-artifact-repair", required);
+
         log?.Diagnostic(
             $"DEM REQUIRED footprint={requiredWidth}x{requiredHeight}; mosaic={mosaicWidth}x{mosaicHeight}; globalPixelOrigin={minX * 256 + cropLeft},{minY * 256 + cropTop}; zoom={zoom}; recoveredTiles={tiles.Count(pixels => pixels.RecoveredElevations != null)}; discardedOutsideSamples={source.Length - required.Length}");
 
@@ -631,6 +640,8 @@ public static class TerrainBuilder
 
         log?.Info(conditioned.Metrics.ToString());
         var working = conditioned.Elevations;
+        crops.Capture("conditioned", working);
+        crops.Write();
 
         float ReadRaster(int x, int y)
         {

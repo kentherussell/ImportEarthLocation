@@ -14,6 +14,7 @@ namespace ImportEarthLocation.Processing;
 // absolute surface level; its depth is recomputed against the final native bed.
 public static class WaterBodyPlanner
 {
+
     // Same even/odd predicate as GeographyPolygons.Inside, but queries inspect
     // only edges crossing the point's horizontal band, not an entire river ring
     // for every DEM pixel. Long edges are stored once to bound index memory.
@@ -89,6 +90,44 @@ public static class WaterBodyPlanner
 
             return inside;
         }
+
+        // The edges Inside can cross for points at z, in the order it meets them. A pass
+        // over one terrain row gathers them once and tests each point with InsideRow, which
+        // gives Inside's answer: the same crossings, by the same expression.
+        public void CrossingEdges(float z, List<(float3 A, float3 B)> crossing)
+        {
+            crossing.Clear();
+
+            if (_bands.TryGetValue((int)Math.Floor(z / Band), out var nearby))
+                AddCrossing(nearby, z, crossing);
+
+            AddCrossing(_long, z, crossing);
+        }
+
+        private void AddCrossing(List<(float3 A, float3 B)> edges, float z, List<(float3 A, float3 B)> crossing)
+        {
+            for (var i = 0; i < edges.Count; i++)
+            {
+                if ((i & 1023) == 0)
+                    _token.ThrowIfCancellationRequested();
+
+                var edge = edges[i];
+
+                if ((edge.A.z > z) != (edge.B.z > z))
+                    crossing.Add(edge);
+            }
+        }
+
+        public static bool InsideRow(List<(float3 A, float3 B)> crossing, float3 point)
+        {
+            var inside = false;
+
+            foreach (var (vectorA, vectorB) in crossing)
+                if (point.x < (vectorB.x - vectorA.x) * (point.z - vectorA.z) / (vectorB.z - vectorA.z) + vectorA.x)
+                    inside = !inside;
+
+            return inside;
+        }
     }
 
     private sealed class Area
@@ -121,44 +160,155 @@ public static class WaterBodyPlanner
 
         public bool InBounds(float3 point) => math.all(point.xz >= Min) && math.all(point.xz <= Max);
 
-        public bool InHole(float3 point) => InBounds(point) && _inner.Any(ring => ring.Inside(point));
+        // Both tests run for every terrain cell of a body, so they loop over the rings
+        // directly instead of allocating a LINQ predicate per call.
+        public bool InHole(float3 point) => InBounds(point) && InsideAny(_inner, point);
 
         public bool Contains(float3 point)
-            => InBounds(point) && _outer.Any(ring => ring.Inside(point)) && !_inner.Any(ring => ring.Inside(point));
+            => InBounds(point) && InsideAny(_outer, point) && !InsideAny(_inner, point);
+
+        private static bool InsideAny(IndexedRing[] rings, float3 point)
+        {
+            foreach (var ring in rings)
+                if (ring.Inside(point))
+                    return true;
+
+            return false;
+        }
+
+        // Contains' answer for passes that walk the terrain grid row by row: each ring's
+        // crossing edges are gathered once for the row's z (IndexedRing.CrossingEdges).
+        private List<(float3 A, float3 B)>[]? _outerRow, _innerRow;
+        private float _rowZ = float.NaN;
+
+        public bool RowContains(float3 point)
+        {
+            if (!InBounds(point))
+                return false;
+
+            if (_outerRow == null || _innerRow == null)
+            {
+                _outerRow = _outer.Select(_ => new List<(float3 A, float3 B)>()).ToArray();
+                _innerRow = _inner.Select(_ => new List<(float3 A, float3 B)>()).ToArray();
+            }
+
+            if (point.z != _rowZ)
+            {
+                _rowZ = point.z;
+
+                for (var i = 0; i < _outer.Length; i++)
+                    _outer[i].CrossingEdges(point.z, _outerRow[i]);
+
+                for (var i = 0; i < _inner.Length; i++)
+                    _inner[i].CrossingEdges(point.z, _innerRow[i]);
+            }
+
+            return InsideAnyRow(_outerRow, point) && !InsideAnyRow(_innerRow, point);
+        }
+
+        private static bool InsideAnyRow(List<(float3 A, float3 B)>[] rows, float3 point)
+        {
+            foreach (var crossing in rows)
+                if (IndexedRing.InsideRow(crossing, point))
+                    return true;
+
+            return false;
+        }
 
         // Exact distance to the nearest outer or inner edge, or +∞ beyond limit.
         // Edges sit in 64 m cells, built on first use; a long river outline has
         // thousands of vertices, so a per-sample scan of every edge is too slow.
+        // The cells are a flat array over the edges' extent, as the shore shaping
+        // asks for every terrain cell of a body; an outline spanning more than
+        // MaximumGridCells of them keeps a dictionary of the occupied cells instead.
+        // Each cell lists its edges in outline order either way.
         private const float EdgeCell = 64;
+        private const long MaximumGridCells = 1 << 20;
+        private bool _edgesBuilt;
         private Dictionary<(int, int), List<(float2 A, float2 B)>>? _edges;
+        private List<(float2 A, float2 B)>?[]? _edgeGrid;
+        private int _edgeGridX, _edgeGridZ, _edgeGridColumns, _edgeGridRows;
+
+        private void BuildEdges()
+        {
+            _edgesBuilt = true;
+            var spans = new List<(float2 A, float2 B, int LowX, int LowZ, int HighX, int HighZ)>();
+            int lowestX = int.MaxValue, lowestZ = int.MaxValue, highestX = int.MinValue, highestZ = int.MinValue;
+
+            foreach (var ring in Polygon.Outer.Concat(Polygon.Inner))
+                for (var i = 0; i < ring.Length; i++)
+                {
+                    var vectorA = ring[i].xz;
+                    var vectorB = ring[(i + 1) % ring.Length].xz;
+                    var low = math.floor(math.min(vectorA, vectorB) / EdgeCell);
+                    var high = math.floor(math.max(vectorA, vectorB) / EdgeCell);
+
+                    if ((high.x - low.x + 1) * (high.y - low.y + 1) > 4096)
+                        continue;
+
+                    spans.Add((vectorA, vectorB, (int)low.x, (int)low.y, (int)high.x, (int)high.y));
+                    lowestX = Math.Min(lowestX, (int)low.x);
+                    lowestZ = Math.Min(lowestZ, (int)low.y);
+                    highestX = Math.Max(highestX, (int)high.x);
+                    highestZ = Math.Max(highestZ, (int)high.y);
+                }
+
+            if (spans.Count == 0)
+            {
+                _edges = new();
+                return;
+            }
+
+            var columns = (long)highestX - lowestX + 1;
+            var rows = (long)highestZ - lowestZ + 1;
+
+            if (columns * rows <= MaximumGridCells)
+            {
+                _edgeGrid = new List<(float2 A, float2 B)>?[columns * rows];
+                _edgeGridX = lowestX;
+                _edgeGridZ = lowestZ;
+                _edgeGridColumns = (int)columns;
+                _edgeGridRows = (int)rows;
+            }
+            else
+                _edges = new();
+
+            foreach (var span in spans)
+                for (var x = span.LowX; x <= span.HighX; x++)
+                    for (var z = span.LowZ; z <= span.HighZ; z++)
+                    {
+                        if (_edgeGrid != null)
+                        {
+                            var index = (z - _edgeGridZ) * _edgeGridColumns + x - _edgeGridX;
+                            (_edgeGrid[index] ??= new()).Add((span.A, span.B));
+                            continue;
+                        }
+
+                        if (!_edges!.TryGetValue((x, z), out var list))
+                            _edges[(x, z)] = list = new();
+
+                        list.Add((span.A, span.B));
+                    }
+        }
+
+        private List<(float2 A, float2 B)>? EdgesIn(int x, int z)
+        {
+            if (_edgeGrid == null)
+                return _edges!.TryGetValue((x, z), out var list) ? list : null;
+
+            if (x < _edgeGridX
+                || z < _edgeGridZ
+                || x - _edgeGridX >= _edgeGridColumns
+                || z - _edgeGridZ >= _edgeGridRows)
+                return null;
+
+            return _edgeGrid[(z - _edgeGridZ) * _edgeGridColumns + x - _edgeGridX];
+        }
 
         public float EdgeDistance(float3 point, float limit, out float2 closest)
         {
-            if (_edges == null)
-            {
-                _edges = new();
-
-                foreach (var ring in Polygon.Outer.Concat(Polygon.Inner))
-                    for (var i = 0; i < ring.Length; i++)
-                    {
-                        var vectorA = ring[i].xz;
-                        var vectorB = ring[(i + 1) % ring.Length].xz;
-                        var low = math.floor(math.min(vectorA, vectorB) / EdgeCell);
-                        var high = math.floor(math.max(vectorA, vectorB) / EdgeCell);
-
-                        if ((high.x - low.x + 1) * (high.y - low.y + 1) > 4096)
-                            continue;
-
-                        for (var x = (int)low.x; x <= (int)high.x; x++)
-                            for (var z = (int)low.y; z <= (int)high.y; z++)
-                            {
-                                if (!_edges.TryGetValue((x, z), out var list))
-                                    _edges[(x, z)] = list = new();
-
-                                list.Add((vectorA, vectorB));
-                            }
-                    }
-            }
+            if (!_edgesBuilt)
+                BuildEdges();
 
             var best = float.PositiveInfinity;
             closest = point.xz;
@@ -168,7 +318,7 @@ public static class WaterBodyPlanner
 
             for (var x = cx - reach; x <= cx + reach; x++)
                 for (var z = cz - reach; z <= cz + reach; z++)
-                    if (_edges.TryGetValue((x, z), out var list))
+                    if (EdgesIn(x, z) is { } list)
                         foreach (var (vectorA, vectorB) in list)
                         {
                             var ab = vectorB - vectorA;
@@ -191,17 +341,25 @@ public static class WaterBodyPlanner
 
     private sealed class AreaIndex
     {
-        private const float Size = 2048;
+        // Cell size in metres: an area is listed in every cell its bounds touch, or among
+        // the large ones when that is more than 4,096 cells. A test that accepts only an
+        // area holding the point (Contains or InHole), which lies within its bounds, gets
+        // the same answer at any cell size, as every candidate is listed in polygon order;
+        // only how many areas a query passes changes. In 2 km cells Amsterdam's
+        // queries went through about 69 lakes each; in 128 m cells a few (report 121 §14).
+        private readonly float _size;
         private readonly Dictionary<(int, int), List<Area>> _cells = new();
         private readonly List<Area> _large = new();
 
-        public AreaIndex(IEnumerable<Area> areas, CancellationToken token = default)
+        public AreaIndex(IEnumerable<Area> areas, CancellationToken token = default, float size = 128)
         {
+            _size = size;
+
             foreach (var area in areas)
             {
                 token.ThrowIfCancellationRequested();
-                var low = (int2)math.floor(area.Min / Size);
-                var high = (int2)math.floor(area.Max / Size);
+                var low = (int2)math.floor(area.Min / _size);
+                var high = (int2)math.floor(area.Max / _size);
 
                 if ((high.x - low.x + 1L) * (high.y - low.y + 1L) > 4096)
                 {
@@ -224,7 +382,7 @@ public static class WaterBodyPlanner
 
         public IEnumerable<Area> Nearby(float3 point)
         {
-            _cells.TryGetValue(((int)Math.Floor(point.x / Size), (int)Math.Floor(point.z / Size)), out var local);
+            _cells.TryGetValue(((int)Math.Floor(point.x / _size), (int)Math.Floor(point.z / _size)), out var local);
             var i = 0;
             var j = 0;
             var count = local?.Count ?? 0;
@@ -237,6 +395,32 @@ public static class WaterBodyPlanner
                 else
                     yield return _large[j++];
         }
+
+        // The first area near point, in the order Nearby gives, that the test accepts, or
+        // null. For tests run on every terrain cell: no enumerator, and a test that only
+        // reads its arguments needs no closure.
+        public Area? First(float3 point, Func<Area, float3, bool> test)
+        {
+            _cells.TryGetValue(((int)Math.Floor(point.x / _size), (int)Math.Floor(point.z / _size)), out var local);
+            var i = 0;
+            var j = 0;
+            var count = local?.Count ?? 0;
+
+            while (i < count || j < _large.Count)
+            {
+                var area =
+                    j == _large.Count || i < count && local![i].Order < _large[j].Order
+                        ? local![i++]
+                        : _large[j++];
+
+                if (test(area, point))
+                    return area;
+            }
+
+            return null;
+        }
+
+        public bool Any(float3 point, Func<Area, float3, bool> test) => First(point, test) != null;
     }
 
     public static Func<float3, float?> SurfaceSampler(WaterPlan water, IReadOnlyList<GeographicPolygon> polygons)
@@ -280,7 +464,8 @@ public static class WaterBodyPlanner
                 .Where(polygon => polygon.Outer.Any(points => points.Length > 0))
             .Select((polygon, i) => new Area(polygon, i, default)).ToArray();
 
-        var maskIndex = new AreaIndex(masks);
+        // The reference sampler keeps the 2 km cells it was written with.
+        var maskIndex = reference ? new AreaIndex(masks, default, 2048) : new AreaIndex(masks);
         var flat =
             water.AreaStages
                 .GroupBy(stage => stage.BodyId)
@@ -386,9 +571,12 @@ public static class WaterBodyPlanner
         // centres), or within a free reach's half width is marked, so a point the
         // full test would find is never cut off.
         const float Cell = 128;
-        var occupied = new HashSet<long>();
+        // Keyed by the pair: packed into one long, x and z cancelled out in the hash
+        // (x ^ z), and the 1.9 million cells of Buenos Aires' Río de la Plata took 15 s
+        // to mark, three times per plan.
+        var occupied = new HashSet<(int, int)>();
 
-        long Key(int x, int z) => ((long)x << 32) ^ (uint)z;
+        (int, int) Key(int x, int z) => (x, z);
 
         void Mark(float2 vectorA, float2 vectorB, float margin)
         {
@@ -448,14 +636,7 @@ public static class WaterBodyPlanner
             if (!occupied.Contains(Key((int)Math.Floor(point.x / Cell), (int)Math.Floor(point.z / Cell))))
                 return null;
 
-            Area? area = null;
-
-            foreach (var firstArea in maskIndex.Nearby(point))
-                if (firstArea.Contains(point))
-                {
-                    area = firstArea;
-                    break;
-                }
+            var area = maskIndex.First(point, (otherArea, at) => otherArea.Contains(at));
 
             if (area != null && flat.TryGetValue(area.Polygon.Identity, out var level))
                 return level;
@@ -475,13 +656,8 @@ public static class WaterBodyPlanner
                 ((int)Math.Floor(point.x / FreeCell), (int)Math.Floor(point.z / FreeCell)),
                 out var lineReaches))
                 lineReaches = none;
-            else
-                foreach (var firstArea in maskIndex.Nearby(point))
-                    if (firstArea.InHole(point))
-                    {
-                        lineReaches = none;
-                        break;
-                    }
+            else if (maskIndex.Any(point, (otherArea, at) => otherArea.InHole(at)))
+                lineReaches = none;
 
             for (int i = 0, j = 0; i < polygonReaches.Count || j < lineReaches.Count;)
             {
@@ -855,7 +1031,8 @@ public static class WaterBodyPlanner
     public static IReadOnlyList<(float3[] Line, float HalfWidth)> OpenChannels(
         OsmDataset? data,
         ImportRequest request,
-        float waterCellSize = 28)
+        float waterCellSize = 28,
+        IReadOnlyDictionary<long, float3>? moved = null)
     {
         if (data == null || !math.isfinite(waterCellSize) || waterCellSize <= 0)
             return Array.Empty<(float3[], float)>();
@@ -869,8 +1046,13 @@ public static class WaterBodyPlanner
             if (!network.Contains(way.Id) || Buried(way.Tags))
                 continue;
 
+            // Where the planner moved a node onto the valley floor (WaterPlan.MovedWaterwayNodes),
+            // the channel is carved there, and that is where a road has to span it.
             var line = way.NodeIds.Select(id =>
 {
+    if (moved != null && moved.TryGetValue(id, out var target))
+        return target;
+
     var node = data.Nodes[id];
     return GeoMath.ToLocalMeters(node.Latitude, node.Longitude, request.Latitude, request.Longitude);
 }).ToArray();
@@ -880,6 +1062,12 @@ public static class WaterBodyPlanner
 
         return result;
     }
+
+    // Offline comparison only: the water replay sets this to plan with the channel
+    // cross-section used before report 116 (a full-width bed rising to the ground over 40%
+    // of the cut's radius), so both cross-sections can be measured on the same ground. The
+    // mod never sets it.
+    internal static bool EarlierChannelProfile;
 
     public static WaterPlan Prepare(OsmDataset? data, IReadOnlyList<GeographicPolygon> polygons, ImportRequest request,
         TerrainBuilder.Result terrain,
@@ -914,6 +1102,8 @@ public static class WaterBodyPlanner
         var clock = Stopwatch.StartNew();
         var lastPulse = -5d;
         var phase = "indexing mapped water";
+        var timedPhase = phase;
+        var phaseStart = 0d;
         long activeBody = 0;
         long bedVisits = 0;
         long reachSamples = 0;
@@ -927,6 +1117,15 @@ public static class WaterBodyPlanner
                 return;
 
             lastPulse = clock.Elapsed.TotalSeconds;
+
+            // Every phase starts with a forced pulse, so each one's time is known here.
+            if (phase != timedPhase)
+            {
+                log.Time("Water plan: " + timedPhase, lastPulse - phaseStart);
+                timedPhase = phase;
+                phaseStart = lastPulse;
+            }
+
             progress?.Invoke($"Planning water: {phase}; {riverCount}/{totalWays} waterways; {sources.Count} controls");
             log.Diagnostic(
                 $"WATER PLAN PROGRESS phase={phase}; body={activeBody}; lakes={lakeCount}; waterways={riverCount}/{totalWays}; reachSamples={reachSamples}; bedCellsVisited={bedVisits}; bedEdits={editCount}; controls={sources.Count}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.###}; cancellationChecked=true");
@@ -968,10 +1167,35 @@ public static class WaterBodyPlanner
         var areaIndex = new AreaIndex(areas, token);
         var holeIndex = new AreaIndex(areas.Where(area => area.HasHoles), token);
 
-        bool Coastal(Area firstArea) => WaterLevels.SeaTagged(firstArea.Polygon.Tags);
+        // Sea-tagged water (tidal, bay, harbour) is left for the game's sea to fill only on a map
+        // with a mapped coastline, where the coast model lowers the ground below the sea. On a
+        // map without one nothing does: the game's sea comes in only over ground already below
+        // it. Quebec City's St Lawrence is a tidal river (tidal=yes) whose surface the elevation
+        // data reads 3 m above the sea, and left to the sea it stayed dry but for its channel
+        // lines. There it is planned like any other river or lake. The coastline must be on the
+        // map: Quebec City's data holds one 33–43 km away, which the coast model never uses.
+        var seaMapped =
+            data.Ways.Values.Any(
+                way => NetworkSelection.HasTag(way.Tags, "natural", "coastline")
+                    && way.NodeIds.Any(
+                        id => data.Nodes.ContainsKey(id)
+                            && Math.Abs(Local(id).x) <= half
+                            && Math.Abs(Local(id).z) <= half));
 
+        bool Coastal(Area firstArea) => seaMapped && WaterLevels.SeaTagged(firstArea.Polygon.Tags);
+
+        log.Count("Water sea-tagged areas left to the sea", areas.Count(Coastal));
+        log.Count(
+            "Water sea-tagged areas planned inland (no coastline on the map)",
+            seaMapped ? 0 : areas.Count(area => WaterLevels.SeaTagged(area.Polygon.Tags)));
+
+        // Rapids are river too, falling through their length: as a lake with one flat level
+        // they could never be contained, and Montreal's Lachine Rapids (water=rapids, 13 m
+        // of fall) were omitted, leaving the St Lawrence dry between Lac Saint-Louis and the
+        // harbour (11-18).
         bool Flowing(Area firstArea)
             => NetworkSelection.HasTag(firstArea.Polygon.Tags, "water", "river")
+                || NetworkSelection.HasTag(firstArea.Polygon.Tags, "water", "rapids")
                 || NetworkSelection.HasTag(firstArea.Polygon.Tags, "waterway", "riverbank");
 
         bool Dry(Area firstArea)
@@ -983,7 +1207,12 @@ public static class WaterBodyPlanner
 
         bool Lake(Area firstArea) => !Flowing(firstArea) && !Coastal(firstArea) && !Dry(firstArea);
 
-        bool MappedDry(float3 point) => holeIndex.Nearby(point).Any(area => area.InHole(point));
+        bool MappedDry(float3 point) => holeIndex.Any(point, (area, at) => area.InHole(at));
+
+        bool InFlowingWater(Area area, float3 point)
+            => Flowing(area) && !Coastal(area) && !Dry(area) && area.Contains(point);
+
+        bool InOpenWater(Area area, float3 point) => !Dry(area) && area.Contains(point);
 
         bool DryFootprint(float3 point, Func<float3, bool> wet)
         {
@@ -1014,7 +1243,15 @@ public static class WaterBodyPlanner
         // water areas, which runs later, must not raise them back into a dam.
         var channelCells = new byte[n * n];
 
-        void Cut(float3 center, float radius, float target, Func<float3, bool> mask, float budget, bool channel = false)
+        // channelLine marks the cut's inner half as channel cells; only the earlier channel
+        // cross-section (EarlierChannelProfile) cuts its channels this way.
+        void Cut(
+            float3 center,
+            float radius,
+            float target,
+            Func<float3, bool> mask,
+            float budget,
+            bool channelLine = false)
         {
             var pixel = Pixel(center);
             var x0 = pixel % n;
@@ -1038,7 +1275,7 @@ public static class WaterBodyPlanner
                     var blend = math.clamp((radius - distance) / (radius * .4f), 0, 1);
                     blend = blend * blend * (3 - 2 * blend);
 
-                    if (channel && blend > .5f && channelCells[index] == 0 && mask(point))
+                    if (channelLine && blend > .5f && channelCells[index] == 0 && mask(point))
                         channelCells[index] = 1;
 
                     var height = Math.Max(0, original - Math.Min(budget, Math.Max(0, original - target)) * blend);
@@ -1063,30 +1300,76 @@ public static class WaterBodyPlanner
                 }
         }
 
-        // A waterway's cross-section (report 116): a flat bed out to bedRadius; a lower bank
-        // rising smoothly from the bed to a shelf (RiverFreeboard above the water), ending at
-        // 1/0.6 of bedRadius, where the earlier cut ended; then an upper bank rising
-        // smoothly from the shelf back to the ground at about BankSlope, at most
-        // MaximumBankWidth wide. The earlier cut rose from the bed straight to the ground
-        // over 40% of its radius: 6–20 m in under 20 m, which the game drew as rock cliffs.
-        // Ground is only ever lowered, by at most budget. Ground below the shelf stays as it
-        // is, and ground beyond the lower bank never drops below the shelf, so the bank
-        // probes just outside it still stand above the water (they stage it and gate its
-        // sources).
-        const float BankSlope = .3f, MaximumBankWidth = 80;
+        // A waterway's cross-section (report 116), in three parts:
+        //  - a flat bed, ChannelDepth below the water;
+        //  - a lower bank rising smoothly from the bed to a shelf RiverFreeboard above the
+        //    water (or the ground, if lower);
+        //  - an upper bank rising smoothly from the shelf back to the ground at about
+        //    BankSlope, at most MaximumBankWidth wide, where the ground stands higher.
+        // On a channel the bed keeps the channel's full half width, as the earlier cut's did,
+        // so the game's water has the same deep section to flow in (report 117; a bed 60% as
+        // wide was planned in report 116 and never run in the game). The lower bank is at
+        // least LowerBankWidth wide and has two parts that meet at the waterline with one
+        // slope: the first 40% rises from the bed to the waterline under the water, the rest
+        // eases from the waterline up to the shelf, about 1 m over 22 m. The waterline lies
+        // about 14 m outside the bed, where the earlier cut's was. The earlier cut rose from
+        // the bed to the ground over 40% of its radius, under 20 m: a wall one terrain cell
+        // wide at the water's edge, which the game drew as rock. A wide mapped river polygon
+        // keeps its full bed, with the bank over the outer 40% as before.
+        // Ground is only ever lowered, by at most budget, and never below the shelf beyond
+        // the lower bank.
+        //
+        // A waterway is cut sample by sample along its line. previous and next are the
+        // neighbouring samples: a sample shapes only the bank ground that lies no nearer to
+        // either of them, so each stretch of bank follows the water level beside it. Without
+        // that, a sample downstream, with its lower water, cut into the banks upstream of it
+        // and steepened them on falling rivers (report 117). The bed is cut by every sample
+        // that reaches it, so the water's path keeps the lowest bed.
+        const float BankSlope = .35f, MaximumBankWidth = 80, LowerBankWidth = 36, UnderwaterBankShare = .4f;
+
+        // Shares of the upper bank's full width at which the ground beside a sample is read.
+        var UpperBankSteps = new[] { .25f, .5f, .75f, 1 };
+
+        // The same for judging a gorge, with the lower bank's edge as well; and the side
+        // slopes, rise over distance from the channel's edge, between which the wide banks
+        // give way to the tight cut (CutChannel): wholly tight where the ground already climbs
+        // at BankSlope. Tried at .3 to .5 and .2 to .4 on Kathmandu and Baguio: .3 to .5 left
+        // a quarter more newly steep ground, .2 to .4 the same within 5% (report 117).
+        var GorgeSteps = new[] { 0, .25f, .5f, .75f, 1 };
+        const float GorgeSlopeStart = .25f, GorgeSlopeFull = .35f, GorgeWindow = 84;
+
+        float LowerBankEdge(float channelRadius) =>
+            channelRadius + Math.Max(LowerBankWidth, channelRadius * .4f / .6f);
+
+        // Enumerable.Max's rule for floats, taken one reading at a time from NaN: the
+        // highest reading, and NaN only while every reading so far is NaN.
+        static float Higher(float highest, float reading)
+            => reading > highest || float.IsNaN(highest) ? reading : highest;
 
         void CutChannel(
             float3 center,
-            float bedRadius,
+            float channelRadius,
+            bool narrow,
             float bedTarget,
+            float waterline,
             float shelf,
             float upperBankHeight,
             Func<float3, bool> mask,
-            float budget)
+            float budget,
+            float3? previous = null,
+            float3? next = null,
+            float3 sideways = default,
+            float2 gorge = default)
         {
-            var lowerEdge = bedRadius / .6f;
-            var bankWidth = math.clamp((upperBankHeight - shelf) / BankSlope, cell, MaximumBankWidth);
-            var outer = lowerEdge + bankWidth;
+            var bedRadius = channelRadius;
+            var lowerEdge = narrow ? LowerBankEdge(channelRadius) : channelRadius / .6f;
+            var underwaterEdge = narrow ? bedRadius + (lowerEdge - bedRadius) * UnderwaterBankShare : lowerEdge;
+            var bankWidth = math.clamp((upperBankHeight - shelf) / BankSlope, spacing * 2, MaximumBankWidth);
+
+            // A wide polygon's cut ends with its lower bank, as the earlier cut's did: the
+            // polygon's shore is shaped separately, and an upper bank measured from the
+            // line would start far outside it.
+            var outer = narrow ? lowerEdge + bankWidth : lowerEdge;
             var pixel = Pixel(center);
             var x0 = pixel % n;
             var z0 = pixel / n;
@@ -1096,6 +1379,22 @@ public static class WaterBodyPlanner
             {
                 t = math.saturate(t);
                 return t * t * (3 - 2 * t);
+            }
+
+            // 0 to 1 with no slope at either end and a straight middle half: its steepest
+            // slope is 1.33 times the mean, where a smoothstep's is 1.5 times.
+            static float Ramp(float t)
+            {
+                const float Ease = .25f;
+                t = math.saturate(t);
+
+                if (t < Ease)
+                    return t * t / (2 * Ease * (1 - Ease));
+
+                if (t > 1 - Ease)
+                    return 1 - (1 - t) * (1 - t) / (2 * Ease * (1 - Ease));
+
+                return (t - Ease / 2) / (1 - Ease);
             }
 
             for (var z = Math.Max(0, z0 - reach); z <= Math.Min(n - 1, z0 + reach); z++)
@@ -1110,25 +1409,85 @@ public static class WaterBodyPlanner
                     if (distance > outer)
                         continue;
 
+                    if (distance > bedRadius
+                        && (previous.HasValue && math.distance(point.xz, previous.Value.xz) < distance
+                            || next.HasValue && math.distance(point.xz, next.Value.xz) < distance))
+                        continue;
+
                     var index = z * n + x;
                     var original = terrain.Heights[index];
                     var floor = Math.Min(original, shelf);
+                    float height;
 
-                    var height =
-                        distance <= bedRadius
-                            ? bedTarget
-                            : distance <= lowerEdge
+                    if (distance <= bedRadius)
+                        height = bedTarget;
+                    else if (!narrow)
+                        height =
+                            distance <= lowerEdge
                                 ? math.lerp(bedTarget, floor, Smooth((distance - bedRadius) / (lowerEdge - bedRadius)))
                                 : math.lerp(floor, original, Smooth((distance - lowerEdge) / bankWidth));
+                    else if (distance <= lowerEdge)
+                    {
+                        // Under the water a cubic from the flat bed to the waterline, above it
+                        // a parabola that flattens onto the shelf; both have the slope
+                        // 2·(floor − edge) / (above-water width) where they meet. Ground lower
+                        // than the waterline has no above-water part.
+                        var edge = Math.Min(waterline, floor);
+                        var underwater = underwaterEdge - bedRadius;
+                        var rise = Math.Max(0, edge - bedTarget);
+                        var slope = Math.Min(2 * (floor - edge) / (lowerEdge - underwaterEdge) * underwater, 3 * rise);
+
+                        if (distance <= underwaterEdge)
+                        {
+                            var t = (distance - bedRadius) / underwater;
+                            height = bedTarget + rise * (3 * t * t - 2 * t * t * t) + slope * (t * t * t - t * t);
+                        }
+                        else
+                        {
+                            var t = (distance - underwaterEdge) / (lowerEdge - underwaterEdge);
+                            height = edge + (floor - edge) * (2 * t - t * t);
+                        }
+                    }
+                    else
+                    {
+                        // The upper bank fades out the depth actually cut at its foot, which
+                        // the budget limits. Fading the full drop to the shelf and limiting
+                        // the result afterwards left a wall where the two met, 20 m and more
+                        // above the water in steep valleys (report 117).
+                        var cut = Math.Min(original - floor, budget);
+                        height = original - cut * (1 - Ramp((distance - lowerEdge) / bankWidth));
+                    }
+
+                    // In a gorge the wide banks give way to the earlier cut's tight one: bed to
+                    // ground over the outer 40% of channelRadius / .6. Ground that already
+                    // climbs faster than BankSlope cannot be met any more gently, and a wide
+                    // bank only steepens more of it (report 117). gorge.x is the share of the
+                    // tight cut on the side sideways points to, gorge.y on the other.
+                    var tight = math.dot(point.xz - center.xz, sideways.xz) >= 0 ? gorge.x : gorge.y;
+
+                    if (narrow && tight > 0 && distance > bedRadius)
+                    {
+                        var tightRadius = channelRadius / .6f;
+                        var blend = Smooth((tightRadius - distance) / (tightRadius * .4f));
+                        var tightHeight = original - Math.Min(budget, Math.Max(0, original - bedTarget)) * blend;
+                        height = math.lerp(height, tightHeight, tight);
+                    }
 
                     height = math.clamp(Math.Max(height, original - budget), 0, Math.Min(original, terrain.HeightScaleMeters));
 
-                    if (distance <= bedRadius + (lowerEdge - bedRadius) * .5f
-                        && channelCells[index] == 0
-                        && mask(point))
-                        channelCells[index] = 1;
+                    // The mask only reads the point, so a cell asks it at most once.
+                    bool? inMask = null;
 
-                    if (height >= conditioned[index] || !mask(point))
+                    if (distance <= (narrow ? underwaterEdge : bedRadius + (lowerEdge - bedRadius) * .5f)
+                        && channelCells[index] == 0)
+                    {
+                        inMask = mask(point);
+
+                        if (inMask.Value)
+                            channelCells[index] = 1;
+                    }
+
+                    if (height >= conditioned[index] || !(inMask ?? mask(point)))
                         continue;
 
                     conditioned[index] = height;
@@ -1196,10 +1555,21 @@ public static class WaterBodyPlanner
                 + height * (3 * t * t - 2 * t * t * t);
         }
 
+        // A wide river deepens toward its middle: beyond the shore band its bed falls
+        // RiverDeepening metres per metre from the nearest bank, down to RiverMaximumDepth
+        // below its surface. At a flat 3 m, Quebec City's 1-2 km St Lawrence read as pale
+        // shallows with its narrower 5 m reach channels showing through as thin dark lines
+        // (11-18). A river under about 2 × (bedBand + 25 m) wide keeps its old bed.
+        // riverShoreDistance: each flowing-water cell's distance to the nearest cell that is
+        // not flowing water, in metres (null until the river mask is known; lakes ignore it).
+        const float RiverDeepening = 1 / 25f, RiverMaximumDepth = 12;
+        float[]? riverShoreDistance = null;
+
         void CarveArea(Area area, Func<float3, float?> level)
         {
             var accepted = 0;
             var blockedByBudget = 0;
+            var lake = Lake(area);
             var pad = (int)Math.Ceiling(shoreBand / spacing);
             var loX = Math.Max(0, (int)Math.Ceiling((area.Min.x + half) / spacing) - pad);
             var hiX = Math.Min(n - 1, (int)Math.Floor((area.Max.x + half) / spacing) + pad);
@@ -1215,7 +1585,7 @@ public static class WaterBodyPlanner
                     var point = new float3(x * spacing - half, 0, z * spacing - half);
                     var edge = area.EdgeDistance(point, shoreBand, out var closest);
 
-                    if (!area.Contains(point) || MappedDry(point))
+                    if (!area.RowContains(point) || MappedDry(point))
                     {
                         if (float.IsPositiveInfinity(edge) || channelCells[z * n + x] != 0)
                             continue;
@@ -1240,7 +1610,7 @@ public static class WaterBodyPlanner
 
                         if (land < levee
                             && land > shore.Value - bankCut
-                            && !areaIndex.Nearby(point).Any(otherArea => otherArea.Contains(point)))
+                            && !areaIndex.Any(point, (otherArea, at) => otherArea.Contains(at)))
                         {
                             var rim =
                                 math.lerp(
@@ -1304,13 +1674,19 @@ public static class WaterBodyPlanner
                     }
 
                     // A flowing polygon is a metre deeper than a lake (rivers read as cut channels).
-                    var depth = Profile(edge, Lake(area) ? 2 : 3, bedBand);
+                    var depth = Profile(edge, lake ? 2 : 3, bedBand);
                     var index = z * n + x;
+
+                    if (!lake && riverShoreDistance != null && riverShoreDistance[index] > bedBand)
+                        depth =
+                            Math.Min(
+                                RiverMaximumDepth,
+                                depth + (riverShoreDistance[index] - bedBand) * RiverDeepening);
                     var original = terrain.Heights[index];
                     var height =
                         Math.Max(
                             0,
-                            Lake(area)
+                            lake
                                 ? Math.Max(original - 8, Math.Min(original, stage.Value - depth))
                                 : Math.Min(original, stage.Value - depth));
 
@@ -1333,7 +1709,7 @@ public static class WaterBodyPlanner
 
                     // The accepted wet interior owns its bed even if it was already
                     // below target. Later earthworks must not introduce a new dam.
-                    if (!Lake(area) && editMask[index] == 0)
+                    if (!lake && editMask[index] == 0)
                     {
                         editMask[index] = 1;
                         editCount++;
@@ -1357,6 +1733,50 @@ public static class WaterBodyPlanner
             log.Count("Water area bed cells above stage", blockedByBudget);
         }
 
+        // Settles where a source stands and how wide it is; false when no footprint fits
+        // its water.
+        bool Place(ref float3 point, ref float radius, ref bool gridSource, Func<float3, bool> mask)
+        {
+            var center = point;
+            var grid = gridSource;
+
+            // No circle spilling onto banks or islands, even for boundary-driven rivers. A
+            // grid source reaches only the water-grid nodes within its radius, so those are
+            // what must lie in the channel.
+            bool Fits(float r)
+                => grid
+                    ? GridNodes(center, r).All(mask)
+                    : Enumerable
+                    .Range(1, 3)
+                    .All(
+                        ring => Enumerable
+                            .Range(0, 16)
+                            .All(
+                                i => mask(
+                                    center
+                                        + new float3(math.cos(i * math.PI / 8), 0, math.sin(i * math.PI / 8))
+                                            * (r * ring / 3))));
+
+            // A grid source keeps its radius: smaller, it reaches no node and adds no water.
+            while (!grid && radius > Math.Max(2, cell * .25f) && !Fits(radius))
+                radius = Math.Max(Math.Max(2, cell * .25f), radius - cell * .25f);
+
+            // A source that had to shrink below 0.9 cell (a pond, a narrow lake) can miss every
+            // grid node and stay dry: 464 of DC's 1,055 such sources were dry on 11-13. It
+            // becomes a grid source on the nearest node inside its water instead.
+            if (!grid && radius < cell * .9f && mask(GridNode(center)))
+            {
+                center = GridNode(center);
+                radius = cell * .9f;
+                grid = true;
+            }
+
+            point = center;
+            gridSource = grid;
+
+            return Fits(radius);
+        }
+
         bool Add(
             long way,
             long body,
@@ -1374,38 +1794,7 @@ public static class WaterBodyPlanner
             if (!Inside(point) || radius < Math.Max(2, cell * .25f) || !math.isfinite(stage))
                 return false;
 
-            // No circle spilling onto banks or islands, even for boundary-driven rivers. A
-            // grid source reaches only the water-grid nodes within its radius, so those are
-            // what must lie in the channel.
-            bool Fits(float r)
-                => gridSource
-                    ? GridNodes(point, r).All(mask)
-                    : Enumerable
-                    .Range(1, 3)
-                    .All(
-                        ring => Enumerable
-                            .Range(0, 16)
-                            .All(
-                                i => mask(
-                                    point
-                                        + new float3(math.cos(i * math.PI / 8), 0, math.sin(i * math.PI / 8))
-                                            * (r * ring / 3))));
-
-            // A grid source keeps its radius: smaller, it reaches no node and adds no water.
-            while (!gridSource && radius > Math.Max(2, cell * .25f) && !Fits(radius))
-                radius = Math.Max(Math.Max(2, cell * .25f), radius - cell * .25f);
-
-            // A source that had to shrink below 0.9 cell (a pond, a narrow lake) can miss every
-            // grid node and stay dry: 464 of DC's 1,055 such sources were dry on 11-13. It
-            // becomes a grid source on the nearest node inside its water instead.
-            if (!gridSource && radius < cell * .9f && mask(GridNode(point)))
-            {
-                point = GridNode(point);
-                radius = cell * .9f;
-                gridSource = true;
-            }
-
-            if (!Fits(radius) || stage > bank - .35f)
+            if (!Place(ref point, ref radius, ref gridSource, mask) || stage > bank - .35f)
             {
                 unresolved++;
                 log.Count(
@@ -1416,7 +1805,35 @@ public static class WaterBodyPlanner
 
             // Give every footprint ring a fully submerged core, including the
             // neighbouring terrain samples used by native bilinear interpolation.
-            Cut(point, (radius + spacing * 2) / .7f, stage - 2.5f, mask, kind == "lake" ? 8 : float.PositiveInfinity);
+            // A river's grid source eases its core into the banks (CutChannel). Clipped to the
+            // channel footprint, the full-depth disc ended in a wall 28 m from the line, the
+            // hard edge of the 11-13 rivers (report 116). The shelf is RiverFreeboard (1 m)
+            // above the water.
+            // The channel's own bed is usually already that deep at the node. Cutting the
+            // core regardless dug a hollow around a node standing off the line, which pushed
+            // the waterline out there, once every 192 m (report 117).
+            if (gridSource && kind == "river" && !EarlierChannelProfile)
+            {
+                if (Height(point) > stage - 2.5f)
+                    CutChannel(
+                        point,
+                        spacing * 2.5f,
+                        true,
+                        stage - 2.5f,
+                        stage,
+                        stage + 1,
+                        stage + 1,
+                        otherPoint => !MappedDry(otherPoint),
+                        float.PositiveInfinity);
+            }
+            else
+            {
+                // A large lake's wide source stands on the lake's own bed, already 2 m under
+                // its level; only the core a standard source would have is cut deeper.
+                var core = kind == "lake" ? Math.Min(radius, cell * 2) : radius;
+                Cut(point, (core + spacing * 2) / .7f, stage - 2.5f, mask, kind == "lake" ? 8 : float.PositiveInfinity);
+            }
+
             point.y = Height(point);
             var depth = stage - point.y;
 
@@ -1505,10 +1922,16 @@ public static class WaterBodyPlanner
         // shore rule's level (lowest bank − 0.5 m), and every shore lower than the new
         // level plus LakeFreeboard gets a levee (shoreLevees, raised after the rivers).
         const float LakeLeveeMax = 5, LakeFreeboard = 1;
+        // LakeEscapeFreeboard is the containment screen's own freeboard. LakeDropFallback is
+        // how far a lake still escaping after containment may be lowered (below).
+        const float LakeDrop = 3, LakeEscapeFreeboard = .35f, LakeDropFallback = 8;
+        // A lake with at least this many probes (about 2.4 km² at the 192 m step) is large.
+        const int LargeLakeProbes = 64;
         var raiseBanks = DesignSwitches.On(DesignSwitches.RaiseBanks);
         var shoreLevees = new List<(float3 A, float3 B, float Height)>();
         var raisedLakes = 0;
-        var coastalMap = data.Ways.Values.Any(way => NetworkSelection.HasTag(way.Tags, "natural", "coastline"));
+        // A lagoon is held at the sea only where the sea is on the map (seaMapped).
+        var coastalMap = seaMapped;
 
         bool Lagoon(Area firstArea)
             => coastalMap
@@ -1637,13 +2060,6 @@ public static class WaterBodyPlanner
                 }
             }
 
-            areaStages.Add(new WaterAreaStage(polygon.Identity, "lake", stage));
-            CarveArea(area, point => stage);
-
-            if (NetworkEvidence.Measure(polygon.Tags, "ele") is float absolute)
-                log.Diagnostic(
-                    $"WATER ELE body={polygon.Id}; sourceAbsoluteMeters={absolute}; stageFromConsistentLocalShore=true; absoluteDatumNotAssumed=true");
-
             var step = Math.Max(cell * 4, 192);
             var probes = new List<float3>();
 
@@ -1665,12 +2081,93 @@ public static class WaterBodyPlanner
                     probes.Add(center);
             }
 
+            bool Placeable(float3 point)
+            {
+                var radius = cell * 2;
+                var gridSource = false;
+
+                return Place(ref point, ref radius, ref gridSource, area.Contains);
+            }
+
+            // A lake where no probe's footprint fits (a pond narrower than a water cell, a
+            // crooked one) still holds water when a water-grid node lies inside it: a source
+            // on that node (Paris rejected 2,137 footprints, report 117).
+            float3? node = null;
+
+            if (!probes.Any(Placeable))
+            {
+                for (var z = (float)Math.Ceiling(Math.Max(-half, area.Min.y) / cell) * cell;
+                    z <= Math.Min(half, area.Max.y) && node == null;
+                    z += cell)
+                    for (var x = (float)Math.Ceiling(Math.Max(-half, area.Min.x) / cell) * cell;
+                        x <= Math.Min(half, area.Max.x) && node == null;
+                        x += cell)
+                    {
+                        var point = new float3(x, 0, z);
+
+                        if (area.Contains(point) && Inside(point))
+                            node = point;
+                    }
+
+                // No source can stand anywhere in it: carved, it would be a dry hollow, so
+                // its ground stays as it is.
+                if (node == null)
+                {
+                    unresolved++;
+                    log.Count("Water lakes left uncarved without a source");
+                    continue;
+                }
+            }
+
+            // The shore rule reads the ground at up to 64 points; the containment screen run
+            // on the finished plan follows every way out, finds lower ground between them,
+            // and drops the lake when its bed, cut for the higher level, stands too high for
+            // the level that holds (9,256 of Dhaka's 10,887 lakes, report 117). The lake
+            // stands at that escape from the start, up to LakeDrop lower. One that would
+            // have to stand lower still keeps the shore rule's level: an earth dam may yet
+            // hold it (Baguio and Leh lost lakes when these were left as ground).
+
+            if (!raiseBanks && !Lagoon(area))
+            {
+                var seeds = node.HasValue ? probes.Append(node.Value) : probes;
+
+                var escape =
+                    WaterContainment.Spill(polygon, seeds, stage, conditioned, width, cell, point => null, token);
+
+                if (escape.HasValue
+                    && escape.Value - LakeEscapeFreeboard < stage
+                    && escape.Value - LakeEscapeFreeboard >= stage - LakeDrop)
+                {
+                    stage = escape.Value - LakeEscapeFreeboard;
+                    sorted[0] = stage + .5f;
+                    log.Count("Water lakes lowered to their escape");
+                }
+            }
+
+            areaStages.Add(new WaterAreaStage(polygon.Identity, "lake", stage));
+            CarveArea(area, point => stage);
+
+            if (NetworkEvidence.Measure(polygon.Tags, "ele") is float absolute)
+                log.Diagnostic(
+                    $"WATER ELE body={polygon.Id}; sourceAbsoluteMeters={absolute}; stageFromConsistentLocalShore=true; absoluteDatumNotAssumed=true");
+
             foreach (var point in probes)
             {
                 Cut(point, step * .8f, stage - 2, area.Contains, 8);
             }
 
             var controls = 0;
+
+            // The game's water spreads slowly out of each source's footprint. Lac Saint-Louis
+            // (145 km², 986 sources of 28 m) showed as hundreds of separate round pools after
+            // import (report 122 §12). A large lake's sources reach twice the probe step, so
+            // together they cover nearly all of it from the start; Place shrinks any that
+            // would cross its shore or an island.
+            var large = probes.Count >= LargeLakeProbes;
+            var sourceRadius = large ? step * 2 : cell * 2;
+
+            if (large)
+                log.Count("Water large lakes given wide sources");
 
             foreach (var point in probes.Where((otherPoint, i) => i % 4 == 0))
                 if (Add(
@@ -1679,13 +2176,54 @@ public static class WaterBodyPlanner
                     "lake",
                     polygon.Tags.TryGetValue("name", out var name) ? name : "lake",
                     point,
-                    cell * 2,
+                    sourceRadius,
                     stage,
                     sorted[0],
                     banks,
                     probes.Take(24).ToArray(),
                     area.Contains))
                     controls++;
+
+            // The probes tried above are every fourth; a lake none of them could serve gets
+            // one source at the first other probe that fits, or on its grid node.
+            if (controls == 0)
+            {
+                var title = polygon.Tags.TryGetValue("name", out var text) ? text : "lake";
+                var others = probes.Where(Placeable).Take(1).ToArray();
+
+                if (others.Length > 0
+                    && Add(
+                        polygon.Id,
+                        polygon.Identity,
+                        "lake",
+                        title,
+                        others[0],
+                        cell * 2,
+                        stage,
+                        sorted[0],
+                        banks,
+                        probes.Take(24).ToArray(),
+                        area.Contains))
+                    controls++;
+                else if (node.HasValue
+                    && Add(
+                        polygon.Id,
+                        polygon.Identity,
+                        "lake",
+                        title,
+                        node.Value,
+                        cell * .9f,
+                        stage,
+                        sorted[0],
+                        banks,
+                        probes.Take(24).ToArray(),
+                        area.Contains,
+                        true))
+                    controls++;
+
+                if (controls > 0)
+                    log.Count("Water lakes given a source on a second try");
+            }
 
             log.Diagnostic(
                 $"WATER BODY id={polygon.Id}; kind=lake; stage={stage:R}; controls={controls}; shoreProbes={banks.Length}; flatStage=true; holesProtected=true");
@@ -1771,6 +2309,163 @@ public static class WaterBodyPlanner
                     ends[id] = way.Id;
             }
 
+        // Mapped lines of mountain rivers often run tens of metres beside the valley the terrain
+        // shows, on its flank, so the ground under the line climbs along the flow: past a climb
+        // of more than ChannelCut the bed cannot reach the water arriving from upstream and
+        // stands as a dam (765 in Baguio, report 117). Each way's nodes may therefore stand up
+        // to SnapReach to either side of the mapped line, on the offsets that together climb
+        // least along the flow. Every metre a node stands aside, and every metre its offset
+        // differs from the previous node's, costs as much as SnapOffsetCost and SnapBendCost
+        // metres of climb, so a line whose ground already falls stays where it was mapped and a
+        // moved stretch stays one smooth line. A way moves only when that saves SnapClimb of
+        // climb. Nodes of buried ways stay, because roads above them were mapped against the
+        // line, and so do nodes shared by two ways, because each way would move them
+        // differently.
+        // At .005 and .04 the costs kept moved lines on the flank where the floor was a few cells
+        // further: .001 and .01 removed 13 of Kathmandu's 93 dams, 57 of Baguio's 539 and 33 of
+        // Guatemala City's 255, lengthened the lines by under 1%, and left Bangkok, Paris and DC
+        // as they were; .0005 and .004 removed only one or two more (report 117).
+        const float SnapReach = 112, SnapClimb = 10, SnapOffsetCost = .001f, SnapBendCost = .01f;
+        var moved = new Dictionary<long, float3>();
+
+        if (!EarlierChannelProfile)
+        {
+            var snapSteps = (int)(SnapReach / spacing);
+            var choices = 2 * snapSteps + 1;
+            var held = new HashSet<long>(buried.SelectMany(way => way.NodeIds));
+            var seen = new HashSet<long>();
+
+            foreach (var way in lines)
+                foreach (var id in way.NodeIds)
+                    if (!seen.Add(id))
+                        held.Add(id);
+
+            bool Open(float3 place)
+                => Inside(place)
+                    && !MappedDry(place)
+                    && !areaIndex.Any(place, (area, at) => InOpenWater(area, at));
+
+            foreach (var way in lines)
+            {
+                var count = way.NodeIds.Length;
+
+                if (count < 2)
+                    continue;
+
+                // heights[i, k]: ground at node i standing (k - snapSteps) cells aside, or
+                // infinity where it may not stand. costs[i, k]: least cost of the line so far.
+                var places = new float3[count, choices];
+                var heights = new float[count, choices];
+                var costs = new float[count, choices];
+                var origins = new int[count, choices];
+
+                for (var i = 0; i < count; i++)
+                {
+                    Pulse();
+                    var point = Local(way.NodeIds[i]);
+                    var before = Local(way.NodeIds[Math.Max(0, i - 1)]);
+                    var after = Local(way.NodeIds[Math.Min(count - 1, i + 1)]);
+                    var along = math.normalizesafe(new float3(after.x - before.x, 0, after.z - before.z));
+                    var across = new float3(-along.z, 0, along.x);
+                    var free = math.lengthsq(along) > 0 && !held.Contains(way.NodeIds[i]) && Open(point);
+                    var ground = BankHeight(point);
+
+                    for (var k = 0; k < choices; k++)
+                    {
+                        var place = point + across * ((k - snapSteps) * spacing);
+                        places[i, k] = place;
+                        heights[i, k] = k == snapSteps ? ground : float.PositiveInfinity;
+
+                        if (k == snapSteps || !free || !Open(place))
+                            continue;
+
+                        // A node only ever moves down: a place above the mapped one may
+                        // smooth the line's climb but is the bank, not the valley floor.
+                        var height = BankHeight(place);
+
+                        if (height < ground)
+                            heights[i, k] = height;
+                    }
+                }
+
+                // The climb of the line as mapped, counted as the search below counts it.
+                var mapped = 0f;
+
+                for (var i = 1; i < count; i++)
+                {
+                    var middle = BankHeight(math.lerp(places[i - 1, snapSteps], places[i, snapSteps], .5f));
+
+                    mapped +=
+                        Math.Max(0, middle - heights[i - 1, snapSteps])
+                            + Math.Max(0, heights[i, snapSteps] - middle);
+                }
+
+                if (mapped < SnapClimb)
+                    continue;
+
+                // The first node's own height is no climb: only its offset costs.
+                for (var k = 0; k < choices; k++)
+                    costs[0, k] =
+                        float.IsPositiveInfinity(heights[0, k])
+                            ? float.PositiveInfinity
+                            : Math.Abs(k - snapSteps) * spacing * SnapOffsetCost;
+
+                for (var i = 1; i < count; i++)
+                    for (var k = 0; k < choices; k++)
+                    {
+                        costs[i, k] = float.PositiveInfinity;
+
+                        if (float.IsPositiveInfinity(heights[i, k]))
+                            continue;
+
+                        for (var j = 0; j < choices; j++)
+                        {
+                            if (float.IsPositiveInfinity(costs[i - 1, j]))
+                                continue;
+
+                            // The ground halfway counts too: a spur between two low nodes
+                            // is a climb the nodes' own heights do not show.
+                            var middle = BankHeight(math.lerp(places[i - 1, j], places[i, k], .5f));
+
+                            var cost =
+                                costs[i - 1, j]
+                                    + Math.Max(0, middle - heights[i - 1, j])
+                                    + Math.Max(0, heights[i, k] - middle)
+                                    + Math.Abs(k - j) * spacing * SnapBendCost
+                                    + Math.Abs(k - snapSteps) * spacing * SnapOffsetCost;
+
+                            if (cost < costs[i, k])
+                            {
+                                costs[i, k] = cost;
+                                origins[i, k] = j;
+                            }
+                        }
+                    }
+
+                var choice = snapSteps;
+
+                for (var k = 0; k < choices; k++)
+                    if (costs[count - 1, k] < costs[count - 1, choice])
+                        choice = k;
+
+                // Only a way that saves SnapClimb of climb moves: on level land the mapped
+                // channel is the better guide, and moving it for less dammed Bangkok (1 dam
+                // to 35).
+                if (mapped - costs[count - 1, choice] < SnapClimb)
+                    continue;
+
+                for (var i = count - 1; i >= 0; i--)
+                {
+                    if (choice != snapSteps)
+                        moved[way.NodeIds[i]] = places[i, choice];
+
+                    choice = origins[i, choice];
+                }
+            }
+
+            log.Count("Water line nodes moved to the valley floor", moved.Count);
+        }
+
         var positions = new Dictionary<long, float3>();
         var nodeStage = new Dictionary<long, float>();
 
@@ -1779,7 +2474,7 @@ public static class WaterBodyPlanner
                 if (!positions.ContainsKey(id))
                 {
                     Pulse();
-                    var point = Local(id);
+                    var point = moved.TryGetValue(id, out var target) ? target : Local(id);
                     positions[id] = point;
                     nodeStage[id] = BankHeight(point) + 2.8f;
                 }
@@ -1802,14 +2497,7 @@ public static class WaterBodyPlanner
                 }
 
                 var normal = math.normalizesafe(new float3(-(neighbor - point).z, 0, (neighbor - point).x));
-                var area =
-                    areaIndex
-                        .Nearby(point)
-                        .FirstOrDefault(
-                            otherArea => Flowing(otherArea)
-                                && !Coastal(otherArea)
-                                && !Dry(otherArea)
-                                && otherArea.Contains(point));
+                var area = areaIndex.First(point, (otherArea, at) => InFlowingWater(otherArea, at));
 
                 var halfWidth =
                     Math.Max(
@@ -1868,11 +2556,7 @@ public static class WaterBodyPlanner
         var missingBankSamples = 0;
         var lowerStage = positions.ToDictionary(entry => entry.Key, entry =>
         {
-            var polygon =
-                areaIndex
-                    .Nearby(entry.Value)
-                    .FirstOrDefault(
-                        area => Flowing(area) && !Coastal(area) && !Dry(area) && area.Contains(entry.Value));
+            var polygon = areaIndex.First(entry.Value, (area, at) => InFlowingWater(area, at));
 
             return polygon != null ? .4f : Math.Max(.4f, baseBed[entry.Key] - 8 + .4f);
         });
@@ -1918,11 +2602,7 @@ public static class WaterBodyPlanner
                     if (MappedDry(point))
                         continue;
 
-                    var polygon =
-                        areaIndex
-                            .Nearby(point)
-                            .FirstOrDefault(
-                                area => Flowing(area) && !Coastal(area) && !Dry(area) && area.Contains(point));
+                    var polygon = areaIndex.First(point, (area, at) => InFlowingWater(area, at));
 
                     var bank = float.PositiveInfinity;
                     var banks = 0;
@@ -2170,11 +2850,33 @@ public static class WaterBodyPlanner
                 list.Add((vectorA, vectorB));
             }
 
-        // A way's end reaches the sea when it lies in mapped sea, within 150 m of a lagoon, or within
-        // 150 m of the coastline.
+        // A lagoon counts up to 150 m outside its bounds, which areaIndex's small cells would
+        // miss: this test keeps the 2 km cells it was written with, over the only areas it
+        // can accept.
+        var seaIndex = new AreaIndex(areas.Where(area => Coastal(area) || Lagoon(area)), token, 2048);
+
+        // A way's end reaches the sea when it lies in mapped sea, within 150 m of a lagoon, within
+        // 150 m of the coastline, or within MapEdgeReach of the map's edge (where a river leaving
+        // the map is clipped, or beyond it) on ground at or above the
+        // sea's surface: the game's sea stands at the map's border, so a river flowing off the
+        // map flows into it. A stretch below the sea's surface is then raised to it and left to
+        // the sea, which fills it through the lowered bed, as on the coast; a river above the
+        // sea is unaffected. Quebec City's St Lawrence leaves the map at both ends, on ground
+        // 4 m above the sea, with a solved surface 3 m below it. Ground below the sea at the
+        // edge is a polder's, and its water is never lifted to the sea (Amsterdam's canals).
+        const float MapEdgeReach = 30;
+
         bool AtSea(float3 point)
         {
-            if (areaIndex
+            if (Math.Abs(point.x) >= half - MapEdgeReach || Math.Abs(point.z) >= half - MapEdgeReach)
+            {
+                var inside = math.clamp(point.xz, -(float)half + 1, (float)half - 1);
+
+                if (NetworkProcessor.Sample(inside.x, inside.y, terrain.Heights, width) >= seaSurface)
+                    return true;
+            }
+
+            if (seaIndex
                 .Nearby(point)
                 .Any(
                     area => Coastal(area) && area.Contains(point)
@@ -2327,14 +3029,7 @@ public static class WaterBodyPlanner
                     if (MappedDry(point))
                         continue;
 
-                    var area =
-                        areaIndex
-                            .Nearby(point)
-                            .FirstOrDefault(
-                                otherArea => Flowing(otherArea)
-                                    && !Coastal(otherArea)
-                                    && !Dry(otherArea)
-                                    && otherArea.Contains(point));
+                    var area = areaIndex.First(point, (otherArea, at) => InFlowingWater(otherArea, at));
 
                     // Do not silently inflate a known 4m canal to the native
                     // 56m source diameter, or reinterpret an island as unmapped water.
@@ -2371,7 +3066,7 @@ public static class WaterBodyPlanner
                             var rim = point + normal * (side * (channel / .6f + cell * .5f));
 
                             if (Inside(rim)
-                                && !areaIndex.Nearby(rim).Any(otherArea => !Dry(otherArea) && otherArea.Contains(rim)))
+                                && !areaIndex.Any(rim, (otherArea, at) => InOpenWater(otherArea, at)))
                                 banks.Add(rim);
                         }
                     }
@@ -2472,6 +3167,143 @@ public static class WaterBodyPlanner
                     bridgedSamples++;
             }
 
+            // How much of a gorge each side of each sample is (CutChannel): 0 where the ground
+            // beside the channel climbs from the water at GorgeSlopeStart or less, 1 at
+            // GorgeSlopeFull or more, read at the lower bank's edge and across the upper bank
+            // (x on the side the segment's left normal points to, y on the other). Averaged
+            // along the line over GorgeWindow either way, so the cross-section changes
+            // gradually: neighbouring samples with different shares left a step between
+            // their banks.
+            //
+            // upperBanks is the ground height each sample's upper bank is sized to meet: the
+            // highest of its bank probes and of the ground across a bank of full width on
+            // either side, then the highest within GorgeWindow along the line, averaged over
+            // the same window. Sized sample by sample, a bank 80 m wide stood next to one
+            // 30 m wide and left a step where the shorter one ended.
+            var gorges = new float2[count];
+            var upperBanks = new float[count];
+
+            if (!EarlierChannelProfile)
+            {
+                var ownGorges = new float2[count];
+                var ownUpperBanks = new float[count];
+                var highestUpperBanks = new float[count];
+
+                for (var k = 0; k < count; k++)
+                {
+                    var sample = samples[k];
+                    var direction = sample.B - sample.A;
+                    var sideways = math.normalizesafe(new float3(-direction.z, 0, direction.x));
+                    var steepest = float2.zero;
+                    // The highest ground of the bank probes and of the points across a bank of
+                    // full width on either side that lie inside the map; the sample's bank when
+                    // there are none.
+                    var highestBank = float.NaN;
+                    var readings = 0;
+
+                    foreach (var bankPoint in sample.Banks)
+                        if (Inside(bankPoint))
+                        {
+                            highestBank = Higher(highestBank, BankHeight(bankPoint));
+                            readings++;
+                        }
+
+                    foreach (var step in UpperBankSteps)
+                    {
+                        var left = sample.P + sideways * (LowerBankEdge(channel) + MaximumBankWidth * step);
+                        var right = sample.P - sideways * (LowerBankEdge(channel) + MaximumBankWidth * step);
+
+                        if (Inside(left))
+                        {
+                            highestBank = Higher(highestBank, BankHeight(left));
+                            readings++;
+                        }
+
+                        if (Inside(right))
+                        {
+                            highestBank = Higher(highestBank, BankHeight(right));
+                            readings++;
+                        }
+                    }
+
+                    ownUpperBanks[k] = readings > 0 ? highestBank : sample.Bank;
+
+                    var climb = float2.zero;
+                    var edge = LowerBankEdge(channel);
+                    var leftEdge = BankHeight(sample.P + sideways * edge);
+                    var rightEdge = BankHeight(sample.P - sideways * edge);
+
+                    foreach (var step in GorgeSteps)
+                    {
+                        var across = edge + MaximumBankWidth * step;
+                        var left = sample.P + sideways * across;
+                        var right = sample.P - sideways * across;
+
+                        if (Inside(left))
+                        {
+                            var height = BankHeight(left);
+                            steepest.x = Math.Max(steepest.x, (height - surface[k]) / (across - channel));
+
+                            if (step > 0)
+                                climb.x = Math.Max(climb.x, (height - leftEdge) / (across - edge));
+                        }
+
+                        if (Inside(right))
+                        {
+                            var height = BankHeight(right);
+                            steepest.y = Math.Max(steepest.y, (height - surface[k]) / (across - channel));
+
+                            if (step > 0)
+                                climb.y = Math.Max(climb.y, (height - rightEdge) / (across - edge));
+                        }
+                    }
+
+                    // The ground itself must climb away from the channel as well: a channel sunk
+                    // deep into level ground stands as far below its banks as a gorge's water
+                    // does, and cut tight it became a trench with walls over 35 degrees (Bangkok
+                    // 8 ha to 61, Jakarta 13 to 100, report 117).
+                    steepest = math.min(steepest, climb);
+                    ownGorges[k] = math.saturate((steepest - GorgeSlopeStart) / (GorgeSlopeFull - GorgeSlopeStart));
+                }
+
+                for (int k = 0, low = 0, high = 0; k < count; k++)
+                {
+                    while (samples[k].Station - samples[low].Station > GorgeWindow)
+                        low++;
+
+                    while (high + 1 < count && samples[high + 1].Station - samples[k].Station <= GorgeWindow)
+                        high++;
+
+                    var sum = float2.zero;
+                    var highest = float.NegativeInfinity;
+
+                    for (var q = low; q <= high; q++)
+                    {
+                        sum += ownGorges[q];
+                        highest = Math.Max(highest, ownUpperBanks[q]);
+                    }
+
+                    gorges[k] = sum / (high - low + 1);
+                    highestUpperBanks[k] = highest;
+                }
+
+                for (int k = 0, low = 0, high = 0; k < count; k++)
+                {
+                    while (samples[k].Station - samples[low].Station > GorgeWindow)
+                        low++;
+
+                    while (high + 1 < count && samples[high + 1].Station - samples[k].Station <= GorgeWindow)
+                        high++;
+
+                    var sum = 0f;
+
+                    for (var q = low; q <= high; q++)
+                        sum += highestUpperBanks[q];
+
+                    upperBanks[k] = sum / (high - low + 1);
+                }
+            }
+
             for (var k = 0; k < count; k++)
             {
                 var sample = samples[k];
@@ -2504,19 +3336,34 @@ public static class WaterBodyPlanner
                 // The banks reach out to the upper bank's outer edge (CutChannel), measured from
                 // the carved channel: a wide mapped polygon keeps its own shore shaping.
                 // Sized for the highest ground it has to meet: the bank probes, and the ground
-                // where a bank of full width would end on either side (a hill keeps rising).
+                // across a bank of full width on either side. Looking only where that bank
+                // would end missed a spur or terrace standing nearer, and the short bank
+                // sized without it cut a wall into its foot (report 117).
+                var lowerBankEdge = LowerBankEdge(channel);
+
+                // The neighbouring samples that stand somewhere else (the samples at a
+                // node of the line coincide).
+                float3? previousSample = null;
+                float3? nextSample = null;
+
+                for (var q = k - 1; q >= 0 && previousSample == null; q--)
+                    if (math.distance(samples[q].P.xz, point.xz) > .01f)
+                        previousSample = samples[q].P;
+
+                for (var q = k + 1; q < count && nextSample == null; q++)
+                    if (math.distance(samples[q].P.xz, point.xz) > .01f)
+                        nextSample = samples[q].P;
                 var sideways = math.normalizesafe(new float3(-(vectorB - vectorA).z, 0, (vectorB - vectorA).x));
-                var upperBank =
-                    banks
-                        .Append(point + sideways * (channel / .6f + MaximumBankWidth))
-                        .Append(point - sideways * (channel / .6f + MaximumBankWidth))
-                        .Where(Inside)
-                        .Select(BankHeight)
-                        .DefaultIfEmpty(sample.Bank)
-                        .Max();
+                var upperBank = upperBanks[k];
+                var gorge = gorges[k];
                 var bankReach =
-                    channel / .6f
-                        + math.clamp((upperBank - stage - RiverFreeboard) / BankSlope, cell, MaximumBankWidth);
+                    EarlierChannelProfile || wetRadius > channel
+                        ? channel / .6f
+                        : lowerBankEdge
+                            + math.clamp(
+                                (upperBank - stage - RiverFreeboard) / BankSlope,
+                                spacing * 2,
+                                MaximumBankWidth);
 
                 Func<float3, bool> channelMask =
                     area != null
@@ -2534,14 +3381,30 @@ public static class WaterBodyPlanner
                     skippedTooDeep++;
                     log.Count("Water locally infeasible reaches");
                     var target = Math.Min(stage - ChannelDepth, bedLimit);
-                    CutChannel(
-                        point,
-                        channel,
-                        target,
-                        stage + RiverFreeboard,
-                        upperBank,
-                        channelMask,
-                        area != null ? float.PositiveInfinity : ChannelCut);
+
+                    if (EarlierChannelProfile)
+                        Cut(
+                            point,
+                            channel / .6f,
+                            target,
+                            channelMask,
+                            area != null ? float.PositiveInfinity : ChannelCut,
+                            true);
+                    else
+                        CutChannel(
+                            point,
+                            channel,
+                            true,
+                            target,
+                            stage,
+                            stage + RiverFreeboard,
+                            upperBank,
+                            channelMask,
+                            area != null ? float.PositiveInfinity : ChannelCut,
+                            previousSample,
+                            nextSample,
+                            sideways,
+                            gorge);
 
                     bedLimit = Math.Max(Height(point), target);
                     continue;
@@ -2597,14 +3460,30 @@ public static class WaterBodyPlanner
                 }
 
                 var bedTarget = Math.Min(stage - ChannelDepth, bedLimit);
-                CutChannel(
-                    point,
-                    Math.Max(wetRadius, channel),
-                    bedTarget,
-                    stage + RiverFreeboard,
-                    upperBank,
-                    channelMask,
-                    area != null ? float.PositiveInfinity : ChannelCut);
+
+                if (EarlierChannelProfile)
+                    Cut(
+                        point,
+                        Math.Max(wetRadius, channel) / .6f,
+                        bedTarget,
+                        channelMask,
+                        area != null ? float.PositiveInfinity : ChannelCut,
+                        true);
+                else
+                    CutChannel(
+                        point,
+                        Math.Max(wetRadius, channel),
+                        wetRadius <= channel,
+                        bedTarget,
+                        stage,
+                        stage + RiverFreeboard,
+                        upperBank,
+                        channelMask,
+                        area != null ? float.PositiveInfinity : ChannelCut,
+                        previousSample,
+                        nextSample,
+                        sideways,
+                        gorge);
 
                 bedLimit = Math.Max(Height(point), bedTarget);
 
@@ -2712,6 +3591,21 @@ public static class WaterBodyPlanner
         log.Diagnostic(
             $"WATER JUNCTION CONTINUITY mappedWays={lines.Length}; conditioningPieces={junctionPieces}; interiorJunctionsCarryStageAndBed=true; sourceWayIdsPreserved=true");
 
+        // Whether each terrain grid point lies in mapped water that is not dry: 0 not yet
+        // known, 1 no, 2 yes. The levees of neighbouring samples overlap, so each grid
+        // point was otherwise tested against the water polygons many times over.
+        byte[]? openWaterCells = null;
+
+        bool OpenWaterCell(int index, float3 point)
+        {
+            openWaterCells ??= new byte[n * n];
+
+            if (openWaterCells[index] == 0)
+                openWaterCells[index] = areaIndex.Any(point, (area, at) => InOpenWater(area, at)) ? (byte)2 : (byte)1;
+
+            return openWaterCells[index] == 2;
+        }
+
         // Levees go up after every channel is cut, never across a channel or
         // into mapped water: full height from the channel's cut out to a water
         // cell beyond it, then easing back to the ground over two more cells.
@@ -2719,6 +3613,11 @@ public static class WaterBodyPlanner
 
         foreach (var (vectorA, vectorB, point, channel, height) in levees)
         {
+            // Ground the channel cut below the water belongs to its gentle lower bank
+            // (CutChannel) and is not raised; other ground takes the crest. Raised at full height from the
+            // channel's edge, the levee rebuilt a wall inside that bank (report 116). Distance
+            // here is to this sample's own piece of the line, not the whole line, so it cannot
+            // say where the bank's slope lies.
             var crest = channel / .6f + cell;
             var outer = crest + 2 * cell;
             var pixel = Pixel(point);
@@ -2740,10 +3639,18 @@ public static class WaterBodyPlanner
                         || math.distance(otherPoint.xz, point.xz) > outer)
                         continue;
 
-                    if (areaIndex.Nearby(otherPoint).Any(area => !Dry(area) && area.Contains(otherPoint)))
+                    if (OpenWaterCell(index, otherPoint))
                         continue;
 
                     var current = conditioned[index];
+
+                    // Cut by the channel and under the water: the bank's slope. Naturally low
+                    // ground under the water level still gets the levee that holds the water in.
+                    if (!EarlierChannelProfile
+                        && current < height - RiverFreeboard
+                        && current < terrain.Heights[index] - .05f)
+                        continue;
+
                     var t = Ramp(Math.Max(0, distanceToSegment - crest) / (outer - crest));
                     var target =
                         math.clamp(math.lerp(height, current, t), 0, terrain.HeightScaleMeters);
@@ -2763,7 +3670,6 @@ public static class WaterBodyPlanner
         }
 
         // Lake shore levees (RaiseBanks): full height from the shore out past the shore
-        // probes a source checks (two water cells), then easing back to the ground over
         // two more cells. Only dry ground outside every water body is raised.
         var shoreCells = 0;
 
@@ -2794,7 +3700,7 @@ public static class WaterBodyPlanner
                         math.clamp(math.lerp(height, current, t), 0, terrain.HeightScaleMeters);
 
                     if (target <= conditioned[index]
-                        || areaIndex.Nearby(otherPoint).Any(area => !Dry(area) && area.Contains(otherPoint)))
+                        || OpenWaterCell(index, otherPoint))
                         continue;
 
                     conditioned[index] = target;
@@ -2843,7 +3749,7 @@ public static class WaterBodyPlanner
 
                     var point = new float3(x * spacing - half, 0, z * spacing - half);
 
-                    if (area.Contains(point) && !MappedDry(point))
+                    if (area.RowContains(point) && !MappedDry(point))
                         wet[z * n + x] = 1;
                 }
         }
@@ -2919,14 +3825,7 @@ public static class WaterBodyPlanner
                 continue;
 
             var point = new float3(i % n * spacing - half, 0, i / n * spacing - half);
-            var area =
-                areaIndex
-                    .Nearby(point)
-                    .FirstOrDefault(
-                        otherArea => Flowing(otherArea)
-                            && !Coastal(otherArea)
-                            && !Dry(otherArea)
-                            && otherArea.Contains(point));
+            var area = areaIndex.First(point, (otherArea, at) => InFlowingWater(otherArea, at));
 
             if (area == null || !reachesByPolygon.TryGetValue(area.Polygon.Identity, out var reaches))
                 continue;
@@ -2978,11 +3877,148 @@ public static class WaterBodyPlanner
 
         log.Count("River raster components reseeded", additionalSeeds);
 
+        // Each flowing-water cell's distance to the nearest cell outside it, by a two-pass
+        // chamfer transform (steps of one spacing, diagonals √2 spacing; within 8% of the true
+        // distance). Off the map counts as water: a river leaving the map has no bank there.
+        var shoreDistance = new float[wet.Length];
+        var diagonal = spacing * (float)Math.Sqrt(2);
+
+        for (var i = 0; i < wet.Length; i++)
+            shoreDistance[i] = wet[i] != 0 ? float.PositiveInfinity : 0;
+
+        float Neighbour(int x, int z) => x < 0 || z < 0 || x >= n || z >= n ? float.PositiveInfinity : shoreDistance[z * n + x];
+
+        for (var z = 0; z < n; z++)
+        {
+            token.ThrowIfCancellationRequested();
+
+            for (var x = 0; x < n; x++)
+                if (wet[z * n + x] != 0)
+                    shoreDistance[z * n + x] =
+                        Math.Min(
+                            shoreDistance[z * n + x],
+                            Math.Min(
+                                Math.Min(Neighbour(x - 1, z) + spacing, Neighbour(x, z - 1) + spacing),
+                                Math.Min(Neighbour(x - 1, z - 1) + diagonal, Neighbour(x + 1, z - 1) + diagonal)));
+        }
+
+        for (var z = n - 1; z >= 0; z--)
+        {
+            token.ThrowIfCancellationRequested();
+
+            for (var x = n - 1; x >= 0; x--)
+                if (wet[z * n + x] != 0)
+                    shoreDistance[z * n + x] =
+                        Math.Min(
+                            shoreDistance[z * n + x],
+                            Math.Min(
+                                Math.Min(Neighbour(x + 1, z) + spacing, Neighbour(x, z + 1) + spacing),
+                                Math.Min(Neighbour(x + 1, z + 1) + diagonal, Neighbour(x - 1, z + 1) + diagonal)));
+        }
+
+        riverShoreDistance = shoreDistance;
+
         foreach (var area in areas.Where(area => Flowing(area) && !Coastal(area) && !Dry(area)))
             CarveArea(area, point => riverSurface[Pixel(point)] > 0 ? riverSurface[Pixel(point)] : (float?)null);
 
+        riverShoreDistance = null;
+
+        // A river wider than the bank search gets no source from its centre line: no sample
+        // finds two banks (the St Lawrence at Montreal, 2-3 km wide, report 122 §9). Carved
+        // but never fed, the game left 15 km² of it dry. Flowing areas get sources of their
+        // own, as lakes do, at the solved river level, one per AreaSourceSpacing square that
+        // holds no source yet. A source needs two shores within the probe reach, both higher
+        // than its level by the usual bank margin, so none stands where the water would spill.
+        // Water at the sea's level is left to the sea where the coast is on the map. Without
+        // one, the game's sea only creeps in from the map's edge: after nine minutes it had
+        // come 25 km up the St Lawrence and no further, so such water gets sources too.
+        const float AreaSourceSpacing = 384;
+        var areaSourceStep = Math.Max(cell * 4, 192);
+        var fedSquares = new HashSet<(int, int)>();
+        var areaSources = 0;
+
+        (int, int) Square(float3 point)
+            => ((int)Math.Floor(point.x / AreaSourceSpacing), (int)Math.Floor(point.z / AreaSourceSpacing));
+
+        foreach (var river in sources)
+            fedSquares.Add(Square(river.Position));
+
+        bool OpenWater(float3 point) => areaIndex.Any(point, InOpenWater);
+
+        foreach (var area in areas.Where(area => Flowing(area) && !Coastal(area) && !Dry(area)))
+        {
+            token.ThrowIfCancellationRequested();
+            var polygon = area.Polygon;
+            // A river already fed by its line keeps one body: its new sources join it.
+            var areaBody =
+                sources
+                    .Where(source => source.BodyKind == "river" && area.Contains(source.Position))
+                    .Select(source => (long?)source.BodyId)
+                    .FirstOrDefault()
+                    ?? polygon.Identity;
+
+            for (var z = Math.Max(-half, area.Min.y) + cell * 2; z < Math.Min(half, area.Max.y); z += areaSourceStep)
+                for (var x = Math.Max(-half, area.Min.x) + cell * 2; x < Math.Min(half, area.Max.x); x += areaSourceStep)
+                {
+                    Pulse();
+                    var point = new float3(x, 0, z);
+
+                    if (fedSquares.Contains(Square(point))
+                        || !Inside(point)
+                        || !area.Contains(point)
+                        || MappedDry(point))
+                        continue;
+
+                    var stage = riverSurface[Pixel(point)];
+
+                    if (stage <= 0 || seaMapped && stage <= seaSurface + .5f)
+                        continue;
+
+                    var shores =
+                        Enumerable
+                            .Range(0, 8)
+                            .Select(
+                                i => DryProbe(
+                                    point,
+                                    new float3(math.cos(i * math.PI / 4), 0, math.sin(i * math.PI / 4)),
+                                    OpenWater,
+                                    0))
+                            .Where(shore => shore.HasValue)
+                            .Select(shore => shore!.Value)
+                            .ToArray();
+
+                    if (shores.Length < 2)
+                        continue;
+
+                    if (Add(
+                        polygon.Id,
+                        areaBody,
+                        "river",
+                        polygon.Tags.TryGetValue("name", out var name) ? name : "river",
+                        point,
+                        cell * 2,
+                        stage,
+                        shores.Min(Height),
+                        shores,
+                        new[] { point },
+                        area.Contains))
+                    {
+                        fedSquares.Add(Square(point));
+                        areaSources++;
+                    }
+                }
+        }
+
+        log.Count("Water sources placed in wide river areas", areaSources);
+
+        var mappedWetCells = 0;
+
+        foreach (var value in wet)
+            if (value != 0)
+                mappedWetCells++;
+
         log.Diagnostic(
-            $"WATER CHANNEL CONTINUITY mappedWetCells={wet.Count(v => v != 0)}; solvedWetCells={tail}; disconnectedUnseededCells={wet.Count(v => v != 0) - tail}; islandsPreserved=true; sourceLevelPropagation=nearestConnectedRasterSeed; quadraticReachSearch=false");
+            $"WATER CHANNEL CONTINUITY mappedWetCells={mappedWetCells}; solvedWetCells={tail}; disconnectedUnseededCells={mappedWetCells - tail}; islandsPreserved=true; sourceLevelPropagation=nearestConnectedRasterSeed; quadraticReachSearch=false");
 
         log.Count("Water shore bank samples shaped", shapedBank);
         log.Diagnostic(
@@ -3060,13 +4096,19 @@ public static class WaterBodyPlanner
         // lowered. Marseille's and DC's lakes lost their controls to probes in
         // the trench of a stream running past or out of them. A control left
         // with no probe keeps its planning bank level.
-        bool PlannedWater(float3 point)
-            => Height(point) < BankHeight(point) - .25f
-                || areaIndex.Nearby(point).Any(area => !Dry(area) && area.Contains(point));
+        //
+        // Lowered ground that still stands a bank's margin (.35 m) above this body's
+        // stage is a graded bank, not water: it holds the body in, so its probe stays.
+        // A river's graded banks (report 116) lower almost every rim probe, which had
+        // left most river sources with no probe for Revalidate to judge (report 117).
+        bool PlannedWater(float3 point, float stage)
+            => Height(point) < BankHeight(point) - .25f && Height(point) < stage + .35f
+                || areaIndex.Any(point, (area, at) => InOpenWater(area, at));
 
         for (var i = 0; i < sources.Count; i++)
         {
-            var kept = sources[i].BankProbes.Where(point => !PlannedWater(point)).ToArray();
+            var stage = sources[i].TargetSurfaceLevel ?? sources[i].Position.y + sources[i].Depth;
+            var kept = sources[i].BankProbes.Where(point => !PlannedWater(point, stage)).ToArray();
 
             if (kept.Length < sources[i].BankProbes.Count)
             {
@@ -3106,29 +4148,59 @@ public static class WaterBodyPlanner
                 WaterCellSize = cell,
                 AreaStages = areaStages,
                 ReachStages = reachStages,
+                MovedWaterwayNodes = moved,
                 BedEdits = new TerrainEditSet("water-bed", "pre-water-terrain", n, editMask)
             };
 
-        var contained =
-            WaterContainment.Validate(plan, terrain with { Heights = conditioned }, width, polygons, log, token);
+        phase = "checking lake containment";
+        Pulse(true);
+
+        // The plan is checked again after dams and after lowering; only the last check's
+        // warnings are logged, so each lake dropped is reported once.
+        var containmentWarnings = new List<string>();
+
+        WaterPlan CheckContainment()
+        {
+            containmentWarnings.Clear();
+
+            return WaterContainment.Validate(
+                plan,
+                terrain with { Heights = conditioned },
+                width,
+                polygons,
+                log,
+                token,
+                containmentWarnings);
+        }
+
+        var contained = CheckContainment();
 
         // A rejected lake whose low rim is short is held by an earth dam: the real dam
         // is usually too narrow for the elevation data. Any other rejected lake gives
         // its terrain back, so it leaves neither a dry pit nor a wall.
+        // Looked up by body: scanning every area for every stage took 40 of Amsterdam's
+        // 80 s (58,204 lakes).
+        var areasByBody = areas.ToLookup(area => area.Polygon.Identity);
+
         IEnumerable<Area> Rejected(WaterPlan checkedPlan)
         {
             var kept = checkedPlan.AreaStages.Select(stage => stage.BodyId).ToHashSet();
             return areaStages
                 .Where(stage => stage.Kind == "lake" && !kept.Contains(stage.BodyId))
-                .SelectMany(stage => areas.Where(area => area.Polygon.Identity == stage.BodyId));
+                .SelectMany(stage => areasByBody[stage.BodyId]);
         }
 
         var dams = 0;
+        var firstLevels = new Dictionary<long, float>();
+
+        foreach (var stage in areaStages)
+            if (!firstLevels.ContainsKey(stage.BodyId))
+                firstLevels[stage.BodyId] = stage.Level;
 
         foreach (var area in Rejected(contained).ToArray())
         {
             token.ThrowIfCancellationRequested();
-            var stage = areaStages.First(otherStage => otherStage.BodyId == area.Polygon.Identity).Level;
+            var stage = firstLevels[area.Polygon.Identity];
             var pad = (int)Math.Ceiling((cell * 2 + spacing) / spacing);
             var rim = new List<int>();
 
@@ -3145,12 +4217,12 @@ public static class WaterBodyPlanner
                 {
                     var point = new float3(x * spacing - half, 0, z * spacing - half);
 
-                    if (area.Contains(point))
+                    if (area.RowContains(point))
                         continue;
 
                     var edge = area.EdgeDistance(point, cell * 2, out _);
 
-                    if (edge <= cell || float.IsPositiveInfinity(edge) || edge > cell * 2)
+                    if (float.IsPositiveInfinity(edge) || edge > cell * 2)
                         continue;
 
                     if (conditioned[z * n + x] < stage
@@ -3158,7 +4230,14 @@ public static class WaterBodyPlanner
                         rim.Add(z * n + x);
                 }
 
-            if (rim.Count == 0 || rim.Count * spacing > 2 * MaximumDamLength)
+            // The dam fills the low ground from the shore out to two water cells. The
+            // containment screen reads each bank point as the lowest ground within half a
+            // water cell, so a dam begun a water cell out, over a low shore, never held:
+            // the screen saw the low shore through it (Quebec City, report 122 §13). Its
+            // length is its area over its width.
+            var damLength = rim.Count * spacing * spacing / (cell * 2);
+
+            if (rim.Count == 0 || damLength > MaximumDamLength)
                 continue;
 
             var crest =
@@ -3176,13 +4255,116 @@ public static class WaterBodyPlanner
         log.Count("Water earth dams built", dams);
 
         if (dams > 0)
-            contained =
-                WaterContainment.Validate(plan, terrain with { Heights = conditioned }, width, polygons, log, token);
+            contained = CheckContainment();
+
+        // A lake still escaping stands at its escape instead, as one within LakeDrop of it does
+        // from the start, when that is at most LakeDropFallback below its planned level, and
+        // the containment screen checks it again. A real lake stands at its outlet. Dropped, it
+        // left grass where the map has water: 231 lakes in Montreal on the source elevation,
+        // most with an escape 2 to 8 m down (report 122 §13). Its bed inside the shore drops by
+        // as much, and its banks are not shaped again for the lower level: that lowered the
+        // very rim it then escaped over. A second round follows a lower escape found once the
+        // first is closed.
+        var fallbackLevels = new Dictionary<long, float>();
+
+        // The whole bed inside the lake drops with its level, so it keeps its depth and shape.
+        // Cutting only around its sources left round pools in a dry bed.
+        void LowerBed(IEnumerable<Area> lakeAreas, float drop)
+        {
+            foreach (var area in lakeAreas)
+            {
+                var loX = Math.Max(0, (int)Math.Floor((area.Min.x + half) / spacing));
+                var hiX = Math.Min(n - 1, (int)Math.Ceiling((area.Max.x + half) / spacing));
+                var loZ = Math.Max(0, (int)Math.Floor((area.Min.y + half) / spacing));
+                var hiZ = Math.Min(n - 1, (int)Math.Ceiling((area.Max.y + half) / spacing));
+
+                for (var z = loZ; z <= hiZ; z++)
+                    for (var x = loX; x <= hiX; x++)
+                    {
+                        if (!area.RowContains(new float3(x * spacing - half, 0, z * spacing - half)))
+                            continue;
+
+                        var index = z * n + x;
+                        conditioned[index] = Math.Max(0, conditioned[index] - drop);
+
+                        if (editMask[index] == 0)
+                        {
+                            editMask[index] = 1;
+                            editCount++;
+                        }
+                    }
+            }
+        }
+
+        for (var round = 0; round < FallbackRounds; round++)
+        {
+            // Lakes that passed hold water at their accepted levels; those that failed do not.
+            var plannedSurface = WaterContainment.PlannedSurface(contained, polygons);
+            var loweredThisRound = 0;
+
+            foreach (var body in Rejected(contained).GroupBy(area => area.Polygon.Identity).ToArray())
+            {
+                token.ThrowIfCancellationRequested();
+                var stage = firstLevels[body.Key];
+
+                var seeds =
+                    plan.Sources
+                        .Where(source => source.BodyId == body.Key)
+                        .Select(source => source.Position)
+                        .ToArray();
+
+                if (seeds.Length == 0)
+                    continue;
+
+                var escape =
+                    WaterContainment.Spill(
+                        body.First().Polygon,
+                        seeds,
+                        stage,
+                        conditioned,
+                        width,
+                        cell,
+                        plannedSurface,
+                        token);
+
+                if (!escape.HasValue)
+                    continue;
+
+                var level = Math.Min(stage, escape.Value - LakeEscapeFreeboard);
+
+                if (!math.isfinite(level)
+                    || stage - level > LakeDropFallback
+                    || fallbackLevels.TryGetValue(body.Key, out var earlier) && level >= earlier - .01f)
+                    continue;
+
+                LowerBed(body, (fallbackLevels.TryGetValue(body.Key, out var previous) ? previous : stage) - level);
+                fallbackLevels[body.Key] = level;
+                loweredThisRound++;
+            }
+
+            if (loweredThisRound == 0)
+                break;
+
+            contained = CheckContainment();
+        }
+
+        foreach (var warning in containmentWarnings)
+            log.Warn(warning);
+
+        var dropped = Rejected(contained).Select(area => area.Polygon.Identity).ToHashSet();
+
+        log.Count(
+            "Water lakes lowered to their escape after containment",
+            fallbackLevels.Keys.Count(id => !dropped.Contains(id)));
+        log.Count("Water lakes dropped after containment", dropped.Count);
 
         var restored = 0;
 
         foreach (var area in Rejected(contained))
         {
+            // Asked for every cell around the lake (Amsterdam: 5.5 million cells), so the
+            // test is made once per lake, not once per cell.
+            Func<Area, float3, bool> otherContains = (otherArea, at) => otherArea != area && otherArea.Contains(at);
             var pad = (int)Math.Ceiling((cell * 2 + shoreBand) / spacing);
 
             for (var z =
@@ -3203,11 +4385,11 @@ public static class WaterBodyPlanner
 
                     var point = new float3(x * spacing - half, 0, z * spacing - half);
 
-                    if (!area.Contains(point)
+                    if (!area.RowContains(point)
                         && float.IsPositiveInfinity(area.EdgeDistance(point, cell * 2 + shoreBand, out _)))
                         continue;
 
-                    if (areaIndex.Nearby(point).Any(otherArea => otherArea != area && otherArea.Contains(point)))
+                    if (areaIndex.Any(point, otherContains))
                         continue;
 
                     conditioned[i] = terrain.Heights[i];
@@ -3216,11 +4398,16 @@ public static class WaterBodyPlanner
         }
 
         log.Count("Water terrain cells restored from rejected lakes", restored);
+        phase = "reporting";
+        Pulse(true);
 
         return contained;
     }
 
     private const float MaximumDamLength = 250;
+
+    // Containment rounds for lakes lowered to their escape after their dams (above).
+    private const int FallbackRounds = 2;
 
     public static WaterPlan Revalidate(
         WaterPlan plan,

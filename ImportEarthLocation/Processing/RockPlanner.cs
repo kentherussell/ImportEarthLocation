@@ -30,7 +30,8 @@ namespace ImportEarthLocation.Processing;
 // and flat rock get none (scattered rocks there looked artificial and cost most
 // of the preparation and placement time). Mapped single boulders (natural=stone)
 // and outcrops (natural=rock nodes) keep their own small clumps. Above
-// MaximumRocks the least rocky slopes are left out.
+// MaximumRocks the least rocky slopes are left out. Steep faces no tag marks also
+// shed a few clumps, after all mapped evidence (report 121 §18).
 // Positions are local metres (x east, z north); y is final terrain height.
 public static class RockPlanner
 {
@@ -47,7 +48,17 @@ public static class RockPlanner
     // Candidate MetadataIndex is an index into Reasons; callers merging with a
     // vegetation plan offset it by their own metadata count.
     public static readonly string[] Reasons =
-        { "stone_node", "rock_node", "rock_area", "bare_rock", "scree", "cliff_talus", "steep_slope", "rockfall" };
+        {
+            "stone_node",
+            "rock_node",
+            "rock_area",
+            "bare_rock",
+            "scree",
+            "cliff_talus",
+            "steep_slope",
+            "rockfall",
+            "steep_face"
+        };
 
     // Cliff clumps: one every CliffClumpStep metres of cliff, found by walking
     // downhill up to RockfallReach metres to where the slope eases below RockfallRest.
@@ -55,9 +66,28 @@ public static class RockPlanner
     // Rocky-slope clumps: at most one per SlopeBlock-metre square, walked up to
     // SlopeReach metres downhill to the slope's foot.
     private const float SlopeBlock = 100, SlopeReach = 120;
-    // Vanilla boulders are 4.4–5.6 m across: neighbours BoulderStep apart
-    // overlap a little, so a clump reads as one pile.
-    private const float BoulderStep = 2.6f;
+    // Downhill traces (Settle): 4 m steps, choosing among seven headings 20° apart, up to
+    // 60° either side of the last step's heading.
+    private const float TraceStep = 4, TraceTurn = math.PI / 3;
+    private const int TraceHeadings = 7;
+    // Steep faces no tag marks (report 121 §18.2): ground at least this steep (40°) over
+    // both FaceGrid metres either side and 6 m. A DEM sample is about 14 m, so the
+    // wide scale shows a sustained face, not one noisy sample.
+    private const float FaceSlope = .84f, FaceGrid = 40;
+    // Faces near a road are engineered cuts and faces near mapped water banks the
+    // importer carved; neither sheds rock. At most MaximumFaceClumps clumps, from the
+    // steepest faces, so mountain maps are not covered in piles.
+    private const float FaceClearance = 40;
+    // At 1,500, Santa Barbara and Kathmandu both reached the cap and gained about 10,600
+    // boulders each, as many as all their mapped evidence: speculative, so kept sparse.
+    private const int MaximumFaceClumps = 500;
+    // Placement keeps a rock only when its centre is at least three quarters of the two
+    // footprint radii from every rock already placed (NativeVegetationPlacement.RockFits).
+    // Vanilla boulders are 4.4–5.6 m across, so boulders 0.75 × 5.6 = 4.2 m apart (plus
+    // 5 cm against rounding) pass whichever boulder each one draws, and still touch or
+    // overlap a little, so a clump reads as one pile. At the former 2.6 m placement
+    // dropped most of every pile (Barcelona: 10,766 of 17,098 boulders, report 121 §18).
+    private const float BoulderStep = 4.25f;
     // Boulders per clump: ClumpBoulders to twice that; fewer than MinimumClump
     // placed and the clump is left out.
     private const int ClumpBoulders = 5, MinimumClump = 3;
@@ -140,6 +170,15 @@ public static class RockPlanner
                     token);
         }
 
+        // The water plan's rivers and lakes (its stages over the ground), with each river
+        // as wide as its carved channel, as the game's water fills it: traces following a
+        // valley reach its river, and rock there would stand in the water. The rock query
+        // carries no waterway lines, so the plan is the only record of rivers here.
+        var plannedSurface = WaterBodyPlanner.ConstructedSurfaceSampler(water, geography);
+
+        bool UnderPlannedWater(float2 at, float ground)
+            => plannedSurface(new float3(at.x, 0, at.y)) is float level && level > ground;
+
         var wet =
             geography
                 .Where(
@@ -205,7 +244,7 @@ public static class RockPlanner
                 && at.x <= wetBounds[i].Max.x
                 && at.y >= wetBounds[i].Min.y
                 && at.y <= wetBounds[i].Max.y
-                && wet[i].Contains(new float3(at.x, 0, at.y));
+                && wet[i].ContainsIndexed(new float3(at.x, 0, at.y));
 
         bool Wet(float2 at)
         {
@@ -248,6 +287,11 @@ public static class RockPlanner
 
         var occupied = new Dictionary<(int, int), List<float2>>();
 
+        // Boulders by BoulderStep square, to keep every two boulders BoulderStep apart.
+        var boulderCells = new Dictionary<(int, int), List<float2>>();
+
+        (int, int) BoulderKey(float2 at) => ((int)Math.Floor(at.x / BoulderStep), (int)Math.Floor(at.y / BoulderStep));
+
         bool Accept(float2 at, VegetationForm form, long source, uint seed, string reason)
         {
             token.ThrowIfCancellationRequested();
@@ -272,7 +316,7 @@ public static class RockPlanner
                 return false;
             }
 
-            if (Wet(at))
+            if (Wet(at) || UnderPlannedWater(at, point.y))
             {
                 Count("water");
                 return false;
@@ -295,10 +339,30 @@ public static class RockPlanner
                         return false;
                     }
 
+            var boulderKey = BoulderKey(at);
+
+            if (form == VegetationForm.RockLarge)
+                for (var x = -1; x <= 1; x++)
+                    for (var z = -1; z <= 1; z++)
+                        if (boulderCells.TryGetValue((boulderKey.Item1 + x, boulderKey.Item2 + z), out var near)
+                            && near.Any(otherPoint => math.distance(otherPoint, at) < BoulderStep - .01f))
+                        {
+                            Count("boulder spacing");
+                            return false;
+                        }
+
             if (!occupied.TryGetValue(bucket, out var list))
                 occupied[bucket] = list = new();
 
             list.Add(at);
+
+            if (form == VegetationForm.RockLarge)
+            {
+                if (!boulderCells.TryGetValue(boulderKey, out var boulderList))
+                    boulderCells[boulderKey] = boulderList = new();
+
+                boulderList.Add(at);
+            }
             output.Add(new(point, form, source, seed, Array.IndexOf(Reasons, reason)));
             Count(reason);
 
@@ -315,8 +379,11 @@ public static class RockPlanner
         // already in it so they overlap slightly. Small rocks were too small to
         // read and cost placement, so none are placed. A clump that cannot stand
         // MinimumClump boulders (road, water, map edge) is removed whole rather
-        // than leaving a lone boulder.
-        void Clump(float2 center, int boulders, int rocks, long source, uint seed, string reason)
+        // than leaving a lone boulder. Rock that fell (heading: the direction it
+        // arrived from a trace, zero for a mapped boulder) piles up along its path:
+        // each boulder goes within 45° of that line, ahead or behind, so the pile is
+        // longer downhill than across.
+        void Clump(float2 center, float2 heading, int boulders, int rocks, long source, uint seed, string reason)
         {
             if (output.Count >= MaximumRocks)
                 return;
@@ -329,11 +396,24 @@ public static class RockPlanner
             var first = output.Count;
             var count = ClumpBoulders + (int)(seed >> 12) % (ClumpBoulders + 1);
 
-            for (var k = 0; k < count * 2 && placed.Count < count; k++)
+            // Each new boulder touches one already in the pile and keeps BoulderStep from all
+            // of them, so more tries find room than when they could overlap.
+            for (var k = 0; k < count * 4 && placed.Count < count; k++)
             {
                 var h = math.hash(new uint3(seed, (uint)k, 0xB0u));
-                var at =
-                    placed.Count == 0 ? center : placed[(int)(h >> 20) % placed.Count] + BoulderStep * Direction(h);
+                var direction = Direction(h);
+
+                if (math.lengthsq(heading) > 0)
+                {
+                    var angle =
+                        math.atan2(heading.y, heading.x)
+                            + ((h & 0xFFFF) / 65536f - .5f) * (math.PI / 2)
+                            + ((h & 0x10000) != 0 ? math.PI : 0);
+
+                    direction = new float2(math.cos(angle), math.sin(angle));
+                }
+
+                var at = placed.Count == 0 ? center : placed[(int)(h >> 20) % placed.Count] + BoulderStep * direction;
 
                 if (Accept(at, VegetationForm.RockLarge, source, h, reason))
                     placed.Add(at);
@@ -348,30 +428,84 @@ public static class RockPlanner
             Count("clumps too small", 1);
 
             foreach (var at in placed)
+            {
                 occupied[((int)Math.Floor(at.x / Spacing), (int)Math.Floor(at.y / Spacing))].Remove(at);
+                boulderCells[BoulderKey(at)].Remove(at);
+            }
         }
 
-        // Downhill from a start in 4 m steps until the slope eases below
-        // RockfallRest or the ground meets the sea or mapped water: where fallen
-        // rocks settle, the last dry step on a shoreline.
-        (float2 Foot, bool Shore) Settle(float2 start, float2 down, float reach)
+        // Downhill from a start in TraceStep steps, the way fallen rock goes: each step takes
+        // the steepest descent, in metres down per metre across, among TraceHeadings
+        // headings up to TraceTurn either side of the last one, so a trace bends into a
+        // gully instead of running straight across it. Equal descents keep the straighter
+        // heading, so the trace is deterministic. It never climbs: with no heading leading
+        // down it stops, so it cannot cross a ridge or the far side of a valley. Each step
+        // is checked every metre along its length: it stops before a road (a narrow
+        // corridor between two samples would let a step jump it) and at the last dry
+        // point before the sea, mapped water or the water plan's rivers and lakes. It also stops where the slope eases below
+        // RockfallRest, after the first 8 m, or at reach.
+        // Returns where the rock settles, whether that is a shoreline, and the heading it
+        // arrived with (the direction a pile spreads along).
+        (float2 Foot, bool Shore, float2 Heading) Settle(float2 start, float2 down, float reach)
         {
             var foot = start;
+            var heading = math.normalizesafe(down);
+            var height = Height(start.x, start.y);
 
-            for (var walked = 4f; walked <= reach; walked += 4)
+            for (var walked = TraceStep; walked <= reach; walked += TraceStep)
             {
-                var next = start + down * walked;
+                var best = 0f;
+                var chosen = float2.zero;
 
-                if (Height(next.x, next.y) <= sea || Wet(next))
-                    return (foot, true);
+                for (var k = 0; k < TraceHeadings; k++)
+                {
+                    // Straight first, then alternately right and left, wider each time.
+                    var angle = (k + 1) / 2 * (TraceTurn / (TraceHeadings / 2)) * (k % 2 == 1 ? -1 : 1);
+                    var direction =
+                        new float2(
+                            heading.x * math.cos(angle) - heading.y * math.sin(angle),
+                            heading.x * math.sin(angle) + heading.y * math.cos(angle));
+
+                    var at = foot + direction * TraceStep;
+                    var descent = (height - Height(at.x, at.y)) / TraceStep;
+
+                    if (descent > best)
+                    {
+                        best = descent;
+                        chosen = direction;
+                    }
+                }
+
+                if (best <= 0)
+                    break;
+
+                var next = foot + chosen * TraceStep;
+
+                if (Math.Abs(next.x) > half || Math.Abs(next.y) > half)
+                    break;
+
+                for (var metre = 1; metre <= TraceStep; metre++)
+                {
+                    var along = foot + chosen * metre;
+
+                    var ground = Height(along.x, along.y);
+
+                    if (ground <= sea || Wet(along) || UnderPlannedWater(along, ground))
+                        return (foot, true, heading);
+
+                    if (corridors.Contains(new float3(along.x, 0, along.y)))
+                        return (foot, false, heading);
+                }
 
                 foot = next;
+                heading = chosen;
+                height = Height(foot.x, foot.y);
 
-                if (walked >= 8 && Slope(next.x, next.y) < RockfallRest)
+                if (walked >= 8 && Slope(foot.x, foot.y) < RockfallRest)
                     break;
             }
 
-            return (foot, false);
+            return (foot, false, heading);
         }
 
         float3 Local(long id)
@@ -395,6 +529,7 @@ public static class RockPlanner
             var seed = math.hash(new int2(unchecked((int)node.Key), unchecked((int)(node.Key >> 32))));
             Clump(
                 point.xz,
+                float2.zero,
                 stone ? 1 : 1 + (int)(seed >> 4 & 1),
                 stone ? 4 + (int)(seed >> 8) % 3 : 6 + (int)(seed >> 8) % 5,
                 node.Key,
@@ -415,6 +550,9 @@ public static class RockPlanner
 
         // A cheap per-cell test (slope) runs before the polygon test, so large
         // gentle scrub areas cost one height sample per cell and create nothing.
+        // The polygon test uses the polygon's band index (the same answer as Contains):
+        // walking every vertex for every 10 m cell took 271 s in Kathmandu, whose scree
+        // and grassland areas are large and detailed (report 118).
         void Fill(GeographicPolygon polygon, Func<float2, float> value, Action<Site, float> apply)
         {
             var points = polygon.Outer.SelectMany(otherPoints => otherPoints).ToArray();
@@ -432,7 +570,7 @@ public static class RockPlanner
                     var c = new float2((x + .5f) * Cell, (z + .5f) * Cell);
                     var v = value(c);
 
-                    if (v > 0 && polygon.Contains(new float3(c.x, 0, c.y)))
+                    if (v > 0 && polygon.ContainsIndexed(new float3(c.x, 0, c.y)))
                         apply(At(x, z), v);
                 }
         }
@@ -594,8 +732,8 @@ public static class RockPlanner
                             ? normal
                             : -normal;
 
-                    var (foot, shore) = Settle(start, down, RockfallReach);
-                    Clump(foot, 1 + (int)(seed >> 4) % 3, 8 + (int)((seed >> 8) % 9), way.Id, seed, "rockfall");
+                    var (foot, shore, heading) = Settle(start, down, RockfallReach);
+                    Clump(foot, heading, 1 + (int)(seed >> 4) % 3, 8 + (int)((seed >> 8) % 9), way.Id, seed, "rockfall");
                     piles++;
 
                     if (shore)
@@ -669,12 +807,117 @@ public static class RockPlanner
                 continue;
 
             var seed = math.hash(new int3(key.Item1, key.Item2, 0x40C5));
-            var (foot, shore) = Settle(center, -math.normalize(gradient), SlopeReach);
-            Clump(foot, 1 + (int)(seed >> 4 & 1), 6 + (int)((seed >> 8) % 7), 0, seed, reason);
+            var (foot, shore, heading) = Settle(center, -math.normalize(gradient), SlopeReach);
+            Clump(foot, heading, 1 + (int)(seed >> 4 & 1), 6 + (int)((seed >> 8) % 7), 0, seed, reason);
             slopeClumps++;
 
             if (shore)
                 shoreClumps++;
+        }
+
+        // Steep faces no tag marks: the steepest FaceGrid point of each SlopeBlock square
+        // that mapped evidence left alone, traced to its foot like a rocky slope. Heights
+        // are read once on the FaceGrid lattice (about two million points on a 57 km map);
+        // the 6 m slope is read only where the lattice is already steep enough.
+        var faceClumps = 0;
+
+        if (!capped)
+        {
+            var columns = (int)Math.Floor(width / FaceGrid) + 1;
+            var lattice = new float[columns * columns];
+
+            for (var z = 0; z < columns; z++)
+            {
+                token.ThrowIfCancellationRequested();
+
+                for (var x = 0; x < columns; x++)
+                    lattice[z * columns + x] = Height(-half + x * FaceGrid, -half + z * FaceGrid);
+            }
+
+            // Rise across two lattice steps, east and north.
+            float2 LatticeGradient(int index)
+                => new(
+                    lattice[index + 1] - lattice[index - 1],
+                    lattice[index + columns] - lattice[index - columns]);
+
+            var faces = new Dictionary<(int, int), (float Slope, int Index)>();
+
+            for (var z = 1; z < columns - 1; z++)
+            {
+                token.ThrowIfCancellationRequested();
+
+                for (var x = 1; x < columns - 1; x++)
+                {
+                    var index = z * columns + x;
+                    var steepness = math.length(LatticeGradient(index)) / (2 * FaceGrid);
+
+                    if (steepness < FaceSlope)
+                        continue;
+
+                    var point = new float2(-half + x * FaceGrid, -half + z * FaceGrid);
+
+                    if (Slope(point.x, point.y) < FaceSlope)
+                        continue;
+
+                    var block = ((int)Math.Floor(point.x / SlopeBlock), (int)Math.Floor(point.y / SlopeBlock));
+
+                    if (blocks.ContainsKey(block))
+                        continue;
+
+                    if (!faces.TryGetValue(block, out var best)
+                        || steepness > best.Slope
+                        || steepness == best.Slope && index < best.Index)
+                        faces[block] = (steepness, index);
+                }
+            }
+
+            // The face point and FaceClearance east, north, west and south of it.
+            var clearanceOffsets =
+                new[]
+                {
+                    float2.zero,
+                    new float2(FaceClearance, 0),
+                    new float2(0, FaceClearance),
+                    new float2(-FaceClearance, 0),
+                    new float2(0, -FaceClearance)
+                };
+
+            bool Clear(float2 point)
+            {
+                foreach (var offset in clearanceOffsets)
+                {
+                    var at = point + offset;
+
+                    if (corridors.Contains(new float3(at.x, 0, at.y)) || Wet(at) || NearSource(at))
+                        return false;
+                }
+
+                return true;
+            }
+
+            foreach (var pair in faces
+                .OrderByDescending(entry => entry.Value.Slope)
+                .ThenBy(entry => entry.Key.Item1)
+                .ThenBy(entry => entry.Key.Item2))
+            {
+                if (faceClumps >= MaximumFaceClumps || output.Count >= MaximumRocks)
+                    break;
+
+                var index = pair.Value.Index;
+                var point = new float2(-half + index % columns * FaceGrid, -half + index / columns * FaceGrid);
+
+                if (Patch(point) < .4f || !Clear(point))
+                    continue;
+
+                var down = -math.normalize(LatticeGradient(index));
+                var seed = math.hash(new int3(pair.Key.Item1, pair.Key.Item2, 0x5FAC));
+                var (foot, shore, heading) = Settle(point, down, SlopeReach);
+                Clump(foot, heading, 1, 6, 0, seed, "steep_face");
+                faceClumps++;
+
+                if (shore)
+                    shoreClumps++;
+            }
         }
 
         string CountText(string key) => counts.TryGetValue(key, out var c) ? c.ToString("N0") : "0";
@@ -688,9 +931,10 @@ public static class RockPlanner
         }
 
         log.Count("Rocks prepared", output.Count);
+        log.Count("Rock clumps below unmapped steep faces", faceClumps);
         log.Time("Rock preparation", timer.Elapsed.TotalSeconds);
         log.Evidence(
-            $"Rocks prepared: {output.Count:N0} ({output.Count(candidate => candidate.Form == VegetationForm.RockLarge):N0} boulders) in {timer.Elapsed.TotalSeconds:0.0} s from {field.Count(entry => entry.Value.Rockiness > .05f):N0} rocky 10 m cells{(capped ? $", capped at {MaximumRocks:N0} keeping the rockiest" : "")}; clumps: {piles:N0} below cliffs, {slopeClumps:N0} at the foot of rocky slopes, {shoreClumps:N0} of them on the shoreline; mapped boulders {CountText("stone_node")}, outcrops {CountText("rock_node")}; rocks by slope source: rock areas {CountText("rock_area")}, bare rock {CountText("bare_rock")}, scree {CountText("scree")}, cliffs {CountText("cliff_talus")}, steep slopes {CountText("steep_slope")}, rockfall {CountText("rockfall")}; rejected near roads {CountText("roads")}, in water {CountText("water")}, spacing {CountText("spacing")}.");
+            $"Rocks prepared: {output.Count:N0} ({output.Count(candidate => candidate.Form == VegetationForm.RockLarge):N0} boulders) in {timer.Elapsed.TotalSeconds:0.0} s from {field.Count(entry => entry.Value.Rockiness > .05f):N0} rocky 10 m cells{(capped ? $", capped at {MaximumRocks:N0} keeping the rockiest" : "")}; clumps: {piles:N0} below cliffs, {slopeClumps:N0} at the foot of rocky slopes, {faceClumps:N0} below unmapped steep faces ({CountText("steep_face")} rocks), {shoreClumps:N0} of them on the shoreline; mapped boulders {CountText("stone_node")}, outcrops {CountText("rock_node")}; rocks by slope source: rock areas {CountText("rock_area")}, bare rock {CountText("bare_rock")}, scree {CountText("scree")}, cliffs {CountText("cliff_talus")}, steep slopes {CountText("steep_slope")}, rockfall {CountText("rockfall")}; rejected near roads {CountText("roads")}, in water {CountText("water")}, spacing {CountText("spacing")}.");
 
         return output;
     }

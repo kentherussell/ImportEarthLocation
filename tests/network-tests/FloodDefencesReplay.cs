@@ -787,6 +787,168 @@ static partial class VisualMetricsReplay
         };
     }
 
+    // Where the sea gets into each basin of land below it (report 121 §15.2), on the ground the
+    // game held. Water spreads from confirmed ocean (the ocean mask), not from every map edge:
+    // a low dry edge is not the sea. Each cell's entry level is the lowest it can be reached
+    // at: the highest ground on the best four-connected path from the ocean (a
+    // minimum–maximum path, Dijkstra with the path's maximum as its cost). A basin is a
+    // four-connected patch of land (not mapped water, ocean or planned lake or river) with
+    // ground below the sea surface; its entry is the lowest entry level of its cells, and
+    // the saddle is the cell on that path whose ground sets it. A basin whose entry lies
+    // below the sea surface is open; its saddle is the first place to close. One saddle is
+    // one leak: closing it can expose the next, so a repair must be checked again.
+    // Levels more than 5 m above the sea are not followed: no sea reaches them.
+    // edgeReach is the existing model's answer (seeded at every map-edge cell below the sea);
+    // land it drowns that the ocean cannot reach is flooding the edge seeding invents.
+    private static JObject EntrySaddles(
+        float[] ground,
+        float sea,
+        OceanMask? ocean,
+        byte[] wet,
+        float[] inland,
+        float[] crest,
+        bool[] edgeReach,
+        double width,
+        Func<int, bool> gameFlooded)
+    {
+        if (ocean == null)
+            return new JObject { ["note"] = "no ocean mask in this capture" };
+
+        var n = (int)Math.Sqrt(ground.Length);
+        var spacing = width / (n - 1);
+        var cellKm2 = spacing * spacing / 1e6;
+        var entry = new float[n * n];
+        var previous = new int[n * n];
+        Array.Fill(entry, float.PositiveInfinity);
+        Array.Fill(previous, -1);
+        var queue = new PriorityQueue<int, float>();
+
+        for (var id = 0; id < entry.Length; id++)
+        {
+            var ox = (int)Math.Round(id % n * (ocean.Resolution - 1) / (double)(n - 1));
+            var oz = (int)Math.Round(id / n * (ocean.Resolution - 1) / (double)(n - 1));
+
+            if (ocean.Classification[oz * ocean.Resolution + ox] != 1)
+                continue;
+
+            entry[id] = ground[id];
+            queue.Enqueue(id, ground[id]);
+        }
+
+        var ceiling = sea + 5;
+
+        // The four neighbours of a cell, -1 past the map edge.
+        int[] Around(int id)
+        {
+            int x = id % n, z = id / n;
+
+            return new[] { x > 0 ? id - 1 : -1, x < n - 1 ? id + 1 : -1, z > 0 ? id - n : -1, z < n - 1 ? id + n : -1 };
+        }
+
+        while (queue.TryDequeue(out var id, out var level))
+        {
+            if (level > entry[id])
+                continue;
+
+            foreach (var next in Around(id))
+            {
+                if (next < 0)
+                    continue;
+
+                var reached = Math.Max(level, ground[next]);
+
+                if (reached >= entry[next] || reached > ceiling)
+                    continue;
+
+                entry[next] = reached;
+                previous[next] = id;
+                queue.Enqueue(next, reached);
+            }
+        }
+
+        bool Land(int id) => wet[id] == 0 && float.IsNaN(inland[id]);
+
+        var edgeOnly = 0;
+
+        for (var id = 0; id < entry.Length; id++)
+            if (Land(id) && edgeReach[id] && !(entry[id] < sea))
+                edgeOnly++;
+
+        // Basins below the sea, largest first.
+        var label = new int[n * n];
+        var basins = new List<(int Cells, int Entry, int GameFlooded)>();
+
+        for (var start = 0; start < label.Length; start++)
+        {
+            if (label[start] != 0 || !Land(start) || !(ground[start] < sea))
+                continue;
+
+            var members = new List<int> { start };
+            label[start] = basins.Count + 1;
+            var best = start;
+            var flooded = 0;
+
+            for (var k = 0; k < members.Count; k++)
+            {
+                var id = members[k];
+
+                if (entry[id] < entry[best])
+                    best = id;
+
+                flooded += gameFlooded(id) ? 1 : 0;
+
+                foreach (var next in Around(id))
+                    if (next >= 0 && label[next] == 0 && Land(next) && ground[next] < sea)
+                    {
+                        label[next] = basins.Count + 1;
+                        members.Add(next);
+                    }
+            }
+
+            basins.Add((members.Count, best, flooded));
+        }
+
+        double Metres(int index) => index * spacing - width / 2;
+
+        JObject Describe((int Cells, int Entry, int GameFlooded) basin)
+        {
+            var level = entry[basin.Entry];
+            var saddle = basin.Entry;
+
+            // Back along the path toward the ocean to the cell whose ground sets the level.
+            for (var at = basin.Entry; at >= 0; at = previous[at])
+                if (ground[at] == level)
+                {
+                    saddle = at;
+                    break;
+                }
+
+            return new JObject
+            {
+                ["areaKm2"] = Math.Round(basin.Cells * cellKm2, 2),
+                ["entryAboveSeaMeters"] =
+                    float.IsPositiveInfinity(level) ? JValue.CreateNull() : new JValue(Math.Round(level - sea, 2)),
+                ["open"] = level < sea,
+                ["saddleX"] = Math.Round(Metres(saddle % n)),
+                ["saddleZ"] = Math.Round(Metres(saddle / n)),
+                ["saddleOnDefenceCrest"] = !float.IsNaN(crest[saddle]),
+                ["saddleOnMappedWater"] = wet[saddle] != 0,
+                ["gameFloodedShare"] = Math.Round(basin.GameFlooded / (double)basin.Cells, 2),
+            };
+        }
+
+        var listed = basins.Where(basin => basin.Cells * cellKm2 >= .1).OrderByDescending(basin => basin.Cells).ToList();
+
+        return new JObject
+        {
+            ["basinsBelowSea"] = listed.Count,
+            ["openBasins"] = listed.Count(basin => entry[basin.Entry] < sea),
+            ["openBasinKm2"] = Math.Round(listed.Where(basin => entry[basin.Entry] < sea).Sum(basin => basin.Cells) * cellKm2, 2),
+            ["landDrownedOnlyFromMapEdgesKm2"] = Math.Round(edgeOnly * cellKm2, 2),
+            ["largest"] = new JArray(listed.Take(15).Select(Describe)),
+        };
+    }
+
     // The game's settled water over the whole map (native-water-depth-cm.u16: centimetres on
     // the game's water grid, row zero south), read at each water cell's centre against the
     // ground the game held. Land is neither ocean nor a planned lake or river; land under more
@@ -985,8 +1147,30 @@ static partial class VisualMetricsReplay
 
         double Km2(int count) => Math.Round(count * cellArea, 2);
 
+        // Whether the game flooded the water cell over a terrain cell.
+        bool GameFlooded(int id)
+        {
+            var x = id % size * capture.Width / (size - 1) - capture.Width / 2;
+            var z = id / size * capture.Width / (size - 1) - capture.Width / 2;
+            var column = (int)Math.Floor((x + cells * cellMeters / 2) / cellMeters);
+            var row = (int)Math.Floor((z + cells * cellMeters / 2) / cellMeters);
+
+            return column >= 0 && row >= 0 && column < cells && row < cells && flooded[row * cells + column];
+        }
+
         return new JObject
         {
+            ["entrySaddles"] =
+                EntrySaddles(
+                    ground,
+                    inputs.SeaSurface,
+                    inputs.Ocean,
+                    wet,
+                    inland,
+                    defences.Crest,
+                    seaReaches,
+                    capture.Width,
+                    GameFlooded),
             ["landKm2"] = Km2(land),
             ["landTheModelDrownsKm2"] = Km2(landModelDrowns),
             ["floodedLandKm2"] = Km2(floodedLand),

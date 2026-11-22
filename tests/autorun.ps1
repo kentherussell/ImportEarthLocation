@@ -12,6 +12,9 @@ param(
     [string[]]$Cities = @('marseille', 'dc'),
     [switch]$All,
     [string]$Switches = '',
+    # Imports without diagnostics, as a player's: for timing only; no run folder, site shots
+    # or checks are written (report 118).
+    [switch]$NoDiagnostics,
     [string]$CitiesFile = (Join-Path $PSScriptRoot 'cities.csv'),
     [int]$MaximumMinutes = 0,
     [int]$StaleHeartbeatMinutes = 20,
@@ -222,6 +225,7 @@ try {
                 lat = $coordinates[$city][0]
                 lon = $coordinates[$city][1]
                 switches = $Switches
+                diagnostics = -not $NoDiagnostics
             }
         }
 

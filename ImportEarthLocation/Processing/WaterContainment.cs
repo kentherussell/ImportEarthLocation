@@ -15,10 +15,21 @@ public static class WaterContainment
     private const int MaximumCells = 1048576;
     private const float Freeboard = .35f;
 
+    // Warnings go to the log, or into warnings when given: the planner checks a plan several
+    // times and logs only its last check's warnings, once per lake.
     public static WaterPlan Validate(WaterPlan plan, TerrainBuilder.Result terrain, double width,
-        IReadOnlyList<GeographicPolygon> polygons, ImportLog log, CancellationToken token)
+        IReadOnlyList<GeographicPolygon> polygons, ImportLog log, CancellationToken token,
+        ICollection<string>? warnings = null)
     {
         token.ThrowIfCancellationRequested();
+
+        void Warn(string message)
+        {
+            if (warnings == null)
+                log.Warn(message);
+            else
+                warnings.Add(message);
+        }
         var lakes = plan.Sources.Where(river => river.BodyKind == "lake").GroupBy(river => river.BodyId).ToArray();
 
         if (lakes.Length == 0)
@@ -27,22 +38,32 @@ public static class WaterContainment
         var outlines =
             polygons.GroupBy(polygon => polygon.Identity).ToDictionary(group => group.Key, group => group.First());
 
-        // A neighbouring standing-water body may itself fail this screen. Only
-        // mapped flowing reaches can establish an intended outlet here.
+        // A neighbouring standing-water body may itself fail this screen, so at first only
+        // mapped flowing reaches can establish an intended outlet here. A lake that escapes
+        // is checked again below with the neighbours that passed as outlets too.
         // Channel cuts feather to zero over their outer 40 percent. Their wet
         // sloping rim may extend beyond the nominal one-cell flat core. Test
         // that rim against actual terrain below the reach's level; treating it
         // as dry exterior rejects otherwise contained lakes with stream outlets.
-        var flowing = plan.ReachStages.Where(reach => !reach.BlockedByBuriedInlet).ToArray();
-        var surface =
-            WaterBodyPlanner.ConstructedSurfaceSampler(
-                plan with { AreaStages = Array.Empty<WaterAreaStage>(), ReachStages = flowing },
-                polygons);
+        var surface = PlannedSurface(plan with { AreaStages = Array.Empty<WaterAreaStage>() }, polygons);
 
         var levels = new Dictionary<long, float>();
         var rejected = new HashSet<long>();
         var checkedBodies = 0;
         var lowered = 0;
+        var unscreened = 0;
+        var escaped =
+            new List<(long Body, GeographicPolygon Polygon, RiverSourcePlan[] Controls, float Stage, string Warning)>();
+
+        bool Wet(RiverSourcePlan[] controls, float level)
+            => controls.Any(
+                river => level
+                    - NetworkProcessor.Sample(
+                        river.Position.x,
+                        river.Position.z,
+                        terrain.Heights,
+                        width)
+                    >= .4f);
 
         foreach (var lake in lakes)
         {
@@ -51,7 +72,7 @@ public static class WaterContainment
             if (!outlines.TryGetValue(lake.Key, out var polygon))
             {
                 rejected.Add(lake.Key);
-                log.Warn($"Lake {lake.Key}: containment outline unavailable; its controls were omitted.");
+                Warn($"Lake {lake.Key}: containment outline unavailable; its controls were omitted.");
                 continue;
             }
 
@@ -62,34 +83,58 @@ public static class WaterContainment
 
             var controls = lake.ToArray();
             var stage = controls.Min(river => river.TargetSurfaceLevel ?? river.Position.y + river.Depth);
-            var spill = Spill(polygon, controls, stage, terrain, width, plan.WaterCellSize, surface, token);
+
+            // A lake larger than the bounded screen cannot be checked, so it keeps the level the
+            // planner set from its own shore (the lowest shore probe less a margin). Omitted, it
+            // lost every control and its ground was restored: Lac Saint-Louis (1.9 million screen
+            // cells) stayed dry but for the river's channel (Montreal, report 122 §11). A lake
+            // planned below the sea's level stands among polders (Amsterdam's Markermeer at
+            // −3.4 m from shore probes on polder land) and is still omitted, as before.
+            var cells = ScreenCells(polygon, terrain.Heights, width, plan.WaterCellSize);
+
+            if (cells > MaximumCells && stage >= terrain.SeaLevelMeters)
+            {
+                levels[lake.Key] = stage;
+                unscreened++;
+                Warn(
+                    $"Lake {lake.Key}: too large for the containment screen ({cells:N0} cells); kept at its planned level {stage:0.##} m.");
+
+                continue;
+            }
+
+            var spill =
+                Spill(
+                    polygon,
+                    controls.Select(river => river.Position),
+                    stage,
+                    terrain.Heights,
+                    width,
+                    plan.WaterCellSize,
+                    surface,
+                    token);
             checkedBodies++;
 
             if (!spill.HasValue)
             {
                 rejected.Add(lake.Key);
-                log.Warn(
+                Warn(
                     $"Lake {lake.Key}: containment coverage exceeded its bounded terrain screen; its controls were omitted.");
 
                 continue;
             }
 
             var safe = Math.Min(stage, spill.Value - Freeboard);
-            var wet =
-                controls.Any(
-                    river => safe
-                        - NetworkProcessor.Sample(
-                            river.Position.x,
-                            river.Position.z,
-                            terrain.Heights,
-                            width)
-                        >= .4f);
 
-            if (!wet || !math.isfinite(safe))
+            if (!Wet(controls, safe) || !math.isfinite(safe))
             {
                 rejected.Add(lake.Key);
-                log.Warn(
-                    $"Lake {lake.Key}: its planned level {stage:0.##} m has an uncontained escape at {spill.Value:0.##} m; its controls were omitted.");
+
+                escaped.Add(
+                    (lake.Key,
+                        polygon,
+                        controls,
+                        stage,
+                        $"Lake {lake.Key}: its planned level {stage:0.##} m has an uncontained escape at {spill.Value:0.##} m; its controls were omitted."));
             }
             else
             {
@@ -101,6 +146,55 @@ public static class WaterContainment
 
             log.Diagnostic(
                 $"WATER CONTAINMENT body={lake.Key}; plannedLevel={stage:R}; lowestSpill={spill.Value:R}; acceptedLevel={(rejected.Contains(lake.Key) ? float.NaN : safe):R}; sourceRejected={rejected.Contains(lake.Key)}; terrainOnly=true; nativeFlowVerified=false; bankRaising=false");
+        }
+
+        // Water passing into a neighbouring lake that passed stays in mapped water. Counted as
+        // an escape over that lake's cut bed, it dropped lakes sharing a shore with another
+        // (100 of Quebec City's 255 dropped lakes, report 122 §13). Only neighbours that
+        // passed count, at their accepted levels: one that failed does not hold water.
+        var standing =
+            plan.AreaStages
+                .Where(stage => levels.ContainsKey(stage.BodyId))
+                .Select(stage => stage with { Level = levels[stage.BodyId] })
+                .ToArray();
+
+        var shared = standing.Length > 0 && escaped.Count > 0
+            ? PlannedSurface(plan with { AreaStages = standing }, polygons)
+            : null;
+
+        var joined = 0;
+
+        foreach (var (body, polygon, controls, stage, warning) in escaped)
+        {
+            token.ThrowIfCancellationRequested();
+
+            var spill =
+                shared == null
+                    ? null
+                    : Spill(
+                        polygon,
+                        controls.Select(river => river.Position),
+                        stage,
+                        terrain.Heights,
+                        width,
+                        plan.WaterCellSize,
+                        shared,
+                        token);
+
+            var safe = spill.HasValue ? Math.Min(stage, spill.Value - Freeboard) : float.NaN;
+
+            if (!math.isfinite(safe) || !Wet(controls, safe))
+            {
+                Warn(warning);
+                continue;
+            }
+
+            rejected.Remove(body);
+            levels[body] = safe;
+            joined++;
+
+            if (safe < stage - .01f)
+                lowered++;
         }
 
         var sources = new List<RiverSourcePlan>();
@@ -129,6 +223,8 @@ public static class WaterContainment
         log.Count("Lake containment bodies checked", checkedBodies);
         log.Count("Lake containment levels lowered", lowered);
         log.Count("Lake containment bodies omitted", rejected.Count);
+        log.Count("Lake containment bodies too large to screen", unscreened);
+        log.Count("Lake containment bodies held by a neighbouring lake", joined);
 
         return plan with
         {
@@ -143,17 +239,56 @@ public static class WaterContainment
         };
     }
 
+    // The planned water surface that ends a containment path: flowing reaches that no
+    // buried inlet blocks, and the plan's area levels.
+    public static Func<float3, float?> PlannedSurface(WaterPlan plan, IReadOnlyList<GeographicPolygon> polygons)
+    {
+        var flowing = plan.ReachStages.Where(reach => !reach.BlockedByBuriedInlet).ToArray();
+
+        return WaterBodyPlanner.ConstructedSurfaceSampler(plan with { ReachStages = flowing }, polygons);
+    }
+
+    // The terrain cells Spill would hold for a polygon: its outer rings' bounds and margin,
+    // clipped to the map.
+    private static long ScreenCells(GeographicPolygon polygon, float[] heights, double width, float waterCell)
+    {
+        var resolution = TerrainSampling.Resolution(heights);
+        var step = (float)width / (resolution - 1);
+        var half = (float)width * .5f;
+        var vertices = polygon.Outer.SelectMany(points => points).ToArray();
+
+        if (vertices.Length < 3)
+            return 0;
+
+        var margin = Math.Max(step * 3, waterCell * 2);
+        var low = vertices.Select(point => point.xz).Aggregate(math.min) - margin;
+        var high = vertices.Select(point => point.xz).Aggregate(math.max) + margin;
+
+        int Pixel(float value) => (int)Math.Floor((value + half) / step);
+
+        var columns = Math.Min(resolution - 1, Pixel(high.x) + 1) - Math.Max(0, Pixel(low.x)) + 1;
+        var rows = Math.Min(resolution - 1, Pixel(high.y) + 1) - Math.Max(0, Pixel(low.y)) + 1;
+
+        return (long)columns * rows;
+    }
+
     // Minimax Dijkstra: a path costs its highest terrain sample. The first dry
     // exterior point popped identifies the lowest escape saddle. Planned flowing
     // outlets terminate their own branch; other dry exterior land remains tested.
-    private static float? Spill(GeographicPolygon polygon, IReadOnlyList<RiverSourcePlan> controls, float stage,
-        TerrainBuilder.Result terrain,
-            double width,
-            float waterCell,
-            Func<float3, float?> surface,
-            CancellationToken token)
+    // The lowest level at which water standing in the polygon escapes over the terrain, or
+    // null when the polygon is too large for the bounded screen. Seeds are points of its
+    // water; the surface gives the level of planned flowing water at a point, if any.
+    public static float? Spill(
+        GeographicPolygon polygon,
+        IEnumerable<float3> seeds,
+        float stage,
+        float[] heights,
+        double width,
+        float waterCell,
+        Func<float3, float?> surface,
+        CancellationToken token)
     {
-        var resolution = TerrainSampling.Resolution(terrain.Heights);
+        var resolution = TerrainSampling.Resolution(heights);
         var step = (float)width / (resolution - 1);
         var half = (float)width * .5f;
         var vertices = polygon.Outer.SelectMany(points => points).ToArray();
@@ -180,7 +315,6 @@ public static class WaterContainment
 
         var inside = new byte[(int)count];
         var crossings = new List<float>();
-
         void Fill(float3[] ring, byte value)
         {
             if (ring.Length < 3)
@@ -265,12 +399,12 @@ public static class WaterContainment
         // A sub-cell ridge can hold water on the DEM yet disappear on the
         // coarser fluid grid. Require the escape barrier to survive a half-cell
         // neighbourhood, rather than accepting a single high terrain vertex.
-        var bankHeights = GridBankHeights(terrain.Heights, resolution, x0, z0, nx, nz,
+        var bankHeights = GridBankHeights(heights, resolution, x0, z0, nx, nz,
             Math.Max(0, (int)Math.Ceiling(waterCell / (2 * step))), token);
 
         float Height(int index)
             => (inside[index] == 2
-                ? terrain.Heights[(index / nx + z0) * resolution + index % nx + x0]
+                ? heights[(index / nx + z0) * resolution + index % nx + x0]
                 : bankHeights[index]);
 
         void Push(int index, float cost)
@@ -342,10 +476,10 @@ public static class WaterContainment
                 Push(i, Height(i));
         }
 
-        foreach (var source in controls)
+        foreach (var seed in seeds)
         {
-            var x = (int)Math.Round((source.Position.x + half) / step) - x0;
-            var z = (int)Math.Round((source.Position.z + half) / step) - z0;
+            var x = (int)Math.Round((seed.x + half) / step) - x0;
+            var z = (int)Math.Round((seed.z + half) / step) - z0;
 
             if (x >= 0 && x < nx && z >= 0 && z < nz)
                 Push(z * nx + x, Height(z * nx + x));
@@ -374,10 +508,13 @@ public static class WaterContainment
                 var point = new float3((x + x0) * step - half, Height(index), (z + z0) * step - half);
                 var outlet = surface(point);
 
+                // Ground under planned flowing water ends the path: the lake drains into a
+                // stream lower than it, and cannot drain into one standing higher, which flows
+                // in. Counting an inlet as an escape dropped lakes whose inlet channel, cut
+                // below the stream's water, reached under the lake's level (report 122 §13).
                 if (inside[index] != 2
                     && allowed[index] == 0
                     && outlet.HasValue
-                    && outlet.Value <= stage + .1f
                     && point.y < outlet.Value + .1f)
                     continue;
 

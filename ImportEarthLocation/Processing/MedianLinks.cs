@@ -57,17 +57,7 @@ public static class MedianLinks
                     && !segment.StartLevelCrossing
                     && !segment.EndLevelCrossing;
 
-        var incident = new Dictionary<long, List<int>>();
-
-        for (var i = 0; i < source.Count; i++)
-            if (source[i].Kind == NetworkKind.Road)
-                foreach (var id in new[] { source[i].StartNodeId, source[i].EndNodeId }.Distinct())
-                {
-                    if (!incident.TryGetValue(id, out var arms))
-                        incident[id] = arms = new();
-
-                    arms.Add(i);
-                }
+        var incident = Incident(source);
 
         var grid = new Dictionary<(int, int), List<(int Section, float2 A, float2 B)>>();
 
@@ -316,17 +306,7 @@ public static class MedianLinks
 
         bool Carriageway(PreparedSegment segment) => IsGround(segment) && segment.OneWay && !IsLink(segment);
 
-        var incident = new Dictionary<long, List<int>>();
-
-        for (var i = 0; i < source.Count; i++)
-            if (source[i].Kind == NetworkKind.Road)
-                foreach (var id in new[] { source[i].StartNodeId, source[i].EndNodeId }.Distinct())
-                {
-                    if (!incident.TryGetValue(id, out var arms))
-                        incident[id] = arms = new();
-
-                    arms.Add(i);
-                }
+        var incident = Incident(source);
 
         var grid = new Dictionary<(int, int), List<(int Section, float2 A, float2 B)>>();
 
@@ -421,8 +401,14 @@ public static class MedianLinks
         var split = new Dictionary<int, (long Node, float3 Point, long[] Ways)>();
         var openings = new List<PreparedSegment>();
         var folded = 0;
-        var ids = new HashSet<long>(source.SelectMany(segment => new[] { segment.StartNodeId, segment.EndNodeId }));
+        var ids = new HashSet<long>();
         var nextId = long.MinValue + 46000000;
+
+        foreach (var segment in source)
+        {
+            ids.Add(segment.StartNodeId);
+            ids.Add(segment.EndNodeId);
+        }
 
         foreach (var segment in source)
             foreach (var alias in segment.SourceNodeAliases)
@@ -672,6 +658,33 @@ public static class MedianLinks
             $"MEDIAN LINKS folded={folded}; openings={openings.Count}; removedSections={removed.Count}; carryingSections={carried.Count}; routesCarried=true");
 
         return SourceTopologyObligations.Transfer(source, result, NetworkKind.Road, remap);
+    }
+
+    // The road sections at each node, in section order; a section ending where it starts is listed once.
+    private static Dictionary<long, List<int>> Incident(IReadOnlyList<PreparedSegment> source)
+    {
+        var incident = new Dictionary<long, List<int>>();
+
+        void Touch(long id, int index)
+        {
+            if (!incident.TryGetValue(id, out var arms))
+                incident[id] = arms = new();
+
+            arms.Add(index);
+        }
+
+        for (var i = 0; i < source.Count; i++)
+        {
+            if (source[i].Kind != NetworkKind.Road)
+                continue;
+
+            Touch(source[i].StartNodeId, i);
+
+            if (source[i].EndNodeId != source[i].StartNodeId)
+                Touch(source[i].EndNodeId, i);
+        }
+
+        return incident;
     }
 
     private static IReadOnlyList<float3> Points(PreparedSegment segment)

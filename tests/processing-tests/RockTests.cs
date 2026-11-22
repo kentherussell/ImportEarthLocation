@@ -23,14 +23,16 @@ static class RockTests
         IReadOnlyDictionary<string, string> Tags(string natural)
             => new Dictionary<string, string> { { "natural", natural } };
 
-        OsmDataset Area(string natural, float half)
+        OsmDataset Area(string natural, float half) => Rectangle(natural, -half, half, -half, half);
+
+        OsmDataset Rectangle(string natural, float west, float east, float south, float north)
         {
             var nodes =
                 new Dictionary<long, OsmNode> {
-                    { 1, Node(1, -half, -half) },
-                    { 2, Node(2, half, -half) },
-                    { 3, Node(3, half, half) },
-                    { 4, Node(4, -half, half) }
+                    { 1, Node(1, west, south) },
+                    { 2, Node(2, east, south) },
+                    { 3, Node(3, east, north) },
+                    { 4, Node(4, west, north) }
                     };
 
             return new OsmDataset
@@ -62,8 +64,11 @@ static class RockTests
 
         bool Rock(VegetationCandidate candidate) => candidate.Form >= VegetationForm.RockSmall;
 
-        // Only boulders, in piles: every boulder overlaps another (2.6 m apart
-        // against 4.4 m and up across), and no small rocks.
+        // Only boulders, in piles: every boulder touches another (4.25 m apart against
+        // 4.4 m and up across), and no small rocks. Placement keeps a rock only at three
+        // quarters of the two footprint radii from every other; with the largest vanilla
+        // boulder (5.6 m across) on both sides that is 4.2 m, so every planned boulder
+        // survives whichever boulder it draws (report 121 §18).
         void Clumped(IReadOnlyList<VegetationCandidate> rocks, string what)
         {
             Check(rocks.Count >= 3, what + " has fewer than three boulders");
@@ -74,14 +79,14 @@ static class RockTests
                     rocks
                         .Where(otherCandidate => !otherCandidate.Equals(candidate))
                         .Min(otherCandidate => math.distance(otherCandidate.Position.xz, candidate.Position.xz))
-                        <= 2.61f,
+                        <= 4.4f,
                     what + " has a boulder not touching another");
 
             for (var i = 0; i < rocks.Count; i++)
                 for (var j = i + 1; j < rocks.Count; j++)
                     Check(
-                        math.distance(rocks[i].Position.xz, rocks[j].Position.xz) >= .8f,
-                        what + " has rocks closer than the 0.8 m spacing");
+                        math.distance(rocks[i].Position.xz, rocks[j].Position.xz) >= .75f * 5.6f,
+                        what + " has boulders that placement would drop as overlapping");
         }
 
         var boulder =
@@ -192,5 +197,104 @@ static class RockTests
 
         Check(talus.Count <= 8 * 21, "A 200 m cliff collected more than a handful of clumps");
         Clumped(talus, "Cliff foot");
+
+        // Downhill traces (report 121 §18.3). A valley whose floor runs north–south at
+        // x = −20 m, with sides of slope 0.8: rocks from the bare rock on either side, all
+        // within a trace's 120 m reach of the floor, settle on it and never climb the far
+        // side, where a straight 120 m walk would have carried them.
+        var valley =
+            new TerrainBuilder.Result(
+                Enumerable.Range(0, 256).Select(i => 200 + Math.Abs(i % 16 - 7) * 32f).ToArray(),
+                1000,
+                0,
+                0,
+                1000);
+
+        var floor = Plan(Rectangle("bare_rock", -120, 80, -150, 150), valley);
+        Check(floor.Count > 0, "A rocky valley side collected no clumps");
+        Check(
+            floor.All(candidate => Math.Abs(candidate.Position.x + 20) < 35),
+            "Rocks climbed the far side of a valley instead of settling on its floor");
+
+        // A road across the fall line stops the trace: rock from the slope above it (east)
+        // never lies beyond it.
+        var crossing =
+            new PreparedSegment(
+                11,
+                3,
+                4,
+                new float3(-40, 0, -300),
+                new float3(-40, 0, 300),
+                NetworkKind.Road,
+                "primary",
+                2,
+                false,
+                false,
+                false,
+                0);
+
+        var stopped = Plan(Rectangle("bare_rock", -20, 150, -150, 150), steep, new[] { crossing });
+        Check(
+            stopped.Count > 0 && stopped.All(candidate => candidate.Position.x > -40),
+            "Fallen rock crossed a road");
+
+        // A pile spreads along the way its rock fell (west here), not across it.
+        var lengthwise = 0f;
+        var across = 0f;
+
+        foreach (var pile in Piles(slope))
+        {
+            var middle = pile.Aggregate(float2.zero, (sum, at) => sum + at) / pile.Count;
+            lengthwise += pile.Sum(at => (at.x - middle.x) * (at.x - middle.x));
+            across += pile.Sum(at => (at.y - middle.y) * (at.y - middle.y));
+        }
+
+        Check(lengthwise > 1.5f * across, "Rock piles are not longer downhill than across");
+
+        // Steep faces no tag marks (report 121 §18.2): a 45° slope sheds clumps with no
+        // rock mapped, 39° and flat ground shed none.
+        var face =
+            new TerrainBuilder.Result(
+                Enumerable.Range(0, 256).Select(i => 15f + i % 16 * 40f).ToArray(),
+                1000,
+                0,
+                0,
+                1000);
+
+        var nothing = new OsmDataset();
+        var shed = Plan(nothing, face);
+        Check(
+            shed.Count > 0
+                && shed.All(candidate => RockPlanner.Reasons[candidate.MetadataIndex] == "steep_face"),
+            "An unmapped steep face shed no rock");
+
+        Clumped(shed, "Steep face");
+        Check(Plan(nothing, steep).Count == 0, "A 39° slope with no rock mapped shed rock");
+        Check(Plan(nothing, flat).Count == 0, "Flat ground with no rock mapped shed rock");
+    }
+
+    // Boulders grouped into piles: each touches (within 4.4 m) another in its pile.
+    private static List<List<float2>> Piles(IReadOnlyList<VegetationCandidate> rocks)
+    {
+        var piles = new List<List<float2>>();
+        var left = rocks.Select(candidate => candidate.Position.xz).ToList();
+
+        while (left.Count > 0)
+        {
+            var pile = new List<float2> { left[0] };
+            left.RemoveAt(0);
+
+            for (var i = 0; i < pile.Count; i++)
+                for (var j = left.Count - 1; j >= 0; j--)
+                    if (math.distance(left[j], pile[i]) <= 4.4f)
+                    {
+                        pile.Add(left[j]);
+                        left.RemoveAt(j);
+                    }
+
+            piles.Add(pile);
+        }
+
+        return piles;
     }
 }

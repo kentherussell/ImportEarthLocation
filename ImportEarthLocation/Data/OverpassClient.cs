@@ -10,7 +10,6 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Xml.Linq;
 using ImportEarthLocation.Core;
 using ImportEarthLocation.Geo;
 
@@ -715,12 +714,42 @@ public sealed class OverpassClient
         if (bytes.Length < 30)
             return false;
 
+        // The same answer as loading the whole document and asking for its root and the root's
+        // "remark" children, without building the document: every cached tile is checked on
+        // every import, 600 MB of them in Paris (report 119). Reading to the end still proves
+        // the tile is well formed, and the reader settings are the ones XDocument.Load uses.
         try
         {
             using var stream = new System.IO.MemoryStream(bytes, writable: false);
-            var document = XDocument.Load(stream);
+            using var reader =
+                System.Xml.XmlReader.Create(
+                    stream,
+                    new System.Xml.XmlReaderSettings
+                    {
+                        IgnoreWhitespace = true,
+                        DtdProcessing = System.Xml.DtdProcessing.Parse,
+                        MaxCharactersFromEntities = 10_000_000
+                    });
 
-            return document.Root?.Name.LocalName == "osm" && !document.Root.Elements("remark").Any();
+            var rootSeen = false;
+
+            while (reader.Read())
+            {
+                if (reader.NodeType != System.Xml.XmlNodeType.Element)
+                    continue;
+
+                if (!rootSeen)
+                {
+                    if (reader.LocalName != "osm")
+                        return false;
+
+                    rootSeen = true;
+                }
+                else if (reader.Depth == 1 && reader.LocalName == "remark" && reader.NamespaceURI.Length == 0)
+                    return false;
+            }
+
+            return rootSeen;
         }
         catch
         {

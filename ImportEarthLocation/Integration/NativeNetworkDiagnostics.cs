@@ -733,15 +733,54 @@ public static partial class NativeNetworkDiagnostics
                 manager.HasComponent<Game.Objects.Attached>(pair.Key) && !manager.HasComponent<Deleted>(pair.Key);
 
             var parent = live ? manager.GetComponentData<Game.Objects.Attached>(pair.Key).m_Parent : Entity.Null;
-            var attached =
-                parent != Entity.Null
-                    && manager.HasComponent<Game.Objects.Attachment>(parent)
-                    && manager.GetComponentData<Game.Objects.Attachment>(parent).m_Attached == pair.Key;
+
+            // The node lists an ordinary attached object in its SubObject buffer; the
+            // reciprocal Attachment component is only written for placeholder parents.
+            var attached = false;
+
+            if (parent != Entity.Null && manager.HasBuffer<Game.Objects.SubObject>(parent))
+            {
+                var subObjects = manager.GetBuffer<Game.Objects.SubObject>(parent, true);
+
+                for (var i = 0; i < subObjects.Length; i++)
+                    attached |= subObjects[i].m_SubObject == pair.Key;
+            }
 
             var radius =
                 parent != Entity.Null && manager.HasComponent<Roundabout>(parent)
                     ? manager.GetComponentData<Roundabout>(parent).m_Radius
                     : 0;
+
+            // Which road ends at the node took a roundabout shape, and which road types
+            // cannot take one at all.
+            int roads = 0, roundaboutEnds = 0, unsupportedRoads = 0;
+
+            if (parent != Entity.Null && manager.HasBuffer<ConnectedEdge>(parent))
+            {
+                foreach (var connected in manager.GetBuffer<ConnectedEdge>(parent, true))
+                {
+                    var road = connected.m_Edge;
+
+                    if (!manager.HasComponent<Edge>(road) || !manager.HasComponent<Composition>(road))
+                        continue;
+
+                    roads++;
+                    var edge = manager.GetComponentData<Edge>(road);
+                    var composition = manager.GetComponentData<Composition>(road);
+                    var end = edge.m_Start == parent ? composition.m_StartNode : composition.m_EndNode;
+
+                    if (manager.HasComponent<NetCompositionData>(end)
+                        && (manager.GetComponentData<NetCompositionData>(end).m_Flags.m_General
+                            & CompositionFlags.General.Roundabout) != 0)
+                        roundaboutEnds++;
+
+                    var prefab = manager.GetComponentData<PrefabRef>(road).m_Prefab;
+
+                    if (manager.HasComponent<NetGeometryData>(prefab)
+                        && (manager.GetComponentData<NetGeometryData>(prefab).m_Flags & GeometryFlags.SupportRoundabout) == 0)
+                        unsupportedRoads++;
+                }
+            }
 
             if (attached && radius > 0)
                 attachedIslands++;
@@ -756,6 +795,9 @@ public static partial class NativeNetworkDiagnostics
                     parent = $"{parent.Index}:{parent.Version}",
                     attached,
                     nativeRadius = radius,
+                    roads,
+                    roundaboutEnds,
+                    unsupportedRoads,
                     renderingVerified = false
                 });
         }
@@ -773,45 +815,7 @@ public static partial class NativeNetworkDiagnostics
     {
         // The stock tools place a NetObject island. A manually assigned node
         // radius is recomputed by NetComponentsSystem and is not the tool contract.
-        var palette = new List<(Entity prefab, ObjectData data, string name, float radius)>();
-        var resolver = new PrefabResolver(prefabs, log);
-        var ringPrefab =
-            resolver.Resolve(
-                new PreparedSegment(0, 1, 2, default, default, NetworkKind.Road, "primary", 2, true, false, false, 0));
-
-        var ringHalf = ringPrefab == Entity.Null ? 0 : resolver.ReadWidth(ringPrefab, false) / 2;
-
-        foreach (var prefab in NativePrefabCatalog.Read<ObjectPrefab>(manager, prefabs))
-        {
-            var entity = prefabs.GetEntity(prefab);
-
-            if (!prefab.name.Contains("Roundabout") || !manager.HasComponent<NetObjectData>(entity)
-                || (manager.GetComponentData<NetObjectData>(entity).m_CompositionFlags.m_General
-                    & CompositionFlags.General.Roundabout)
-                    == 0
-                    || !manager.HasComponent<ObjectGeometryData>(entity) || !manager.HasComponent<ObjectData>(entity))
-                continue;
-
-            var geometry = manager.GetComponentData<ObjectGeometryData>(entity);
-            var radius = math.max(geometry.m_Size.x, geometry.m_Size.z) / 2 + ringHalf;
-            var data = manager.GetComponentData<ObjectData>(entity);
-            using var components = data.m_Archetype.GetComponentTypes(Allocator.Temp);
-            var types = new HashSet<ComponentType>();
-
-            foreach (var type in components)
-                types.Add(type);
-
-            if (!types.Contains(ComponentType.ReadWrite<Game.Objects.Attached>())
-                || !types.Contains(ComponentType.ReadWrite<Game.Objects.Transform>())
-                || !types.Contains(ComponentType.ReadWrite<PrefabRef>()))
-                continue;
-
-            if (!math.isfinite(radius) || radius <= 0)
-                continue;
-
-            palette.Add((entity, data, prefab.name, radius));
-        }
-
+        var palette = new PrefabResolver(prefabs, log).ReadRoundaboutIslands();
         var planned = new Dictionary<string, (float3 point, float radius)>();
 
         foreach (var segment in sections)
@@ -888,11 +892,12 @@ public static partial class NativeNetworkDiagnostics
 
             var node = candidates.Single();
 
-            if (manager.GetBuffer<ConnectedEdge>(node, true).Length < 3)
+            // A stock roundabout fits a node with any number of roads, a dead end included.
+            if (manager.GetBuffer<ConnectedEdge>(node, true).Length < 1)
             {
                 unverified++;
                 log.Warn(
-                    "Small roundabout upgrade found fewer than three native approaches. Junction left unchanged and reported for connectivity review; no road removed by the upgrade.");
+                    "Small roundabout upgrade found a node with no roads. Node left unchanged and reported for connectivity review.");
 
                 continue;
             }
@@ -913,15 +918,15 @@ public static partial class NativeNetworkDiagnostics
 
             var selected =
                 palette
-                    .OrderBy(item => Math.Abs(item.radius - plan.radius))
-                    .ThenByDescending(item => item.radius)
+                    .OrderBy(item => Math.Abs(item.Radius - plan.radius))
+                    .ThenByDescending(item => item.Radius)
                     .First();
 
-            var island = manager.CreateEntity(selected.data.m_Archetype);
+            var island = manager.CreateEntity(selected.Data.m_Archetype);
 
             try
             {
-                manager.SetComponentData(island, new PrefabRef { m_Prefab = selected.prefab });
+                manager.SetComponentData(island, new PrefabRef { m_Prefab = selected.Prefab });
                 manager.SetComponentData(
                     island,
                     new Game.Objects.Transform
@@ -930,16 +935,39 @@ public static partial class NativeNetworkDiagnostics
                         m_Rotation = quaternion.identity
                     });
 
-                manager.SetComponentData(
-                    island,
-                    new Game.Objects.Attached { m_Parent = node, m_OldParent = Entity.Null, m_CurvePosition = 0 });
+                // The island is attached to its node as the stock tool attaches it; a prefab
+                // whose archetype lacks the component gets it here.
+                var attached =
+                    new Game.Objects.Attached { m_Parent = node, m_OldParent = Entity.Null, m_CurvePosition = 0 };
+
+                if (manager.HasComponent<Game.Objects.Attached>(island))
+                    manager.SetComponentData(island, attached);
+                else
+                    manager.AddComponentData(island, attached);
 
                 if (!manager.HasComponent<Updated>(island))
                     manager.AddComponentData(island, default(Updated));
 
-                RoundaboutIslands[island] = (node, plan.radius, selected.name);
+                // The game takes a node's roundabout from the net objects in its SubObject
+                // buffer (CompositionSelectSystem.GetSubObjectFlags). AttachSystem enters an
+                // updated attached object there too, but possibly after this frame's
+                // composition pass, so the island is entered now; the add is idempotent.
+                var subObjects =
+                    manager.HasBuffer<Game.Objects.SubObject>(node)
+                        ? manager.GetBuffer<Game.Objects.SubObject>(node)
+                        : manager.AddBuffer<Game.Objects.SubObject>(node);
+
+                var listed = false;
+
+                for (var i = 0; i < subObjects.Length; i++)
+                    listed |= subObjects[i].m_SubObject == island;
+
+                if (!listed)
+                    subObjects.Add(new Game.Objects.SubObject(island));
+
+                RoundaboutIslands[island] = (node, plan.radius, selected.Name);
                 log.Diagnostic(
-                    $"ROUNDABOUT stock object created prefab={selected.name}; object={island}; node={node}; selectedCenterlineRadius={selected.radius}; requestedRadius={plan.radius}; nativeAttachmentRebuildPending=true");
+                    $"ROUNDABOUT stock object created prefab={selected.Name}; object={island}; node={node}; selectedCenterlineRadius={selected.Radius}; requestedRadius={plan.radius}; nativeAttachmentRebuildPending=true");
             }
             catch (Exception error)
             {
@@ -949,17 +977,21 @@ public static partial class NativeNetworkDiagnostics
                 continue;
             }
 
-            var upgraded = manager.HasComponent<Upgraded>(node) ? manager.GetComponentData<Upgraded>(node) : default;
-            upgraded.m_Flags.m_General |= CompositionFlags.General.Roundabout;
-
-            if (manager.HasComponent<Upgraded>(node))
-                manager.SetComponentData(node, upgraded);
-            else
-                manager.AddComponentData(node, upgraded);
-
+            // The game chooses a junction's shape per road end, and only for roads marked
+            // updated (CompositionSelectSystem); the stock tool's apply marks the node's roads,
+            // and a marked node alone leaves their old ends and a roundabout radius of zero
+            // (report 121: 0 of 210 islands). The roundabout comes from the island itself, not
+            // from a hand-set Upgraded flag, so removing the island in the game removes it.
             if (!manager.HasComponent<Updated>(node))
                 manager.AddComponentData(node, default(Updated));
 
+            var roads = manager.GetBuffer<ConnectedEdge>(node, true).ToNativeArray(Allocator.Temp);
+
+            foreach (var road in roads)
+                if (!manager.HasComponent<Updated>(road.m_Edge))
+                    manager.AddComponentData(road.m_Edge, default(Updated));
+
+            roads.Dispose();
             applied++;
         }
 

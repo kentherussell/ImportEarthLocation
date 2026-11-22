@@ -134,6 +134,15 @@ public static partial class VisualCompilerProfile
     {
         float Ground(double2 point) => NetworkProcessor.Sample((float)point.x, (float)point.y, terrain, width);
 
+        // The solve's parts are timed: it was the largest part of road design in Paris (report 119).
+        var partClock = System.Diagnostics.Stopwatch.StartNew();
+
+        void Part(string name)
+        {
+            log.Time("Visual compiler profile " + name, partClock.Elapsed.TotalSeconds);
+            partClock.Restart();
+        }
+
         // 1. Corridor-robust targets.
         var tau = strokes.Select(stroke => stroke.Point.Select((point, k) =>
         {
@@ -191,6 +200,7 @@ public static partial class VisualCompilerProfile
         }
 
         WaterApproaches(strokes, tau, partner, requiredNodeFloors);
+        Part("targets");
 
         // 2. Coupled points.
         var vars = new List<(double Tau, double Lo, double Hi)>();
@@ -332,7 +342,9 @@ public static partial class VisualCompilerProfile
                 strokeVars[i].Add((pin.Station, v));
             }
 
+        Part("junction points");
         var clearances = Crossings(strokes, token).ToList();
+        Part("crossing search");
         var crossingBase = vars.Count;
         var crossingConstraints = new List<(int Over, int Under, double Clearance)>();
         // Under a tunnel, the lower bore goes deeper; the upper keeps its cover.
@@ -465,15 +477,36 @@ public static partial class VisualCompilerProfile
         var accepted = new List<(int Over, int Under, double Clearance)>();
         var loweringRejected = 0;
 
-        bool Lowered(double[] before)
-            => h.Where((v, i) => v < lowerBound[i] - .5 && before[i] >= lowerBound[i] - .5).Any()
-                || accepted.Any(item => h[item.Over] - h[item.Under] < item.Clearance - .05);
+        // Only a height the attempt changed can newly fall below its bound, so the test reads
+        // the attempt's changes (each variable's height before it) instead of every height.
+        bool Lowered(Dictionary<int, double> before)
+        {
+            foreach (var change in before)
+            {
+                var v = change.Key;
+
+                if (h[v] < lowerBound[v] - .5 && change.Value >= lowerBound[v] - .5)
+                    return true;
+            }
+
+            foreach (var item in accepted)
+                if (h[item.Over] - h[item.Under] < item.Clearance - .05)
+                    return true;
+
+            return false;
+        }
 
         // A crossing that cannot get its full clearance still takes the most it
         // can, at 60% and then 35%: roads left at one height intersect, and the
         // game joins them (a stray roundabout under I-495 at VA-267).
         var partial = 0;
         var snapshot = new double[h.Length];
+
+        // Each attempt records the height every variable had before the attempt changed it;
+        // a rejected attempt restores just those. One queue buffer serves the attempts' and the
+        // junction reconciliation's closures.
+        var attemptChanges = new Dictionary<int, double>();
+        var closureQueued = new bool[h.Length];
 
         foreach (var full in crossingConstraints)
         {
@@ -508,7 +541,9 @@ public static partial class VisualCompilerProfile
                 conflicts++;
         }
 
+        Part("grade and clearance closures");
         var (curveMoved, curveBefore, curveAfter, curveSweeps) = CurveFeasibleHeights();
+        Part("vertical curve heights");
         log.Count("Visual compiler coupled points moved for vertical curves", curveMoved);
         log.Diagnostic(
             $"VISUAL COMPILER profile coupled curvature moved={curveMoved}; violationsBefore={curveBefore}; violationsAfter={curveAfter}; sweeps={curveSweeps}");
@@ -623,15 +658,23 @@ public static partial class VisualCompilerProfile
             var lambda = new double[rows.Count];
             var sweeps = 0;
 
+            // Paris runs all 2,000 sweeps over 226,000 rows with more than half of them still
+            // stepping, so the loop reads the rows in place from an array: the same arithmetic
+            // in the same order, without copying each row out of the list twice (report 119).
+            var table = rows.ToArray();
+
             for (; sweeps < CurveSweeps; sweeps++)
             {
                 token.ThrowIfCancellationRequested();
                 var largest = 0d;
 
-                for (var r = 0; r < rows.Count; r++)
+                for (var r = 0; r < table.Length; r++)
                 {
-                    var row = rows[r];
-                    var next = Math.Min(row.Cap, Math.Max(0, lambda[r] + (Value(r, y) - row.Bound) / norm[r]));
+                    ref readonly var row = ref table[r];
+                    var value =
+                        row.Ca * y[row.A] + (row.B >= 0 ? row.Cb * y[row.B] : 0) + (row.C >= 0 ? row.Cc * y[row.C] : 0);
+
+                    var next = Math.Min(row.Cap, Math.Max(0, lambda[r] + (value - row.Bound) / norm[r]));
                     var delta = next - lambda[r];
 
                     if (delta == 0)
@@ -670,24 +713,36 @@ public static partial class VisualCompilerProfile
             return (moved, before, Bent(h), sweeps);
         }
 
-        // One backup buffer serves every attempt; it holds the heights before the
-        // current one until the next begins.
+        // Heights the attempt pushed more than 0.5 m over their upper bound. Only a changed
+        // height can newly exceed it, so the attempt's changes are all that is read.
         int Overshoot()
         {
             var n = 0;
 
-            for (var i = 0; i < h.Length; i++)
-                if (h[i] > upper[i] + .5 && snapshot[i] <= upper[i] + .5)
+            foreach (var change in attemptChanges)
+            {
+                var v = change.Key;
+
+                if (h[v] > upper[v] + .5 && change.Value <= upper[v] + .5)
                     n++;
+            }
 
             return n;
+        }
+
+        void RestoreAttempt()
+        {
+            foreach (var change in attemptChanges)
+                h[change.Key] = change.Value;
+
+            attemptChanges.Clear();
         }
 
         bool Attempt((int Over, int Under, double Clearance) item, out bool failedBudget)
         {
             // Only the new constraint can be violated, so relaxation starts from
-            // its endpoints alone; the snapshot restores a rejected attempt.
-            Array.Copy(h, snapshot, h.Length);
+            // its endpoints alone; the recorded changes restore a rejected attempt.
+            attemptChanges.Clear();
             var tunnel = vars[item.Under].Hi < vars[item.Under].Tau || stacked.Contains(item.Under);
 
             if (tunnel)
@@ -695,13 +750,15 @@ public static partial class VisualCompilerProfile
 
             up[item.Under].Add((item.Over, -item.Clearance));
             var failed =
-                (tunnel ? Close(h, down, upper, lower: true, new[] { item.Over }) : 0)
-                    + Close(h, up, lowerBound, lower: false, new[] { item.Under });
+                (tunnel
+                    ? Close(h, down, upper, lower: true, new[] { item.Over }, attemptChanges, closureQueued)
+                    : 0)
+                + Close(h, up, lowerBound, lower: false, new[] { item.Under }, attemptChanges, closureQueued);
 
             failedBudget = failed > 0;
             var overshoot = Overshoot();
 
-            if (failed == 0 && overshoot == 0 && tunnel && Lowered(snapshot))
+            if (failed == 0 && overshoot == 0 && tunnel && Lowered(attemptChanges))
             {
                 overshoot = 1;
                 loweringRejected++;
@@ -716,7 +773,7 @@ public static partial class VisualCompilerProfile
                 return true;
             }
 
-            Array.Copy(snapshot, h, h.Length);
+            RestoreAttempt();
             // Recipe before rejection (report 64 V3 step 2b): a ground road beneath
             // may dip into a cutting up to twice its cut budget, taking the whole
             // shortfall, so the bridge need not climb more than its grades allow.
@@ -727,14 +784,15 @@ public static partial class VisualCompilerProfile
                 var originalLow = lowerBound[item.Under];
                 var relaxed = under.Lo - (under.Tau - under.Lo);
                 lowerBound[item.Under] = relaxed;
+                attemptChanges[item.Under] = h[item.Under];
                 h[item.Under] = Math.Max(relaxed, h[item.Under] - (item.Clearance - (h[item.Over] - h[item.Under])));
                 var retry =
-                    Close(h, down, upper, lower: true, new[] { item.Under })
-                        + Close(h, up, lowerBound, lower: false, new[] { item.Under });
+                    Close(h, down, upper, lower: true, new[] { item.Under }, attemptChanges, closureQueued)
+                        + Close(h, up, lowerBound, lower: false, new[] { item.Under }, attemptChanges, closureQueued);
 
                 if (retry == 0 && Overshoot() == 0)
                 {
-                    if (!Lowered(snapshot))
+                    if (!Lowered(attemptChanges))
                     {
                         floors.Add(item.Over);
                         ceilings.Add(item.Under);
@@ -750,7 +808,7 @@ public static partial class VisualCompilerProfile
                 lowerBound[item.Under] = originalLow;
             }
 
-            Array.Copy(snapshot, h, h.Length);
+            RestoreAttempt();
 
             if (tunnel)
                 down[item.Over].RemoveAt(down[item.Over].Count - 1);
@@ -1093,7 +1151,9 @@ public static partial class VisualCompilerProfile
             }
         }
 
+        Part("junction heights and decks");
         SmoothAll(Enumerable.Range(0, strokes.Count).ToArray());
+        Part("stroke smoothing");
         // 4. A pin that a stroke cannot reach (a deck lifted for a crossing beside
         // a junction, held by its curvature limit) left the other arms meeting the
         // node at another height: a step at the junction. The node takes the
@@ -1169,7 +1229,7 @@ public static partial class VisualCompilerProfile
 
                 var prior = new Dictionary<int, double> { { v, h[v] } };
                 h[v] = target;
-                var failed = Close(h, down, upper, lower: true, new[] { v }, prior);
+                var failed = Close(h, down, upper, lower: true, new[] { v }, prior, closureQueued);
                 var seeds = new HashSet<int> { v };
 
                 foreach (var change in prior)
@@ -1184,7 +1244,7 @@ public static partial class VisualCompilerProfile
                             seeds.Add(from);
                 }
 
-                failed += Close(h, up, lowerBound, lower: false, seeds.ToArray(), prior);
+                failed += Close(h, up, lowerBound, lower: false, seeds.ToArray(), prior, closureQueued);
                 var outside = false;
 
                 foreach (var change in prior)
@@ -1235,6 +1295,7 @@ public static partial class VisualCompilerProfile
                 break;
         }
 
+        Part("junction reconciliation");
         log.Count("Visual compiler junction pins reconciled", reconciled);
         log.Count("Visual compiler junction reconciliation constraint conflicts", reconciliationConflicts);
         log.Diagnostic(
@@ -1260,6 +1321,8 @@ public static partial class VisualCompilerProfile
             log.Diagnostic(
                 $"VISUAL COMPILER profile interchanges pass={pass}; clusters={interchanges.Clusters}; accepted={interchanges.Accepted}; skipped={interchanges.Skipped}; unknowns={interchanges.Unknowns}; scoreBefore={interchanges.Before}; scoreAfter={interchanges.After}; ms={interchangeClock.ElapsedMilliseconds}");
         }
+
+        Part("interchanges");
 
         if (Environment.GetEnvironmentVariable("VISUAL_DEBUG_PINS") == "1")
         {
@@ -1298,69 +1361,75 @@ public static partial class VisualCompilerProfile
                 log.Diagnostic("VISUAL DEBUG pin " + line);
         }
 
-        // Where does the solved profile itself exceed the class grade-change rate?
-        int nearPin = 0, nearCrossing = 0, nearStructure = 0, elsewhere = 0;
-        var crossingStations = strokes.Select(_ => new List<double>()).ToArray();
-
-        for (var i = 0; i < strokes.Count; i++)
-            foreach (var (station, v) in strokeVars[i])
-                if (v >= crossingBase && v < crossingEnd)
-                    crossingStations[i].Add(station);
-
-        for (var i = 0; i < strokes.Count; i++)
+        // The grade-change samples and pair gaps feed only diagnostic lines: a run without
+        // diagnostics skips them.
+        if (log.DiagnosticsEnabled)
         {
-            var stroke = strokes[i];
+            // Where does the solved profile itself exceed the class grade-change rate?
+            int nearPin = 0, nearCrossing = 0, nearStructure = 0, elsewhere = 0;
+            var crossingStations = strokes.Select(_ => new List<double>()).ToArray();
 
-            for (var k = 1; k < stroke.Height.Length - 1; k++)
+            for (var i = 0; i < strokes.Count; i++)
+                foreach (var (station, v) in strokeVars[i])
+                    if (v >= crossingBase && v < crossingEnd)
+                        crossingStations[i].Add(station);
+
+            for (var i = 0; i < strokes.Count; i++)
             {
-                var g0 = (stroke.Height[k] - stroke.Height[k - 1]) / (stroke.Station[k] - stroke.Station[k - 1]);
-                var g1 = (stroke.Height[k + 1] - stroke.Height[k]) / (stroke.Station[k + 1] - stroke.Station[k]);
+                var stroke = strokes[i];
 
-                if (Math.Abs(g1 - g0) * 100
-                    <= 10 / stroke.Class.K * (stroke.Station[k + 1] - stroke.Station[k - 1]) / 2 / 10)
-                    continue;
+                for (var k = 1; k < stroke.Height.Length - 1; k++)
+                {
+                    var g0 = (stroke.Height[k] - stroke.Height[k - 1]) / (stroke.Station[k] - stroke.Station[k - 1]);
+                    var g1 = (stroke.Height[k + 1] - stroke.Height[k]) / (stroke.Station[k + 1] - stroke.Station[k]);
 
-                if (crossingStations[i].Any(c => Math.Abs(c - stroke.Station[k]) < 200))
-                    nearCrossing++;
-                else if (stroke.Pins.Any(item => Math.Abs(item.Station - stroke.Station[k]) < 30))
-                    nearPin++;
-                else if (stroke.Mode[k] != 0
-                    || stroke.Mode[Math.Max(0, k - 3)] != 0
-                    || stroke.Mode[Math.Min(stroke.Mode.Length - 1, k + 3)] != 0)
-                    nearStructure++;
-                else
-                    elsewhere++;
+                    if (Math.Abs(g1 - g0) * 100
+                        <= 10 / stroke.Class.K * (stroke.Station[k + 1] - stroke.Station[k - 1]) / 2 / 10)
+                        continue;
+
+                    if (crossingStations[i].Any(c => Math.Abs(c - stroke.Station[k]) < 200))
+                        nearCrossing++;
+                    else if (stroke.Pins.Any(item => Math.Abs(item.Station - stroke.Station[k]) < 30))
+                        nearPin++;
+                    else if (stroke.Mode[k] != 0
+                        || stroke.Mode[Math.Max(0, k - 3)] != 0
+                        || stroke.Mode[Math.Min(stroke.Mode.Length - 1, k + 3)] != 0)
+                        nearStructure++;
+                    else
+                        elsewhere++;
+                }
             }
+
+            log.Diagnostic(
+                $"VISUAL COMPILER profile grade-change samples nearCrossings={nearCrossing}; nearPins={nearPin}; nearStructureEnds={nearStructure}; elsewhere={elsewhere}");
+
+            var gaps =
+                strokes
+                    .SelectMany(
+                        (
+                            stroke,
+                            i) => partner[i].Select(
+                                (
+                                    item,
+                                    k) => item.Stroke < 0
+                                        ? double.NaN
+                                        : Math.Abs(stroke.Height[k] - strokes[item.Stroke].HeightAt(item.Station))))
+                    .Where(g => !double.IsNaN(g))
+                    .OrderBy(g => g)
+                    .ToArray();
+
+            double Quantile(double q) => gaps.Length == 0 ? 0 : gaps[(int)(q * (gaps.Length - 1))];
+
+            log.Diagnostic(
+                $"VISUAL COMPILER vertical strokes={strokes.Count}; coupledPoints={vars.Count}; junctionPoints={nodeVar.Count}; crossings={crossingConstraints.Count}; pairTwins={twins}; sharedPairSamples={shared}; conflicts={conflicts}; pairGapP50={Quantile(.5):F2}; pairGapP90={Quantile(.9):F2}; pairGapP99={Quantile(.99):F2}; pairGapOver03={gaps.Count(g => g > .3)}");
         }
-
-        log.Diagnostic(
-            $"VISUAL COMPILER profile grade-change samples nearCrossings={nearCrossing}; nearPins={nearPin}; nearStructureEnds={nearStructure}; elsewhere={elsewhere}");
-
-        var gaps =
-            strokes
-                .SelectMany(
-                    (
-                        stroke,
-                        i) => partner[i].Select(
-                            (
-                                item,
-                                k) => item.Stroke < 0
-                                    ? double.NaN
-                                    : Math.Abs(stroke.Height[k] - strokes[item.Stroke].HeightAt(item.Station))))
-                .Where(g => !double.IsNaN(g))
-                .OrderBy(g => g)
-                .ToArray();
-
-        double Quantile(double q) => gaps.Length == 0 ? 0 : gaps[(int)(q * (gaps.Length - 1))];
-
-        log.Diagnostic(
-            $"VISUAL COMPILER vertical strokes={strokes.Count}; coupledPoints={vars.Count}; junctionPoints={nodeVar.Count}; crossings={crossingConstraints.Count}; pairTwins={twins}; sharedPairSamples={shared}; conflicts={conflicts}; pairGapP50={Quantile(.5):F2}; pairGapP90={Quantile(.9):F2}; pairGapP99={Quantile(.99):F2}; pairGapOver03={gaps.Count(g => g > .3)}");
 
         log.Count("Visual compiler vertical conflicts", conflicts);
         log.Diagnostic(
             $"VISUAL COMPILER crossing conflicts budget={budgetConflicts}; bound={boundConflicts}; overshootBeforeCrossings={preexisting}; repairedByDippingRoadBeneath={recipes}; loweringRejectedToKeepAcceptedFloors={loweringRejected}; metAtReducedClearance={partial}; stackedTunnels={stacked.Count}; stackedTunnelsAccepted={accepted.Count(item => stacked.Contains(item.Under))}");
 
         log.Count("Visual compiler crossings repaired", recipes);
+        Part("report lines");
     }
 
     // Monotone label-correcting closure. Lower: h[to] = min(h[to], h[from]+b) and
@@ -1384,13 +1453,15 @@ public static partial class VisualCompilerProfile
         double[] bounds,
         bool lower,
         int[]? start,
-        Dictionary<int, double>? prior = null)
+        Dictionary<int, double>? prior = null,
+        bool[]? queuedBuffer = null)
     {
         // FIFO worklist as a list with a moving head; the game's references define
-        // Queue<T> twice, so the generic queue type is avoided here.
+        // Queue<T> twice, so the generic queue type is avoided here. A caller that
+        // closes many times passes one all-false queued buffer, left all false again.
         var queue = new List<int>();
         var head = 0;
-        var queued = new bool[h.Length];
+        var queued = queuedBuffer ?? new bool[h.Length];
 
         foreach (var v in start ?? Enumerable.Range(0, h.Length))
         {
@@ -1411,7 +1482,12 @@ public static partial class VisualCompilerProfile
         while (head < queue.Count)
         {
             if (--budget < 0)
+            {
+                for (var rest = head; rest < queue.Count; rest++)
+                    queued[queue[rest]] = false;
+
                 return 1;
+            }
 
             var v = queue[head++];
             queued[v] = false;
@@ -1422,8 +1498,12 @@ public static partial class VisualCompilerProfile
                 head = 0;
             }
 
-            foreach (var (to, bound) in outgoing[v])
+            // Indexed rather than foreach: the game's Mono runtime enumerates lists slowly.
+            var edges = outgoing[v];
+
+            for (var edge = 0; edge < edges.Count; edge++)
             {
+                var (to, bound) = edges[edge];
                 var candidate = lower ? h[v] + bound : h[v] - bound;
 
                 if (lower ? candidate < h[to] - 1e-6 : candidate > h[to] + 1e-6)
@@ -2332,11 +2412,14 @@ public static partial class VisualCompilerProfile
     // Mason Bridge 12 m above its ends.
     private const double EnvelopeReach = 300, EnvelopeMargin = 2;
 
+    // With windows (ascending, disjoint sample ranges), only their samples are computed and the
+    // others stay zero: an interchange cluster reads the envelope inside its windows alone.
     private static (double[] Low, double[] High) Envelope(
         Stroke stroke,
         double[] tau,
         List<(double Station, double Height)> pins,
-        List<(int Sample, double Height, bool Floor)> bounds)
+        List<(int Sample, double Height, bool Floor)> bounds,
+        IReadOnlyList<(int A, int B)>? windows = null)
     {
         var length = tau.Length;
         var high = (double[])tau.Clone();
@@ -2362,25 +2445,38 @@ public static partial class VisualCompilerProfile
         var resultHigh = new double[length];
         var resultLow = new double[length];
 
-        for (int k = 0, a = 0, b = 0; k < length; k++)
+        // The reach pointers only move forward, and for each sample they stop at the first and
+        // last samples within reach wherever they start below those, so skipping the samples
+        // between windows leaves every computed sample's reach unchanged.
+        var a = 0;
+        var b = 0;
+        var windowCount = windows?.Count ?? 1;
+
+        for (var window = 0; window < windowCount; window++)
         {
-            while (stroke.Station[k] - stroke.Station[a] > EnvelopeReach)
-                a++;
+            var start = windows == null ? 0 : windows[window].A;
+            var end = windows == null ? length - 1 : windows[window].B;
 
-            while (b + 1 < length && stroke.Station[b + 1] - stroke.Station[k] <= EnvelopeReach)
-                b++;
-
-            var otherHigh = double.NegativeInfinity;
-            var otherLow = double.PositiveInfinity;
-
-            for (var j = a; j <= b; j++)
+            for (var k = start; k <= end; k++)
             {
-                otherHigh = Math.Max(otherHigh, high[j]);
-                otherLow = Math.Min(otherLow, low[j]);
-            }
+                while (stroke.Station[k] - stroke.Station[a] > EnvelopeReach)
+                    a++;
 
-            resultHigh[k] = otherHigh + EnvelopeMargin;
-            resultLow[k] = otherLow - EnvelopeMargin;
+                while (b + 1 < length && stroke.Station[b + 1] - stroke.Station[k] <= EnvelopeReach)
+                    b++;
+
+                var otherHigh = double.NegativeInfinity;
+                var otherLow = double.PositiveInfinity;
+
+                for (var j = a; j <= b; j++)
+                {
+                    otherHigh = Math.Max(otherHigh, high[j]);
+                    otherLow = Math.Min(otherLow, low[j]);
+                }
+
+                resultHigh[k] = otherHigh + EnvelopeMargin;
+                resultLow[k] = otherLow - EnvelopeMargin;
+            }
         }
 
         return (resultLow, resultHigh);
@@ -2610,27 +2706,35 @@ public static partial class VisualCompilerProfile
         return y;
     }
 
-    // Largest grade allowed over each sample interval.
-    private static double[] GradeLimits(Stroke stroke, double[] plateau)
+    // Largest grade allowed over each sample interval. With windows (sample ranges), only the
+    // intervals starting inside them are computed and the others stay zero.
+    private static double[] GradeLimits(Stroke stroke, double[] plateau, IReadOnlyList<(int A, int B)>? windows = null)
     {
         var length = stroke.Station.Length;
         var limit = new double[Math.Max(0, length - 1)];
         // Water approaches retain their full existing grade allowance so the
         // smoothing target can reach the accepted deck/shore clearance.
         var waterApproach = stroke.Kind == NetworkKind.Road && stroke.Water.Any(v => !float.IsNaN(v));
+        var windowCount = windows?.Count ?? 1;
 
-        for (var k = 0; k < length - 1; k++)
+        for (var window = 0; window < windowCount; window++)
         {
-            // Match the coupled grade's 15% headroom: cubic emission
-            // interpolates between samples and can be steeper than their chord.
-            var middle = (stroke.Station[k] + stroke.Station[k + 1]) / 2;
-            limit[k] = stroke.Grade[k] * (waterApproach ? 1 : GradeShare);
+            var start = windows == null ? 0 : windows[window].A;
+            var end = windows == null ? length - 2 : Math.Min(windows[window].B, length - 2);
 
-            if (plateau.Any(p => Math.Abs(p - middle) <= stroke.Class.PlateauLength))
-                limit[k] = Math.Min(limit[k], stroke.Class.PlateauGrade);
+            for (var k = start; k <= end; k++)
+            {
+                // Match the coupled grade's 15% headroom: cubic emission
+                // interpolates between samples and can be steeper than their chord.
+                var middle = (stroke.Station[k] + stroke.Station[k + 1]) / 2;
+                limit[k] = stroke.Grade[k] * (waterApproach ? 1 : GradeShare);
 
-            if (stroke.LevelCrossings.Any(item => Math.Abs(item.Station - middle) <= item.Reach))
-                limit[k] = Math.Min(limit[k], .001);
+                if (plateau.Any(p => Math.Abs(p - middle) <= stroke.Class.PlateauLength))
+                    limit[k] = Math.Min(limit[k], stroke.Class.PlateauGrade);
+
+                if (stroke.LevelCrossings.Any(item => Math.Abs(item.Station - middle) <= item.Reach))
+                    limit[k] = Math.Min(limit[k], .001);
+            }
         }
 
         return limit;

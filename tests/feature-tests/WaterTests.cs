@@ -597,6 +597,23 @@ static class WaterTests
                 };
 
             var hillPlan = Plan(Array.Empty<GeographicPolygon>(), valley, data: hillRiver);
+
+            // WATER_SECTION=1: the same river on flat ground at 30 m, its cross-section printed.
+            if (Environment.GetEnvironmentVariable("WATER_SECTION") == "1")
+            {
+                var flat = new TerrainBuilder.Result(Enumerable.Repeat(30f, 64 * 64).ToArray(), 400, 0, 0, 400);
+                var flatPlan = Plan(Array.Empty<GeographicPolygon>(), flat, data: hillRiver);
+
+                for (var x = 20; x < 44; x++)
+                    Console.WriteLine(
+                        $"FLAT SECTION {(x / 63f - .5f) * 1000,6:0} m {flatPlan.ConditionedHeights![32 * 64 + x],6:0.00}");
+
+                for (var x = 20; x < 50; x++)
+                    Console.WriteLine(
+                        $"HILL SECTION {(x / 63f - .5f) * 1000,6:0} m {hillPlan.ConditionedHeights![32 * 64 + x],6:0.00} (ground {hill[32 * 64 + x]:0.00})");
+
+                Console.WriteLine($"SECTION level {(flatPlan.ReachStages.Count > 0 ? flatPlan.ReachStages[0].StartLevel : float.NaN):0.00}");
+            }
             var shaped = hillPlan.ConditionedHeights ?? hill;
             var level = hillPlan.ReachStages.Count > 0 ? hillPlan.ReachStages.Max(reach => reach.StartLevel) : 30;
             var cellMetres = 1000f / 63;
@@ -618,6 +635,72 @@ static class WaterTests
                 $"A river's dry bank against a hillside is a cliff: steepest slope {steepest:0.00}");
 
             Console.WriteLine($"PASS: a river's dry bank eases into a 1-in-4 hillside (steepest slope {steepest:0.00}).");
+        }
+
+        // A river mapped 48 m up the flank of a valley, across a spur 25 m high (report 117):
+        // its nodes at the spur move down onto the valley floor. Without the spur the line's
+        // ground does not climb, and it stays where it was mapped.
+        {
+            float[] Valley(float spur)
+            {
+                var ground = new float[64 * 64];
+
+                for (var z = 0; z < 64; z++)
+                    for (var x = 0; x < 64; x++)
+                    {
+                        var east = (x / 63f - .5f) * 1000;
+                        var north = (z / 63f - .5f) * 1000;
+
+                        ground[z * 64 + x] =
+                            60
+                                - north * .01f
+                                + Math.Abs(east - 48) * .5f
+                                + spur
+                                    * (float)Math.Exp(-(north / 80) * (north / 80))
+                                    * Math.Clamp((40 - east) / 40, 0, 1);
+                    }
+
+                return ground;
+            }
+
+            var ids = Enumerable.Range(0, 10).Select(i => 401L + i).ToArray();
+
+            var flankRiver =
+                new OsmDataset
+                {
+                    Nodes = ids.ToDictionary(id => id, id => Node(id, 0, 450 - (id - 401) * 100)),
+                    Ways = new Dictionary<long, OsmWay>
+                    {
+                        { 401, new OsmWay(401, ids, new Dictionary<string, string> { { "waterway", "river" } }) }
+                    }
+                };
+
+            var spurPlan =
+                Plan(
+                    Array.Empty<GeographicPolygon>(),
+                    new TerrainBuilder.Result(Valley(25), 400, 0, 0, 400),
+                    data: flankRiver);
+
+            var plainPlan =
+                Plan(
+                    Array.Empty<GeographicPolygon>(),
+                    new TerrainBuilder.Result(Valley(0), 400, 0, 0, 400),
+                    data: flankRiver);
+
+            var moved = spurPlan.MovedWaterwayNodes;
+
+            Check(
+                moved.Count > 0
+                    && moved.Values.All(point => point.x > 15 && point.x < 80)
+                    && new[] { 405L, 406L }.All(moved.ContainsKey),
+                "A river crossing a spur on a valley's flank was not moved onto the valley floor: "
+                    + string.Join(" ", moved.Select(pair => $"{pair.Key} ({pair.Value.x:0},{pair.Value.z:0})")));
+
+            Check(
+                plainPlan.MovedWaterwayNodes.Count == 0,
+                $"A river whose ground does not climb was moved off its mapped line ({plainPlan.MovedWaterwayNodes.Count} nodes)");
+
+            Console.WriteLine($"PASS: a river crossing a spur moves onto the valley floor ({moved.Count} nodes); one that does not climb stays.");
         }
 
         // Classification selects natural waterways independently of mapped width.

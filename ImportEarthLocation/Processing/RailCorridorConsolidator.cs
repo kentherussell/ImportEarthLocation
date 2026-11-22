@@ -101,6 +101,8 @@ public static class RailCorridorConsolidator
         ImportLog log,
         CancellationToken token)
     {
+        var stepClock = Stopwatch.StartNew();
+
         // Transferring switches can expose a short redundant triangle: the
         // direct axis and an identical two-edge approach. Re-consolidate the
         // canonical raw geometry before fitting curves, preserving all tails.
@@ -120,11 +122,21 @@ public static class RailCorridorConsolidator
                         : segment)
                 .ToArray();
 
-        var result = ExactPhysicalDemands(CollapseShortConnections(source, log, token), log, token);
+        log.AddDuration("Rail consolidation track attributes", stepClock.Elapsed.TotalSeconds);
+        stepClock.Restart();
+
+        var collapsed = CollapseShortConnections(source, log, token);
+        log.AddDuration("Rail consolidation short connections", stepClock.Elapsed.TotalSeconds);
+        stepClock.Restart();
+
+        var result = ExactPhysicalDemands(collapsed, log, token);
+        log.AddDuration("Rail consolidation exact physical demands", stepClock.Elapsed.TotalSeconds);
 
         for (var pass = 0; pass < 8; pass++)
         {
+            stepClock.Restart();
             var next = PreparePass(result, log, token);
+            log.AddDuration("Rail consolidation passes", stepClock.Elapsed.TotalSeconds);
 
             if (next.SequenceEqual(result))
                 return next;
@@ -1285,6 +1297,14 @@ public static class RailCorridorConsolidator
         return merged == 0 ? source : result;
     }
 
+    // The attributes every consolidated rail section is given (Prepare and PreparePass).
+    private static bool HasTrackAttributes(PreparedSegment segment)
+        => segment.Lanes == 2
+            && segment.PhysicalTracks == 2
+            && !segment.OneWay
+            && segment.ExplicitWallSides == NetworkSides.None
+            && segment.RetainingWallSides == NetworkSides.None;
+
     private static IReadOnlyList<PreparedSegment> PreparePass(
         IReadOnlyList<PreparedSegment> source,
         ImportLog log,
@@ -1317,22 +1337,40 @@ public static class RailCorridorConsolidator
         var removed = new HashSet<PreparedSegment>();
         var map = new Dictionary<(int, long), (long node, float3 point)>();
         var sourceJunctions = new Dictionary<long, (long node, float3 point)>();
-        var protectedNodes =
-            new HashSet<long>(
-                source
-                    .Where(segment => segment.Kind == NetworkKind.Road)
-                    .SelectMany(segment => new[] { segment.StartNodeId, segment.EndNodeId }));
+        var protectedNodes = new HashSet<long>();
+
+        foreach (var segment in source)
+            if (segment.Kind == NetworkKind.Road)
+            {
+                protectedNodes.Add(segment.StartNodeId);
+                protectedNodes.Add(segment.EndNodeId);
+            }
 
         // Earlier consolidation passes can retire a generated node while its
         // identity remains in an alias. It must never name a new rail junction.
-        var ids = new HashSet<long>(source.SelectMany(segment => new[] { segment.StartNodeId, segment.EndNodeId }
-            .Concat(
-                segment.SourceNodeAliases.SelectMany(alias => new[] { alias.SourceNodeId, alias.CanonicalNodeId }))));
-
+        // Most passes create no node, so the identities are gathered on first use.
+        HashSet<long>? ids = null;
         long next = -7_800_000_000_000_000_000;
 
         long NewNode()
         {
+            if (ids == null)
+            {
+                ids = new HashSet<long>();
+
+                foreach (var segment in source)
+                {
+                    ids.Add(segment.StartNodeId);
+                    ids.Add(segment.EndNodeId);
+
+                    foreach (var alias in segment.SourceNodeAliases)
+                    {
+                        ids.Add(alias.SourceNodeId);
+                        ids.Add(alias.CanonicalNodeId);
+                    }
+                }
+            }
+
             while (ids.Contains(next))
                 next++;
 
@@ -1784,8 +1822,10 @@ public static class RailCorridorConsolidator
                         ? AbsorbedSources(original).Distinct().ToArray()
                         : Array.Empty<PreparedSegment>();
 
+                // A rail section from an earlier pass already carries these values; it is passed
+                // on as it is rather than copied (equal by value, which is all later steps compare).
                 var segment =
-                    original.Kind == NetworkKind.Rail
+                    original.Kind == NetworkKind.Rail && !HasTrackAttributes(original)
                         ? original with
                         {
                             Lanes = 2,

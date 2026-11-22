@@ -1047,6 +1047,8 @@ namespace ImportEarthLocation.Core
         }
 
         public void Time(string text, double seconds) { }
+
+        public void AddDuration(string text, double seconds) { }
     }
 }
 namespace ImportEarthLocation.Data

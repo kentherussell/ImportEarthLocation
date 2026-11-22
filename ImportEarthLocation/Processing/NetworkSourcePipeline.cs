@@ -42,30 +42,42 @@ public static class NetworkSourcePipeline
     {
         var merged = new Dictionary<SourceNodeKey, long>();
         IReadOnlyList<PreparedSegment> result = NetworkNormalizer.Normalize(input, log, token, width, merged);
-        var kept =
-            new HashSet<SourceNodeKey>(
-                result.SelectMany(
-                    segment => new[] {
-                        new SourceNodeKey(segment.Kind, segment.StartNodeId),
-                        new SourceNodeKey(segment.Kind, segment.EndNodeId)
-                        }));
+        var transferClock = System.Diagnostics.Stopwatch.StartNew();
 
-        var lost =
-            SourceTopologyObligations.Capture(input).Ports
-                .Concat(earlierPorts)
-                .Distinct()
-                .Where(nodeKey => !kept.Contains(nodeKey) && merged.ContainsKey(nodeKey))
-                .ToArray();
+        var kept = new HashSet<SourceNodeKey>();
 
-        foreach (var kind in lost.Select(nodeKey => nodeKey.Kind).Distinct())
-            result =
-                SourceTopologyObligations.Transfer(
-                    input,
-                    result,
-                    kind,
-                    lost
-                        .Where(nodeKey => nodeKey.Kind == kind)
-                        .ToDictionary(nodeKey => nodeKey.Id, nodeKey => merged[nodeKey]));
+        foreach (var segment in result)
+        {
+            kept.Add(new SourceNodeKey(segment.Kind, segment.StartNodeId));
+            kept.Add(new SourceNodeKey(segment.Kind, segment.EndNodeId));
+        }
+
+        // The ports merged away, by kind, each mapped to the node it was merged into. Transfer
+        // sorts every section's aliases by source node, so the order they are found in is not seen.
+        var inputPorts = SourceTopologyObligations.Ports(input);
+        var lost = new Dictionary<NetworkKind, Dictionary<long, long>>();
+
+        void Consider(SourceNodeKey nodeKey)
+        {
+            if (!merged.TryGetValue(nodeKey, out var target) || kept.Contains(nodeKey))
+                return;
+
+            if (!lost.TryGetValue(nodeKey.Kind, out var remap))
+                lost[nodeKey.Kind] = remap = new();
+
+            remap[nodeKey.Id] = target;
+        }
+
+        foreach (var nodeKey in inputPorts)
+            Consider(nodeKey);
+
+        foreach (var nodeKey in earlierPorts)
+            Consider(nodeKey);
+
+        foreach (var pair in lost)
+            result = SourceTopologyObligations.Transfer(input, result, pair.Key, pair.Value, inputPorts);
+
+        log.AddDuration("Normalization port transfer", transferClock.Elapsed.TotalSeconds);
 
         return result;
     }
@@ -83,6 +95,7 @@ public static class NetworkSourcePipeline
         var stages = new[]
         {
             new Stage("limited-access",false,false,segments=>NetworkLimitedAccess.Apply(segments,dataset,log)),
+            new Stage("regular-links",false,false,segments=>NetworkLimitedAccess.RegularLinks(segments,dataset,log)),
             new Stage(
                 "tunnel-intervals",
                 false,
@@ -96,6 +109,7 @@ public static class NetworkSourcePipeline
             new Stage("junction-clusters",true,false,segments=>StreetJunctionClusters.Prepare(segments,log,token)),
             new Stage("split-roads",true,false,segments=>NetworkSplitRoads.Prepare(segments,log,token)),
             new Stage("roundabouts",true,false,segments=>RoundaboutPlanner.Prepare(segments,log,token)),
+            new Stage("teardrops",false,false,segments=>NetworkDeadEnds.RemoveTeardrops(segments,log)),
             new Stage(
                 "rail-consolidation",
                 true,
@@ -128,6 +142,7 @@ public static class NetworkSourcePipeline
                 false,
                 false,
                 segments=>NetworkNormalizer.RemoveCoincidentCourses(segments,log,token)),
+            new Stage("late-teardrops",false,false,segments=>NetworkDeadEnds.RemoveTeardrops(segments,log)),
             new Stage("late-stubs",true,false,segments=>NetworkDeadEnds.PruneStubs(segments,request,log)),
             new Stage(
                 "street-connectors",
@@ -144,7 +159,9 @@ public static class NetworkSourcePipeline
             if (!stages.Any(stage => stage.Name == name && !stage.Required))
                 throw new ArgumentException("Stage cannot be skipped: " + name);
 
+        var buildClock = System.Diagnostics.Stopwatch.StartNew();
         var sections = NetworkProcessor.BuildSegments(dataset, request, log, token);
+        log.Time("Source stage build-segments", buildClock.Elapsed.TotalSeconds);
         SourceTopologyManifest? raw = null;
         SourceTopologyManifest? cleanup = null;
 

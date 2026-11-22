@@ -141,11 +141,13 @@ public static class RoundaboutPlanner
             var entries = approaches.Count(segment => !segment.OneWay || ids.Contains(segment.EndNodeId));
             var exits = approaches.Count(segment => !segment.OneWay || ids.Contains(segment.StartNodeId));
 
+            // A ring no larger than the game's largest roundabout becomes one junction node that
+            // carries a stock roundabout, whatever its number of roads: the game places one on
+            // any node, a dead end included.
             if (circular
                 && stockRadius > 0
                 && radius <= stockRadii[stockRadii.Length - 1]
-                && approaches.Length >= 3
-                && approaches.Length <= 6
+                && approaches.Length >= 1
                 && entries > 0
                 && exits > 0
                 && ids.All(

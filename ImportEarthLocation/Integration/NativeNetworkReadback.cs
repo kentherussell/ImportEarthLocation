@@ -567,6 +567,15 @@ public static class NativeNetworkReadback
         var trainCurvatureFailed = 0;
         var trainContractUnavailable = 0;
         var worstTrainCurvature = 0d;
+
+        // Each failing train lane on the final capture, to rank by how far it exceeds its own
+        // asset's limit and to find the writer that bent it (report 121 §12.5): an edge-owned
+        // lane points at the section's course, a node-owned one at the junction's ports.
+        // A capture without source sections (the chunked owned-lane captures) has no source
+        // ways; its records still name the owning entity, to join with its other records.
+        var curvatureFailures =
+            new List<(double Excess, double Curviness, double Maximum, bool NodeOwned, Entity Owner, float3 At, long[] Ways)>();
+
         using var lanesQuery =
             manager.CreateEntityQuery(
                 new EntityQueryDesc
@@ -687,7 +696,43 @@ public static class NativeNetworkReadback
                         worstTrainCurvature = Math.Max(worstTrainCurvature, track.m_Curviness);
 
                         if (!math.isfinite(track.m_Curviness) || track.m_Curviness > contract.m_MaxCurviness)
+                        {
                             trainCurvatureFailed++;
+
+                            if (finalCapture)
+                            {
+                                var owner =
+                                    manager.HasComponent<Owner>(entity)
+                                        ? manager.GetComponentData<Owner>(entity).m_Owner
+                                        : Entity.Null;
+
+                                // The cubic's midpoint: (a + 3b + 3c + d) / 8.
+                                var bezier =
+                                    manager.HasComponent<Curve>(entity)
+                                        ? manager.GetComponentData<Curve>(entity).m_Bezier
+                                        : default;
+
+                                var at = (bezier.a + 3 * bezier.b + 3 * bezier.c + bezier.d) / 8;
+
+                                var ways = new SortedSet<long>();
+
+                                if (owners.TryGetValue(lane.m_StartNode.GetOwnerIndex(), out var startWays))
+                                    ways.UnionWith(startWays);
+
+                                if (owners.TryGetValue(lane.m_EndNode.GetOwnerIndex(), out var endWays))
+                                    ways.UnionWith(endWays);
+
+                                curvatureFailures.Add(
+                                    (
+                                        (double)track.m_Curviness / contract.m_MaxCurviness,
+                                        track.m_Curviness,
+                                        contract.m_MaxCurviness,
+                                        owner != Entity.Null && manager.HasComponent<Node>(owner),
+                                        owner,
+                                        at,
+                                        ways.ToArray()));
+                            }
+                        }
                     }
                 }
             }
@@ -1262,6 +1307,41 @@ public static class NativeNetworkReadback
                 railUnavailable,
                 0,
                 "Two train lanes in opposite directions on one retained axis");
+
+            // Worst first, then by source way: the count per way separates one bad bend from
+            // a way whose many sections each fail.
+            if (curvatureFailures.Count > 0)
+            {
+                var perWay =
+                    curvatureFailures
+                        .SelectMany(failure => failure.Ways.Select(way => (Way: way, failure.Excess)))
+                        .GroupBy(item => item.Way)
+                        .ToDictionary(
+                            group => group.Key,
+                            group => (Count: group.Count(), Worst: group.Max(item => item.Excess)));
+
+                log.DiagnosticRecordChunks(
+                    artifactStem + "-train-curvature-failures.ndjson",
+                    curvatureFailures
+                        .OrderByDescending(failure => failure.Excess)
+                        .Take(2000)
+                        .Select(
+                            failure => (object)new
+                            {
+                                excessRatio = Math.Round(failure.Excess, 3),
+                                curviness = failure.Curviness,
+                                maximum = failure.Maximum,
+                                owner = failure.NodeOwned ? "node" : "edge",
+                                ownerEntity = failure.Owner.ToString(),
+                                x = Math.Round(failure.At.x, 1),
+                                z = Math.Round(failure.At.z, 1),
+                                ways = failure.Ways,
+                                failuresOnWays = failure.Ways.Sum(way => perWay[way].Count)
+                            }));
+
+                log.Diagnostic(
+                    $"NATIVE TRAIN CURVATURE artifact={artifactStem}; failures={curvatureFailures.Count}; nodeOwned={curvatureFailures.Count(failure => failure.NodeOwned)}; ways={perWay.Count}; worstExcessRatio={curvatureFailures.Max(failure => failure.Excess):0.###}; worstWays={string.Join(",", perWay.OrderByDescending(entry => entry.Value.Worst).Take(10).Select(entry => $"{entry.Key}x{entry.Value.Count}"))}");
+            }
 
             Quality(
                 "actual-train-curvature",

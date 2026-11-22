@@ -50,11 +50,14 @@ public static class NetworkDeadEnds
         if (kept.Count == source.Count)
             return kept;
 
-        var alive =
-            new HashSet<long>(
-                kept
-                    .Where(segment => segment.Kind == NetworkKind.Road)
-                    .SelectMany(segment => new[] { segment.StartNodeId, segment.EndNodeId }));
+        var alive = new HashSet<long>();
+
+        foreach (var segment in kept)
+            if (segment.Kind == NetworkKind.Road)
+            {
+                alive.Add(segment.StartNodeId);
+                alive.Add(segment.EndNodeId);
+            }
 
         var parent = new Dictionary<long, long>();
 
@@ -178,9 +181,59 @@ public static class NetworkDeadEnds
                     request.Longitude)
                 : null;
 
+        // A node of an imported way may no longer be on the plan: merging an avenue replaces
+        // its carriageways' nodes. A street path ending there joined nothing, and stopped
+        // 4.5 m short of Boulevard Sir-Wilfrid-Laurier's merged end (Montreal, report 122 §14).
+        // It joins the live node that replaced it, through the merge's aliases, or else the
+        // nearest node within NodeSnap of an ordinary road at grade: as in Close, a street
+        // never joins a bridge, a tunnel or a highway.
+        var live = new Dictionary<long, float3>();
+        var ordinary = new Dictionary<long, float3>();
+        var replacedBy = new Dictionary<long, long>();
+
+        foreach (var segment in source)
+            if (segment.Kind == NetworkKind.Road)
+            {
+                live[segment.StartNodeId] = segment.Start;
+                live[segment.EndNodeId] = segment.End;
+
+                if (!NetworkStructure.IsStructure(segment)
+                    && !segment.Classification.StartsWith("motorway", StringComparison.Ordinal)
+                    && !segment.Classification.StartsWith("trunk", StringComparison.Ordinal))
+                {
+                    ordinary[segment.StartNodeId] = segment.Start;
+                    ordinary[segment.EndNodeId] = segment.End;
+                }
+
+                foreach (var alias in segment.SourceNodeAliases)
+                    replacedBy[alias.SourceNodeId] = alias.CanonicalNodeId;
+            }
+
+        (long Node, float3 Point) Join(long node, float3 point)
+        {
+            if (live.ContainsKey(node))
+                return (node, point);
+
+            if (replacedBy.TryGetValue(node, out var replacement) && live.TryGetValue(replacement, out var at))
+                return (replacement, at);
+
+            var nearest = (Node: node, Point: point, Distance: NodeSnap);
+
+            foreach (var entry in ordinary)
+            {
+                var distance = math.distance(entry.Value.xz, point.xz);
+
+                if (distance <= nearest.Distance)
+                    nearest = (entry.Key, entry.Value, distance);
+            }
+
+            return (nearest.Node, nearest.Point);
+        }
+
         var added = new List<PreparedSegment>();
         var seen = new HashSet<(long, long)>();
         var connected = 0;
+        var rejoined = 0;
 
         foreach (var start in degree.Where(entry => entry.Value == 1).Select(entry => entry.Key).OrderBy(id => id))
         {
@@ -237,6 +290,10 @@ public static class NetworkDeadEnds
                 continue;
 
             connected++;
+            var joined = Join(reached.Value, Local(reached.Value)!.Value);
+
+            if (joined.Node != reached.Value)
+                rejoined++;
 
             for (var node = reached.Value; node != start; node = from[node].Node)
             {
@@ -248,14 +305,15 @@ public static class NetworkDeadEnds
                     continue;
 
                 var vectorA = Local(previous)!.Value;
-                var vectorB = Local(node)!.Value;
+                var last = node == reached.Value;
+                var vectorB = last ? joined.Point : Local(node)!.Value;
                 way.Tags.TryGetValue("name", out var name);
                 added.Add(
                     NativeAssetKeys.ApplyMetadata(
                         new PreparedSegment(
                             way.Id,
                             previous,
-                            node,
+                            last ? joined.Node : node,
                             vectorA,
                             vectorB,
                             NetworkKind.Road,
@@ -278,7 +336,8 @@ public static class NetworkDeadEnds
 
         log.Count("Dead ends connected through unimported streets", connected);
         log.Count("Street sections imported as connectors", added.Count);
-        log.Diagnostic($"STREET CONNECTORS connected={connected}; sections={added.Count}; reachMeters={StreetReach}");
+        log.Count("Street connectors joined to the node that replaced their end", rejoined);
+        log.Diagnostic($"STREET CONNECTORS connected={connected}; sections={added.Count}; rejoined={rejoined}; reachMeters={StreetReach}");
 
         return added.Count == 0 ? source : source.Concat(added).ToArray();
     }
@@ -361,6 +420,116 @@ public static class NetworkDeadEnds
         return extended == 0 ? source : result;
     }
 
+    // A short out-and-back loop left where a junction was merged (report 121 §24): a node
+    // whose only two roads are one-way sections to and from the same merged junction.
+    // Merging gave the loop's two far ends one identity (Santa Barbara: North Jameson Lane
+    // ran 165633986 → 11159887761 → 12011764025, and both neighbours became one junction),
+    // so the road's through route already passes the junction and the loop leads nowhere;
+    // in the game it is a 180° turn a few metres long. Both sections go when each is
+    // shorter than TeardropLength, carries no structure and the junction keeps another
+    // road. Their aliases, and the loop's tip itself, become aliases of the junction on
+    // each road still meeting it, so movement checks still find every source node.
+    public static IReadOnlyList<PreparedSegment> RemoveTeardrops(IReadOnlyList<PreparedSegment> source, ImportLog log)
+    {
+        const float TeardropLength = 20;
+        var arms = new Dictionary<long, List<int>>();
+
+        void Touch(long id, int index)
+        {
+            if (!arms.TryGetValue(id, out var list))
+                arms[id] = list = new();
+
+            list.Add(index);
+        }
+
+        for (var i = 0; i < source.Count; i++)
+            if (source[i].Kind == NetworkKind.Road)
+            {
+                Touch(source[i].StartNodeId, i);
+
+                if (source[i].EndNodeId != source[i].StartNodeId)
+                    Touch(source[i].EndNodeId, i);
+            }
+
+        bool Plain(PreparedSegment segment)
+            => segment.OneWay
+                && !segment.Bridge
+                && !segment.Tunnel
+                && !segment.Roundabout
+                && math.distance(segment.Start.xz, segment.End.xz) < TeardropLength;
+
+        var removed = new HashSet<int>();
+        var carried = new Dictionary<long, List<SourceNodeAlias>>();
+        var examples = new List<string>();
+
+        for (var i = 0; i < source.Count; i++)
+        {
+            var outward = source[i];
+            var junction = outward.StartNodeId;
+            var tip = outward.EndNodeId;
+
+            if (outward.Kind != NetworkKind.Road
+                || removed.Contains(i)
+                || junction == tip
+                || !Plain(outward)
+                || arms[tip].Count != 2
+                || arms[junction].Count(index => !removed.Contains(index)) < 3)
+                continue;
+
+            var back = arms[tip].First(index => index != i);
+            var inward = source[back];
+
+            if (removed.Contains(back) || inward.StartNodeId != tip || inward.EndNodeId != junction || !Plain(inward))
+                continue;
+
+            removed.Add(i);
+            removed.Add(back);
+
+            if (!carried.TryGetValue(junction, out var aliases))
+                carried[junction] = aliases = new();
+
+            aliases.Add(new SourceNodeAlias(tip, junction, false));
+
+            foreach (var alias in outward.SourceNodeAliases.Concat(inward.SourceNodeAliases))
+                aliases.Add(
+                    alias.CanonicalNodeId == tip ? alias with { CanonicalNodeId = junction } : alias);
+
+            if (examples.Count < 8)
+                examples.Add($"{outward.WayId}/{inward.WayId}@{junction}->{tip}");
+        }
+
+        if (removed.Count == 0)
+            return source;
+
+        var result = new List<PreparedSegment>(source.Count - removed.Count);
+
+        for (var i = 0; i < source.Count; i++)
+        {
+            if (removed.Contains(i))
+                continue;
+
+            var segment = source[i];
+            var added = new List<SourceNodeAlias>();
+
+            if (carried.TryGetValue(segment.StartNodeId, out var atStart))
+                added.AddRange(atStart);
+
+            if (segment.EndNodeId != segment.StartNodeId && carried.TryGetValue(segment.EndNodeId, out var atEnd))
+                added.AddRange(atEnd);
+
+            result.Add(
+                added.Count == 0
+                    ? segment
+                    : segment with { SourceNodeAliases = segment.SourceNodeAliases.Concat(added).Distinct().ToArray() });
+        }
+
+        log.Count("Short out-and-back loops removed at merged junctions", removed.Count / 2);
+        log.Diagnostic(
+            $"TEARDROPS removed={removed.Count / 2}; maximumMeters={TeardropLength}; examples={string.Join(",", examples)}");
+
+        return result;
+    }
+
     // A one-way road still ending inland leads nowhere or comes from nowhere, and the
     // game warns at it. Its run back to the first junction goes, up to BlindLength,
     // with its ports aliased to that junction.
@@ -373,22 +542,38 @@ public static class NetworkDeadEnds
         var half = width / 2 - BorderMargin;
         var arms = new Dictionary<long, List<int>>();
 
+        void Touch(long id, int index)
+        {
+            if (!arms.TryGetValue(id, out var list))
+                arms[id] = list = new();
+
+            list.Add(index);
+        }
+
         for (var i = 0; i < source.Count; i++)
             if (source[i].Kind == NetworkKind.Road)
-                foreach (var id in new[] { source[i].StartNodeId, source[i].EndNodeId })
-                {
-                    if (!arms.TryGetValue(id, out var l))
-                        arms[id] = l = new();
-
-                    l.Add(i);
-                }
+            {
+                Touch(source[i].StartNodeId, i);
+                Touch(source[i].EndNodeId, i);
+            }
 
         var removed = new HashSet<int>();
         var remap = new Dictionary<long, long>();
 
-        foreach (var (id, list) in arms.OrderBy(entry => entry.Key))
+        // Only dead ends can start a run, so only they are put in order (node identifiers are distinct).
+        var deadEnds = new List<long>();
+
+        foreach (var pair in arms)
+            if (pair.Value.Count == 1)
+                deadEnds.Add(pair.Key);
+
+        deadEnds.Sort();
+
+        foreach (var id in deadEnds)
         {
-            if (list.Count != 1 || !source[list[0]].OneWay || removed.Contains(list[0]))
+            var list = arms[id];
+
+            if (!source[list[0]].OneWay || removed.Contains(list[0]))
                 continue;
 
             var first = source[list[0]];
@@ -466,12 +651,23 @@ public static class NetworkDeadEnds
         var half = width / 2 - BorderMargin;
         var parent = new Dictionary<SourceNodeKey, SourceNodeKey>();
 
+        // Every node walked is pointed straight at its root, so later walks take one step.
+        // The roots and the pieces are the same as without it; only the walks are shorter
+        // (Paris spent 14 s here, walking the same long chains for every section).
         SourceNodeKey Root(SourceNodeKey key)
         {
-            while (parent.TryGetValue(key, out var up) && up != key)
-                key = up;
+            var root = key;
 
-            return key;
+            while (parent.TryGetValue(root, out var up) && up != root)
+                root = up;
+
+            while (parent.TryGetValue(key, out var next) && next != root)
+            {
+                parent[key] = root;
+                key = next;
+            }
+
+            return root;
         }
 
         foreach (var segment in source)

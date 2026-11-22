@@ -21,19 +21,10 @@ public static class AvenueJunctionRepair
         bool completeStreetJunctions = false)
     {
         token.ThrowIfCancellationRequested();
-        var incident = new Dictionary<long, List<PreparedSegment>>();
-
-        foreach (var segment in source)
-            foreach (var id in new[] { segment.StartNodeId, segment.EndNodeId })
-            {
-                if (!incident.TryGetValue(id, out var list))
-                    incident[id] = list = new();
-
-                list.Add(segment);
-            }
-
         var parent = new Dictionary<long, long>();
         var points = new Dictionary<long, float3>();
+        // The IDs in points by their root, so a cluster's members need no scan of every point.
+        var clusters = new Dictionary<long, List<long>>();
 
         long Root(long id)
         {
@@ -60,23 +51,123 @@ public static class AvenueJunctionRepair
                 ? segment.NativeWidth
                 : segment.Lanes > 4 ? 32 : 24;
 
-        var collapsed = new HashSet<PreparedSegment>();
+        bool Continuation(PreparedSegment link, PreparedSegment segment, long node)
+        {
+            if (Avenue(segment))
+                return true;
 
-        // The bound below is never above 32 m, so a longer link is skipped before it is
-        // sorted; that is nearly every road of the map on every pass. The conditions read
-        // only the link itself, so filtering before the (stable) sort leaves the same links
-        // in the same order (report 114).
-        bool Candidate(PreparedSegment link)
+            if (!completeStreetJunctions || segment.OneWay || segment == link)
+                return false;
+
+            var away = (segment.StartNodeId == node ? segment.End - segment.Start : segment.Start - segment.End).xz;
+            var toward = (link.StartNodeId == node ? link.End - link.Start : link.Start - link.End).xz;
+
+            // The direction test is cheap and rejects nearly every arm before the names are compared.
+            if (!(math.dot(math.normalizesafe(away), math.normalizesafe(toward)) < -.9f))
+                return false;
+
+            return link.Name.Trim().Length > 0
+                    && link.Name.Trim().Equals(segment.Name.Trim(), StringComparison.OrdinalIgnoreCase)
+                || link.Reference.Trim().Length > 0
+                    && link.Reference.Trim().Equals(segment.Reference.Trim(), StringComparison.OrdinalIgnoreCase);
+        }
+
+        bool Transverse(PreparedSegment link, float distance)
+        {
+            var original = link.OriginalGeometry;
+
+            return original.Count >= 2 && distance > .01f
+                && Math.Abs(
+                    math.dot(
+                        math.normalizesafe(original[original.Count - 1].xz - original[0].xz),
+                        math.normalizesafe(link.End.xz - link.Start.xz)))
+                    < .5f;
+        }
+
+        bool Duplicate(PreparedSegment link, PreparedSegment segment)
+            => segment.ConsolidatedAvenue
+                && ((segment.StartNodeId == link.StartNodeId && segment.EndNodeId == link.EndNodeId)
+                    || (segment.EndNodeId == link.StartNodeId && segment.StartNodeId == link.EndNodeId));
+
+        bool SourceEvidence(PreparedSegment link, PreparedSegment segment)
+            => Avenue(segment) && segment.SourceWayIds.Contains(link.WayId);
+
+        // The loop below collapses a link only as a transverse duplicate interval, or with
+        // source evidence when at most 2 m long or a one-way approach within half its bound;
+        // the bound is never above 32 m. A link that fails this on its own fields is skipped
+        // whatever its arms, and that is nearly every road of the map on every pass.
+        bool ShortLink(PreparedSegment link)
         {
             if (link.ConsolidatedAvenue || !Ground(link) || link.StartNodeId == link.EndNodeId)
                 return false;
 
             var length = math.distance(link.Start.xz, link.End.xz);
 
-            return math.isfinite(length) && length <= 32;
+            return math.isfinite(length)
+                && length <= 32
+                && (Transverse(link, length)
+                    || length <= 2
+                    || completeStreetJunctions && link.OneWay && length <= 16);
         }
 
-        foreach (var link in source
+        var shortLinks = new List<PreparedSegment>();
+        var linkNodes = new HashSet<long>();
+
+        foreach (var segment in source)
+            if (ShortLink(segment))
+            {
+                shortLinks.Add(segment);
+                linkNodes.Add(segment.StartNodeId);
+                linkNodes.Add(segment.EndNodeId);
+            }
+
+        // Every node looked up below is an end of one of those links: the link's own, or
+        // a cluster member taken from an earlier link. Arms stay in source order.
+        var incident = new Dictionary<long, List<PreparedSegment>>();
+
+        void AddIncident(long id, PreparedSegment segment)
+        {
+            if (!incident.TryGetValue(id, out var list))
+                incident[id] = list = new();
+
+            list.Add(segment);
+        }
+
+        foreach (var segment in source)
+        {
+            if (linkNodes.Contains(segment.StartNodeId))
+                AddIncident(segment.StartNodeId, segment);
+
+            if (linkNodes.Contains(segment.EndNodeId))
+                AddIncident(segment.EndNodeId, segment);
+        }
+
+        var collapsed = new HashSet<PreparedSegment>();
+
+        // The rest of the loop's tests that read only the link and its arms, which the loop
+        // does not change: the evidence above, and a continuation at both ends. Filtering
+        // before the (stable) sort leaves the same links in the same order (report 114).
+        bool Candidate(PreparedSegment link)
+        {
+            var startArms = incident[link.StartNodeId];
+            var endArms = incident[link.EndNodeId];
+            var distance = math.distance(link.Start.xz, link.End.xz);
+            var evidenceCounts = distance <= 2 || completeStreetJunctions && link.OneWay && distance <= 16;
+
+            var collapsible =
+                Transverse(link, distance)
+                    && (startArms.Any(segment => Duplicate(link, segment))
+                        || endArms.Any(segment => Duplicate(link, segment)))
+                || evidenceCounts
+                    && (startArms.Any(segment => SourceEvidence(link, segment))
+                        || endArms.Any(segment => SourceEvidence(link, segment)));
+
+            return collapsible
+                && startArms.Any(segment => Continuation(link, segment, link.StartNodeId))
+                && endArms.Any(segment => Continuation(link, segment, link.EndNodeId));
+        }
+
+        foreach (var link in shortLinks
             .Where(Candidate)
             .OrderBy(segment => segment.WayId)
             .ThenBy(segment => segment.StartNodeId)
@@ -95,31 +186,11 @@ public static class AvenueJunctionRepair
                     || completeStreetJunctions && NativeAssetKeys.IsHighway(segment)))
                 continue;
 
-            bool Continuation(PreparedSegment segment, long node)
-            {
-                if (Avenue(segment))
-                    return true;
-
-                if (!completeStreetJunctions || segment.OneWay || segment == link)
-                    return false;
-
-                var named =
-                    link.Name.Trim().Length > 0
-                        && link.Name.Trim().Equals(segment.Name.Trim(), StringComparison.OrdinalIgnoreCase)
-                        || link.Reference.Trim().Length > 0
-                        && link.Reference.Trim().Equals(segment.Reference.Trim(), StringComparison.OrdinalIgnoreCase);
-
-                var away = (segment.StartNodeId == node ? segment.End - segment.Start : segment.Start - segment.End).xz;
-                var toward = (link.StartNodeId == node ? link.End - link.Start : link.Start - link.End).xz;
-
-                return named && math.dot(math.normalizesafe(away), math.normalizesafe(toward)) < -.9f;
-            }
-
             var firstSegments =
-                incident[link.StartNodeId].Where(segment => Continuation(segment, link.StartNodeId)).ToArray();
+                incident[link.StartNodeId].Where(segment => Continuation(link, segment, link.StartNodeId)).ToArray();
 
             var secondSegments =
-                incident[link.EndNodeId].Where(segment => Continuation(segment, link.EndNodeId)).ToArray();
+                incident[link.EndNodeId].Where(segment => Continuation(link, segment, link.EndNodeId)).ToArray();
 
             if (firstSegments.Length == 0 || secondSegments.Length == 0)
                 continue;
@@ -129,19 +200,9 @@ public static class AvenueJunctionRepair
             if (!math.isfinite(distance) || distance > bound)
                 continue;
 
-            var duplicate = arms.Any(segment => segment.ConsolidatedAvenue
-                && ((segment.StartNodeId == link.StartNodeId && segment.EndNodeId == link.EndNodeId)
-                    || (segment.EndNodeId == link.StartNodeId && segment.StartNodeId == link.EndNodeId)));
-
-            var original = link.OriginalGeometry;
-            var transverse = original.Count >= 2 && distance > .01f
-                && Math.Abs(
-                    math.dot(
-                        math.normalizesafe(original[original.Count - 1].xz - original[0].xz),
-                        math.normalizesafe(link.End.xz - link.Start.xz)))
-                    < .5f;
-
-            var sourceEvidence = arms.Any(segment => Avenue(segment) && segment.SourceWayIds.Contains(link.WayId));
+            var duplicate = arms.Any(segment => Duplicate(link, segment));
+            var transverse = Transverse(link, distance);
+            var sourceEvidence = arms.Any(segment => SourceEvidence(link, segment));
             // Palm Springs: a transverse median link became a duplicate
             // longitudinal avenue interval. Oman: an explicit ~1 m tie-in
             // between remapped junctions retained its own carriageway evidence.
@@ -159,8 +220,15 @@ public static class AvenueJunctionRepair
                 continue;
             }
 
-            var members = points.Keys.Concat(new[] { link.StartNodeId, link.EndNodeId }).Distinct()
-                .Where(id => Root(id) == first || Root(id) == last).OrderBy(id => id).ToArray();
+            var memberSet = new HashSet<long> { link.StartNodeId, link.EndNodeId };
+
+            if (clusters.TryGetValue(first, out var firstCluster))
+                memberSet.UnionWith(firstCluster);
+
+            if (clusters.TryGetValue(last, out var lastCluster))
+                memberSet.UnionWith(lastCluster);
+
+            var members = memberSet.OrderBy(id => id).ToArray();
 
             float3 Point(long id)
                 => points.TryGetValue(id, out var point)
@@ -229,6 +297,10 @@ public static class AvenueJunctionRepair
             foreach (var id in members)
                 points[id] = Point(id);
 
+            // Every point whose root was first or last is a member, and now has the canonical root.
+            clusters.Remove(first);
+            clusters.Remove(last);
+            clusters[canonical] = new List<long>(members);
             collapsed.Add(link);
 
             if (shortApproach)
@@ -305,10 +377,11 @@ public static class AvenueJunctionRepair
         log.Diagnostic(
             $"AVENUE JUNCTION RECOVERY complete; connectors={collapsed.Count}; internalIntervals={internalIntervals}; armsReconnected={reconnected}; outputSections={result.Count}; nearbyUnconnectedRoadsUntouched=true");
 
-        return SourceTopologyObligations.Transfer(
+        var transferred = SourceTopologyObligations.Transfer(
             source,
             result,
             NetworkKind.Road,
             parent.Keys.ToDictionary(id => id, Root));
+        return transferred;
     }
 }

@@ -24,6 +24,14 @@ public static class NetworkSplitRoads
         MinimumAlignment = .6f,
         MaximumRatio = 1.6f;
 
+    // Some junctions are mapped as a small box: the road splits into two one-way legs that
+    // flare around the crossing street and rejoin just beyond it (Montreal, way 436364814).
+    // Legs this short may leave the split node and turn at any angle short of a hairpin; the
+    // merge then folds the crossing onto one junction of the two-way road.
+    private const float CompactLeg = 50,
+        CompactTurn = -.3f,
+        Turn = .5f;
+
     private sealed record Leg(
         List<PreparedSegment> Sections,
         List<long> Nodes,
@@ -87,52 +95,162 @@ public static class NetworkSplitRoads
         ImportLog log,
         CancellationToken token)
     {
-        for (var pass = 0; pass < 4; pass++)
-        {
-            var before = source.Count;
-            var merged = Pass(ref source, log, token);
-            log.Count("Split road stretches merged", merged);
+        var joinClock = System.Diagnostics.Stopwatch.StartNew();
+        source = JoinCoincidentStructures(source, log);
+        log.AddDuration("Split roads coincident structures", joinClock.Elapsed.TotalSeconds);
 
-            if (merged == 0)
-                break;
+        // Ordinary splits settle first; the compact flared ones are swept afterwards, so they
+        // never take a leg an ordinary split would have used.
+        foreach (var flared in new[] { false, true })
+            for (var pass = 0; pass < 4; pass++)
+            {
+                var before = source.Count;
+                var merged = Pass(ref source, flared, log, token);
+                log.Count(flared ? "Flared split road junctions merged" : "Split road stretches merged", merged);
 
-            log.Diagnostic($"SPLIT ROADS pass={pass}; merged={merged}; sections {before}->{source.Count}");
-        }
+                if (merged == 0)
+                    break;
+
+                log.Diagnostic(
+                    $"SPLIT ROADS pass={pass}; flared={flared}; merged={merged}; sections {before}->{source.Count}");
+            }
 
         return source;
     }
 
-    private static int Pass(ref IReadOnlyList<PreparedSegment> source, ImportLog log, CancellationToken token)
+    // The passes below leave structures alone: a bridge or tunnel is not moved onto a middle
+    // line. But two opposing one-way legs on a structure can already lie on one course between
+    // the same two nodes, when both of their own end junctions were folded into neighbouring
+    // avenues (a four-carriageway corridor whose inner pair became one avenue: Kathmandu ways
+    // 670112954 and 1091877749 on a bridge, report 117). The game cannot build one course twice:
+    // the nodes later split into each leg stood on top of the other's, four dead ends. Such a
+    // pair becomes one two-way section where it already is, so nothing moves. Legs further apart
+    // than CoincidentTolerance anywhere along them stay as they are.
+    private static IReadOnlyList<PreparedSegment> JoinCoincidentStructures(
+        IReadOnlyList<PreparedSegment> source,
+        ImportLog log)
     {
-        var roads = source.Where(segment => segment.Kind == NetworkKind.Road).ToArray();
-        var incident = new Dictionary<long, List<PreparedSegment>>();
+        const float CoincidentTolerance = .5f;
 
-        foreach (var segment in roads)
-            foreach (var id in new[] { segment.StartNodeId, segment.EndNodeId })
+        static bool Leg(PreparedSegment segment)
+            => segment.Kind == NetworkKind.Road
+                && segment.OneWay
+                && !segment.Roundabout
+                && !segment.ProtectedLink
+                && NetworkStructure.IsStructure(segment);
+
+        static bool SameCourse(PreparedSegment first, PreparedSegment second)
+            => first.Layer == second.Layer
+                && first.Bridge == second.Bridge
+                && first.Tunnel == second.Tunnel
+                && Enumerable
+                    .Range(0, 17)
+                    .All(
+                        j => math.distance(
+                                NetworkNormalizer.Evaluate(first, j / 16f).xz,
+                                NetworkNormalizer.Evaluate(second, 1 - j / 16f).xz)
+                            < CoincidentTolerance);
+
+        var byEnds = new Dictionary<(long Start, long End), int>();
+        var result = new List<PreparedSegment>(source.Count);
+        var joined = 0;
+
+        foreach (var segment in source)
+        {
+            if (Leg(segment)
+                && byEnds.TryGetValue((segment.EndNodeId, segment.StartNodeId), out var opposite)
+                && SameCourse(result[opposite], segment))
             {
-                if (!incident.TryGetValue(id, out var segments))
-                    incident[id] = segments = new();
+                var first = result[opposite];
+                var lanes = NetworkSelection.MatchedLanes(first.Lanes + segment.Lanes, false, false);
 
-                segments.Add(segment);
+                result[opposite] = first with
+                {
+                    SourceWayIds =
+                        new[] { first, segment }
+                            .SelectMany(
+                                leg => leg.SourceWayIds.Count > 0 ? leg.SourceWayIds : new[] { leg.WayId })
+                            .Distinct()
+                            .ToArray(),
+                    SourceNodeAliases =
+                        first.SourceNodeAliases.Concat(segment.SourceNodeAliases).Distinct().ToArray(),
+                    OriginalGeometry = first.OriginalGeometry.Concat(segment.OriginalGeometry).ToArray(),
+                    OneWay = false,
+                    Lanes = lanes,
+                    ForwardLanes = lanes / 2,
+                    BackwardLanes = lanes / 2,
+                    BothWaysLanes = 0,
+                    SourceWidthMeters = null,
+                    ConsolidatedAvenue = lanes > 2,
+                    CorridorId = 0,
+                    MaximumNativeWidth = float.PositiveInfinity
+                };
+
+                byEnds.Remove((segment.EndNodeId, segment.StartNodeId));
+                joined++;
+                log.Diagnostic(
+                    $"SPLIT ROAD coincident structure joined ways={first.WayId},{segment.WayId}; nodes={first.StartNodeId}/{first.EndNodeId}; lanes={lanes}; toleranceMeters={CoincidentTolerance}");
+
+                continue;
             }
 
-        var rail =
-            new HashSet<long>(
-                source
-                    .Where(segment => segment.Kind == NetworkKind.Rail)
-                    .SelectMany(segment => new[] { segment.StartNodeId, segment.EndNodeId }));
+            if (Leg(segment))
+                byEnds[(segment.StartNodeId, segment.EndNodeId)] = result.Count;
 
-        var outgoing =
-            roads
-                .Where(Eligible)
-                .GroupBy(segment => segment.StartNodeId)
-                .ToDictionary(group => group.Key, group => group.ToArray());
+            result.Add(segment);
+        }
 
-        var incoming =
-            roads
-                .Where(Eligible)
-                .GroupBy(segment => segment.EndNodeId)
-                .ToDictionary(group => group.Key, group => group.ToArray());
+        if (joined == 0)
+            return source;
+
+        log.Count("Coincident structure legs joined", joined);
+
+        return result;
+    }
+
+    private static int Pass(
+        ref IReadOnlyList<PreparedSegment> source,
+        bool flared,
+        ImportLog log,
+        CancellationToken token)
+    {
+        var stepClock = System.Diagnostics.Stopwatch.StartNew();
+        var roads = new List<PreparedSegment>();
+        var incident = new Dictionary<long, List<PreparedSegment>>();
+        var rail = new HashSet<long>();
+        var outgoing = new Dictionary<long, List<PreparedSegment>>();
+        var incoming = new Dictionary<long, List<PreparedSegment>>();
+
+        static void AddTo(Dictionary<long, List<PreparedSegment>> lists, long node, PreparedSegment segment)
+        {
+            if (!lists.TryGetValue(node, out var segments))
+                lists[node] = segments = new();
+
+            segments.Add(segment);
+        }
+
+        // One sweep in source order, so every list keeps the order the queries used to give.
+        foreach (var segment in source)
+        {
+            if (segment.Kind == NetworkKind.Rail)
+            {
+                rail.Add(segment.StartNodeId);
+                rail.Add(segment.EndNodeId);
+            }
+
+            if (segment.Kind != NetworkKind.Road)
+                continue;
+
+            roads.Add(segment);
+            AddTo(incident, segment.StartNodeId, segment);
+            AddTo(incident, segment.EndNodeId, segment);
+
+            if (!Eligible(segment))
+                continue;
+
+            AddTo(outgoing, segment.StartNodeId, segment);
+            AddTo(incoming, segment.EndNodeId, segment);
+        }
 
         static float2 Heading(PreparedSegment segment) => math.normalizesafe((segment.End - segment.Start).xz);
 
@@ -167,7 +285,12 @@ public static class NetworkSplitRoads
                         ? next.Where(segment => !sections.Contains(segment)).ToArray()
                         : Array.Empty<PreparedSegment>();
 
-                if (options.Length != 1 || math.dot(Heading(current), Heading(options[0])) < .5f)
+                if (options.Length != 1)
+                    break;
+
+                var turn = math.dot(Heading(current), Heading(options[0]));
+
+                if (turn < Turn && (!flared || turn < CompactTurn || length > CompactLeg))
                     break;
 
                 current = options[0];
@@ -176,25 +299,45 @@ public static class NetworkSplitRoads
             return new(sections, nodes, points, stations);
         }
 
+        static bool Sharp(Leg leg)
+        {
+            for (var k = 1; k < leg.Sections.Count; k++)
+                if (math.dot(Heading(leg.Sections[k - 1]), Heading(leg.Sections[k])) < Turn)
+                    return true;
+
+            return false;
+        }
+
         var consumed = new HashSet<PreparedSegment>();
         var moved = new Dictionary<long, (long Node, float3 Point)>();
         var created = new List<PreparedSegment>();
-        var ids =
-            new HashSet<long>(
-                source.SelectMany(
-                    segment => new[] {
-                        segment.StartNodeId,
-                        segment.EndNodeId
-                        }.Concat(
-                            segment.SourceNodeAliases.SelectMany(
-                                alias => new[] { alias.SourceNodeId, alias.CanonicalNodeId }))));
-
+        // Node and way identities in use are needed only once a pass merges, so they are
+        // gathered on first use; the source does not change during the pass.
+        var sections = source;
+        HashSet<long>? ids = null;
+        HashSet<long>? ways = null;
         long nextNode = -8_100_000_000_000_000_000;
         long nextWay = -7_800_000_000_000_000_000;
-        var ways = new HashSet<long>(source.Select(segment => segment.WayId));
 
         long NewNode()
         {
+            if (ids == null)
+            {
+                ids = new HashSet<long>();
+
+                foreach (var segment in sections)
+                {
+                    ids.Add(segment.StartNodeId);
+                    ids.Add(segment.EndNodeId);
+
+                    foreach (var alias in segment.SourceNodeAliases)
+                    {
+                        ids.Add(alias.SourceNodeId);
+                        ids.Add(alias.CanonicalNodeId);
+                    }
+                }
+            }
+
             while (ids.Contains(nextNode))
                 nextNode++;
 
@@ -222,6 +365,9 @@ public static class NetworkSplitRoads
                 if (outgoing.ContainsKey(x) && incoming.ContainsKey(y))
                     seeds.Add((x, y));
 
+        log.AddDuration("Split roads indexes and seeds", stepClock.Elapsed.TotalSeconds);
+        stepClock.Restart();
+
         foreach (var (seedOut, seedIn) in seeds)
         {
             token.ThrowIfCancellationRequested();
@@ -232,9 +378,9 @@ public static class NetworkSplitRoads
             foreach (var otherSegment in outgoing[seedOut])
                 foreach (var segment in incoming[seedIn])
                 {
-                    if (consumed.Contains(otherSegment)
-                        || consumed.Contains(segment)
-                        || math.dot(Heading(otherSegment), -Heading(segment)) < MinimumAlignment)
+                    var aligned = math.dot(Heading(otherSegment), -Heading(segment)) >= MinimumAlignment;
+
+                    if (consumed.Contains(otherSegment) || consumed.Contains(segment) || !flared && !aligned)
                         continue;
 
                     var firstLeg = Walk(otherSegment, true);
@@ -308,6 +454,13 @@ public static class NetworkSplitRoads
                             != 1)
                         continue;
 
+                    // The flared sweep takes only the shapes the ordinary one could not.
+                    if (flared
+                        && (aligned && !Sharp(legA) && !Sharp(legB)
+                            || legA.Length > CompactLeg
+                            || legB.Length > CompactLeg))
+                        continue;
+
                     if (Math.Max(legA.Length, legB.Length) / Math.Max(1, Math.Min(legA.Length, legB.Length))
                         > MaximumRatio
                         && Math.Max(legA.Length, legB.Length) > 60)
@@ -368,6 +521,14 @@ public static class NetworkSplitRoads
                                 : incident[seedOut].Count >= incident[seedIn].Count ? seedOut : seedIn;
 
                     var near = seed == seedOut ? legA.Points[0] : legB.Points[0];
+
+                    // A flared pair must split a two-way road that carries on at both ends: not a
+                    // turning loop at the end of one, nor one-way ramps around an interchange.
+                    bool TwoWayBeyond(long node)
+                        => incident[node].Any(arm => !body.Contains(arm) && !arm.OneWay);
+
+                    if (flared && (!TwoWayBeyond(seed) || !TwoWayBeyond(keep)))
+                        continue;
 
                     if (seed == keep
                         || seedOut == endB
@@ -473,6 +634,14 @@ public static class NetworkSplitRoads
                         moved[node] = Nearest(point);
                     }
 
+                    if (ways == null)
+                    {
+                        ways = new HashSet<long>();
+
+                        foreach (var section in sections)
+                            ways.Add(section.WayId);
+                    }
+
                     while (ways.Contains(nextWay))
                         nextWay++;
 
@@ -550,6 +719,9 @@ public static class NetworkSplitRoads
                 }
         }
 
+        log.AddDuration("Split roads leg merging", stepClock.Elapsed.TotalSeconds);
+        stepClock.Restart();
+
         if (merged == 0)
             return 0;
 
@@ -594,6 +766,7 @@ public static class NetworkSplitRoads
                 .ToDictionary(entry => entry.Key, entry => entry.Value.Node);
 
         source = SourceTopologyObligations.Transfer(source, result, NetworkKind.Road, retired);
+        log.AddDuration("Split roads rebuild and transfer", stepClock.Elapsed.TotalSeconds);
 
         return merged;
     }

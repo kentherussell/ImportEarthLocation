@@ -36,6 +36,8 @@ public static class AutoRun
         public string Latitude = "";
         public string Longitude = "";
         public string Switches = "";
+        // Off only for a timing run: a player's import has no diagnostics (report 118).
+        public bool Diagnostics = true;
         public string Result = "pending";
         public string? RunFolder;
         public string? Error;
@@ -58,6 +60,8 @@ public static class AutoRun
 
     public static string Switches => s_Runs[s_Index].Switches;
 
+    public static bool Diagnostics => s_Runs[s_Index].Diagnostics;
+
     private static string Root => Path.Combine(Application.persistentDataPath, "ModsData", Mod.Id, "diagnostics");
 
     public static void Begin()
@@ -79,7 +83,8 @@ public static class AutoRun
                         Name = (string?)row["name"] ?? "city",
                         Latitude = (string)row["lat"]!,
                         Longitude = (string)row["lon"]!,
-                        Switches = (string?)row["switches"] ?? ""
+                        Switches = (string?)row["switches"] ?? "",
+                        Diagnostics = (bool?)row["diagnostics"] ?? true
                     });
 
             if (s_Runs.Count == 0)

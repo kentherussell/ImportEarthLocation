@@ -284,6 +284,8 @@ namespace ImportEarthLocation.Core
 
         public void Diagnostic(string text) => Messages.Add(text);
 
+        public void Evidence(string text, bool warning = false) => Messages.Add(text);
+
         public void Count(string text) => Messages.Add("COUNT " + text);
     }
 

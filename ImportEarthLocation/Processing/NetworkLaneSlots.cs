@@ -77,12 +77,24 @@ public static class NetworkLaneSlots
             }
         }
 
+        // Sections whose slots were estimated: with no measured lane offsets for the asset,
+        // one slot per planned lane, 4 m apart and centred. An estimate can guide geometry
+        // but proves nothing about direction, width or connection, so it is counted apart
+        // (report 121 §20).
+        var estimated = new HashSet<(long Way, long Start, long End)>();
+
         float[] Lanes(PreparedSegment segment)
-            => segment.NativeLaneOffsets.Count > 0 ? segment.NativeLaneOffsets.OrderBy(x => x).ToArray() :
-            Enumerable
+        {
+            if (segment.NativeLaneOffsets.Count > 0)
+                return segment.NativeLaneOffsets.OrderBy(x => x).ToArray();
+
+            estimated.Add((segment.WayId, segment.StartNodeId, segment.EndNodeId));
+
+            return Enumerable
                 .Range(0, Math.Max(1, segment.Lanes))
                 .Select(k => (k - (Math.Max(1, segment.Lanes) - 1) * .5f) * 4f)
                 .ToArray();
+        }
 
         // Travel direction at the port, pointing along the road's travel.
         float2 Travel(PreparedSegment segment, bool start)
@@ -578,8 +590,9 @@ public static class NetworkLaneSlots
         log.Count("Lane slots aligned at merges and splits", aligned);
         log.Count("Lane slots aligned where lanes are added or dropped", widths);
         log.Count("Lane slots aligned where two-way roads divide", divided);
+        log.Count("Lane slots estimated without measured lane offsets", estimated.Count);
         log.Diagnostic(
-            $"LANE SLOTS mergesAndSplits={aligned}; laneCountChanges={widths}; twoWayDivisions={divided}; twoWayDivisionsLeftCentred={undivided}; oneWayPairsAtTwoWayNotParallel={wideDivisions}; leftCentredBecause={string.Join(",", centred.Select(entry => entry.Key + ":" + entry.Value))}; branchEndsShifted={shifted}; skippedNotParallelOrAmbiguous={skipped}; maximumShiftMeters={MaximumShift}");
+            $"LANE SLOTS estimatedSlotSections={estimated.Count}; mergesAndSplits={aligned}; laneCountChanges={widths}; twoWayDivisions={divided}; twoWayDivisionsLeftCentred={undivided}; oneWayPairsAtTwoWayNotParallel={wideDivisions}; leftCentredBecause={string.Join(",", centred.Select(entry => entry.Key + ":" + entry.Value))}; branchEndsShifted={shifted}; skippedNotParallelOrAmbiguous={skipped}; maximumShiftMeters={MaximumShift}");
 
         return result;
     }

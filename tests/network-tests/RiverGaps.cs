@@ -10,7 +10,14 @@ static class RiverGaps
 {
     public static void Run(string folder, float minimumDepth)
     {
-        var meta = JObject.Parse(File.ReadAllText(CapturedRunFiles.Resolve(folder, "native-water-depth.json")));
+        // RIVER_DEPTH=late reads the late-water-readback reading instead of the settled one.
+        var reading =
+            Environment.GetEnvironmentVariable("RIVER_DEPTH") == "late"
+                ? "native-water-depth-late.json"
+                : "native-water-depth.json";
+
+        var meta = JObject.Parse(File.ReadAllText(CapturedRunFiles.Resolve(folder, reading)));
+        Console.WriteLine($"water reading: {reading}, {(double?)meta["elapsedWallSeconds"]:0} s after the sources");
         var cells = (int)meta["cells"]!;
         var cellMeters = (float)meta["cellMeters"]!;
         var bytes = File.ReadAllBytes(CapturedRunFiles.Resolve(folder, (string)meta["file"]!));
@@ -127,6 +134,104 @@ static class RiverGaps
             }
 
             return;
+        }
+
+        // RIVER_VOLUME=1: the water standing within 100 m of channel reaches (no polygon), in
+        // million m³, and the wet area there: how much the rivers hold at this reading.
+        if (Environment.GetEnvironmentVariable("RIVER_VOLUME") == "1")
+        {
+            var near = new bool[cells * cells];
+
+            foreach (var reach in reaches.Where(reach => reach.PolygonId == null && !reach.BlockedByBuriedInlet))
+            {
+                var minX = (int)Math.Floor((Math.Min(reach.Start.x, reach.End.x) - 100 + half) / cellMeters);
+                var maxX = (int)Math.Ceiling((Math.Max(reach.Start.x, reach.End.x) + 100 + half) / cellMeters);
+                var minZ = (int)Math.Floor((Math.Min(reach.Start.z, reach.End.z) - 100 + half) / cellMeters);
+                var maxZ = (int)Math.Ceiling((Math.Max(reach.Start.z, reach.End.z) + 100 + half) / cellMeters);
+
+                for (var j = Math.Max(0, minZ); j <= Math.Min(cells - 1, maxZ); j++)
+                    for (var i = Math.Max(0, minX); i <= Math.Min(cells - 1, maxX); i++)
+                    {
+                        var point = new float3(i * cellMeters - half, 0, j * cellMeters - half);
+
+                        if (ImportEarthLocation.Processing.NetworkNormalizer.DistanceToSegment(point, reach.Start, reach.End) <= 100)
+                            near[j * cells + i] = true;
+                    }
+            }
+
+            double volume = 0, wet = 0;
+
+            for (var k = 0; k < near.Length; k++)
+                if (near[k] && depth[k] > 5)
+                {
+                    volume += depth[k] / 100.0 * cellMeters * cellMeters;
+                    wet += cellMeters * cellMeters;
+                }
+
+            Console.WriteLine(
+                $"river volume within 100 m of channel reaches: {volume / 1e6:0.000} million m³ over {wet / 1e4:0.0} ha wet; cells in band {near.Count(value => value):N0}");
+
+            // Inland water elsewhere (surface more than 1 m above RIVER_SEA): lakes and ponds,
+            // whose sources fill them as fast as the rivers', so a slower simulation shows
+            // there too.
+            if (float.TryParse(
+                Environment.GetEnvironmentVariable("RIVER_SEA"),
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var sea))
+            {
+                double inland = 0, inlandWet = 0;
+
+                for (var k = 0; k < near.Length; k++)
+                {
+                    if (near[k] || depth[k] <= 5)
+                        continue;
+
+                    var x = k % cells * cellMeters - half;
+                    var z = k / cells * cellMeters - half;
+
+                    if (Ground(x, z) + depth[k] / 100f <= sea + 1)
+                        continue;
+
+                    inland += depth[k] / 100.0 * cellMeters * cellMeters;
+                    inlandWet += cellMeters * cellMeters;
+                }
+
+                Console.WriteLine(
+                    $"inland water away from channels: {inland / 1e6:0.000} million m³ over {inlandWet / 1e4:0.0} ha wet");
+            }
+        }
+
+        // RIVER_DEPTH_BY_SOURCE=1: mean water depth along channel lines, by distance to the
+        // nearest source. Lower everywhere means the sources fill slower; lower only far from
+        // them means the water is slow to travel along the channel.
+        if (Environment.GetEnvironmentVariable("RIVER_DEPTH_BY_SOURCE") == "1")
+        {
+            var bands = new[] { 50f, 100f, 150f, 200f, float.PositiveInfinity };
+            var sums = new double[bands.Length];
+            var counts = new long[bands.Length];
+
+            foreach (var reach in reaches.Where(reach => reach.PolygonId == null && !reach.BlockedByBuriedInlet))
+            {
+                var steps = Math.Max(1, (int)Math.Ceiling(math.distance(reach.Start.xz, reach.End.xz) / 7));
+
+                for (var k = 0; k < steps; k++)
+                {
+                    var point = math.lerp(reach.Start, reach.End, (k + .5f) / steps);
+                    var nearest = sources.Length == 0 ? float.PositiveInfinity : sources.Min(source => math.distance(source.xz, point.xz));
+                    var band = Array.FindIndex(bands, limit => nearest < limit);
+                    sums[band] += Depth(point.x, point.z);
+                    counts[band]++;
+                }
+            }
+
+            Console.WriteLine(
+                "channel depth by distance to the nearest source: "
+                    + string.Join(
+                        ", ",
+                        bands.Select(
+                            (limit, i) =>
+                                $"<{(float.IsPositiveInfinity(limit) ? "any" : limit.ToString("0"))} m {(counts[i] == 0 ? 0 : sums[i] / counts[i]):0.00} m ({counts[i]:N0})")));
         }
 
         var ways =

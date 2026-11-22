@@ -771,9 +771,9 @@ namespace ImportEarthLocation.Systems
                         _latitude = AutoRun.Latitude;
                         _longitude = AutoRun.Longitude;
                         _designSwitches = AutoRun.Switches;
-                        _diagnosticsEnabled = true;
-                        _log.DiagnosticsEnabled = true;
-                        _diagnosticsBinding.Update(true);
+                        _diagnosticsEnabled = AutoRun.Diagnostics;
+                        _log.DiagnosticsEnabled = AutoRun.Diagnostics;
+                        _diagnosticsBinding.Update(AutoRun.Diagnostics);
                         _unavailableData = null;
                         AutoRun.Started();
                         StartPrepare();
@@ -1460,6 +1460,9 @@ namespace ImportEarthLocation.Systems
                     token,
                     new SourceOptions
                     {
+                        // Each cleanup stage's own time: network cleanup had silent gaps of
+                        // 5–13 s between its logged passes (report 118).
+                        AfterStage = (stage, sections, seconds) => log.Time("Source stage " + stage, seconds),
                         BeforeStage = (stage, sections) =>
                     {
                         switch (stage)
@@ -1491,6 +1494,10 @@ namespace ImportEarthLocation.Systems
                     }
                     });
 
+            // The validation clock restarted when the "coincident-courses" stage began.
+            log.Time("Geometry validation source stages", clock.Elapsed.TotalSeconds);
+            var partClock = Stopwatch.StartNew();
+
             sourceManifest = new SourceManifest(sourceManifest.Chains.ToArray(), source.CleanupTopology);
             var aligned = source.Sections;
             NetworkGeometrySafety.ValidateEnvelope(
@@ -1499,6 +1506,9 @@ namespace ImportEarthLocation.Systems
                 terrain.HeightScaleMeters,
                 token,
                 log);
+
+            log.Time("Geometry validation envelope", partClock.Elapsed.TotalSeconds);
+            partClock.Restart();
 
             progress.Begin("Blending the ground beneath roads and railways");
             var networkTerrain = terrain;
@@ -1522,6 +1532,11 @@ namespace ImportEarthLocation.Systems
                                     && (natural == "cliff" || natural == "coastline"))
                 .Select(way => way.NodeIds.Where(geography.Nodes.ContainsKey).Select(id =>
     {
+        // A river node the water plan moved onto the valley floor is protected where its
+        // channel was carved, not where it was mapped.
+        if (water.MovedWaterwayNodes.TryGetValue(id, out var target))
+            return target;
+
         var node = geography.Nodes[id];
         return GeoMath.ToLocalMeters(node.Latitude, node.Longitude, bundle.Request.Latitude, bundle.Request.Longitude);
     }).ToArray()).ToArray();
@@ -1535,6 +1550,8 @@ namespace ImportEarthLocation.Systems
         return GeoMath.ToLocalMeters(node.Latitude, node.Longitude, bundle.Request.Latitude, bundle.Request.Longitude);
     }).ToArray()).ToArray();
 
+            log.Time("Geometry validation protected areas and lines", partClock.Elapsed.TotalSeconds);
+
             // Resolve water earthworks before freezing network profiles. Roadbed construction
             // protects these features; it must not trigger another profile/spacing cycle.
             // Both steps are timed: DC's 50 s geometry validation had no inner log.
@@ -1545,7 +1562,12 @@ namespace ImportEarthLocation.Systems
                     aligned,
                     WaterBodyPlanner
                         .BuriedChannels(geography, bundle.Request, water.WaterCellSize)
-                        .Concat(WaterBodyPlanner.OpenChannels(geography, bundle.Request, water.WaterCellSize))
+                        .Concat(
+                            WaterBodyPlanner.OpenChannels(
+                                geography,
+                                bundle.Request,
+                                water.WaterCellSize,
+                                water.MovedWaterwayNodes))
                         .ToArray(),
                     (int)Math.Sqrt(terrain.Heights.Length),
                 bundle.Request.MapSize.WidthMeters, log, token);
@@ -1598,6 +1620,11 @@ namespace ImportEarthLocation.Systems
             log.Time("Structure intervals", stepClock.Elapsed.TotalSeconds);
             log.Evidence(
                 $"Geometry validation steps: water revalidation {waterSeconds:0.0} s; bridge/tunnel intervals {stepClock.Elapsed.TotalSeconds:0.0} s (water sampler build {samplerSeconds:0.0} s, {aligned.Count:N0} sections, {water.ReachStages.Count:N0} reaches, {polygons.Count:N0} polygons).");
+
+            log.Time("Geometry validation crossing bridges", crossingSeconds);
+            log.Time("Geometry validation water revalidate", revalidateSeconds);
+            log.Time("Geometry validation beach terrain", waterSeconds - crossingSeconds - revalidateSeconds);
+            log.Time("Geometry validation water sampler", samplerSeconds);
 
             var geometryReference = aligned;
             log.Diagnostic(
@@ -1827,6 +1854,17 @@ namespace ImportEarthLocation.Systems
                         new { schemaVersion = 2, inputFile, requiresCompleteManifests = true });
                 }
 
+                // Each step's own time, so the design stage's silent stretches show (report 118).
+                var stepClock = Stopwatch.StartNew();
+
+                void Step(string name)
+                {
+                    log.AddDuration("Design step " + name, stepClock.Elapsed.TotalSeconds);
+                    stepClock.Restart();
+                }
+
+                Step("setup and replay capture");
+
                 // Cleaned after the capture, so a replay of the capture cleans the same grid
                 // the same way. The retained terrain is never cleaned, so a second design
                 // pass cleans the original again rather than lowering twice.
@@ -1889,6 +1927,8 @@ namespace ImportEarthLocation.Systems
                     terrain = terrain with { Heights = roadbedBaseline };
                 }
 
+                Step("terrain preparation");
+
                 // Fast Road Design is the only designer; a failure stops the import with its reason.
                 var designClock = Stopwatch.StartNew();
                 var compiled = true;
@@ -1905,6 +1945,8 @@ namespace ImportEarthLocation.Systems
 
                 log.Evidence(
                     $"Road design: {reference.Length:N0} sections designed into {sections.Count:N0} in {designClock.Elapsed.TotalSeconds:0.0} s; {log.Metric("Visual compiler strokes"):N0} roads; {log.Metric("Visual compiler vertical conflicts"):N0} bridge crossings left without full clearance.");
+
+                Step("visual compiler");
 
                 // Do not add manual retaining-wall/quay upgrades or split solved
                 // decks merely to apply decorative side-composition intervals.
@@ -1937,8 +1979,10 @@ namespace ImportEarthLocation.Systems
                 // Drawn structures change sections' modes, and with them their asset keys. A
                 // stale key here made the preflight redesign the whole map on every import.
                 sections = NativeAssetKeys.Refresh(sections, assets);
+                Step("units, structures and endpoints");
                 SourceTopologyObligations.Validate(result.Source?.Topology, sections, log, token);
                 NetworkQualityAudit.Planned(sections, log, token, result.Source?.Topology != null);
+                Step("topology obligations and quality audit");
 
                 if (log.DiagnosticsEnabled && result.NetworkData != null)
                     log.DiagnosticJson(
@@ -1963,6 +2007,7 @@ namespace ImportEarthLocation.Systems
                     "planned",
                     "final-design");
 
+                Step("road quality report and ports");
                 progress.Detail("Building the final ground support beneath roads and railways");
                 var roadbedClock = Stopwatch.StartNew();
                 var roadbedRaster =
@@ -2006,23 +2051,31 @@ namespace ImportEarthLocation.Systems
                         request.MapSize.WidthMeters,
                         log);
 
-                log.Diagnostic(
-                    "DRAWN PREDICTION "
-                        + NetworkDrawnStructures.Predict(
-                            sections,
-                            terrain.Heights,
-                            request.MapSize.WidthMeters));
+                // The drawn-structure prediction and the ground-support certificate only
+                // report (one diagnostic line, and the quality ledger, a diagnostics file);
+                // the certificate took 22 s in Paris (report 118), so both run only with
+                // diagnostics on.
+                if (log.DiagnosticsEnabled)
+                {
+                    log.Diagnostic(
+                        "DRAWN PREDICTION "
+                            + NetworkDrawnStructures.Predict(
+                                sections,
+                                terrain.Heights,
+                                request.MapSize.WidthMeters));
 
-                NetworkTerrainSupport.Validate(
-                    sections,
-                    terrain.Heights,
-                    terrain.HeightScaleMeters,
-                    request.MapSize.WidthMeters,
-                    log,
-                    token,
-                    progress.Detail);
+                    NetworkTerrainSupport.Validate(
+                        sections,
+                        terrain.Heights,
+                        terrain.HeightScaleMeters,
+                        request.MapSize.WidthMeters,
+                        log,
+                        token,
+                        progress.Detail);
+                }
 
                 log.Time("Final terrain support validation", roadbedClock.Elapsed.TotalSeconds);
+                stepClock.Restart();
                 var water =
                     WaterContainment.Validate(
                         result.Water,
@@ -2050,6 +2103,7 @@ namespace ImportEarthLocation.Systems
                     assets);
 
                 NetworkContinuity.Validate(result.Segments, sections, log, token, allowQualityWarnings: true);
+                Step("containment, geometry safety and continuity");
 
                 if (sections.Count != result.Segments.Count)
                     log.Diagnostic(
@@ -2135,6 +2189,7 @@ namespace ImportEarthLocation.Systems
 
                 var finalDesign = new FinalNetworkDesign(sections, result.NativeAssets, result.Source);
                 sections = finalDesign.Sections;
+                Step("surfaces, rail certificates and final design");
                 log.Time("Native-informed network design", clock.Elapsed.TotalSeconds);
                 log.Diagnostic(
                     $"FINAL DESIGN sections={sections.Count}; nativeAssets={assets.Count}; assetCaptureBeforeDesign=true; conservativeSideEnvelope=true; designPasses={result.DesignPasses + 1}; terrainSupportPasses=1; exactFloatDeckFrozen=true; qualityAcceptance=RequiresReview; geometryFailureBlocksPlacement=false");
@@ -2255,37 +2310,25 @@ namespace ImportEarthLocation.Systems
 
                     // The density slider keeps a share of the plan, chosen by each
                     // candidate's own seed so the thinning is even and repeatable.
+                    // Above VegetationCeiling mapped trees are kept first and trees
+                    // and bushes get separate quotas (VegetationBudget). The editor's
+                    // hierarchy copies every entity each update and crashed natively
+                    // at about 3.86 M trees (DC, 6 m spacing, 4.3 M planned); imports
+                    // up to about 3.2 M objects completed.
                     var density = result.Download.Request.VegetationDensity;
 
-                    // Above VegetationCeiling the same hash thins the whole plan
-                    // evenly. The editor's hierarchy copies every entity each update
-                    // and crashed natively at about 3.86 M trees (DC, 6 m spacing,
-                    // 4.3 M planned); imports up to about 3.2 M objects completed.
-                    if (vegetation.Count * density > VegetationCeiling)
+                    if ((density < 1 || vegetation.Count > VegetationCeiling) && vegetation.Count > 0)
                     {
-                        var share = VegetationCeiling / (float)vegetation.Count;
-                        log.Evidence(
-                            $"Vegetation ceiling: {vegetation.Count:N0} planned trees and bushes at {density:P0} exceed {VegetationCeiling:N0}; density lowered to {share:P0}.");
+                        var budget = VegetationBudget.Fit(vegetation, density, VegetationCeiling);
 
-                        density = share;
-                    }
-
-                    if (density < 1 && vegetation.Count > 0)
-                    {
-                        var kept =
-                            vegetation
-                                .Where(
-                                    candidate => (Unity.Mathematics.math.hash(
-                                        new Unity.Mathematics.uint2(candidate.Seed, 0x7E5u))
-                                        & 0xFFFF)
-                                        / 65536f
-                                        < density)
-                                .ToArray();
+                        if (budget.Capped)
+                            log.Evidence(
+                                $"Vegetation ceiling: {budget.TreesPlanned + budget.ShrubsPlanned:N0} trees and bushes at {density:P0} exceed {VegetationCeiling:N0}; kept {budget.MappedKept:N0} mapped, {budget.TreesKept:N0} of {budget.TreesPlanned:N0} trees and {budget.ShrubsKept:N0} of {budget.ShrubsPlanned:N0} bushes.");
 
                         log.Evidence(
-                            $"Vegetation density {density:P0}: {kept.Length:N0} of {vegetation.Count:N0} planned trees and bushes kept.");
+                            $"Vegetation density {density:P0}: {budget.Kept.Length:N0} of {budget.Planned:N0} planned trees and bushes kept.");
 
-                        vegetation = new VegetationPlan(kept, vegetation.Metadata.ToArray());
+                        vegetation = new VegetationPlan(budget.Kept, vegetation.Metadata.ToArray());
                     }
                 }
                 catch (Exception error) when (error is not OperationCanceledException

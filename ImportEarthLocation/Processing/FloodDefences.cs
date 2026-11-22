@@ -285,6 +285,26 @@ public static class FloodDefences
         return restored;
     }
 
+    // Restore on a window of the map: `heights` holds `width` columns per row, its first cell
+    // at column x and row z of the crests' grid, `resolution` cells square.
+    public static int Restore(float[] heights, float[] crests, int x, int z, int width, int resolution)
+    {
+        var restored = 0;
+
+        for (var index = 0; index < heights.Length; index++)
+        {
+            var id = (z + index / width) * resolution + x + index % width;
+
+            if (heights[index] < crests[id])
+            {
+                heights[index] = crests[id];
+                restored++;
+            }
+        }
+
+        return restored;
+    }
+
     // Land cells some water reaches: cells below the sea or an inland surface (metres, NaN
     // where none) that the water floods into and that are not themselves that water.
     public static bool[] Drowned(float[] heights, float seaSurface, float[]? inlandSurface)

@@ -544,8 +544,10 @@ namespace ImportEarthLocation.Systems
 
                 _leaseLog?.Count("Vegetation accepted native objects", accepted);
                 _leaseLog?.Count("Vegetation native outcomes unverified", unverified);
-                _leaseLog?.Diagnostic(
-                    $"VEGETATION OUTCOME batch={_diagnosticBatchStem}; candidatesProcessed={_foliageRequested}; definitionsSubmitted={_foliageDefinitions}; capturedNewPlantTemps={_foliageCandidates.Count}; acceptedCapturedObjects={accepted}; unverifiedCapturedObjects={unverified}; definitionToObjectMatching=false; definitionMinusCapturedDifference={_foliageDefinitions - _foliageCandidates.Count}; differenceIsNotProvenLoss=true; mapSession={_leaseEpoch.MapSession}; generation={_leaseEpoch.Generation}");
+
+                if (_leaseLog?.DiagnosticsEnabled == true)
+                    _leaseLog.Diagnostic(
+                        $"VEGETATION OUTCOME batch={_diagnosticBatchStem}; candidatesProcessed={_foliageRequested}; definitionsSubmitted={_foliageDefinitions}; capturedNewPlantTemps={_foliageCandidates.Count}; acceptedCapturedObjects={accepted}; unverifiedCapturedObjects={unverified}; definitionToObjectMatching=false; definitionMinusCapturedDifference={_foliageDefinitions - _foliageCandidates.Count}; differenceIsNotProvenLoss=true; mapSession={_leaseEpoch.MapSession}; generation={_leaseEpoch.Generation}");
             }
 
             _foliageCandidates.Clear();
@@ -558,8 +560,9 @@ namespace ImportEarthLocation.Systems
                         && !EntityManager.HasComponent<PrefabData>(entity)
                         && !EntityManager.HasComponent<NetCompositionData>(entity));
 
-                _leaseLog?.Diagnostic(
-                    $"NATIVE OWNERSHIP SETTLED batch={_diagnosticBatchStem}; retainedEntities={_ownedEntities.Count}; includesGeneratedObjects=true; candidatesFromExclusivePreviewOnly=true; worldScan=false; geometryCertificationRequired=false");
+                if (_leaseLog?.DiagnosticsEnabled == true)
+                    _leaseLog.Diagnostic(
+                        $"NATIVE OWNERSHIP SETTLED batch={_diagnosticBatchStem}; retainedEntities={_ownedEntities.Count}; includesGeneratedObjects=true; candidatesFromExclusivePreviewOnly=true; worldScan=false; geometryCertificationRequired=false");
             }
             else
                 _ownedEntities.DiscardBatch();
@@ -619,8 +622,8 @@ namespace ImportEarthLocation.Systems
                     wrongPrefab++;
             }
 
-            if (_foliageRequested >= 0)
-                _leaseLog?.Diagnostic(
+            if (_foliageRequested >= 0 && _leaseLog?.DiagnosticsEnabled == true)
+                _leaseLog.Diagnostic(
                     $"VEGETATION PREVIEW FUNNEL batch={_diagnosticBatchStem}; candidatesProcessed={_foliageRequested}; definitionsSubmitted={_foliageDefinitions}; claimedTemps={_claimedTemps.Count}; eligibleNewPlantTemps={_foliageCandidates.Count}; missingTempOrPrefabRef={missingContract}; deletedOrCancelled={retiredOrCancelled}; originalUpdates={originalUpdates}; nonPlantObjects={nonPlant}; missingPlantPrefabData={wrongPrefab}; filtersPartitionClaimedTemps=true; definitionToObjectMatching=false");
         }
 
@@ -640,8 +643,9 @@ namespace ImportEarthLocation.Systems
                     (temporary.m_Flags & TempFlags.Delete) != 0, (temporary.m_Flags & TempFlags.Cancel) != 0);
             }
 
-            _leaseLog?.Diagnostic(
-                $"NATIVE OWNERSHIP CAPTURE batch={_diagnosticBatchStem}; claimedPreviewEntities={_claimedTemps.Count}; retainedBeforeApply={_ownedEntities.Count}; includesGeneratedObjects=true; applyIssued=false");
+            if (_leaseLog?.DiagnosticsEnabled == true)
+                _leaseLog.Diagnostic(
+                    $"NATIVE OWNERSHIP CAPTURE batch={_diagnosticBatchStem}; claimedPreviewEntities={_claimedTemps.Count}; retainedBeforeApply={_ownedEntities.Count}; includesGeneratedObjects=true; applyIssued=false");
         }
 
         public static long BeginMapRetirement()

@@ -73,7 +73,11 @@ public sealed class Cap
         ["cairo-1113b"] = "r-53b8b90288444fe287759b439e540292",
         ["marseille-1113d"] = "r-d63b4b30392843a894ea9c9f9fe1a090",
         ["dc-1113d"] = "r-9dc3b4d084254135b338a29ac3557fd7",
-        ["cairo-1113d"] = "r-00b4dfc7377842b4bddee066c0a2c78f"
+        ["cairo-1113d"] = "r-00b4dfc7377842b4bddee066c0a2c78f",
+        ["montreal-1119"] = "r-16aea08148814e68a4afeb2b38c141a3",
+        ["quebec-1119"] = "r-ed736ed2132b4680a5037e2160ba69c2",
+        ["montreal-1120"] = "r-636d89f8b19142139e6383a053862e43",
+        ["quebec-1120"] = "r-f1d692b5007c4e5c9216db47c8b51500"
         };
 
     public Cap(string map)

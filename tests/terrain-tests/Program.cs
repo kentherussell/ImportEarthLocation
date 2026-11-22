@@ -303,6 +303,10 @@ namespace ImportEarthLocation.Core
         public bool StrictRecovery { get; init; }
 
         public void Diagnostic(string text) { }
+
+        public void AddDuration(string name, double seconds) { }
+
+        public void Count(string name, int count = 1) { }
     }
 }
 namespace ImportEarthLocation.Processing

@@ -255,16 +255,34 @@ static partial class VisualMetricsReplay
     {
         var capture = Load(folder);
         var request = capture.Input["request"]!.ToObject<ImportRequest>()! with { ImportRocks = true };
-        // Several tiles (separated by |) are parsed one by one and combined.
+        // Several tiles (separated by |) are parsed one by one and combined. A parsed-OSM
+        // cache file (.bin) is the exact dataset the game planned from. A folder of them
+        // stands for every cache file whose first node lies within 40 km of the map centre.
+        var files =
+            Directory.Exists(osm)
+                ? Directory
+                    .GetFiles(osm, "*.bin")
+                    .Where(
+                        file => WaterReplayMetrics.FirstNode(file) is var (latitude, longitude)
+                            && math.length(
+                                ImportEarthLocation.Geo.GeoMath
+                                    .ToLocalMeters(latitude, longitude, request.Latitude, request.Longitude)
+                                    .xz)
+                                < 40000)
+                    .OrderBy(file => file, StringComparer.Ordinal)
+                    .ToArray()
+                : osm.Split('|');
+
         var tiles =
-            osm
-                .Split('|')
+            files
                 .Select(
-                    text => OsmParser.Merge(
-                        new[] { File.ReadAllBytes(text) },
-                        new ImportLog(),
-                        default,
-                        wholeMap: true))
+                    text => text.EndsWith(".bin", StringComparison.OrdinalIgnoreCase)
+                        ? OsmParsedCache.LoadSnapshot(text, default)
+                        : OsmParser.Merge(
+                            new[] { File.ReadAllBytes(text) },
+                            new ImportLog(),
+                            default,
+                            wholeMap: true))
                 .ToArray();
 
         var data = tiles.Length == 1 ? tiles[0] : new OsmDataset
@@ -294,6 +312,22 @@ static partial class VisualMetricsReplay
                 : Array.Empty<GeographicPolygon>();
 
         var terrain = new TerrainBuilder.Result(capture.Terrain, capture.Scale, 0, 0, capture.Scale);
+
+        // The captured water plan's stages: the rivers and lakes rock must stay out of. Its
+        // sources are not captured, so placement near them is not checked here.
+        WaterStage[] Stages<WaterStage>(string name)
+            => capture.Input[name] != null
+                ? CorrectiveCapturedReplay.ReadManifest<WaterStage>(folder, (string)capture.Input[name]!)
+                : Array.Empty<WaterStage>();
+
+        var waterPlan =
+            new WaterPlan(false, 0, 0, 0, "replay")
+            {
+                WaterCellSize = CapturedRunFiles.WaterCellSize(folder, capture.Input),
+                AreaStages = Stages<WaterAreaStage>("waterAreasManifest"),
+                ReachStages = Stages<WaterReachStage>("waterReachesManifest")
+            };
+
         var log = new ImportLog();
         var watch = System.Diagnostics.Stopwatch.StartNew();
         var rocks =
@@ -303,7 +337,7 @@ static partial class VisualMetricsReplay
                 terrain,
                 capture.Source,
                 water,
-                new WaterPlan(false, 0, 0, 0, "replay"),
+                waterPlan,
                 log,
                 default);
 
@@ -1038,6 +1072,73 @@ static partial class VisualMetricsReplay
                 new MapSizeProfile("replay", "replay", item.Width, false),
                 false);
 
+        var phaseWatch = System.Diagnostics.Stopwatch.StartNew();
+
+        void Phase(string name)
+        {
+            Console.WriteLine($"  TIME {name}: {phaseWatch.Elapsed.TotalSeconds:0.0} s");
+            phaseWatch.Restart();
+        }
+
+        // A folder of parsed caches: the file with the most waterways on this map. Only
+        // files whose first node lies within 150 km of the map centre are loaded in full;
+        // the folder holds several gigabytes of other cities.
+        if (Directory.Exists(osm))
+        {
+            bool Near(string file)
+            {
+                try
+                {
+                    if (WaterReplayMetrics.FirstNode(file) is not var (latitude, longitude))
+                        return false;
+
+                    var local =
+                        GeoMath.ToLocalMeters(latitude, longitude, importRequest.Latitude, importRequest.Longitude);
+
+                    return math.length(local.xz) < 150000;
+                }
+                catch (IOException)
+                {
+                    return false;
+                }
+            }
+
+            var files = Directory.GetFiles(osm, "*.bin");
+            var near = files.Where(Near).ToArray();
+
+            osm =
+                (near.Length > 0 ? near : files)
+                    .Select(file =>
+                    {
+                        try
+                        {
+                            var candidate = OsmParsedCache.LoadSnapshot(file, default);
+                            var count =
+                                candidate.Ways.Values.Count(
+                                    way => way.Tags.ContainsKey("waterway")
+                                        && way.NodeIds.Length > 0
+                                        && candidate.Nodes.TryGetValue(way.NodeIds[0], out var node)
+                                        && GeoMath.ToLocalMeters(
+                                                node.Latitude,
+                                                node.Longitude,
+                                                importRequest.Latitude,
+                                                importRequest.Longitude) is var local
+                                        && Math.Abs(local.x) < half
+                                        && Math.Abs(local.z) < half);
+
+                            return (File: file, Count: count);
+                        }
+                        catch (Exception error) when (error is InvalidDataException or EndOfStreamException or IOException)
+                        {
+                            return (File: file, Count: 0);
+                        }
+                    })
+                    .OrderByDescending(entry => entry.Count)
+                    .First()
+                    .File;
+        }
+
+        Console.WriteLine("water replay OSM: " + Path.GetFileName(osm));
         var data = OsmParsedCache.LoadSnapshot(osm, default);
         var polygons =
             CorrectiveCapturedReplay.ReadManifest<GeographicPolygon>(
@@ -1096,19 +1197,8 @@ static partial class VisualMetricsReplay
             }
         }
 
-        var wetIndex =
-            polygons
-                .Select(
-                    polygon => (
-                        Polygon: polygon,
-                        Min: polygon.Outer
-                            .SelectMany(points => points)
-                            .Aggregate(new float2(float.MaxValue), (m, point) => math.min(m, point.xz)),
-                        Max: polygon.Outer
-                            .SelectMany(points => points)
-                            .Aggregate(new float2(float.MinValue), (m, point) => math.max(m, point.xz))))
-                .ToArray();
-
+        Phase("load");
+        var wet = WaterReplayMetrics.Inside(polygons, resolution, spacing, half);
         var cells = new List<int>();
 
         for (var i = 0; i < restore.Length; i++)
@@ -1116,14 +1206,7 @@ static partial class VisualMetricsReplay
             if (!restore[i])
                 continue;
 
-            var point = new float3(i % resolution * spacing - half, 0, i / resolution * spacing - half);
-
-            if (wetIndex.Any(
-                otherItem => point.x >= otherItem.Min.x
-                    && point.z >= otherItem.Min.y
-                    && point.x <= otherItem.Max.x
-                    && point.z <= otherItem.Max.y
-                    && otherItem.Polygon.Contains(point)))
+            if (wet[i])
             {
                 restore[i] = false;
                 continue;
@@ -1140,23 +1223,296 @@ static partial class VisualMetricsReplay
             foreach (var i in cells)
                 ground[i] = (ground[i - 1] + ground[i + 1] + ground[i - resolution] + ground[i + resolution]) / 4;
 
+        // WATER_DEM=<file>: a float32 grid of the source elevation in sea-relative metres, at the
+        // map's resolution. It replaces the whole ground, so lakes and rivers are planned on the
+        // ground the game planned on, not on its own water cuts in the captured heightmap.
+        if (Environment.GetEnvironmentVariable("WATER_DEM") is { Length: > 0 } demFile && File.Exists(demFile))
+        {
+            var raw = File.ReadAllBytes(demFile);
+            var dem = new float[raw.Length / 4];
+            Buffer.BlockCopy(raw, 0, dem, 0, raw.Length);
+            var replaced = 0;
+
+            for (var i = 0; i < ground.Length && i < dem.Length; i++)
+                if (!float.IsNaN(dem[i]))
+                {
+                    ground[i] = dem[i] + seaLevel;
+                    replaced++;
+                }
+
+            Console.WriteLine($"  WATER_DEM replaced {replaced:N0} cells");
+        }
+
         var original = ground;
         Console.WriteLine($"  restored {cells.Count:N0} cells near {lines.Length:N0} waterways");
+        Phase("rebuild ground");
         var terrain = new TerrainBuilder.Result(original, item.Scale, seaLevel, 0, item.Scale);
+
+        // Plans on the rebuilt ground with the earlier or the current channel cross-section,
+        // so the two are compared like for like (report 117).
+        WaterPlan Plan(bool earlierProfile, ImportLog planLog)
+        {
+            WaterBodyPlanner.EarlierChannelProfile = earlierProfile;
+
+            try
+            {
+                return WaterBodyPlanner.Prepare(data, polygons, importRequest, terrain, planLog, default, cell);
+            }
+            finally
+            {
+                WaterBodyPlanner.EarlierChannelProfile = false;
+            }
+        }
+
+        // The crossing report only needs the current plan.
+        var earlierLog = new ImportLog();
+        var earlierPlan = reportPath == null ? Plan(true, earlierLog) : null;
+
+        if (earlierPlan != null)
+            Phase("plan, earlier profile");
+
         var log = new ImportLog();
         var watch = System.Diagnostics.Stopwatch.StartNew();
-        var plan = WaterBodyPlanner.Prepare(data, polygons, importRequest, terrain, log, default, cell);
+        var plan = Plan(false, log);
         var traceDams = int.TryParse(Environment.GetEnvironmentVariable("WATER_DAMS"), out var shown) ? shown : 0;
 
         float Bed(float[] map, float3 point) => NetworkProcessor.Sample(point.x, point.z, map, item.Width);
 
         Console.WriteLine($"  planned in {watch.Elapsed.TotalSeconds:0.0} s");
+        Console.WriteLine("  FINGERPRINT water plan " + PlanHash.Water(plan));
+
+        if (earlierPlan != null)
+            Console.WriteLine("  FINGERPRINT water plan, earlier profile " + PlanHash.Water(earlierPlan));
+
+        // WATER_PROBE_LINE=x0,z0,x1,z1[,step]: the rebuilt ground, the planned bed and the
+        // planned water surface along a line, in metres above the sea level given, to see
+        // what the plan does across a river (Quebec City's St Lawrence, 11-18).
+        if (Environment.GetEnvironmentVariable("WATER_PROBE_LINE") is { Length: > 0 } probeLine)
+        {
+            var values =
+                probeLine.Split(',').Select(text => float.Parse(text, CultureInfo.InvariantCulture)).ToArray();
+
+            var surface = WaterBodyPlanner.ConstructedSurfaceSampler(plan, polygons);
+            var bed = plan.ConditionedHeights ?? original;
+            var from = new float2(values[0], values[1]);
+            var to = new float2(values[2], values[3]);
+            var stepMeters = values.Length > 4 ? values[4] : 250;
+            var length = math.distance(from, to);
+
+            for (var along = 0f; along <= length; along += stepMeters)
+            {
+                var at = math.lerp(from, to, along / length);
+                var point = new float3(at.x, 0, at.y);
+                var level = surface(point) is float stage ? (stage - seaLevel).ToString("0.0") : "-";
+                var nearest =
+                    plan.ReachStages
+                        .Select(reach =>
+                        {
+                            var delta = reach.End.xz - reach.Start.xz;
+                            var t = math.clamp(math.dot(at - reach.Start.xz, delta) / Math.Max(1e-6f, math.lengthsq(delta)), 0, 1);
+                            return (Reach: reach, Distance: math.distance(at, math.lerp(reach.Start.xz, reach.End.xz, t)), T: t);
+                        })
+                        .OrderBy(item => item.Distance)
+                        .FirstOrDefault();
+
+                var reachText =
+                    nearest.Reach == null
+                        ? "none"
+                        : $"{nearest.Distance:0} m, level {math.lerp(nearest.Reach.StartLevel, nearest.Reach.EndLevel, nearest.T) - seaLevel:0.0}, polygon {nearest.Reach.PolygonId}";
+
+                Console.WriteLine(
+                    $"  PROBE x={at.x:0} z={at.y:0} ground={Bed(original, point) - seaLevel:0.0} bed={Bed(bed, point) - seaLevel:0.0} surface={level} nearestReach={reachText}");
+            }
+        }
+
+        foreach (var name in new[]
+            {
+                "indexing mapped water",
+                "mapped lakes",
+                "connecting river reaches",
+                "sampling contained river stage bounds",
+                "solving directed water stages",
+                "conditioning river beds and placing controls",
+                "publishing conditioned water terrain",
+                "smoothing newly carved banks",
+                "checking lake containment"
+                })
+            Console.WriteLine($"    PHASE {name}: {log.Metric($"Water plan: {name} time (s)"):0.00} s");
+        Phase("plan, current profile");
 
         foreach (var line in log.Lines.Where(
             otherText => otherText.StartsWith("Rivers:") || otherText.StartsWith("Water:")))
             Console.WriteLine("  " + line);
 
         var planned = plan.ConditionedHeights ?? original;
+
+        // Dry river banks (report 116): across every channel reach, the steepest step
+        // between neighbouring grid samples where both stand over half a metre above the
+        // water, out to 200 m each side. The capture's own terrain carries the cut it was
+        // planned with, so the two lines compare the earlier banks with the current ones.
+        void BankSlopes(string label, float[] map)
+        {
+            var steepest = new List<float>();
+
+            foreach (var reach in plan.ReachStages.Where(reach => reach.PolygonId == null))
+            {
+                var middle = (reach.Start + reach.End) * .5f;
+                var level = (reach.StartLevel + reach.EndLevel) * .5f;
+                var along = math.normalizesafe((reach.End - reach.Start).xz);
+                var across = new float3(-along.y, 0, along.x);
+
+                foreach (var side in new[] { -1, 1 })
+                {
+                    var worst = 0f;
+
+                    for (var d = spacing; d <= 200; d += spacing)
+                    {
+                        var a = Bed(map, middle + across * (side * (d - spacing)));
+                        var b = Bed(map, middle + across * (side * d));
+
+                        if (a > level + .5f && b > level + .5f)
+                            worst = Math.Max(worst, Math.Abs(b - a) / spacing);
+                    }
+
+                    steepest.Add(worst);
+                }
+            }
+
+            if (steepest.Count == 0)
+                return;
+
+            steepest.Sort();
+            float Share(float limit) => 100f * steepest.Count(slope => slope > limit) / steepest.Count;
+
+            Console.WriteLine(
+                $"  BANKS {label}: steepest dry slope P50 {steepest[steepest.Count / 2]:0.00}, P90 {steepest[steepest.Count * 9 / 10]:0.00}, P99 {steepest[steepest.Count * 99 / 100]:0.00}; over 0.7 (35°) {Share(.7f):0.0}%, over 1.0 (45°) {Share(1f):0.0}% of {steepest.Count} bank sides");
+        }
+
+        var earlierPlanned = earlierPlan?.ConditionedHeights;
+        BankSlopes("captured (earlier cut, true ground)", item.Terrain);
+
+        if (earlierPlanned != null)
+            BankSlopes("earlier profile (rebuilt ground)", earlierPlanned);
+
+        BankSlopes("planned now (rebuilt ground)", planned);
+
+        // Cut-only figures: every waterway reach of the current plan, polygon rivers
+        // included, out to 150 m.
+        var band = WaterReplayMetrics.NearestLevel(plan.ReachStages, resolution, spacing, half, 200, out var bandDistance);
+
+        if (earlierPlanned != null)
+        {
+            WaterReplayMetrics.CutBanks("earlier profile", original, earlierPlanned, band, bandDistance, wet, resolution, spacing);
+            double outside = 0;
+
+            for (var i = 0; i < planned.Length; i++)
+                if (float.IsNaN(band[i]))
+                    outside += Math.Abs(earlierPlanned[i] - planned[i]);
+
+            Console.WriteLine(
+                FormattableString.Invariant(
+                    $"  CUT profiles differ outside the 200 m band by {outside * spacing * spacing / 1e6:0.000} million m³"));
+        }
+
+        WaterReplayMetrics.CutBanks("planned now", original, planned, band, bandDistance, wet, resolution, spacing);
+        Phase("bank metrics");
+
+        // WATER_RENDER="x,z,half,file.png": shaded relief (3x vertical, 1 m contours) of that window, the capture's
+        // terrain (earlier cut) left and the planned terrain right, at 1.5 m a pixel, light
+        // from the north-west. Ground below the nearest channel reach's level within 150 m
+        // is drawn blue, darker with depth.
+        if (Environment.GetEnvironmentVariable("WATER_RENDER")?.Split(',') is { Length: 4 } render)
+        {
+            var cx = float.Parse(render[0], System.Globalization.CultureInfo.InvariantCulture);
+            var cz = float.Parse(render[1], System.Globalization.CultureInfo.InvariantCulture);
+            var window = float.Parse(render[2], System.Globalization.CultureInfo.InvariantCulture);
+            const float Pixel = 1.5f;
+            var size = (int)(2 * window / Pixel);
+            var rgb = new byte[size * 2 * size * 3];
+
+            var nearby =
+                plan.ReachStages
+                    .Where(
+                        reach => reach.PolygonId == null
+                            && math.distance(((reach.Start + reach.End) * .5f).xz, new float2(cx, cz)) < window + 300)
+                    .ToArray();
+
+            float Level(float3 point)
+            {
+                var best = float.NaN;
+                var nearest = 150f;
+
+                foreach (var reach in nearby)
+                {
+                    var distance = NetworkNormalizer.DistanceToSegment(point, reach.Start, reach.End);
+
+                    if (distance < nearest)
+                    {
+                        nearest = distance;
+                        best = (reach.StartLevel + reach.EndLevel) * .5f;
+                    }
+                }
+
+                return best;
+            }
+
+            for (var panel = 0; panel < 2; panel++)
+            {
+                var map = panel == 0 ? item.Terrain : planned;
+
+                for (var row = 0; row < size; row++)
+                    for (var column = 0; column < size; column++)
+                    {
+                        var point = new float3(cx - window + column * Pixel, 0, cz + window - row * Pixel);
+                        var h = Bed(map, point);
+                        var dx = Bed(map, point + new float3(Pixel, 0, 0)) - Bed(map, point - new float3(Pixel, 0, 0));
+                        var dz = Bed(map, point + new float3(0, 0, Pixel)) - Bed(map, point - new float3(0, 0, Pixel));
+                        // Three times vertical exaggeration, and a darker line at every whole metre.
+                        var normal = math.normalize(new float3(-3 * dx, 2 * Pixel, -3 * dz));
+                        var light = math.saturate(math.dot(normal, math.normalize(new float3(-1, 1.5f, 1))));
+                        var shade = .15f + .85f * light;
+                        var colour = new float3(.55f, .6f, .4f) * shade;
+                        var right = Bed(map, point + new float3(Pixel, 0, 0));
+                        var below = Bed(map, point - new float3(0, 0, Pixel));
+
+                        if (Math.Floor(h) != Math.Floor(right) || Math.Floor(h) != Math.Floor(below))
+                            colour *= .55f;
+                        var level = Level(point);
+
+                        if (!float.IsNaN(level) && h < level)
+                            colour = math.lerp(colour, new float3(.1f, .3f, .55f), math.saturate(.4f + (level - h) / 8));
+
+                        var at = (row * size * 2 + panel * size + column) * 3;
+                        rgb[at] = (byte)(255 * math.saturate(colour.x));
+                        rgb[at + 1] = (byte)(255 * math.saturate(colour.y));
+                        rgb[at + 2] = (byte)(255 * math.saturate(colour.z));
+                    }
+            }
+
+            // The cross-section through the nearest reach, every 7 m from 100 m on one side to
+            // 100 m on the other: earlier cut, planned.
+            var closest =
+                nearby.OrderBy(reach => NetworkNormalizer.DistanceToSegment(new float3(cx, 0, cz), reach.Start, reach.End))
+                    .FirstOrDefault();
+
+            if (closest != null)
+            {
+                var middle = (closest.Start + closest.End) * .5f;
+                var along = math.normalizesafe((closest.End - closest.Start).xz);
+                var across = new float3(-along.y, 0, along.x);
+                Console.WriteLine($"  SECTION at ({middle.x:0}, {middle.z:0}); water level {(closest.StartLevel + closest.EndLevel) * .5f:0.0}");
+
+                for (var d = -100f; d <= 100f; d += 7)
+                {
+                    var p = middle + across * d;
+                    Console.WriteLine($"  SECTION {d,5:0} m  earlier {Bed(item.Terrain, p),7:0.0}  planned {Bed(planned, p),7:0.0}");
+                }
+            }
+
+            WritePng(render[3], size * 2, size, rgb);
+            Console.WriteLine("  render saved: " + render[3]);
+        }
+
         IReadOnlyList<PreparedSegment>? networks = null;
         object? crossingReport = null;
 
@@ -1171,7 +1527,7 @@ static partial class VisualMetricsReplay
             var channels =
                 WaterBodyPlanner
                     .BuriedChannels(data, importRequest, cell)
-                    .Concat(WaterBodyPlanner.OpenChannels(data, importRequest, cell))
+                    .Concat(WaterBodyPlanner.OpenChannels(data, importRequest, cell, plan.MovedWaterwayNodes))
                     .ToArray();
 
             networks = NetworkStructureIntervals.CulvertBridges(captured, channels, resolution, width, log, default);
@@ -1181,14 +1537,52 @@ static partial class VisualMetricsReplay
         var revalidated =
             WaterBodyPlanner.Revalidate(plan, terrain with { Heights = planned }, item.Width, log, default, networks);
 
+        Console.WriteLine("  FINGERPRINT revalidated water plan " + PlanHash.Water(revalidated));
+
         Console.WriteLine(
             $"  sources {plan.Sources.Count:N0}, kept by Revalidate {revalidated.Sources.Count:N0} (rivers {plan.Sources.Count(river => river.BodyKind == "river"):N0} → {revalidated.Sources.Count(river => river.BodyKind == "river"):N0})");
+
+        Phase("revalidate");
+
+        // River line at risk of running dry in the game (report 117), for each profile with
+        // the sources its own Revalidate keeps.
+        void Connectivity(string label, WaterPlan kept, float[] map) =>
+            WaterReplayMetrics.Connectivity(
+                label,
+                WaterReplayMetrics.WalkLines(
+                    kept.ReachStages,
+                    (x, z) => NetworkProcessor.Sample(x, z, map, item.Width),
+                    kept.Sources
+                        .Select(
+                            river => new WaterReplayMetrics.Source(
+                                river.Position.xz,
+                                river.Radius,
+                                river.TargetSurfaceLevel ?? river.Position.y + river.Depth))
+                        .ToArray(),
+                    cell,
+                    WaterReplayMetrics.MinimumGridWeight));
+
+        if (earlierPlan != null && earlierPlanned != null)
+            Connectivity(
+                "earlier profile",
+                WaterBodyPlanner.Revalidate(
+                    earlierPlan,
+                    terrain with { Heights = earlierPlanned },
+                    item.Width,
+                    earlierLog,
+                    default,
+                    networks),
+                earlierPlanned);
+
+        Connectivity("planned now", revalidated, planned);
+        Phase("connectivity");
 
         var keptIds =
             revalidated.Sources.Select(river => (river.BodyId, river.Position.x, river.Position.z)).ToHashSet();
 
         foreach (var river in plan.Sources
             .Where(otherRiver => !keptIds.Contains((otherRiver.BodyId, otherRiver.Position.x, otherRiver.Position.z)))
+            .Where(otherRiver => otherRiver.BankProbes.Count > 0)
             .Take(traceDams))
         {
             var low = river.BankProbes.OrderBy(point => Bed(planned, point)).First();
@@ -1203,20 +1597,157 @@ static partial class VisualMetricsReplay
         foreach (var name in new[]{
             "Water stage bank conflicts",
             "Water source footprint policy rejected",
+            "Water lakes left uncarved without a source",
+            "Water lakes lowered to their escape",
+            "Water lakes lowered to their escape after containment",
+            "Water lakes dropped after containment",
+            "Water earth dams built",
+            "Water terrain cells restored from rejected lakes",
+            "Water lakes given a source on a second try",
+            "Water sea-level samples left to the sea without a source",
+            "Water sources placed in wide river areas",
             "Water locally infeasible reaches",
             "Water final bank conflicts",
+            "Water controls with bank probes on planned water",
+            "Water levee cells raised",
             "River raster components reseeded",
             "Water stage uphill residual edges",
             "Water endpoint gaps connected",
+                "Water line nodes moved to the valley floor",
                 "Water buried waterways opened",
                 "Water buried channel metres",
                 "Lake containment bodies checked",
                 "Lake containment levels lowered",
-                "Lake containment bodies omitted"
+                "Lake containment bodies omitted",
+                "Lake containment bodies too large to screen",
+                "Water large lakes given wide sources"
                 })
             Console.WriteLine($"    {name}: {log.Metric(name)}");
 
-        long samples = 0, dammed = 0, dams = 0;
+        // WATER_SOURCES_NEAR=x,z,radius: the planned sources inside that circle, and whether
+        // each is still there after Revalidate.
+        if (Environment.GetEnvironmentVariable("WATER_SOURCES_NEAR") is { Length: > 0 } circle)
+        {
+            var parts =
+                circle.Split(',')
+                    .Select(text => float.Parse(text, System.Globalization.CultureInfo.InvariantCulture))
+                    .ToArray();
+
+            foreach (var river in plan.Sources.Where(
+                river => math.distance(river.Position.xz, new float2(parts[0], parts[1])) <= parts[2]))
+                Console.WriteLine(
+                    $"    SOURCE way {river.WayId} body {river.BodyId} {river.BodyKind} at ({river.Position.x:0},{river.Position.z:0}) bed {river.Position.y:0.0} depth {river.Depth:0.0} radius {river.Radius:0.0} grid {river.GridSnapped}; kept {revalidated.Sources.Any(other => math.distance(other.Position.xz, river.Position.xz) < .5f)}");
+        }
+
+        // WATER_NATIVE_BANKS=1: the apply-time bank check (NativeWaterBridge), replayed on the
+        // game's own terrain as this run read it back: how many sources the game would skip
+        // because a bank probe stands under their level there, and how many of those a level
+        // 0.35 m under that bank would keep.
+        if (Environment.GetEnvironmentVariable("WATER_NATIVE_BANKS") == "1")
+        {
+            var nativeMeta =
+                JObject.Parse(File.ReadAllText(CapturedRunFiles.Resolve(folder, "native-observed-terrain.json")));
+
+            var native =
+                CapturedRunFiles.Heights(
+                    CapturedRunFiles.Resolve(folder, (string)nativeMeta["heightFile"]!),
+                    (float)nativeMeta["scale"]!);
+
+            var nativeWidth = (double)nativeMeta["width"]!;
+
+            float Native(float3 point) => NetworkProcessor.Sample(point.x, point.z, native, nativeWidth);
+
+            int skipped = 0, rescued = 0, tooFar = 0, tooThin = 0;
+            var drops = new List<float>();
+
+            foreach (var river in revalidated.Sources)
+            {
+                var target = river.TargetSurfaceLevel ?? river.Position.y + river.Depth;
+                var bank = river.BankProbes.Aggregate(river.BankLevel, (lowest, probe) => Math.Min(lowest, Native(probe)));
+
+                if (target <= bank - .25f)
+                    continue;
+
+                skipped++;
+                drops.Add(target - (bank - .35f));
+
+                if (target - (bank - .35f) > 1)
+                    tooFar++;
+                else if (bank - .35f - Native(river.Position) < .4f)
+                    tooThin++;
+                else
+                    rescued++;
+            }
+
+            // Against what the game actually created (the snapshot after apply), so the check
+            // above is calibrated: which planned sources are missing, and how many of those it
+            // predicts.
+            var snapshot =
+                JObject.Parse(File.ReadAllText(CapturedRunFiles.Resolve(folder, "native-snapshot-after-apply.json")));
+
+            var created =
+                (snapshot["water"] as JArray ?? new JArray())
+                    .Select(item => new float2((float)item["x"]!, (float)item["z"]!))
+                    .ToArray();
+
+            int missing = 0, missingPredicted = 0, presentPredicted = 0;
+
+            foreach (var river in revalidated.Sources)
+            {
+                var target = river.TargetSurfaceLevel ?? river.Position.y + river.Depth;
+                var bank = river.BankProbes.Aggregate(river.BankLevel, (lowest, probe) => Math.Min(lowest, Native(probe)));
+                var predicted = target > bank - .25f;
+                var present = created.Any(point => math.distance(point, river.Position.xz) < .5f);
+
+                if (!present)
+                {
+                    missing++;
+
+                    if (predicted)
+                        missingPredicted++;
+
+                    if (missing <= 12)
+                        Console.WriteLine(
+                            $"    MISSING {river.BodyKind} way {river.WayId} at ({river.Position.x:0},{river.Position.z:0}) target {target:0.00} game bank {bank:0.00} game bed {Native(river.Position):0.00} grid {river.GridSnapped} radius {river.Radius:0.0}");
+                }
+                else if (predicted)
+                    presentPredicted++;
+            }
+
+            Console.WriteLine(
+                $"  NATIVE BANKS vs game: {created.Length:N0} created; {missing:N0} replayed sources missing in the game, {missingPredicted:N0} of them predicted by the bank check; {presentPredicted:N0} predicted but present");
+
+            drops.Sort();
+            Console.WriteLine(
+                $"  NATIVE BANKS: of {revalidated.Sources.Count:N0} sources, {skipped:N0} stand above a bank on the game's terrain; lowered 0.35 m under it: kept {rescued:N0}, over 1 m lower {tooFar:N0}, under 0.4 m of water {tooThin:N0}; drop needed P50 {(drops.Count > 0 ? drops[drops.Count / 2] : 0):0.00}, P90 {(drops.Count > 0 ? drops[drops.Count * 9 / 10] : 0):0.00} m");
+        }
+
+        // WATER_LINES=<text>: the planner's diagnostic lines that contain it.
+        if (Environment.GetEnvironmentVariable("WATER_LINES") is { Length: > 0 } wanted)
+            foreach (var line in log.Lines.Where(line => line.Contains(wanted)))
+                Console.WriteLine($"    LINE {line}");
+
+        // The line as the planner carved it: nodes it moved onto the valley floor stand there.
+        float3 Placed(long id) => plan.MovedWaterwayNodes.TryGetValue(id, out var target) ? target : Local(id);
+
+        foreach (var pair in plan.MovedWaterwayNodes
+            .OrderBy(pair => Bed(original, pair.Value) - Bed(original, Local(pair.Key)))
+            .Take(traceDams))
+            Console.WriteLine(
+                $"    MOVED {pair.Key} ({Local(pair.Key).x:0},{Local(pair.Key).z:0}) to ({pair.Value.x:0},{pair.Value.z:0}): ground {Bed(original, Local(pair.Key)):0.0} to {Bed(original, pair.Value):0.0}");
+
+        long samples = 0, dammed = 0, dams = 0, damSideLower = 0;
+        var damSide = Environment.GetEnvironmentVariable("WATER_DAM_SIDE") == "1";
+
+        // WATER_DAM_WHY=1: each dam (first dammed sample of a run) by what kept the line there:
+        // its way moved no node, a node at either end of its segment is shared with another
+        // waterway, or the segment is long (over 56 m) so the dam may sit between nodes.
+        var damWhy = new Dictionary<string, int>();
+        var nodeUse = new Dictionary<long, int>();
+
+        foreach (var otherWay in lines)
+            foreach (var id in otherWay.NodeIds.Distinct())
+                nodeUse[id] = nodeUse.TryGetValue(id, out var uses) ? uses + 1 : 1;
         var cuts = new List<float>();
         var byType = new Dictionary<string, (long Samples, long Dammed)>();
         var stagesByWay =
@@ -1235,8 +1766,8 @@ static partial class VisualMetricsReplay
 
             for (var i = 1; i < way.NodeIds.Length; i++)
             {
-                var vectorA = Local(way.NodeIds[i - 1]);
-                var vectorB = Local(way.NodeIds[i]);
+                var vectorA = Placed(way.NodeIds[i - 1]);
+                var vectorB = Placed(way.NodeIds[i]);
 
                 if (Math.Max(Math.Abs(vectorA.x), Math.Abs(vectorA.z)) > half - 100
                     || Math.Max(Math.Abs(vectorB.x), Math.Abs(vectorB.z)) > half - 100)
@@ -1279,9 +1810,42 @@ static partial class VisualMetricsReplay
                     {
                         dammed++;
 
+                        // WATER_DAM_SIDE=1: is there ground across the line, within the valley
+                        // search's 112 m, low enough to carry this water (original ground no
+                        // higher than the upstream low plus the 20 m channel cut)?
+                        if (damSide)
+                        {
+                            var across =
+                                math.normalizesafe(new float3(-(vectorB - vectorA).z, 0, (vectorB - vectorA).x));
+
+                            var lower = false;
+
+                            for (var offset = 14; offset <= 112 && !lower; offset += 14)
+                                lower =
+                                    Bed(original, point + across * offset) - 20 <= lowest + .1f
+                                    || Bed(original, point - across * offset) - 20 <= lowest + .1f;
+
+                            if (lower)
+                                damSideLower++;
+                        }
+
                         if (!blocked)
                         {
                             dams++;
+
+                            if (Environment.GetEnvironmentVariable("WATER_DAM_WHY") == "1")
+                            {
+                                var wayMoved = way.NodeIds.Any(plan.MovedWaterwayNodes.ContainsKey);
+                                var shared = nodeUse[way.NodeIds[i - 1]] > 1 || nodeUse[way.NodeIds[i]] > 1;
+                                var length = math.distance(vectorA.xz, vectorB.xz);
+
+                                var why =
+                                    $"{(wayMoved ? "way moved" : "way not moved")}, "
+                                        + $"{(shared ? "shared end" : "free ends")}, "
+                                        + $"{(length > 56 ? "long segment" : "short segment")}";
+
+                                damWhy[why] = damWhy.TryGetValue(why, out var seen) ? seen + 1 : 1;
+                            }
 
                             if (traceDams-- > 0)
                                 Console.WriteLine(
@@ -1298,8 +1862,21 @@ static partial class VisualMetricsReplay
         }
 
         cuts.Sort();
+
+        // A map with no open river or stream inside its edges has nothing to measure.
+        if (cuts.Count == 0)
+            cuts.Add(0);
+
         Console.WriteLine(
             $"  open waterways: {samples:N0} samples, dammed {dammed:N0} ({dammed / (double)Math.Max(1, samples):P1}) at {dams:N0} dams; cut depth median {cuts[cuts.Count / 2]:0.0} m, p95 {cuts[(int)(cuts.Count * .95)]:0.0} m, over 10 m {cuts.Count(v => v > 10):N0}");
+        Phase("dam walk");
+
+        foreach (var pair in damWhy.OrderByDescending(pair => pair.Value))
+            Console.WriteLine($"    dams: {pair.Key}: {pair.Value}");
+
+        if (damSide)
+            Console.WriteLine(
+                $"  dammed samples with low enough ground within 112 m across the line: {damSideLower:N0} of {dammed:N0}");
 
         Console.WriteLine(
             "    dammed by type: "
@@ -1465,6 +2042,23 @@ static partial class VisualMetricsReplay
 
             File.WriteAllText(reportPath, JsonConvert.SerializeObject(report, Formatting.Indented));
             Console.WriteLine("  crossing report: " + JsonConvert.SerializeObject(crossingReport));
+        }
+
+        // WATER_REPLAY_GROUND=prefix: the planned ground of each profile as raw float metres,
+        // for the road replay's ROAD_REPLAY_TERRAIN (report 117).
+        if (Environment.GetEnvironmentVariable("WATER_REPLAY_GROUND") is string groundPrefix && groundPrefix.Length > 0)
+        {
+            void Save(string name, float[] heights)
+            {
+                var raw = new byte[heights.Length * sizeof(float)];
+                Buffer.BlockCopy(heights, 0, raw, 0, raw.Length);
+                File.WriteAllBytes(groundPrefix + "." + name + ".f32", raw);
+            }
+
+            Save("current", planned);
+
+            if (earlierPlanned != null)
+                Save("earlier", earlierPlanned);
         }
 
         if (Environment.GetEnvironmentVariable("WATER_REPLAY_OUT") is string output && output.Length > 0)
@@ -5157,6 +5751,43 @@ static partial class VisualMetricsReplay
                 if (items.Length > 0)
                     Console.WriteLine(
                         $"    depth {band.Item1}-{band.Item2} m: {items.Length} sections, {items.Count(otherItem => !otherItem.Tunnel)} drawn open; submitted elevation P50 {items.Select(otherItem => otherItem.Elevation).OrderBy(v => v).ElementAt(items.Length / 2):F1}");
+            }
+
+            return;
+        }
+
+        // LIVE_NEAR=x,z,radius: every live edge with an end inside that circle, as recorded.
+        if (Environment.GetEnvironmentVariable("LIVE_NEAR") is { Length: > 0 } circle)
+        {
+            var parts =
+                circle.Split(',')
+                    .Select(text => float.Parse(text, System.Globalization.CultureInfo.InvariantCulture))
+                    .ToArray();
+
+            var centre = new float2(parts[0], parts[1]);
+
+            foreach (var row in records)
+            {
+                var a = ReadPoint(row["a"]!);
+                var d = ReadPoint(row["d"]!);
+
+                if (math.distance(a.xz, centre) > parts[2] && math.distance(d.xz, centre) > parts[2])
+                    continue;
+
+                Console.WriteLine($"  NEAR {row.ToString(Newtonsoft.Json.Formatting.None)}");
+            }
+
+            // The sections as they were sent to the game, for the same circle.
+            foreach (var row in CorrectiveCapturedReplay.ReadManifest<JObject>(folder, "final-prepared-network-chunks.json"))
+            {
+                var a = ReadPoint(row["a"]!);
+                var d = ReadPoint(row["d"]!);
+
+                if (math.distance(a.xz, centre) > parts[2] && math.distance(d.xz, centre) > parts[2])
+                    continue;
+
+                Console.WriteLine(
+                    $"  SENT way {row["WayId"]} {row["Classification"]} oneway={row["OneWay"]} bridge={row["Bridge"]} width={row["NativeWidth"]} a({a.x:0.0},{a.y:0.0},{a.z:0.0}) d({d.x:0.0},{d.y:0.0},{d.z:0.0})");
             }
 
             return;

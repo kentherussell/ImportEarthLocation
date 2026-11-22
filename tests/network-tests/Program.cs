@@ -94,6 +94,13 @@ static class Program
             return;
         }
 
+        if (args.Length == 1 && args[0] == "--regular-links-only")
+        {
+            RegularLinkTests.Run();
+            Console.WriteLine("PASS regular links");
+            return;
+        }
+
         if (args.Length >= 3 && args[0] == "--road-replay")
         {
             var skip = Array.IndexOf(args, "--skip");
@@ -153,6 +160,13 @@ static class Program
         if (args.Length >= 2 && args[0] == "--river-gaps")
         {
             RiverGaps.Run(args[1], args.Length > 2 ? float.Parse(args[2], System.Globalization.CultureInfo.InvariantCulture) : .1f);
+
+            return;
+        }
+
+        if (args.Length == 2 && args[0] == "--river-connectivity")
+        {
+            WaterReplayMetrics.Calibrate(args[1]);
 
             return;
         }
@@ -380,6 +394,7 @@ static class Program
         WaterRoadTests.Run();
         RebalanceRegressionTests.Run();
         ConnectivityTests.Run();
+        RegularLinkTests.Run();
         TerrainSamplingTests.Run();
         WaterAreaHoleTests.Run();
 
@@ -992,6 +1007,12 @@ namespace ImportEarthLocation.Core
         public void Time(string text, double seconds)
         {
             _metrics[text + " time (s)"] = seconds;
+        }
+
+        public void AddDuration(string text, double seconds)
+        {
+            _metrics.TryGetValue(text + " time (s)", out var old);
+            _metrics[text + " time (s)"] = old + seconds;
         }
 
         public double Metric(string text) => _metrics.TryGetValue(text, out var value) ? value : 0;

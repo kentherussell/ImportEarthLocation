@@ -401,6 +401,10 @@ public sealed record WaterPlan(bool Coastal, int Rivers, int Lakes, int Skipped,
     public TerrainEditSet? BedEdits { get; init; }
     public TerrainEditSet? FinalBedEdits { get; init; }
     public float[]? PlannedBedHeights { get; init; }
+    // Waterway nodes the planner moved onto the valley floor beside their mapped place, in
+    // local map metres by node id (WaterBodyPlanner.Prepare). Channel lines handed to road
+    // crossings must use them, or bridges stand beside the carved channel.
+    public IReadOnlyDictionary<long, float3> MovedWaterwayNodes { get; init; } = new Dictionary<long, float3>();
 
     public const string GeometryVersion = "geographic-stage-v3-rivers-only";
 }

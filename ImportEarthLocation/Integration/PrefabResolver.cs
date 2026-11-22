@@ -631,57 +631,102 @@ public sealed class PrefabResolver
         return Entity.Null;
     }
 
-    private void CaptureRoundaboutPalette()
+    // A stock roundabout: an object prefab the game's tools attach to a junction node, with
+    // its centreline radius (half the island's larger side plus half the ring road's width).
+    public sealed record RoundaboutIsland(Entity Prefab, ObjectData Data, string Name, float Radius);
+
+    // The game's roundabouts are objects whose net object carries the roundabout composition
+    // flag (SmallRoundabout, MediumRoundabout02, XLRoundabout and so on). Until 2026-11-17 an
+    // archetype without the Attached component was also refused, and no run in 366 found any;
+    // placement now adds that component itself. Each candidate's outcome is logged.
+    public List<RoundaboutIsland> ReadRoundaboutIslands()
     {
         var manager = _prefabSystem.EntityManager;
-        var radii = new List<float>();
+        var islands = new List<RoundaboutIsland>();
         var ringRoad =
             ResolveRoad(
                 new PreparedSegment(0, 1, 2, default, default, NetworkKind.Road, "primary", 2, true, false, false, 0));
 
         var laneHalfWidth = ringRoad == Entity.Null ? 0 : ReadWidth(ringRoad) / 2;
+        var candidates = 0;
 
         foreach (var prefab in NativePrefabCatalog.Read<ObjectPrefab>(manager, _prefabSystem))
         {
+            if (prefab.name.IndexOf("roundabout", StringComparison.OrdinalIgnoreCase) < 0)
+                continue;
+
+            candidates++;
             var entity = _prefabSystem.GetEntity(prefab);
+            var refusal = RoundaboutRefusal(manager, entity, laneHalfWidth, out var island, out var hasAttached);
 
-            if (!prefab.name.Contains("Roundabout")
-                || !manager.HasComponent<NetObjectData>(entity)
-                || !manager.HasComponent<ObjectGeometryData>(entity)
-                || !manager.HasComponent<ObjectData>(entity))
-                continue;
-
-            var data = manager.GetComponentData<NetObjectData>(entity);
-
-            if ((data.m_CompositionFlags.m_General & CompositionFlags.General.Roundabout) == 0)
-                continue;
-
-            using var components =
-                manager.GetComponentData<ObjectData>(entity).m_Archetype.GetComponentTypes(Allocator.Temp);
-
-            var types = new HashSet<ComponentType>();
-
-            foreach (var type in components)
-                types.Add(type);
-
-            if (!types.Contains(ComponentType.ReadWrite<Game.Objects.Attached>())
-                || !types.Contains(ComponentType.ReadWrite<Game.Objects.Transform>())
-                || !types.Contains(ComponentType.ReadWrite<PrefabRef>()))
-                continue;
-
-            var size = manager.GetComponentData<ObjectGeometryData>(entity).m_Size;
-            var islandRadius = Math.Max(size.x, size.z) / 2;
-
-            if (!float.IsNaN(islandRadius) && !float.IsInfinity(islandRadius) && islandRadius > 0 && laneHalfWidth > 0)
+            if (refusal != null)
             {
-                radii.Add(islandRadius + laneHalfWidth);
-                _log.Diagnostic(
-                    $"ROUNDABOUT PALETTE prefab={prefab.name}; islandRadiusMeters={islandRadius}; measuredLaneHalfWidth={laneHalfWidth}; centerlineRadiusMeters={islandRadius + laneHalfWidth}; nativeObjectContract=true");
+                _log.Diagnostic($"ROUNDABOUT PALETTE refused prefab={prefab.name}; reason={refusal}");
+                continue;
             }
+
+            var data = manager.GetComponentData<ObjectData>(entity);
+            islands.Add(new RoundaboutIsland(entity, data, prefab.name, island + laneHalfWidth));
+            _log.Diagnostic(
+                $"ROUNDABOUT PALETTE prefab={prefab.name}; islandRadiusMeters={island}; measuredLaneHalfWidth={laneHalfWidth}; centerlineRadiusMeters={island + laneHalfWidth}; archetypeHasAttached={hasAttached}");
         }
 
-        ImportEarthLocation.Processing.RoundaboutPlanner.ConfigureStockRadii(radii);
+        var listed = string.Join(", ", islands.Select(item => $"{item.Name} {item.Radius:0.#} m"));
+        _log.Evidence(
+            $"Roundabout palette: {islands.Count} of {candidates} game roundabout objects usable"
+                + (islands.Count > 0 ? ": " + listed : "")
+                + (laneHalfWidth > 0 ? "" : "; the ring road's width could not be read"));
+
+        return islands;
     }
+
+    private static string? RoundaboutRefusal(
+        EntityManager manager,
+        Entity entity,
+        float laneHalfWidth,
+        out float islandRadius,
+        out bool hasAttached)
+    {
+        islandRadius = 0;
+        hasAttached = false;
+
+        if (!manager.HasComponent<NetObjectData>(entity))
+            return "no net object";
+
+        var flags = manager.GetComponentData<NetObjectData>(entity).m_CompositionFlags.m_General;
+
+        if ((flags & CompositionFlags.General.Roundabout) == 0)
+            return "no roundabout flag (" + flags + ")";
+
+        if (!manager.HasComponent<ObjectGeometryData>(entity) || !manager.HasComponent<ObjectData>(entity))
+            return "no object geometry or data";
+
+        using var components =
+            manager.GetComponentData<ObjectData>(entity).m_Archetype.GetComponentTypes(Allocator.Temp);
+
+        var types = new HashSet<ComponentType>();
+
+        foreach (var type in components)
+            types.Add(type);
+
+        hasAttached = types.Contains(ComponentType.ReadWrite<Game.Objects.Attached>());
+
+        if (!types.Contains(ComponentType.ReadWrite<Game.Objects.Transform>())
+            || !types.Contains(ComponentType.ReadWrite<PrefabRef>()))
+            return "archetype without transform or prefab reference";
+
+        var size = manager.GetComponentData<ObjectGeometryData>(entity).m_Size;
+        islandRadius = Math.Max(size.x, size.z) / 2;
+
+        if (float.IsNaN(islandRadius) || float.IsInfinity(islandRadius) || islandRadius <= 0)
+            return "no island size (" + size + ")";
+
+        return laneHalfWidth > 0 ? null : "ring road width unknown";
+    }
+
+    private void CaptureRoundaboutPalette()
+        => ImportEarthLocation.Processing.RoundaboutPlanner.ConfigureStockRadii(
+            ReadRoundaboutIslands().Select(island => island.Radius));
 
     private static bool AllowedPalette(string name, bool highway, bool oneWay)
     {

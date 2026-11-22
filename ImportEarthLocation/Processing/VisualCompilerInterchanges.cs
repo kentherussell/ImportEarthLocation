@@ -61,16 +61,36 @@ public static partial class VisualCompilerProfile
                         && stroke.LevelCrossings.Count == 0)
                 .ToArray();
 
-        var dry =
-            strokes
-                .Select(
-                    stroke => Enumerable
-                        .Range(0, stroke.Station.Length)
-                        .Select(k => double.IsNegativeInfinity(WaterFloor(stroke, k)))
-                        .ToArray())
-                .ToArray();
+        var dry = new bool[strokes.Count][];
+
+        for (var i = 0; i < strokes.Count; i++)
+        {
+            dry[i] = new bool[strokes[i].Station.Length];
+
+            for (var k = 0; k < dry[i].Length; k++)
+                dry[i][k] = double.IsNegativeInfinity(WaterFloor(strokes[i], k));
+        }
 
         var bend = strokes.Select(BendLimits).ToArray();
+
+        // Twin pairs by variable, so a cluster finds its own without scanning them all each round.
+        var twinsOf = new Dictionary<int, List<int>>();
+
+        for (var pair = 0; pair < twinPairs.Count; pair++)
+        {
+            var (pin, twin) = twinPairs[pair];
+
+            if (!twinsOf.TryGetValue(pin, out var pinPairs))
+                twinsOf[pin] = pinPairs = new();
+
+            pinPairs.Add(pair);
+
+            if (!twinsOf.TryGetValue(twin, out var twinPairList))
+                twinsOf[twin] = twinPairList = new();
+
+            twinPairList.Add(pair);
+        }
+
         var occurrences = new Dictionary<int, List<(int Stroke, double Station)>>();
 
         for (var i = 0; i < strokes.Count; i++)
@@ -177,7 +197,7 @@ public static partial class VisualCompilerProfile
         // Windows are runs of marked samples; a shared node or a carriageway
         // pair joins two windows into one cluster.
         var runs = new List<(int Stroke, int A, int B)>();
-        var runOf = strokes.Select(stroke => Enumerable.Repeat(-1, stroke.Station.Length).ToArray()).ToArray();
+        var runOf = UnsetPerSample(strokes);
 
         for (var i = 0; i < strokes.Count; i++)
             for (var k = 0; k < mark[i].Length;)
@@ -243,8 +263,9 @@ public static partial class VisualCompilerProfile
             }
         }
 
-        var unknown = strokes.Select(stroke => Enumerable.Repeat(-1, stroke.Station.Length).ToArray()).ToArray();
+        var unknown = UnsetPerSample(strokes);
         int clusters = 0, accepted = 0, unknowns = 0, scoreBefore = 0, scoreAfter = 0, skipped = 0;
+        var raised = Array.Empty<double>();
 
         foreach (var cluster in Enumerable
             .Range(0, runs.Count)
@@ -281,7 +302,14 @@ public static partial class VisualCompilerProfile
             var node = new Dictionary<int, int>();
             var touched = new HashSet<int>();
 
-            foreach (var (i, a, b) in cluster)
+            // The pins inside each window, in strokeVars order, found once for every round's terms.
+            var windowPins = new List<(double Station, int Var)>[cluster.Length];
+
+            for (var r = 0; r < cluster.Length; r++)
+            {
+                var (i, a, b) = cluster[r];
+                windowPins[r] = new();
+
                 foreach (var (station, v) in strokeVars[i])
                 {
                     if (crossing(v))
@@ -293,7 +321,9 @@ public static partial class VisualCompilerProfile
                         continue;
 
                     touched.Add(v);
+                    windowPins[r].Add((station, v));
                 }
+            }
 
             foreach (var v in touched)
                 if (movable(v)
@@ -308,21 +338,52 @@ public static partial class VisualCompilerProfile
                 continue;
             }
 
+            // The twin pairs with a node in this cluster, in twinPairs order and each once.
+            var clusterTwins = new List<int>();
+
+            foreach (var v in node.Keys)
+                if (twinsOf.TryGetValue(v, out var pairs))
+                    clusterTwins.AddRange(pairs);
+
+            clusterTwins.Sort();
+
+            for (var p = clusterTwins.Count - 1; p > 0; p--)
+                if (clusterTwins[p] == clusterTwins[p - 1])
+                    clusterTwins.RemoveAt(p);
+
+            // A stroke's grade limits and envelope are read only inside its windows here, and
+            // nothing they depend on changes before the cluster ends, so each member's are
+            // computed once, for its windows alone.
+            var windowsOf = new Dictionary<int, List<(int A, int B)>>();
+
+            foreach (var (i, a, b) in cluster)
+            {
+                if (!windowsOf.TryGetValue(i, out var windows))
+                    windowsOf[i] = windows = new();
+
+                windows.Add((a, b));
+            }
+
+            var envelopeOf = new Dictionary<int, (double[] Low, double[] High)>();
+            var gradeLimitOf = new Dictionary<int, double[]>();
+
             Dictionary<int, JointStroke> Fresh() => members.ToDictionary(i => i, i =>
             {
                 var otherStroke = strokes[i];
-                var pins =
-                    strokeVars[i]
-                        .Where(item => !crossing(item.Var))
-                        .Select(item => (item.Station, h[item.Var]))
-                        .ToList();
 
-                var js =
-                    new JointStroke(
-                        otherStroke,
-                        GradeLimits(otherStroke, plateaus[i]),
-                        Envelope(otherStroke, tau[i], pins, bounds[i]),
-                        bounds[i].Count);
+                if (!envelopeOf.TryGetValue(i, out var envelope))
+                {
+                    var pins =
+                        strokeVars[i]
+                            .Where(item => !crossing(item.Var))
+                            .Select(item => (item.Station, h[item.Var]))
+                            .ToList();
+
+                    envelopeOf[i] = envelope = Envelope(otherStroke, tau[i], pins, bounds[i], windowsOf[i]);
+                    gradeLimitOf[i] = GradeLimits(otherStroke, plateaus[i], windowsOf[i]);
+                }
+
+                var js = new JointStroke(otherStroke, gradeLimitOf[i], envelope, bounds[i].Count);
 
                 // Stiffness starts where the stroke's own smoothing left it.
                 if (stiffness[i] != null)
@@ -506,8 +567,9 @@ public static partial class VisualCompilerProfile
 
             void Terms()
             {
-                foreach (var (i, a, b) in cluster)
+                for (var r = 0; r < cluster.Length; r++)
                 {
+                    var (i, a, b) = cluster[r];
                     var otherStroke = strokes[i];
                     var js = stroke[i];
                     var length = otherStroke.Station.Length;
@@ -566,16 +628,8 @@ public static partial class VisualCompilerProfile
                         End(js.BoundWeight[b2]);
                     }
 
-                    foreach (var (station, v) in strokeVars[i])
+                    foreach (var (station, v) in windowPins[r])
                     {
-                        if (crossing(v))
-                            continue;
-
-                        var k = Nearest(i, station);
-
-                        if (k < a || k > b)
-                            continue;
-
                         Begin(0);
                         Interpolated(i, station, 1);
                         Node(v, -1);
@@ -583,14 +637,14 @@ public static partial class VisualCompilerProfile
                     }
                 }
 
-                foreach (var (v, w) in twinPairs)
-                    if (node.ContainsKey(v) || node.ContainsKey(w))
-                    {
-                        Begin(0);
-                        Node(v, 1);
-                        Node(w, -1);
-                        End(JointTwinWeight);
-                    }
+                foreach (var pair in clusterTwins)
+                {
+                    var (v, w) = twinPairs[pair];
+                    Begin(0);
+                    Node(v, 1);
+                    Node(w, -1);
+                    End(JointTwinWeight);
+                }
 
                 foreach (var (v, u) in node)
                     if (nodeWeight.TryGetValue(v, out var bound))
@@ -650,7 +704,17 @@ public static partial class VisualCompilerProfile
                         var js = stroke[i];
                         var length = otherStroke.Station.Length;
                         var alpha = js.Alpha;
-                        var raised = (double[])js.Stiff.Clone();
+
+                        // Only samples within two of the window can be raised, so only those are
+                        // staged in the scratch buffer and copied back.
+                        var raisedLow = Math.Max(1, a - 2);
+                        var raisedHigh = Math.Min(length - 2, b + 2);
+
+                        if (raised.Length < length)
+                            raised = new double[length];
+
+                        if (raisedHigh >= raisedLow)
+                            Array.Copy(js.Stiff, raisedLow, raised, raisedLow, raisedHigh - raisedLow + 1);
 
                         for (var k = a; k <= b; k++)
                         {
@@ -693,7 +757,8 @@ public static partial class VisualCompilerProfile
                             }
                         }
 
-                        Array.Copy(raised, js.Stiff, raised.Length);
+                        if (raisedHigh >= raisedLow)
+                            Array.Copy(raised, raisedLow, js.Stiff, raisedLow, raisedHigh - raisedLow + 1);
 
                         for (var b2 = 0; b2 < bounds[i].Count; b2++)
                         {
@@ -765,6 +830,22 @@ public static partial class VisualCompilerProfile
         return (clusters, accepted, unknowns, scoreBefore, scoreAfter, skipped);
     }
 
+    // One index per sample of every stroke, all -1 (none).
+    private static int[][] UnsetPerSample(IReadOnlyList<Stroke> strokes)
+    {
+        var result = new int[strokes.Count][];
+
+        for (var i = 0; i < strokes.Count; i++)
+        {
+            result[i] = new int[strokes[i].Station.Length];
+
+            for (var k = 0; k < result[i].Length; k++)
+                result[i][k] = -1;
+        }
+
+        return result;
+    }
+
     // Largest second difference over one sample spacing that keeps a vertical
     // curve within the class K: 1% grade change per K metres is 0.01·h²/K.
     private static double[] BendLimits(Stroke stroke)
@@ -796,8 +877,15 @@ public static partial class VisualCompilerProfile
             Alpha = Math.Pow(s.Class.Wavelength / (2 * Math.PI), 4) / Math.Pow(Spacing, 4);
             Limit = limit;
             Envelope = envelope;
-            Stiff = Enumerable.Repeat(1d, length).ToArray();
-            Cap = Enumerable.Repeat(StiffnessCap, length).ToArray();
+            Stiff = new double[length];
+            Cap = new double[length];
+
+            for (var k = 0; k < length; k++)
+            {
+                Stiff[k] = 1;
+                Cap[k] = StiffnessCap;
+            }
+
             BandWeight = new double[length];
             BandTarget = new double[length];
             GradeWeight = new double[length];
@@ -841,17 +929,21 @@ public static partial class VisualCompilerProfile
                 return;
             }
 
+            // w·c[a] is formed once per row; w·c[a]·c[b] multiplies left to right either way.
             for (var a = 0; a < count; a++)
             {
                 var pa = position[index[a]];
-                rhs[pa] += w * c[a] * t;
+                var weighted = w * c[a];
+                var rowA = row[pa];
+                var firstA = first[pa];
+                rhs[pa] += weighted * t;
 
                 for (var b = 0; b < count; b++)
                 {
                     var pb = position[index[b]];
 
                     if (pb <= pa)
-                        row[pa][pb - first[pa]] += w * c[a] * c[b];
+                        rowA[pb - firstA] += weighted * c[b];
                 }
             }
         }

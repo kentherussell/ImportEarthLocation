@@ -103,7 +103,19 @@ public static class NetworkNormalizer
         double mapWidth = double.PositiveInfinity,
         IDictionary<SourceNodeKey, long>? merged = null)
     {
+        // Each step's time, from the end of the previous step, as a Stopwatch timestamp.
+        var stepStarted = Stopwatch.GetTimestamp();
+
+        void Step(string name)
+        {
+            var now = Stopwatch.GetTimestamp();
+            log.AddDuration("Normalization " + name, (now - stepStarted) / (double)Stopwatch.Frequency);
+            stepStarted = now;
+        }
+
         input = NormalizeLaneRuns(input, log, token);
+        Step("lane runs");
+
         var clock = Stopwatch.StartNew();
         log.Diagnostic(
             $"PROCESS normalization begin; sourceSections={input.Count}; junctions/sharp-turns/levels protected=true");
@@ -138,6 +150,8 @@ public static class NetworkNormalizer
         }
 
         log.Time("Topology/cleanup", clock.Elapsed.TotalSeconds);
+        Step("node degrees");
+
         clock.Restart();
         // OSM way boundaries are metadata boundaries, not mandatory native nodes.
         // Merge compatible degree-two continuations, retaining every real junction.
@@ -160,16 +174,21 @@ public static class NetworkNormalizer
         // Groups share no sections and are concatenated in order, so the result
         // does not depend on scheduling. A node merged away is recorded, so a source
         // port there keeps its identity as an alias of the merged section's start.
+        // Each group either passes its sections on in outputs or lists the pieces to fit.
         var outputs = new List<PreparedSegment>[groups.Length];
+        var groupPieces = new List<(List<float3> Points, List<PreparedSegment> Sections)>[groups.Length];
         var mergedNodes = new ConcurrentDictionary<SourceNodeKey, long>();
         var protectedRamps = 0;
+        var options = new ParallelOptions { CancellationToken = token };
+        var fitted = Array.Empty<List<PreparedSegment>>();
 
         try
         {
-            Parallel.For(0, groups.Length, new ParallelOptions { CancellationToken = token }, g =>
+            Parallel.For(0, groups.Length, options, g =>
                     {
                         var group = groups[g];
                         var output = outputs[g] = new List<PreparedSegment>();
+                        var pieces = groupPieces[g] = new List<(List<float3>, List<PreparedSegment>)>();
 
                         // RoundaboutPlanner has already fitted approved circular arcs. Endpoint-only
                         // refitting would erase their handles and turn the ring into a polygon.
@@ -217,8 +236,8 @@ public static class NetworkNormalizer
                                 for (var k = 1; k < piece.Count; k++)
                                     mergedNodes[new(piece[k].Kind, piece[k].StartNodeId)] = piece[0].StartNodeId;
 
-                                Fit(points, piece, output, token, (float)(mapWidth / 2));
-                                piece.Clear();
+                                pieces.Add((points, piece));
+                                piece = new List<PreparedSegment>();
                                 length = 0;
                             }
 
@@ -272,6 +291,18 @@ public static class NetworkNormalizer
 
                         Flush();
                     });
+
+            // Fitting is most of the work and one group can hold most of the network, so the
+            // pieces of all groups are fitted in parallel. Fit reads only its own piece, and
+            // each piece keeps its own output, joined below in group and piece order.
+            var allPieces = groupPieces.SelectMany(pieces => pieces).ToArray();
+            fitted = new List<PreparedSegment>[allPieces.Length];
+
+            Parallel.For(0, allPieces.Length, options, p =>
+            {
+                fitted[p] = new List<PreparedSegment>();
+                Fit(allPieces[p].Points, allPieces[p].Sections, fitted[p], token, (float)(mapWidth / 2));
+            });
         }
         catch (AggregateException exception) when (exception.InnerExceptions.All(
             inner => inner is OperationCanceledException))
@@ -280,7 +311,19 @@ public static class NetworkNormalizer
             throw;
         }
 
-        var output = outputs.SelectMany(otherSegments => otherSegments).ToList();
+        var output = new List<PreparedSegment>();
+        var fittedPiece = 0;
+
+        for (var g = 0; g < groups.Length; g++)
+        {
+            output.AddRange(outputs[g]);
+
+            for (var k = 0; k < groupPieces[g].Count; k++)
+                output.AddRange(fitted[fittedPiece++]);
+        }
+
+        Step("merging and fitting");
+
         log.Count("Protected ramps preserved", protectedRamps);
         log.Count("Segments merged", Math.Max(0, input.Count - output.Count));
         var unique = new List<PreparedSegment>();
@@ -339,8 +382,12 @@ public static class NetworkNormalizer
             unique.Add(segment);
         }
 
+        Step("duplicates");
+
         log.Time("Smoothing", clock.Elapsed.TotalSeconds);
         SmoothJoins(unique, log, token, (float)(mapWidth / 2));
+        Step("tangent continuity");
+
         log.Diagnostic(
             $"PROCESS normalization complete; sourceSections={input.Count}; outputSections={unique.Count}; elapsedSeconds={clock.Elapsed.TotalSeconds:0.0}");
 
@@ -362,24 +409,36 @@ public static class NetworkNormalizer
                 .ThenBy(segment => segment.WayId)
             .ThenBy(segment => segment.StartNodeId).ThenBy(segment => segment.EndNodeId).ToArray();
 
-        var remaining = new HashSet<int>(Enumerable.Range(0, items.Length));
+        // Items are only ever taken, so the lowest remaining index never moves back: a cursor
+        // finds the next seed rather than a search of every remaining item for each chain.
+        var taken = new bool[items.Length];
+        var remaining = items.Length;
+        var seed = 0;
         var nodes = new Dictionary<SourceNodeKey, List<int>>();
 
-        for (var i = 0; i < items.Length; i++)
-            foreach (var id in new[] { items[i].StartNodeId, items[i].EndNodeId })
-            {
-                var key = NodeKey(items[i], id);
-
-                if (!nodes.TryGetValue(key, out var list))
-                    nodes[key] = list = new();
-
-                list.Add(i);
-            }
-
-        while (remaining.Count > 0)
+        void AddNode(int index, long id)
         {
-            var seed = remaining.Min();
-            remaining.Remove(seed);
+            var key = NodeKey(items[index], id);
+
+            if (!nodes.TryGetValue(key, out var list))
+                nodes[key] = list = new();
+
+            list.Add(index);
+        }
+
+        for (var i = 0; i < items.Length; i++)
+        {
+            AddNode(i, items[i].StartNodeId);
+            AddNode(i, items[i].EndNodeId);
+        }
+
+        while (remaining > 0)
+        {
+            while (taken[seed])
+                seed++;
+
+            taken[seed] = true;
+            remaining--;
             var chain = new LinkedList<PreparedSegment>();
             var first = items[seed];
 
@@ -398,12 +457,20 @@ public static class NetworkNormalizer
                     if (degree[key] != 2)
                         break;
 
-                    var candidates = nodes[key].Where(remaining.Contains).ToArray();
+                    // A closed section is listed twice at its node and so counts twice here.
+                    var candidates = 0;
+                    var index = -1;
 
-                    if (candidates.Length != 1)
+                    foreach (var item in nodes[key])
+                        if (!taken[item])
+                        {
+                            candidates++;
+                            index = item;
+                        }
+
+                    if (candidates != 1)
                         break;
 
-                    var index = candidates[0];
                     var segment = items[index];
                     var matches = prepend ? segment.EndNodeId == id : segment.StartNodeId == id;
 
@@ -415,7 +482,8 @@ public static class NetworkNormalizer
                         segment = Reverse(segment);
                     }
 
-                    remaining.Remove(index);
+                    taken[index] = true;
+                    remaining--;
 
                     if (prepend)
                         chain.AddFirst(segment);
@@ -1090,7 +1158,6 @@ public static class NetworkNormalizer
                 && DistanceToSegment(segment.Control2 ?? segment.End, segment.Start, segment.End) < .01f)
             return true;
 
-        var sourceIndex = new LineDistanceIndex(segment.SourceGeometry);
         var c1 = segment.Control1 ?? math.lerp(segment.Start, segment.End, 1f / 3f);
         var c2 = segment.Control2 ?? math.lerp(segment.Start, segment.End, 2f / 3f);
         var a = segment.Start;
@@ -1113,9 +1180,32 @@ public static class NetworkNormalizer
         if (allowance <= 0)
             return false;
 
+        // The largest coordinate either line holds, for the rounding margin (RoundingMargin).
+        var extent = 0d;
+
+        foreach (var sample in samples)
+            extent = Math.Max(extent, Math.Max(Math.Abs((double)sample.x), Math.Abs((double)sample.z)));
+
+        foreach (var sourcePoint in segment.SourceGeometry)
+            extent = Math.Max(extent, Math.Max(Math.Abs((double)sourcePoint.x), Math.Abs((double)sourcePoint.z)));
+
+        // Consecutive samples are usually near the same source piece. A piece near the cursor
+        // that lies within the allowance by more than the rounding margin settles a sample:
+        // the index could only answer at least as near (see CertainlyNear). The index decides
+        // every other sample, so the answer is the index's for every sample.
+        LineDistanceIndex? sourceIndex = null;
+        var sourceCursor = 0;
+
         foreach (var point in samples)
+        {
+            if (CertainlyNear(segment.SourceGeometry, point, allowance, extent, ref sourceCursor))
+                continue;
+
+            sourceIndex ??= new LineDistanceIndex(segment.SourceGeometry);
+
             if (sourceIndex.Distance(point) > allowance)
                 return false;
+        }
 
         // Every source point must lie within 0.75 tolerance of the sampled curve. The curve
         // runs the same way as the source, so the nearest sample piece is almost always next
@@ -1135,7 +1225,7 @@ public static class NetworkNormalizer
             {
                 var point = math.lerp(start, end, j / (float)steps);
 
-                if (NearPiece(samples, point, limit, ref cursor))
+                if (NearPiece(samples, point, limit, extent, ref cursor))
                     continue;
 
                 curveIndex ??= new LineDistanceIndex(samples);
@@ -1150,8 +1240,8 @@ public static class NetworkNormalizer
 
     // Whether a piece of the sampled line within a few pieces of the cursor lies within
     // the limit of the point, using the same distance as LineDistanceIndex. Moves the
-    // cursor to the nearest such piece.
-    private static bool NearPiece(float3[] samples, float3 point, float limit, ref int cursor)
+    // cursor to the nearest such piece. Extent bounds the size of every coordinate involved.
+    private static bool NearPiece(float3[] samples, float3 point, float limit, double extent, ref int cursor)
     {
         const int Window = 24;
         var first = Math.Max(0, cursor - Window);
@@ -1159,9 +1249,26 @@ public static class NetworkNormalizer
         var best = float.PositiveInfinity;
         var bestPiece = -1;
 
+        // The result is the nearest piece (the first of equally near ones) and its distance.
+        // The cursor's own piece, inside the window, bounds that distance, so a piece lying
+        // further off than reach along x or z is further than it even after rounding: it
+        // can be neither and is skipped. A NaN or infinite coordinate makes reach NaN or
+        // infinite, and then nothing is skipped.
+        var cursorDistance = (double)DistanceToSegment(point, samples[cursor], samples[cursor + 1]);
+        var reach = cursorDistance + RoundingMargin(extent, cursorDistance);
+
         for (var piece = first; piece <= last; piece++)
         {
-            var distance = DistanceToSegment(point, samples[piece], samples[piece + 1]);
+            var start = samples[piece];
+            var end = samples[piece + 1];
+
+            if (Math.Min(start.x, end.x) - (double)point.x > reach
+                || point.x - (double)Math.Max(start.x, end.x) > reach
+                || Math.Min(start.z, end.z) - (double)point.z > reach
+                || point.z - (double)Math.Max(start.z, end.z) > reach)
+                continue;
+
+            var distance = DistanceToSegment(point, start, end);
 
             if (distance < best)
             {
@@ -1176,6 +1283,50 @@ public static class NetworkNormalizer
         cursor = bestPiece;
 
         return true;
+    }
+
+    // How far a float distance from DistanceToSegment or LineDistanceIndex.Lower can fall short
+    // of the true one, with ten times to spare. Float rounding there stays under about
+    // 1e-6 x the largest coordinate involved (extent) + 5e-7 x the distance itself.
+    private static double RoundingMargin(double extent, double distance) => 1e-5 * (extent + distance) + 1e-3;
+
+    // Whether LineDistanceIndex.Distance(point) over this line is certainly within the limit,
+    // judged on the pieces near the cursor; moves the cursor to the piece that settled it.
+    // The index returns the least distance among the pieces its search reaches. It passes a
+    // piece over only when a box around it lies further off than the best distance found so
+    // far, and the box is no further than the piece. So with a piece within the limit by more
+    // than the rounding margin, the index's answer is within the limit too.
+    private static bool CertainlyNear(
+        IReadOnlyList<float3> line,
+        float3 point,
+        float limit,
+        double extent,
+        ref int cursor)
+    {
+        const int Window = 4;
+
+        bool Settles(int piece)
+        {
+            var distance = (double)DistanceToSegment(point, line[piece], line[piece + 1]);
+
+            return distance <= limit - RoundingMargin(extent, distance);
+        }
+
+        if (Settles(cursor))
+            return true;
+
+        var first = Math.Max(0, cursor - Window);
+        var last = Math.Min(line.Count - 2, cursor + Window);
+
+        for (var piece = first; piece <= last; piece++)
+            if (piece != cursor && Settles(piece))
+            {
+                cursor = piece;
+
+                return true;
+            }
+
+        return false;
     }
 
     // Exact nearest-segment queries with bounding-box pruning. This retains the

@@ -12,7 +12,23 @@ namespace ImportEarthLocation.Processing;
 // Existing OSM/climate evidence and final terrain, independent of surface paint.
 public static class VegetationPlanner
 {
-    private sealed record Habitat(GeographicPolygon Polygon, PolygonIndex Shape, float2 Min, float2 Max);
+    // What a habitat polygon tells a point inside it, from its tags alone.
+    [Flags]
+    private enum HabitatFlags : byte
+    {
+        None = 0,
+        Water = 1,
+        Beach = 2,
+        Built = 4,
+        Woodland = 8
+    }
+
+    private sealed record Habitat(
+        GeographicPolygon Polygon,
+        PolygonIndex Shape,
+        float2 Min,
+        float2 Max,
+        HabitatFlags Flags);
 
     // GeographicPolygon.Contains with the same answer, each ring indexed so a test visits
     // only the edges near the point. Every tree and bank sample is tested against the
@@ -20,13 +36,15 @@ public static class VegetationPlanner
     // took 13 minutes on the plain test offline and 10 seconds indexed, same plan.
     private sealed class PolygonIndex
     {
+        private const int DirectLimit = 32;
+
         private readonly ForestProcessor.RingIndex[] _outer;
         private readonly ForestProcessor.RingIndex[] _inner;
 
         public PolygonIndex(GeographicPolygon polygon)
         {
-            _outer = polygon.Outer.Select(points => new ForestProcessor.RingIndex(points)).ToArray();
-            _inner = polygon.Inner.Select(points => new ForestProcessor.RingIndex(points)).ToArray();
+            _outer = polygon.Outer.Select(points => new ForestProcessor.RingIndex(points, DirectLimit)).ToArray();
+            _inner = polygon.Inner.Select(points => new ForestProcessor.RingIndex(points, DirectLimit)).ToArray();
         }
 
         public bool Contains(float3 point)
@@ -53,7 +71,58 @@ public static class VegetationPlanner
 
     private sealed record Evidence(long Id, float3 A, float3 B, IReadOnlyDictionary<string, string> Tags);
 
-    private sealed record TaxonEvidence(string Raw, string Trimmed, string LeafType);
+    // One tag set's species evidence, classified once instead of for every candidate
+    // that cites it. Raw is "taxon species genus" in lower case.
+    private sealed class TaxonEvidence
+    {
+        public TaxonEvidence(string raw, string leafType)
+        {
+            Raw = raw;
+            Trimmed = raw.Trim();
+            LeafType = leafType;
+
+            Palm =
+                raw.Contains("phoenix")
+                    || raw.Contains("washingtonia")
+                    || raw.Contains("cocos")
+                    || raw.Contains("arecaceae")
+                    || raw.Contains("palm")
+                    || leafType == "palm";
+
+            Conifer =
+                leafType == "needleleaved"
+                    || raw.Contains("pinus")
+                    || raw.Contains("picea")
+                    || raw.Contains("abies")
+                    || raw.Contains("cedrus")
+                    || raw.Contains("pine")
+                    || raw.Contains("spruce");
+
+            BroadleafTaxon =
+                raw.Contains("quercus")
+                    || raw.Contains("acer")
+                    || raw.Contains("betula")
+                    || raw.Contains("populus")
+                    || raw.Contains("fagus")
+                    || raw.Contains("oak")
+                    || raw.Contains("maple");
+        }
+
+        public string Raw { get; }
+
+        public string Trimmed { get; }
+
+        public string LeafType { get; }
+
+        public bool Palm { get; }
+
+        public bool Conifer { get; }
+
+        public bool BroadleafTaxon { get; }
+
+        // Metadata entry per evidence reason (base * 5 + variant), -1 until first used.
+        public int[] MetadataIndexes { get; } = Enumerable.Repeat(-1, 20).ToArray();
+    }
 
     public static VegetationPlan Prepare(OsmDataset? data, IReadOnlyList<float3> trees,
         ImportRequest request, TerrainBuilder.Result terrain, IReadOnlyList<PreparedSegment> networks,
@@ -86,12 +155,34 @@ public static class VegetationPlanner
                     polygon,
                     new PolygonIndex(polygon),
                     polygon.Outer.SelectMany(points => points).Select(point => point.xz).Aggregate(math.min),
-                    polygon.Outer.SelectMany(points => points).Select(point => point.xz).Aggregate(math.max)))
+                    polygon.Outer.SelectMany(points => points).Select(point => point.xz).Aggregate(math.max),
+                    FlagsOf(polygon.Tags)))
                 .ToArray();
 
+        HabitatFlags FlagsOf(IReadOnlyDictionary<string, string> tags)
+        {
+            var flags = HabitatFlags.None;
+
+            if (Tag(tags, "natural", "water") || tags.ContainsKey("water") || Tag(tags, "waterway", "riverbank"))
+                flags |= HabitatFlags.Water;
+
+            if (Tag(tags, "natural", "beach"))
+                flags |= HabitatFlags.Beach;
+
+            if (tags.ContainsKey("building") || Tag(tags, "amenity", "parking"))
+                flags |= HabitatFlags.Built;
+
+            if (ForestProcessor.Kind(tags) == ForestProcessor.AreaKind.Woodland)
+                flags |= HabitatFlags.Woodland;
+
+            return flags;
+        }
+
+        // Only habitats that tell a point something are filed for At; the rest are
+        // still in habitats for the shrub layer.
         var habitatGrid = new Dictionary<(int, int), List<Habitat>>();
 
-        foreach (var habitat in habitats)
+        foreach (var habitat in habitats.Where(otherHabitat => otherHabitat.Flags != HabitatFlags.None))
             for (var z =
                 (int)Math.Floor(
                     Math.Max(-half, habitat.Min.y)
@@ -114,9 +205,7 @@ public static class VegetationPlanner
 
         (bool Water, bool Beach, Habitat? Forest, bool Built) At(float3 point)
         {
-            var wet = false;
-            var beach = false;
-            var built = false;
+            var found = HabitatFlags.None;
             Habitat? forest = null;
 
             if (habitatGrid.TryGetValue(
@@ -124,27 +213,27 @@ public static class VegetationPlanner
                 out var bucket))
                 foreach (var habitat in bucket)
                 {
-                    if (point.x < habitat.Min.x
+                    // A habitat that could only repeat what is already found is not
+                    // tested: the Woodland flag is found only once forest is set.
+                    if ((habitat.Flags & ~found) == HabitatFlags.None
+                        || point.x < habitat.Min.x
                         || point.x > habitat.Max.x
                         || point.z < habitat.Min.y
                         || point.z > habitat.Max.y
                         || !habitat.Shape.Contains(point))
                         continue;
 
-                    var tags = habitat.Polygon.Tags;
-                    wet |=
-                        Tag(tags, "natural", "water")
-                            || tags.ContainsKey("water")
-                            || Tag(tags, "waterway", "riverbank");
+                    found |= habitat.Flags;
 
-                    beach |= Tag(tags, "natural", "beach");
-                    built |= tags.ContainsKey("building") || Tag(tags, "amenity", "parking");
-
-                    if (forest == null && ForestProcessor.Kind(tags) == ForestProcessor.AreaKind.Woodland)
+                    if (forest == null && (habitat.Flags & HabitatFlags.Woodland) != HabitatFlags.None)
                         forest = habitat;
                 }
 
-            return (wet, beach, forest, built);
+            return (
+                (found & HabitatFlags.Water) != HabitatFlags.None,
+                (found & HabitatFlags.Beach) != HabitatFlags.None,
+                forest,
+                (found & HabitatFlags.Built) != HabitatFlags.None);
         }
 
         var evidence = new Dictionary<(int, int), List<Evidence>>();
@@ -200,7 +289,7 @@ public static class VegetationPlanner
         var metadata = new List<VegetationMetadata>();
         var metadataIndex = new Dictionary<(string, string), int>();
         var taxonCache = new Dictionary<IReadOnlyDictionary<string, string>, TaxonEvidence>();
-        var noTaxon = new TaxonEvidence("  ", "", "");
+        var noTaxon = new TaxonEvidence("  ", "");
         var reasonVariants = new string[4, 5];
         var bases = new[] { "mapped-node/row", "mapped-habitat", "climate-prior", "riparian-bank" };
         var suffixes =
@@ -222,7 +311,7 @@ public static class VegetationPlanner
 
             var raw = Value(tags, "taxon") + " " + Value(tags, "species") + " " + Value(tags, "genus");
 
-            return taxonCache[tags] = new TaxonEvidence(raw, raw.Trim(), Value(tags, "leaf_type"));
+            return taxonCache[tags] = new TaxonEvidence(raw, Value(tags, "leaf_type"));
         }
 
         int Metadata(string reason, string taxon)
@@ -235,6 +324,20 @@ public static class VegetationPlanner
             index = metadata.Count;
             metadataIndex.Add(key, index);
             metadata.Add(new(reason, taxon));
+
+            return index;
+        }
+
+        int TaxonMetadata(TaxonEvidence taxon, int reasonBase, int reasonVariant)
+        {
+            var slot = reasonBase * 5 + reasonVariant;
+            var index = taxon.MetadataIndexes[slot];
+
+            if (index < 0)
+            {
+                index = Metadata(reasonVariants[reasonBase, reasonVariant], taxon.Trimmed);
+                taxon.MetadataIndexes[slot] = index;
+            }
 
             return index;
         }
@@ -278,6 +381,9 @@ public static class VegetationPlanner
             dry && climate != null && climate.Temperatures.Length == 12 && climate.Temperatures.Average() > 18;
 
         var cold = climate != null && climate.Temperatures.Length > 0 && climate.Temperatures.Average() < 8;
+
+        // Read only when warmArid, which implies twelve monthly temperatures.
+        var coldestMonth = warmArid ? climate!.Temperatures.Min() : 0;
         var continuousWater = waterSurface ?? WaterBodyPlanner.ConstructedSurfaceSampler(water, geography);
         var bankSites = new Dictionary<(int, int), List<(float3 Point, bool Shrub)>>();
         var bankTrees = 0;
@@ -454,35 +560,12 @@ public static class VegetationPlanner
             var tags = explicitSource?.Tags ?? habitatTags ?? habitat?.Polygon.Tags;
             var id = explicitSource?.Id ?? (habitatId != 0 ? habitatId : habitat?.Polygon.Id ?? 0);
             var taxonInfo = Taxon(tags);
-            var taxon = taxonInfo.Raw;
-            var explicitPalm =
-                taxon.Contains("phoenix")
-                    || taxon.Contains("washingtonia")
-                    || taxon.Contains("cocos")
-                    || taxon.Contains("arecaceae")
-                    || taxon.Contains("palm")
-                    || taxonInfo.LeafType == "palm";
-
-            var conifer =
-                taxonInfo.LeafType == "needleleaved"
-                    || taxon.Contains("pinus")
-                    || taxon.Contains("picea")
-                    || taxon.Contains("abies")
-                    || taxon.Contains("cedrus")
-                    || taxon.Contains("pine")
-                    || taxon.Contains("spruce");
+            var explicitPalm = taxonInfo.Palm;
+            var conifer = taxonInfo.Conifer;
 
             // Palms are broadleaved too. That generic leaf tag is not a species
             // override of a warm-arid prior; an actual oak/maple taxon still is.
-            var explicitBroadleaf =
-                (!warmArid && taxonInfo.LeafType == "broadleaved")
-                    || taxon.Contains("quercus")
-                    || taxon.Contains("acer")
-                    || taxon.Contains("betula")
-                    || taxon.Contains("populus")
-                    || taxon.Contains("fagus")
-                    || taxon.Contains("oak")
-                    || taxon.Contains("maple");
+            var explicitBroadleaf = (!warmArid && taxonInfo.LeafType == "broadleaved") || taxonInfo.BroadleafTaxon;
 
             var form =
                 shrub || explicitSource != null && Tag(explicitSource.Tags, "natural", "shrub")
@@ -500,7 +583,7 @@ public static class VegetationPlanner
 
             if (!explicitPalm && !conifer && !explicitBroadleaf && form != VegetationForm.Shrub)
             {
-                if (warmArid && (!riparian || climate!.Temperatures.Min() > 5))
+                if (warmArid && (!riparian || coldestMonth > 5))
                 {
                     form = VegetationForm.Palm;
                     reasonVariant = 1;
@@ -571,7 +654,7 @@ public static class VegetationPlanner
             }
 
             output.Add(
-                new(point, form, id, seed, Metadata(reasonVariants[reasonBase, reasonVariant], taxonInfo.Trimmed)));
+                new(point, form, id, seed, TaxonMetadata(taxonInfo, reasonBase, reasonVariant)));
 
             formCounts[(int)form]++;
 
@@ -646,6 +729,7 @@ public static class VegetationPlanner
             outward /= length;
             var shore = point;
             var found = false;
+            var habitat = default((bool Water, bool Beach, Habitat? Forest, bool Built));
 
             for (var d = 0f; d <= 96; d += 3)
             {
@@ -657,7 +741,12 @@ public static class VegetationPlanner
                         terrain.Heights,
                         request.MapSize.WidthMeters);
 
-                if (shore.y > level + .5f && !At(shore).Water)
+                if (shore.y <= level + .5f)
+                    continue;
+
+                habitat = At(shore);
+
+                if (!habitat.Water)
                 {
                     found = true;
                     break;
@@ -667,7 +756,6 @@ public static class VegetationPlanner
             if (!found || shore.y > level + 8)
                 return;
 
-            var habitat = At(shore);
             var uphill = shore + outward * 120;
             var relief =
                 Math.Abs(
@@ -732,6 +820,13 @@ public static class VegetationPlanner
 
         var mappedBanks = new HashSet<long>();
 
+        // The first polygon with each banked identity, as a first-match search would find.
+        var bankPolygonByIdentity = new Dictionary<long, GeographicPolygon>();
+
+        foreach (var polygon in geography)
+            if (bankPolygons.Contains(polygon.Identity) && !bankPolygonByIdentity.ContainsKey(polygon.Identity))
+                bankPolygonByIdentity.Add(polygon.Identity, polygon);
+
         foreach (var reach in water.ReachStages
             .OrderBy(reach => reach.BodyId)
             .ThenBy(reach => reach.WayId)
@@ -745,9 +840,7 @@ public static class VegetationPlanner
                 if (!mappedBanks.Add(polygonId))
                     continue;
 
-                var polygon = geography.FirstOrDefault(otherPolygon => otherPolygon.Identity == polygonId);
-
-                if (polygon == null)
+                if (!bankPolygonByIdentity.TryGetValue(polygonId, out var polygon))
                     continue;
 
                 var shape = new PolygonIndex(polygon);

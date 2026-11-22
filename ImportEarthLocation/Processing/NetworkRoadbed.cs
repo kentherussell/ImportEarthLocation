@@ -27,6 +27,13 @@ public static class NetworkRoadbed
         // on the game's grid as the full terrain is (TerrainSampling.HeightKeepingCrests).
         public float[]? Crests { get; init; }
 
+        // Indices of the cells the bridge must publish: those that took the rebuilt ground
+        // and their eight neighbours, which a bilinear sample between rebuilt and kept ground
+        // can reach. Every other cell holds `current`, the ground already published, so the
+        // bridge leaves those pixels as the game has them (report 118). Listed on the refit's
+        // background task, so the game's thread visits only these. Null: publish every cell.
+        public int[]? Published { get; init; }
+
         // Height in metres at a map point inside the patch.
         public double HeightAt(double x, double z)
             => TerrainSampling.HeightKeepingCrests(
@@ -37,6 +44,17 @@ public static class NetworkRoadbed
                 (x - Minimum.x) / Math.Max(1e-8, Maximum.x - Minimum.x),
                 (z - Minimum.y) / Math.Max(1e-8, Maximum.y - Minimum.y));
 
+        // The patch cell nearest a map point inside the patch.
+        public int CellAt(double x, double z)
+        {
+            var u = (x - Minimum.x) / Math.Max(1e-8, Maximum.x - Minimum.x);
+            var v = (z - Minimum.y) / Math.Max(1e-8, Maximum.y - Minimum.y);
+            var column = (int)Math.Round(Math.Max(0, Math.Min(1, u)) * (Width - 1));
+            var row = (int)Math.Round(Math.Max(0, Math.Min(1, v)) * (Height - 1));
+
+            return row * Width + column;
+        }
+
         public void CopyTo(float[] destination)
         {
             for (var z = 0; z < Height; z++)
@@ -44,33 +62,267 @@ public static class NetworkRoadbed
         }
     }
 
+    // The map's count of baseline cells below their defence crest, kept for the baseline and
+    // crests it was counted on: a design's refits share both arrays, and neither is written
+    // after design (refits only read them). Replaced as a whole, so a refit on another
+    // thread reads a consistent entry.
+    private sealed class BelowCrestCount
+    {
+        public BelowCrestCount(float[] baseline, float[] crests, int count)
+        {
+            Baseline = baseline;
+            Crests = crests;
+            Count = count;
+        }
+
+        public float[] Baseline { get; }
+
+        public float[] Crests { get; }
+
+        public int Count { get; }
+    }
+
+    private static volatile BelowCrestCount? s_belowCrestCount;
+
+    // The baseline cells outside the region that lie below their crest, the cells a restore
+    // of the whole map would raise there.
+    private static int BaselineCellsBelowCrestOutside(float[] baseline, float[] crests, int4 region, int resolution)
+    {
+        var total = s_belowCrestCount;
+
+        if (total == null || total.Baseline != baseline || total.Crests != crests)
+        {
+            var count = 0;
+
+            for (var id = 0; id < baseline.Length; id++)
+                if (baseline[id] < crests[id])
+                    count++;
+
+            total = new BelowCrestCount(baseline, crests, count);
+            s_belowCrestCount = total;
+        }
+
+        var inside = 0;
+
+        for (var z = region.y; z <= region.w; z++)
+            for (var id = z * resolution + region.x; id <= z * resolution + region.z; id++)
+                if (baseline[id] < crests[id])
+                    inside++;
+
+        return total.Count - inside;
+    }
+
+    // What one import's local refits share and would otherwise rebuild on every call over the
+    // whole plan or map: each planned section's box, the extent of each protected ring and
+    // line, and, with diagnostics on, the whole-map ground the support check reads. Each part
+    // is checked on every use against what it was built from: the plan's sections by
+    // reference, so a section the plan replaced after a refit is measured again, and the
+    // design's arrays by identity (they are not written after design). ImportApplySystem
+    // starts a refit only after the last one finished and drops its cache with the plan when
+    // an import ends, so one refit uses a cache at a time: a refit still unwinding after a
+    // reset keeps the cache it captured, and the next import makes its own. With diagnostics
+    // on, the ground copy (64 MiB on a 4,096-square map) is held until the import ends.
+    public sealed class LocalPatchCache
+    {
+        private PreparedSegment?[] _sections = Array.Empty<PreparedSegment?>();
+        private float2[] _lows = Array.Empty<float2>();
+        private float2[] _highs = Array.Empty<float2>();
+        private float[] _reaches = Array.Empty<float>();
+        private double _cell = double.NaN;
+        private IEnumerable<float3[]>? _ringSource;
+        private float[]? _ringRanges;
+        private IEnumerable<float3[]>? _lineSource;
+        private float[]? _lineBoxes;
+        private float[]? _ground;
+        private float[]? _groundBaseline;
+        private float[]? _groundCrests;
+
+        // The plan's sections' boxes and reaches, index for index (see Measure).
+        public void Bounds(
+            IReadOnlyList<PreparedSegment> plan,
+            double cell,
+            out float2[] lows,
+            out float2[] highs,
+            out float[] reaches)
+        {
+            if (_sections.Length != plan.Count || _cell != cell)
+            {
+                _sections = new PreparedSegment?[plan.Count];
+                _lows = new float2[plan.Count];
+                _highs = new float2[plan.Count];
+                _reaches = new float[plan.Count];
+                _cell = cell;
+            }
+
+            for (var index = 0; index < plan.Count; index++)
+            {
+                var segment = plan[index];
+
+                if (ReferenceEquals(_sections[index], segment))
+                    continue;
+
+                _sections[index] = segment;
+                Measure(segment, cell, out _lows[index], out _highs[index], out _reaches[index]);
+            }
+
+            lows = _lows;
+            highs = _highs;
+            reaches = _reaches;
+        }
+
+        public float[] RingRanges(IEnumerable<float3[]> rings)
+        {
+            if (_ringRanges == null || !ReferenceEquals(_ringSource, rings))
+            {
+                _ringRanges = NetworkRoadbed.RingRanges(rings);
+                _ringSource = rings;
+            }
+
+            return _ringRanges;
+        }
+
+        public float[] LineBoxes(IEnumerable<float3[]> lines)
+        {
+            if (_lineBoxes == null || !ReferenceEquals(_lineSource, lines))
+            {
+                _lineBoxes = NetworkRoadbed.LineBoxes(lines);
+                _lineSource = lines;
+            }
+
+            return _lineBoxes;
+        }
+
+        // The baseline with its defences restored (crests null: none). The caller may write
+        // into it but must put back what it wrote before the next use.
+        public float[] Ground(float[] baseline, float[]? crests)
+        {
+            if (_ground == null || _groundBaseline != baseline || _groundCrests != crests)
+            {
+                var ground = (float[])baseline.Clone();
+
+                if (crests != null)
+                    FloodDefences.Restore(ground, crests);
+
+                _ground = ground;
+                _groundBaseline = baseline;
+                _groundCrests = crests;
+            }
+
+            return _ground;
+        }
+    }
+
+    // A section's box over its four course points (lowest and highest x and z) and the
+    // distance, in metres, within which its earthworks can reach a cell.
+    private static void Measure(PreparedSegment segment, double cell, out float2 low, out float2 high, out float reach)
+    {
+        low =
+            math.min(
+                math.min(segment.CourseStart.xz, segment.CourseControl1.xz),
+                math.min(segment.CourseControl2.xz, segment.CourseEnd.xz));
+
+        high =
+            math.max(
+                math.max(segment.CourseStart.xz, segment.CourseControl1.xz),
+                math.max(segment.CourseControl2.xz, segment.CourseEnd.xz));
+
+        reach = (float)(240 + Math.Max(0, segment.NativeWidth) + 2 * cell);
+    }
+
+    // Each ring's lowest and highest x and z, four per ring in order, found as PrepareRegion
+    // finds them (NaN z for a ring of fewer than three points, which it passes over).
+    private static float[] RingRanges(IEnumerable<float3[]> rings)
+    {
+        var ranges = new List<float>();
+
+        foreach (var ring in rings)
+        {
+            var lowX = float.PositiveInfinity;
+            var highX = float.NegativeInfinity;
+
+            foreach (var point in ring)
+            {
+                lowX = Math.Min(lowX, point.x);
+                highX = Math.Max(highX, point.x);
+            }
+
+            ranges.Add(lowX);
+            ranges.Add(highX);
+            ranges.Add(ring.Length < 3 ? float.NaN : ring.Min(point => point.z));
+            ranges.Add(ring.Length < 3 ? float.NaN : ring.Max(point => point.z));
+        }
+
+        return ranges.ToArray();
+    }
+
+    // Each line's lowest x and z and highest x and z, four per line in order (NaN for a line
+    // with a coordinate that is not finite, which is never skipped).
+    private static float[] LineBoxes(IEnumerable<float3[]> lines)
+    {
+        var boxes = new List<float>();
+
+        foreach (var line in lines)
+        {
+            var low = new float2(float.PositiveInfinity);
+            var high = new float2(float.NegativeInfinity);
+            var finite = true;
+
+            foreach (var point in line)
+            {
+                finite &= math.all(math.isfinite(point.xz));
+                low = math.min(low, point.xz);
+                high = math.max(high, point.xz);
+            }
+
+            if (!finite)
+                low = high = new float2(float.NaN);
+
+            boxes.Add(low.x);
+            boxes.Add(low.y);
+            boxes.Add(high.x);
+            boxes.Add(high.y);
+        }
+
+        return boxes.ToArray();
+    }
+
+    // cache: what the import's earlier refits measured (null: measured afresh for this call).
     public static Patch BuildLocalPatch(
         PreparedImport prepared,
         float[] current,
         IReadOnlyList<PreparedSegment> plan,
         int start,
-        IReadOnlyList<PreparedSegment> revision, ImportLog log, CancellationToken token)
+        IReadOnlyList<PreparedSegment> revision, ImportLog log, CancellationToken token,
+        LocalPatchCache? cache = null)
     {
+        var partClock = System.Diagnostics.Stopwatch.StartNew();
+        cache ??= new LocalPatchCache();
         var baseline = prepared.RoadbedBaseline;
         var resolution = TerrainSampling.Resolution(baseline);
 
         if (current.Length != baseline.Length || resolution < 2)
             throw new InvalidOperationException("Local roadbed baseline is unavailable.");
 
+        if (start < 0 || start + revision.Count > plan.Count)
+            throw new ArgumentOutOfRangeException(nameof(start), "A local revision must lie within the plan.");
+
         var otherLow = new float2(float.PositiveInfinity);
         var otherHigh = new float2(float.NegativeInfinity);
 
-        foreach (var segment in plan.Skip(start).Take(revision.Count).Concat(revision))
-            foreach (var point in new[] {
-                segment.CourseStart,
-                segment.CourseControl1,
-                segment.CourseControl2,
-                segment.CourseEnd
-                })
-            {
-                otherLow = math.min(otherLow, point.xz);
-                otherHigh = math.max(otherHigh, point.xz);
-            }
+        // The old sections the revision replaces, then the revision, each one's course points
+        // in order.
+        for (var index = 0; index < 2 * revision.Count; index++)
+        {
+            var segment = index < revision.Count ? plan[start + index] : revision[index - revision.Count];
+            otherLow = math.min(otherLow, segment.CourseStart.xz);
+            otherHigh = math.max(otherHigh, segment.CourseStart.xz);
+            otherLow = math.min(otherLow, segment.CourseControl1.xz);
+            otherHigh = math.max(otherHigh, segment.CourseControl1.xz);
+            otherLow = math.min(otherLow, segment.CourseControl2.xz);
+            otherHigh = math.max(otherHigh, segment.CourseControl2.xz);
+            otherLow = math.min(otherLow, segment.CourseEnd.xz);
+            otherHigh = math.max(otherHigh, segment.CourseEnd.xz);
+        }
 
         var width = prepared.Request.MapSize.WidthMeters;
         var cell = width / (resolution - 1);
@@ -87,69 +339,35 @@ public static class NetworkRoadbed
                 Math.Min(resolution - 1, Pixel(otherHigh.x) + 1),
                 Math.Min(resolution - 1, Pixel(otherHigh.y) + 1));
 
-        var all = plan.ToArray();
+        // The plan's sections' boxes, measured once per import and again only where the plan
+        // replaced a section, and the revision's, which stand in for the sections it replaces.
+        cache.Bounds(plan, cell, out var lows, out var highs, out var reaches);
+        var revisedLows = new float2[revision.Count];
+        var revisedHighs = new float2[revision.Count];
+        var revisedReaches = new float[revision.Count];
 
-        for (var i = 0; i < revision.Count; i++)
-            all[start + i] = revision[i];
-
-        bool Nearby(PreparedSegment segment)
-        {
-            var min =
-                math.min(
-                    math.min(segment.CourseStart.xz, segment.CourseControl1.xz),
-                    math.min(segment.CourseControl2.xz, segment.CourseEnd.xz));
-
-            var max =
-                math.max(
-                    math.max(segment.CourseStart.xz, segment.CourseControl1.xz),
-                    math.max(segment.CourseControl2.xz, segment.CourseEnd.xz));
-
-            var reach = 240 + Math.Max(0, segment.NativeWidth) + 2 * cell;
-
-            return math.all(max >= otherLow - (float)reach) && math.all(min <= otherHigh + (float)reach);
-        }
+        for (var index = 0; index < revision.Count; index++)
+            Measure(revision[index], cell, out revisedLows[index], out revisedHighs[index], out revisedReaches[index]);
 
         // A unit can run for kilometres, so its bounding box holds far more ground than it
         // changes. Earthworks reach at most `margin` from a section, so only cells within
         // that distance of an old or revised section can differ, and only sections within a
         // second `margin` of those can shape such a cell. Everything else keeps `current`.
-        var changedBoxes =
-            plan.Skip(start)
-                .Take(revision.Count)
-                .Concat(revision)
-                .Select(
-                    segment =>
-                    {
-                        var min =
-                            math.min(
-                                math.min(segment.CourseStart.xz, segment.CourseControl1.xz),
-                                math.min(segment.CourseControl2.xz, segment.CourseEnd.xz));
+        var changedBoxes = new (float2 Low, float2 High)[2 * revision.Count];
 
-                        var max =
-                            math.max(
-                                math.max(segment.CourseStart.xz, segment.CourseControl1.xz),
-                                math.max(segment.CourseControl2.xz, segment.CourseEnd.xz));
-
-                        return (Low: min - new float2((float)margin), High: max + new float2((float)margin));
-                    })
-                .ToArray();
-
-        bool NearChange(PreparedSegment segment)
+        for (var index = 0; index < revision.Count; index++)
         {
-            if (!Nearby(segment))
+            changedBoxes[index] =
+                (lows[start + index] - new float2((float)margin), highs[start + index] + new float2((float)margin));
+
+            changedBoxes[revision.Count + index] =
+                (revisedLows[index] - new float2((float)margin), revisedHighs[index] + new float2((float)margin));
+        }
+
+        bool NearChange(float2 min, float2 max, float reach)
+        {
+            if (!(math.all(max >= otherLow - reach) && math.all(min <= otherHigh + reach)))
                 return false;
-
-            var min =
-                math.min(
-                    math.min(segment.CourseStart.xz, segment.CourseControl1.xz),
-                    math.min(segment.CourseControl2.xz, segment.CourseEnd.xz));
-
-            var max =
-                math.max(
-                    math.max(segment.CourseStart.xz, segment.CourseControl1.xz),
-                    math.max(segment.CourseControl2.xz, segment.CourseEnd.xz));
-
-            var reach = (float)(240 + Math.Max(0, segment.NativeWidth) + 2 * cell);
 
             foreach (var box in changedBoxes)
                 if (math.all(max >= box.Low - reach) && math.all(min <= box.High + reach))
@@ -158,9 +376,38 @@ public static class NetworkRoadbed
             return false;
         }
 
-        var neighbours = all.Where(NearChange).ToArray();
+        // The sections near the change, in plan order with the revision in place of the
+        // sections it replaces, and those of them already issued that stand on the ground.
+        var neighbourList = new List<PreparedSegment>();
+        var issued = new List<PreparedSegment>();
+
+        for (var index = 0; index < plan.Count; index++)
+        {
+            var revised = index - start;
+            var replaced = revised >= 0 && revised < revision.Count;
+            var near =
+                replaced
+                    ? NearChange(revisedLows[revised], revisedHighs[revised], revisedReaches[revised])
+                    : NearChange(lows[index], highs[index], reaches[index]);
+
+            if (!near)
+                continue;
+
+            var segment = replaced ? revision[revised] : plan[index];
+            neighbourList.Add(segment);
+
+            if (index < start && !NetworkStructure.IsStructure(segment))
+                issued.Add(segment);
+        }
+
+        var neighbours = neighbourList.ToArray();
+        log.AddDuration("Local refit patch neighbours", partClock.Elapsed.TotalSeconds);
+        partClock.Restart();
+        var w = region.z - region.x + 1;
+        var h = region.w - region.y + 1;
+        // The rebuilt ground of the region alone, row by row, cell for cell as the patch.
         var rebuilt =
-            Prepare(
+            PrepareRegion(
                 baseline,
                 prepared.HeightScaleMeters,
                 width,
@@ -169,26 +416,43 @@ public static class NetworkRoadbed
                 prepared.RoadbedProtectedLines,
                 log,
                 token,
-                region);
+                region,
+                float.NaN,
+                cache);
+
+        partClock.Restart();
 
         // Earthworks may cut a defence where a road crosses it; it goes back up, as in design.
-        if (prepared.DefenceCrests?.Length == rebuilt.Length)
-            log.Count("Local refit flood defence cells restored", FloodDefences.Restore(rebuilt, prepared.DefenceCrests));
+        // The count covers the whole map, as it did when the whole map was rebuilt: outside the
+        // region that is the baseline's cells below their crest.
+        if (prepared.DefenceCrests?.Length == baseline.Length)
+            log.Count(
+                "Local refit flood defence cells restored",
+                BaselineCellsBelowCrestOutside(baseline, prepared.DefenceCrests, region, resolution)
+                    + FloodDefences.Restore(rebuilt, prepared.DefenceCrests, region.x, region.y, w, resolution));
 
-        var issued =
-            all.Take(start).Where(segment => !NetworkStructure.IsStructure(segment) && NearChange(segment)).ToArray();
-
-        var w = region.z - region.x + 1;
-        var h = region.w - region.y + 1;
+        log.AddDuration("Local refit patch flood defences", partClock.Elapsed.TotalSeconds);
+        partClock.Restart();
         var samples = new float[w * h];
         var preserved = 0;
         var protectedCores = new bool[w * h];
         var changeable = new bool[w * h];
+        // Each changeable cell once: only these can take the rebuilt ground, so the passes
+        // below visit them rather than the whole rectangle.
+        var changeableCells = new List<int>();
 
         foreach (var box in changedBoxes)
             for (var z = Math.Max(region.y, Pixel(box.Low.y)); z <= Math.Min(region.w, Pixel(box.High.y) + 1); z++)
                 for (var x = Math.Max(region.x, Pixel(box.Low.x)); x <= Math.Min(region.z, Pixel(box.High.x) + 1); x++)
-                    changeable[(z - region.y) * w + x - region.x] = true;
+                {
+                    var index = (z - region.y) * w + x - region.x;
+
+                    if (changeable[index])
+                        continue;
+
+                    changeable[index] = true;
+                    changeableCells.Add(index);
+                }
 
         foreach (var segment in issued)
         {
@@ -222,33 +486,37 @@ public static class NetworkRoadbed
             }
         }
 
+        // Every cell holds the ground already published unless it can change and is free.
         for (var z = 0; z < h; z++)
-            for (var x = 0; x < w; x++)
+            Array.Copy(current, (region.y + z) * resolution + region.x, samples, z * w, w);
+
+        var edits = prepared.RoadbedLaterEdits;
+        var rebuiltCells = new List<int>();
+
+        foreach (var index in changeableCells)
+        {
+            token.ThrowIfCancellationRequested();
+            var id = (region.y + index / w) * resolution + region.x + index % w;
+            // Preserve already-issued ground cores, including an interpolation
+            // cell of support. A local retry owns only its unissued support.
+            var protectedCore = protectedCores[index] || edits?.Mask.Length == current.Length && edits.Mask[id] != 0;
+
+            if (protectedCore)
             {
-                token.ThrowIfCancellationRequested();
-                var gx = region.x + x;
-                var gz = region.y + z;
-                var id = gz * resolution + gx;
-                // Preserve already-issued ground cores, including an interpolation
-                // cell of support. A local retry owns only its unissued support.
-                var edits = prepared.RoadbedLaterEdits;
-                var protectedCore =
-                    !changeable[z * w + x]
-                    || protectedCores[z * w + x]
-                    || edits?.Mask.Length == current.Length && edits.Mask[id] != 0;
-
-                samples[z * w + x] = protectedCore ? current[id] : rebuilt[id];
-
-                if (protectedCore && changeable[z * w + x])
-                    preserved++;
+                preserved++;
+                continue;
             }
+
+            samples[index] = rebuilt[index];
+            rebuiltCells.Add(index);
+        }
 
         log.Diagnostic(
             $"LOCAL ROADBED staged samples={samples.Length}; neighbourSections={neighbours.Length}; issuedCoreSamplesPreserved={preserved}; baselineImmutable=true; nativeMutation=false");
 
         float[]? crests = null;
 
-        if (prepared.DefenceCrests?.Length == rebuilt.Length)
+        if (prepared.DefenceCrests?.Length == baseline.Length)
         {
             crests = new float[w * h];
 
@@ -256,16 +524,77 @@ public static class NetworkRoadbed
                 Array.Copy(prepared.DefenceCrests, (region.y + z) * resolution + region.x, crests, z * w, w);
         }
 
-        var patch = new Patch(region.x, region.y, w, h, samples, resolution, width) { Crests = crests };
-        patch.CopyTo(rebuilt);
-        NetworkTerrainSupport.Validate(
-            revision,
-            rebuilt,
-            prepared.HeightScaleMeters,
-            width,
-            log,
-            token,
-            scope: $"native-unit-{revision[0].NativeUnitId}");
+        // A cell is published when it or one of its eight neighbours took the rebuilt ground:
+        // the rebuilt cells' neighbourhoods, listed once each and sorted into row order.
+        var published = new List<int>();
+        var listed = new bool[w * h];
+
+        foreach (var index in rebuiltCells)
+        {
+            var x = index % w;
+            var z = index / w;
+
+            for (var dz = Math.Max(0, z - 1); dz <= Math.Min(h - 1, z + 1); dz++)
+                for (var dx = Math.Max(0, x - 1); dx <= Math.Min(w - 1, x + 1); dx++)
+                {
+                    var neighbour = dz * w + dx;
+
+                    if (listed[neighbour])
+                        continue;
+
+                    listed[neighbour] = true;
+                    published.Add(neighbour);
+                }
+        }
+
+        published.Sort();
+
+        var patch =
+            new Patch(region.x, region.y, w, h, samples, resolution, width)
+            {
+                Crests = crests,
+                Published = published.ToArray()
+            };
+
+        log.AddDuration("Local refit patch assembly", partClock.Elapsed.TotalSeconds);
+
+        // The ground-support certificate only reports (report 118), and placement waits for
+        // this refit, so it runs only with diagnostics on; only it reads the patched ground.
+        // The whole map it reads is the baseline, with its defences restored, under the patch:
+        // the cache's copy, with the patch written in for the check and taken out after it.
+        if (log.DiagnosticsEnabled)
+        {
+            partClock.Restart();
+            var ground =
+                cache.Ground(
+                    baseline,
+                    prepared.DefenceCrests?.Length == baseline.Length ? prepared.DefenceCrests : null);
+
+            var underPatch = new float[w * h];
+
+            for (var z = 0; z < h; z++)
+                Array.Copy(ground, (region.y + z) * resolution + region.x, underPatch, z * w, w);
+
+            try
+            {
+                patch.CopyTo(ground);
+                NetworkTerrainSupport.Validate(
+                    revision,
+                    ground,
+                    prepared.HeightScaleMeters,
+                    width,
+                    log,
+                    token,
+                    scope: $"native-unit-{revision[0].NativeUnitId}");
+            }
+            finally
+            {
+                for (var z = 0; z < h; z++)
+                    Array.Copy(underPatch, z * w, ground, (region.y + z) * resolution + region.x, w);
+            }
+
+            log.AddDuration("Local refit patch support check", partClock.Elapsed.TotalSeconds);
+        }
 
         return patch;
     }
@@ -286,21 +615,76 @@ public static class NetworkRoadbed
         if (n * n != source.Length || n < 2 || width <= 0 || scale <= 0)
             throw new InvalidOperationException("Invalid roadbed terrain.");
 
+        var window =
+            PrepareRegion(
+                source,
+                scale,
+                width,
+                segments,
+                protectedAreas,
+                protectedLines,
+                log,
+                token,
+                dirtyRegion,
+                waterSurface,
+                null);
+
+        if (dirtyRegion is not int4 region)
+            return window;
+
+        // Nothing outside the region changes: the whole grid is the source with the window in it.
+        var result = (float[])source.Clone();
+        var regionWidth = region.z - region.x + 1;
+
+        for (var z = region.y; z <= region.w; z++)
+            Array.Copy(window, (z - region.y) * regionWidth, result, z * n + region.x, regionWidth);
+
+        return result;
+    }
+
+    // Prepare's work, returning only the region (the whole grid when there is none), row by
+    // row: every edit lies inside it, so a local refit need not copy the rest of the map.
+    // localRefit: a local refit's cache, which holds the protected rings' and lines' extents;
+    // the refit's parts are timed. Null for a design, which measures them afresh.
+    private static float[] PrepareRegion(
+        float[] source,
+        float scale,
+        double width,
+        IReadOnlyList<PreparedSegment> segments,
+        IEnumerable<float3[]> protectedAreas,
+        IEnumerable<float3[]> protectedLines,
+        ImportLog log,
+        CancellationToken token,
+        int4? dirtyRegion,
+        float waterSurface,
+        LocalPatchCache? localRefit)
+    {
+        var partClock = System.Diagnostics.Stopwatch.StartNew();
+        var n = (int)Math.Sqrt(source.Length);
         var cell = (float)(width / (n - 1));
-        var protectedMask = new bool[source.Length];
-        var lineGuard = new bool[source.Length];
         var region = dirtyRegion ?? new int4(0, 0, n - 1, n - 1);
+        // The masks and the result cover the region only, row by row (the whole grid when
+        // there is none): nothing outside it is marked, read or changed. A local refit's
+        // region is a part of the map.
+        var regionWidth = region.z - region.x + 1;
+        var regionCells = regionWidth * (region.w - region.y + 1);
+        var protectedMask = new bool[regionCells];
+        var lineGuard = new bool[regionCells];
         // Inside mapped water and quarry polygons only, without the guard bands
         // around them and around cliff, waterway and coast lines: tunnel roof
         // cover may be built there (Marseille's tunnels pass beside cliffs and
         // under buried streams, whose bands left their bores exposed).
-        var areaMask = new bool[source.Length];
+        var areaMask = new bool[regionCells];
         var coordinates = new float[n];
 
         for (var i = 0; i < n; i++)
             coordinates[i] = (i / (float)(n - 1) - .5f) * (float)width;
 
         int Pixel(float value) => (int)Math.Round((value / width + .5) * (n - 1));
+
+        int MaskIndex(int x, int z) => (z - region.y) * regionWidth + x - region.x;
+
+        int ResultIndex(int id) => MaskIndex(id % n, id / n);
 
         void Guard(float3 vectorA, float3 vectorB, float margin, bool[]? mask = null)
         {
@@ -316,26 +700,62 @@ public static class NetworkRoadbed
                     var t = math.clamp(math.dot(point - vectorA.xz, delta) / denominator, 0, 1);
 
                     if (math.distance(point, math.lerp(vectorA.xz, vectorB.xz, t)) <= margin)
-                        (mask ?? protectedMask)[z * n + x] = true;
+                        (mask ?? protectedMask)[MaskIndex(x, z)] = true;
                 }
         }
+
+        // A refit takes each ring's x extent and each line's box from its cache, measured once.
+        var ringRanges = localRefit?.RingRanges(protectedAreas);
+        var lineBoxes = localRefit?.LineBoxes(protectedLines);
+        var ringIndex = -1;
 
         // Protect the actual polygon, not its rectangular envelope. A winding
         // river's bounding box can cover kilometres of dry roads and prevent
         // their entire cut/fill pass from being applied.
         foreach (var ring in protectedAreas)
         {
+            ringIndex++;
             token.ThrowIfCancellationRequested();
 
             if (ring.Length < 3)
                 continue;
 
+            var lowX = float.PositiveInfinity;
+            var highX = float.NegativeInfinity;
+
+            if (ringRanges != null)
+            {
+                lowX = ringRanges[4 * ringIndex];
+                highX = ringRanges[4 * ringIndex + 1];
+            }
+            else
+                foreach (var point in ring)
+                {
+                    lowX = Math.Min(lowX, point.x);
+                    highX = Math.Max(highX, point.x);
+                }
+
+            // A ring that reaches no column of the region marks nothing: its interior lies
+            // between its lowest and highest x, and its edge guards one cell beyond them
+            // (rounding moves a crossing by far less than a cell). A ring with a coordinate
+            // that is not finite is left to the passes below.
+            if (math.isfinite(lowX)
+                && math.isfinite(highX)
+                && (Pixel(highX + cell) < region.x || Pixel(lowX - cell) > region.z))
+                continue;
+
+            var lowZ = ringRanges != null ? ringRanges[4 * ringIndex + 2] : ring.Min(point => point.z);
+            var highZ = ringRanges != null ? ringRanges[4 * ringIndex + 3] : ring.Max(point => point.z);
+
+            // Nor does a ring that reaches no row of the region, for the same reasons.
+            if (math.isfinite(lowZ)
+                && math.isfinite(highZ)
+                && (Pixel(highZ + cell) < region.y || Pixel(lowZ - cell) > region.w))
+                continue;
+
             var crossings = new List<float>(ring.Length);
 
-            for (var z =
-                Math.Max(
-                    region.y,
-                    Pixel(ring.Min(point => point.z))); z <= Math.Min(region.w, Pixel(ring.Max(point => point.z))); z++)
+            for (var z = Math.Max(region.y, Pixel(lowZ)); z <= Math.Min(region.w, Pixel(highZ)); z++)
             {
                 token.ThrowIfCancellationRequested();
                 var y = coordinates[z];
@@ -357,7 +777,7 @@ public static class NetworkRoadbed
                 for (var i = 1; i < crossings.Count; i += 2)
                     for (var x =
                         Math.Max(region.x, Pixel(crossings[i - 1])); x <= Math.Min(region.z, Pixel(crossings[i])); x++)
-                        protectedMask[z * n + x] = areaMask[z * n + x] = true;
+                        protectedMask[MaskIndex(x, z)] = areaMask[MaskIndex(x, z)] = true;
             }
 
             for (var i = 0; i < ring.Length; i++)
@@ -369,12 +789,33 @@ public static class NetworkRoadbed
         // from which the ground under its centre is read: the road stands there in
         // game whatever the ground does, and left unstamped it floated or sank
         // beside bridges over streams (300 of Marseille's 1,455 mismatches).
+        var lineIndex = -1;
+
         foreach (var line in protectedLines)
+        {
+            lineIndex++;
+
+            // A refit passes over a line that reaches no cell of the region: each of its bands
+            // lies within its box widened by two cells, and a third covers rounding.
+            if (lineBoxes != null
+                && math.isfinite(lineBoxes[4 * lineIndex])
+                && (Pixel(lineBoxes[4 * lineIndex + 2] + cell * 3) < region.x
+                    || Pixel(lineBoxes[4 * lineIndex] - cell * 3) > region.z
+                    || Pixel(lineBoxes[4 * lineIndex + 3] + cell * 3) < region.y
+                    || Pixel(lineBoxes[4 * lineIndex + 1] - cell * 3) > region.w))
+                continue;
+
             for (var i = 1; i < line.Length; i++)
             {
                 token.ThrowIfCancellationRequested();
                 Guard(line[i - 1], line[i], cell * 2, lineGuard);
             }
+        }
+
+        if (localRefit != null)
+            log.AddDuration("Local refit patch protection", partClock.Elapsed.TotalSeconds);
+
+        partClock.Restart();
 
         // Tunnel nodes that also meet an open section. The game draws the first
         // PortalOpen metres of a bore as an open cut, so there is no roof to keep:
@@ -669,6 +1110,8 @@ public static class NetworkRoadbed
                         ? endPoint + outEnd * ((i - steps) * length / steps)
                         : NetworkNormalizer.Evaluate(segment, i / (float)steps);
 
+            var point = Station(-extendStart);
+
             for (var i = -extendStart; i <= steps + extendEnd; i++)
             {
                 token.ThrowIfCancellationRequested();
@@ -682,10 +1125,14 @@ public static class NetworkRoadbed
                 }
 
                 var t = math.clamp(i / (float)steps, 0, 1);
-                var point = Station(i);
+                // The span runs from the last station to this one (the first is its own).
+                var previous = point;
+
+                if (i > -extendStart)
+                    point = Station(i);
+
                 var px = Pixel(point.x);
                 var pz = Pixel(point.z);
-                var previous = Station(Math.Max(-extendStart, i - 1));
                 var span = point.xz - previous.xz;
                 var spanLengthSquared = math.lengthsq(span);
                 var originalCenter = NetworkProcessor.Sample(point.x, point.z, source, width);
@@ -725,9 +1172,36 @@ public static class NetworkRoadbed
                             - NetworkNormalizer.Evaluate(segment, Math.Max(0, t - .01f))).xz);
 
                 var leftNormal = new float2(-tangent.y, tangent.x);
+                // No side reaches further than `radius` from the span (a wall side's shoulder
+                // is narrower than any earth bank), so a cell more than a metre beyond that
+                // from the span's bounding box fails the distance test below: rounding moves
+                // that distance by millimetres. Rows and columns of such cells are skipped,
+                // except about a span whose position is not finite.
+                var pruned = math.all(math.isfinite(previous.xz)) && math.all(math.isfinite(point.xz));
+                var limit = radius + 1d;
+                var spanLowX = Math.Min(previous.x, point.x);
+                var spanHighX = Math.Max(previous.x, point.x);
+                var spanLowZ = Math.Min(previous.z, point.z);
+                var spanHighZ = Math.Max(previous.z, point.z);
 
                 for (var z = Math.Max(region.y, pz - reach); z <= Math.Min(region.w, pz + reach); z++)
-                    for (var x = Math.Max(region.x, px - reach); x <= Math.Min(region.z, px + reach); x++)
+                {
+                    var firstX = Math.Max(region.x, px - reach);
+                    var lastX = Math.Min(region.z, px + reach);
+
+                    if (pruned)
+                    {
+                        var rowGap = Math.Max(0, Math.Max(spanLowZ - coordinates[z], coordinates[z] - spanHighZ));
+
+                        if (rowGap > limit)
+                            continue;
+
+                        var chord = Math.Sqrt(limit * limit - (double)rowGap * rowGap);
+                        firstX = Math.Max(firstX, (int)Math.Floor(((spanLowX - chord) / width + .5) * (n - 1)));
+                        lastX = Math.Min(lastX, (int)Math.Ceiling(((spanHighX + chord) / width + .5) * (n - 1)));
+                    }
+
+                    for (var x = firstX; x <= lastX; x++)
                     {
                         var sample = new float2(coordinates[x], coordinates[z]);
                         var station =
@@ -756,7 +1230,7 @@ public static class NetworkRoadbed
 
                         var id = z * n + x;
 
-                        if (protectedMask[id] || lineGuard[id] && distance > half + cell)
+                        if (protectedMask[MaskIndex(x, z)] || lineGuard[MaskIndex(x, z)] && distance > half + cell)
                         {
                             protectedSamples++;
                             continue;
@@ -811,6 +1285,7 @@ public static class NetworkRoadbed
                                 targets[id] = (supportedTarget, budget, weight, distance);
                         }
                     }
+                }
             }
 
             if (unsupported)
@@ -824,6 +1299,11 @@ public static class NetworkRoadbed
                 nextProgress = clock.Elapsed.TotalSeconds + 5;
             }
         }
+
+        if (localRefit != null)
+            log.AddDuration("Local refit patch stamping", partClock.Elapsed.TotalSeconds);
+
+        partClock.Restart();
 
         // Under a bridge deck: city elevation data carries viaducts and their
         // embankments (the A7 into Marseille), and a deck sat in the ground it
@@ -862,7 +1342,10 @@ public static class NetworkRoadbed
                         var id = z * n + x;
                         var distance = math.distance(new float2(coordinates[x], coordinates[z]), point.xz);
 
-                        if (distance > edge || protectedMask[id] || lineGuard[id] || targets.ContainsKey(id))
+                        if (distance > edge
+                            || protectedMask[MaskIndex(x, z)]
+                            || lineGuard[MaskIndex(x, z)]
+                            || targets.ContainsKey(id))
                             continue;
 
                         var original = source[id];
@@ -878,7 +1361,11 @@ public static class NetworkRoadbed
             }
         }
 
-        var result = (float[])source.Clone();
+        var result = new float[regionCells];
+
+        for (var z = region.y; z <= region.w; z++)
+            Array.Copy(source, z * n + region.x, result, (z - region.y) * regionWidth, regionWidth);
+
         var changed = 0;
         var maximum = 0f;
 
@@ -895,9 +1382,9 @@ public static class NetworkRoadbed
                     Math.Max(0, original - entry.Value.budget),
                     Math.Min(scale, original + entry.Value.budget));
 
-            result[entry.Key] = target;
+            result[ResultIndex(entry.Key)] = target;
 
-            if (result[entry.Key] != source[entry.Key])
+            if (result[ResultIndex(entry.Key)] != source[entry.Key])
                 changed++;
 
             maximum = Math.Max(maximum, Math.Abs(target - original));
@@ -907,9 +1394,9 @@ public static class NetworkRoadbed
         {
             var value = math.clamp(target, 0, scale);
 
-            if (value < result[id])
+            if (value < result[ResultIndex(id)])
             {
-                result[id] = value;
+                result[ResultIndex(id)] = value;
                 changed++;
             }
         }
@@ -964,11 +1451,11 @@ public static class NetworkRoadbed
                         var id = z * n + x;
                         var distance = math.distance(new float2(coordinates[x], coordinates[z]), point.xz);
 
-                        if (areaMask[id] || distance > reach)
+                        if (areaMask[MaskIndex(x, z)] || distance > reach)
                             continue;
 
                         var original = source[id];
-                        var current = result[id];
+                        var current = result[ResultIndex(id)];
                         var target =
                             Math.Min(point.y + RoofHeight - Math.Max(0, distance - core) * RoofSlope, original + fill);
 
@@ -987,32 +1474,61 @@ public static class NetworkRoadbed
             }
         }
 
+        // Every ground section's points at half-cell spacing, start to end, section after
+        // section: the roof ceilings below and the refinement sweeps after them both walk
+        // them. A section's points run from its start index to the next section's.
+        var groundSections = segments.Where(otherSegment => !NetworkStructure.IsStructure(otherSegment)).ToArray();
+        var deckPoints = new List<float3>();
+        var sectionStarts = new int[groundSections.Length + 1];
+
+        for (var section = 0; section < groundSections.Length; section++)
+        {
+            var segment = groundSections[section];
+            var steps = Math.Max(1, (int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(segment) / (cell * .5f)));
+            sectionStarts[section] = deckPoints.Count;
+
+            for (var i = 0; i <= steps; i++)
+                deckPoints.Add(NetworkNormalizer.Evaluate(segment, i / (float)steps));
+        }
+
+        sectionStarts[groundSections.Length] = deckPoints.Count;
+
         if (roofTargets.Count > 0)
         {
+            // Tiles of Tile x Tile cells holding a roof target, by tile column and row.
             const int Tile = 16;
-            var tiles = new HashSet<(int, int)>();
+            var tilesPerRow = (n + Tile - 1) / Tile;
+            var tiles = new bool[tilesPerRow * tilesPerRow];
+            var sectionPoints = deckPoints.ToArray();
 
             foreach (var id in roofTargets.Keys)
-                tiles.Add((id % n / Tile, id / n / Tile));
+                tiles[id / n / Tile * tilesPerRow + id % n / Tile] = true;
 
-            foreach (var segment in segments.Where(otherSegment => !NetworkStructure.IsStructure(otherSegment)))
+            bool RoofTile(int column, int row)
+                => column >= 0
+                    && column < tilesPerRow
+                    && row >= 0
+                    && row < tilesPerRow
+                    && tiles[row * tilesPerRow + column];
+
+            for (var section = 0; section < groundSections.Length; section++)
             {
                 token.ThrowIfCancellationRequested();
+                var segment = groundSections[section];
                 var half = segment.NativeWidth > 0 ? segment.NativeWidth * .5f : 6;
                 var reach = half + cell + RoofFill / RoofSlope;
                 var r = (int)Math.Ceiling(reach / cell);
-                var steps = Math.Max(1, (int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(segment) / (cell * .5f)));
 
-                for (var i = 0; i <= steps; i++)
+                for (var pointIndex = sectionStarts[section]; pointIndex < sectionStarts[section + 1]; pointIndex++)
                 {
-                    var point = NetworkNormalizer.Evaluate(segment, i / (float)steps);
+                    var point = sectionPoints[pointIndex];
                     var px = Pixel(point.x);
                     var pz = Pixel(point.z);
                     var near = false;
 
                     for (var dz = -1; dz <= 1 && !near; dz++)
                         for (var dx = -1; dx <= 1 && !near; dx++)
-                            near = tiles.Contains((px / Tile + dx, pz / Tile + dz));
+                            near = RoofTile(px / Tile + dx, pz / Tile + dz);
 
                     if (!near)
                         continue;
@@ -1045,10 +1561,10 @@ public static class NetworkRoadbed
 
         foreach (var (id, target) in roofTargets)
         {
-            if (target <= result[id])
+            if (target <= result[ResultIndex(id)])
                 continue;
 
-            result[id] = math.clamp(target, 0, scale);
+            result[ResultIndex(id)] = math.clamp(target, 0, scale);
             roofSamples++;
         }
 
@@ -1064,102 +1580,157 @@ public static class NetworkRoadbed
         // halved the replayed terrain mismatches for about 0.3 s; three gave a
         // third, and the gain per sweep was still falling at twelve.
         const int RefineSweeps = 12;
-        var refined = new Dictionary<int, float>();
 
-        float Height(int id) => refined.TryGetValue(id, out var h) ? h : result[id];
-
-        var deckPoints = new List<float3>();
-
-        foreach (var segment in segments.Where(otherSegment => !NetworkStructure.IsStructure(otherSegment)))
-        {
-            var steps = Math.Max(1, (int)Math.Ceiling(NetworkVerticalProfiles.ArcLength(segment) / (cell * .5f)));
-
-            for (var i = 0; i <= steps; i++)
-                deckPoints.Add(NetworkNormalizer.Evaluate(segment, i / (float)steps));
-        }
-
+        // A deck point's four samples, their bilinear weights and which of them a sweep may
+        // move (inside the region, unprotected, owned by a formation) do not change between
+        // sweeps, so they are found once. A point whose movable weight is under one half is
+        // never stepped and is dropped. Each movable sample gets a slot holding its refined
+        // height, which starts at its built height; a sample that is not movable always
+        // reads its built height (the source outside the region, which is never built).
+        // Corners are stored four to a point, in the order (x0, z0), (x1, z0), (x0, z1), (x1, z1).
+        var cornerHeights = new float[deckPoints.Count * 4];
+        var cornerSlots = new int[deckPoints.Count * 4];
+        var readWeights = new float[deckPoints.Count * 4];
+        var stepWeights = new float[deckPoints.Count * 4];
+        var stepNorms = new float[deckPoints.Count];
+        var deckHeights = new float[deckPoints.Count];
+        var steppedPoints = 0;
+        var slotOfCell = new Dictionary<int, int>();
+        var slotCells = new List<int>();
         var ids = new int[4];
         var weights = new float[4];
 
+        foreach (var point in deckPoints)
+        {
+            token.ThrowIfCancellationRequested();
+            var gx = math.clamp(point.x / width + .5, 0, 1) * (n - 1);
+            var gz = math.clamp(point.z / width + .5, 0, 1) * (n - 1);
+            int x0 = (int)gx, z0 = (int)gz, x1 = Math.Min(x0 + 1, n - 1), z1 = Math.Min(z0 + 1, n - 1);
+            var tx = (float)(gx - x0);
+            var tz = (float)(gz - z0);
+            ids[0] = z0 * n + x0;
+            ids[1] = z0 * n + x1;
+            ids[2] = z1 * n + x0;
+            ids[3] = z1 * n + x1;
+            weights[0] = (1 - tx) * (1 - tz);
+            weights[1] = tx * (1 - tz);
+            weights[2] = (1 - tx) * tz;
+            weights[3] = tx * tz;
+            var first = steppedPoints * 4;
+            var norm = 0f;
+            var movable = 0f;
+
+            for (var k = 0; k < 4; k++)
+            {
+                var x = k % 2 == 0 ? x0 : x1;
+                var z = k < 2 ? z0 : z1;
+                var outside = x < region.x || x > region.z || z < region.y || z > region.w;
+                var fixedSample = outside || protectedMask[MaskIndex(x, z)] || !targets.ContainsKey(ids[k]);
+
+                cornerHeights[first + k] = outside ? source[ids[k]] : result[MaskIndex(x, z)];
+                readWeights[first + k] = weights[k];
+                cornerSlots[first + k] = -1;
+
+                if (fixedSample)
+                    weights[k] = 0;
+                else if (!slotOfCell.TryGetValue(ids[k], out cornerSlots[first + k]))
+                {
+                    cornerSlots[first + k] = slotCells.Count;
+                    slotOfCell[ids[k]] = slotCells.Count;
+                    slotCells.Add(ids[k]);
+                }
+
+                stepWeights[first + k] = weights[k];
+                norm += weights[k] * weights[k];
+                movable += weights[k];
+            }
+
+            if (movable < .5f)
+                continue;
+
+            stepNorms[steppedPoints] = norm;
+            deckHeights[steppedPoints] = point.y;
+            steppedPoints++;
+        }
+
+        var slotHeights = new float[slotCells.Count];
+        var slotOriginals = new float[slotCells.Count];
+        var slotBudgets = new float[slotCells.Count];
+        var slotRefined = new bool[slotCells.Count];
+
+        for (var slot = 0; slot < slotCells.Count; slot++)
+        {
+            slotHeights[slot] = result[ResultIndex(slotCells[slot])];
+            slotOriginals[slot] = source[slotCells[slot]];
+            slotBudgets[slot] = targets[slotCells[slot]].budget;
+        }
+
+        float Height(int corner) => cornerSlots[corner] < 0 ? cornerHeights[corner] : slotHeights[cornerSlots[corner]];
+
         for (var sweep = 0; sweep < RefineSweeps; sweep++)
-            foreach (var point in deckPoints)
+            for (var pointIndex = 0; pointIndex < steppedPoints; pointIndex++)
             {
                 token.ThrowIfCancellationRequested();
-                var gx = math.clamp(point.x / width + .5, 0, 1) * (n - 1);
-                var gz = math.clamp(point.z / width + .5, 0, 1) * (n - 1);
-                int x0 = (int)gx, z0 = (int)gz, x1 = Math.Min(x0 + 1, n - 1), z1 = Math.Min(z0 + 1, n - 1);
-                var tx = (float)(gx - x0);
-                var tz = (float)(gz - z0);
-                ids[0] = z0 * n + x0;
-                ids[1] = z0 * n + x1;
-                ids[2] = z1 * n + x0;
-                ids[3] = z1 * n + x1;
-                weights[0] = (1 - tx) * (1 - tz);
-                weights[1] = tx * (1 - tz);
-                weights[2] = (1 - tx) * tz;
-                weights[3] = tx * tz;
+                var first = pointIndex * 4;
+                var deckHeight = deckHeights[pointIndex];
+                var norm = stepNorms[pointIndex];
                 var read = 0f;
-                var norm = 0f;
-                var movable = 0f;
 
                 for (var k = 0; k < 4; k++)
-                {
-                    read += weights[k] * Height(ids[k]);
-                    var x = k % 2 == 0 ? x0 : x1;
-                    var z = k < 2 ? z0 : z1;
-
-                    if (x < region.x
-                        || x > region.z
-                        || z < region.y
-                        || z > region.w
-                        || protectedMask[ids[k]]
-                        || !targets.ContainsKey(ids[k]))
-                        weights[k] = 0;
-
-                    norm += weights[k] * weights[k];
-                    movable += weights[k];
-                }
+                    read += readWeights[first + k] * Height(first + k);
 
                 // Where most of the read is fixed ground the step would be amplified
                 // into a spike; a sample may pass the deck height by at most 1 m.
-                var residual = point.y - read;
+                var residual = deckHeight - read;
 
-                if (Math.Abs(residual) < .05f || movable < .5f)
+                if (Math.Abs(residual) < .05f)
                     continue;
 
                 for (var k = 0; k < 4; k++)
                 {
-                    if (weights[k] == 0)
+                    var weight = stepWeights[first + k];
+
+                    if (weight == 0)
                         continue;
 
-                    var id = ids[k];
-                    var original = source[id];
-                    var budget = targets[id].budget;
-                    var current = Height(id);
+                    var slot = cornerSlots[first + k];
+                    var original = slotOriginals[slot];
+                    var budget = slotBudgets[slot];
+                    var current = slotHeights[slot];
                     var next =
                         math.clamp(
-                            current + residual * weights[k] / norm,
-                            Math.Min(current, point.y) - 1,
-                            Math.Max(current, point.y) + 1);
+                            current + residual * weight / norm,
+                            Math.Min(current, deckHeight) - 1,
+                            Math.Max(current, deckHeight) + 1);
 
-                    refined[id] = math.clamp(next, Math.Max(0, original - budget), Math.Min(scale, original + budget));
+                    slotHeights[slot] =
+                        math.clamp(next, Math.Max(0, original - budget), Math.Min(scale, original + budget));
+
+                    slotRefined[slot] = true;
                 }
             }
 
-        foreach (var (id, height) in refined)
-        {
-            var value = math.clamp(height, 0, scale);
+        var refinedSamples = 0;
 
-            if (value != result[id])
+        for (var slot = 0; slot < slotCells.Count; slot++)
+        {
+            if (!slotRefined[slot])
+                continue;
+
+            refinedSamples++;
+            var index = ResultIndex(slotCells[slot]);
+            var value = math.clamp(slotHeights[slot], 0, scale);
+
+            if (value != result[index])
             {
-                if (result[id] == source[id])
+                if (result[index] == slotOriginals[slot])
                     changed++;
 
-                result[id] = value;
+                result[index] = value;
             }
         }
 
-        log.Count("Roadbed samples refined to the decks that read them", refined.Count);
+        log.Count("Roadbed samples refined to the decks that read them", refinedSamples);
         log.Count("Roadbed terrain samples changed", changed);
         log.Count("Roadbed protected samples avoided", protectedSamples);
         log.Count("Roadbed samples beyond cut/fill budget", beyondBudget);
@@ -1170,6 +1741,9 @@ public static class NetworkRoadbed
 
         log.Diagnostic(
             $"PROCESS roadbed complete; changedSamples={changed}; maximumCutFillMeters={maximum:0.###}; target=nearest-curve-station; shoulderMetersPerFillMeter=6; maximumShoulderMeters=240; zeroWeightAtToe=true; targetAndShoulderBoundedBeforeFeather=true; protectedWaterCliffsQuarries=true; structuresExcluded=true; elapsedSeconds={clock.Elapsed.TotalSeconds:0.0}");
+
+        if (localRefit != null)
+            log.AddDuration("Local refit patch refinement", partClock.Elapsed.TotalSeconds);
 
         return result;
     }

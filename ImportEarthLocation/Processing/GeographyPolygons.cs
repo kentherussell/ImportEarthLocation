@@ -219,6 +219,249 @@ public sealed record GeographicPolygon(
 
 public static class GeographyPolygons
 {
+    // How far beyond the map an open relation ring is cut and closed (metres).
+    private const float OutsideMargin = 300;
+
+    // Closes open chains (each with both ends beyond the square |x|, |z| <= half) into rings:
+    // each chain is cut to the square, and each piece's exit joins the next piece's entry
+    // along the square's edge, corners included. Walking the edge one way or the other gives
+    // the two sides of the chains; the side that holds most of the islands is the inside, or
+    // with no islands the smaller side (a river or lake crossing the map is smaller than the
+    // land around it). Null when the pieces do not pair up.
+    internal static List<float3[]>? CloseAlongBounds(
+        IReadOnlyList<float3[]> chains,
+        float half,
+        IReadOnlyList<float3[]>? islands)
+    {
+        var perimeter = 8 * half;
+
+        // Position along the square's edge, counter-clockwise from (-half, -half).
+        float Along(float2 point)
+        {
+            if (Math.Abs(point.y + half) < .01f)
+                return point.x + half;
+
+            if (Math.Abs(point.x - half) < .01f)
+                return 2 * half + point.y + half;
+
+            if (Math.Abs(point.y - half) < .01f)
+                return 4 * half + half - point.x;
+
+            return 6 * half + half - point.y;
+        }
+
+        float2[] corners = { new(-half, -half), new(half, -half), new(half, half), new(-half, half) };
+        float[] cornerAlong = { 0, 2 * half, 4 * half, 6 * half };
+
+        bool Inside(float2 point) => Math.Abs(point.x) <= half && Math.Abs(point.y) <= half;
+
+        // Where the segment from a to b crosses the square's edge, as a fraction of it.
+        float Crossing(float2 a, float2 b)
+        {
+            var low = 0f;
+            var high = 1f;
+            var d = b - a;
+            float[] p = { -d.x, d.x, -d.y, d.y };
+            float[] q = { a.x + half, half - a.x, a.y + half, half - a.y };
+
+            for (var k = 0; k < 4; k++)
+            {
+                if (Math.Abs(p[k]) < 1e-9f)
+                    continue;
+
+                var t = q[k] / p[k];
+
+                if (p[k] < 0)
+                    low = Math.Max(low, t);
+                else
+                    high = Math.Min(high, t);
+            }
+
+            return Inside(a) ? high : low;
+        }
+
+        var pieces = new List<(List<float2> Points, float Entry, float Exit)>();
+
+        foreach (var chain in chains)
+        {
+            List<float2>? current = null;
+            var entry = 0f;
+
+            for (var k = 0; k + 1 < chain.Length; k++)
+            {
+                var a = chain[k].xz;
+                var b = chain[k + 1].xz;
+                bool insideA = Inside(a), insideB = Inside(b);
+
+                if (!insideA && !insideB)
+                {
+                    // A segment can cross the square without either end inside it.
+                    var d = b - a;
+                    var low = 0f;
+                    var high = 1f;
+                    float[] p = { -d.x, d.x, -d.y, d.y };
+                    float[] q = { a.x + half, half - a.x, a.y + half, half - a.y };
+                    var misses = false;
+
+                    for (var m = 0; m < 4 && !misses; m++)
+                    {
+                        if (Math.Abs(p[m]) < 1e-9f)
+                        {
+                            misses = q[m] < 0;
+                            continue;
+                        }
+
+                        var t = q[m] / p[m];
+
+                        if (p[m] < 0)
+                            low = Math.Max(low, t);
+                        else
+                            high = Math.Min(high, t);
+                    }
+
+                    if (misses || low >= high)
+                        continue;
+
+                    var into = a + d * low;
+                    var outOf = a + d * high;
+                    pieces.Add((new List<float2> { into, outOf }, Along(into), Along(outOf)));
+                    continue;
+                }
+
+                if (!insideA)
+                {
+                    var into = math.lerp(a, b, Crossing(a, b));
+                    current = new List<float2> { into };
+                    entry = Along(into);
+                }
+
+                if (insideB)
+                {
+                    current?.Add(b);
+                    continue;
+                }
+
+                var outOfSquare = math.lerp(a, b, Crossing(a, b));
+                current?.Add(outOfSquare);
+
+                if (current != null)
+                    pieces.Add((current, entry, Along(outOfSquare)));
+
+                current = null;
+            }
+
+            if (current != null)
+                return null;
+        }
+
+        if (pieces.Count == 0)
+            return new List<float3[]>();
+
+        // The rings walking the edge one way (forward: counter-clockwise) from each exit.
+        List<List<float2>>? Close(bool forward)
+        {
+            float Gap(float from, float to) => forward ? (to - from + perimeter) % perimeter : (from - to + perimeter) % perimeter;
+
+            var used = new bool[pieces.Count];
+            var rings = new List<List<float2>>();
+
+            for (var start = 0; start < pieces.Count; start++)
+            {
+                if (used[start])
+                    continue;
+
+                var ring = new List<float2>();
+                var current = start;
+
+                for (var guard = 0; guard <= pieces.Count; guard++)
+                {
+                    used[current] = true;
+                    ring.AddRange(pieces[current].Points);
+                    var exit = pieces[current].Exit;
+                    var next = -1;
+                    var best = float.PositiveInfinity;
+
+                    for (var j = 0; j < pieces.Count; j++)
+                    {
+                        var gap = Gap(exit, pieces[j].Entry);
+
+                        if ((j == start || !used[j]) && gap < best)
+                        {
+                            best = gap;
+                            next = j;
+                        }
+                    }
+
+                    if (next < 0)
+                        return null;
+
+                    // The corners passed on the way, in walking order.
+                    foreach (var k in Enumerable.Range(0, 4)
+                        .Where(k => Gap(exit, cornerAlong[k]) > 0 && Gap(exit, cornerAlong[k]) < best)
+                        .OrderBy(k => Gap(exit, cornerAlong[k])))
+                        ring.Add(corners[k]);
+
+                    if (next == start)
+                        break;
+
+                    if (used[next])
+                        return null;
+
+                    current = next;
+                }
+
+                rings.Add(ring);
+            }
+
+            return rings;
+        }
+
+        double Area(List<float2> ring)
+        {
+            var sum = 0d;
+
+            for (var k = 0; k < ring.Count; k++)
+            {
+                var a = ring[k];
+                var b = ring[(k + 1) % ring.Count];
+                sum += (double)a.x * b.y - (double)b.x * a.y;
+            }
+
+            return Math.Abs(sum / 2);
+        }
+
+        static bool Contains(List<float2> ring, float2 point)
+        {
+            var inside = false;
+
+            for (int k = 0, j = ring.Count - 1; k < ring.Count; j = k++)
+                if ((ring[k].y > point.y) != (ring[j].y > point.y)
+                    && point.x < (ring[j].x - ring[k].x) * (point.y - ring[k].y) / (ring[j].y - ring[k].y) + ring[k].x)
+                    inside = !inside;
+
+            return inside;
+        }
+
+        var forwardRings = Close(true);
+        var backwardRings = Close(false);
+
+        int Holding(List<List<float2>>? rings)
+            => rings == null || islands == null
+                ? 0
+                : islands.Count(island => rings.Any(ring => Contains(ring, island[0].xz)));
+
+        List<List<float2>>? chosen;
+
+        if (forwardRings == null || backwardRings == null)
+            chosen = forwardRings ?? backwardRings;
+        else if (Holding(forwardRings) != Holding(backwardRings))
+            chosen = Holding(forwardRings) > Holding(backwardRings) ? forwardRings : backwardRings;
+        else
+            chosen = forwardRings.Sum(Area) <= backwardRings.Sum(Area) ? forwardRings : backwardRings;
+
+        return chosen?.Select(ring => ring.Select(point => new float3(point.x, 0, point.y)).ToArray()).ToList();
+    }
+
     public static List<GeographicPolygon> Build(
         OsmDataset data,
         ImportRequest request,
@@ -228,6 +471,7 @@ public static class GeographyPolygons
         var polygons = new List<GeographicPolygon>();
         var members = new HashSet<long>();
         var fallbackHoles = new Dictionary<long, List<float3[]>>();
+        var clipHalf = (float)(request.MapSize.WidthMeters / 2) + OutsideMargin;
 
         foreach (var relation in data.Relations.OrderBy(relation => relation.Id))
         {
@@ -238,12 +482,12 @@ public static class GeographyPolygons
 
             try
             {
-                var outer = Rings(relation.Members.Where(item => !item.inner).Select(item => item.wayId));
+                var inner = RelationRings(relation.Members.Where(item => item.inner).Select(item => item.wayId), null);
+                var outer = RelationRings(relation.Members.Where(item => !item.inner).Select(item => item.wayId), inner);
 
                 if (outer.Count == 0)
                     throw new InvalidOperationException("No outer polygon rings.");
 
-                var inner = Rings(relation.Members.Where(item => item.inner).Select(item => item.wayId));
                 polygons.Add(new GeographicPolygon(relation.Id, relation.Tags, outer, inner) { IsRelation = true });
 
                 foreach (var member in relation.Members)
@@ -315,7 +559,44 @@ public static class GeographyPolygons
             }
         }
 
-        List<float3[]> Rings(IEnumerable<long> ids)
+        // A large relation (Montreal's St Lawrence) runs far beyond the downloaded area, so its
+        // rings arrive open where their outside ways are missing. Open chains whose ends all lie
+        // beyond the map are cut to a square OutsideMargin beyond it and closed along that
+        // square's edge (CloseAlongBounds); the closing edges lie outside the map. A chain
+        // ending on the map is genuinely broken and still rejects the relation.
+        float3 Local(long id)
+        {
+            var node = data.Nodes[id];
+            return GeoMath.ToLocalMeters(node.Latitude, node.Longitude, request.Latitude, request.Longitude);
+        }
+
+        // The relation's closed rings, plus its open chains closed along the clip square;
+        // islands (the hint) choose which side of the square's edge is the inside.
+        List<float3[]> RelationRings(IEnumerable<long> ids, IReadOnlyList<float3[]>? islands)
+        {
+            var open = new List<float3[]>();
+            var rings = Rings(ids, open);
+
+            if (open.Count == 0)
+                return rings;
+
+            if (open.Any(chain => Math.Max(Math.Abs(chain[0].x), Math.Abs(chain[0].z)) < clipHalf - OutsideMargin
+                || Math.Max(Math.Abs(chain[chain.Length - 1].x), Math.Abs(chain[chain.Length - 1].z))
+                    < clipHalf - OutsideMargin))
+                throw new InvalidOperationException("Open/ambiguous multipolygon ring.");
+
+            var closed = CloseAlongBounds(open, clipHalf, islands);
+
+            if (closed == null)
+                throw new InvalidOperationException("Open multipolygon ring could not be closed along the map's edge.");
+
+            log.Count("Geographic relation rings closed along the map's edge", closed.Count);
+            rings.AddRange(closed);
+
+            return rings;
+        }
+
+        List<float3[]> Rings(IEnumerable<long> ids, List<float3[]>? open = null)
         {
             var remaining = new SortedDictionary<long, long[]>();
 
@@ -346,6 +627,30 @@ public static class GeographyPolygons
                             .Where(entry => entry.Value[0] == end || entry.Value[entry.Value.Length - 1] == end)
                             .ToArray();
 
+                    if (choices.Length == 0 && open != null)
+                    {
+                        // An open end: extend the chain from its start too, then keep it open.
+                        while (true)
+                        {
+                            var start = ring[0];
+                            var before =
+                                remaining
+                                    .Where(entry => entry.Value[0] == start || entry.Value[entry.Value.Length - 1] == start)
+                                    .ToArray();
+
+                            if (before.Length != 1)
+                                break;
+
+                            remaining.Remove(before[0].Key);
+                            var head = before[0].Value[before[0].Value.Length - 1] == start ? before[0].Value : before[0].Value.Reverse().ToArray();
+                            ring.InsertRange(0, head.Take(head.Length - 1));
+                        }
+
+                        open.Add(ring.Select(Local).ToArray());
+                        ring = null;
+                        break;
+                    }
+
                     if (choices.Length != 1)
                         throw new InvalidOperationException("Open/ambiguous multipolygon ring.");
 
@@ -353,6 +658,9 @@ public static class GeographyPolygons
                     remaining.Remove(next.Key);
                     ring.AddRange((next.Value[0] == end ? next.Value : next.Value.Reverse()).Skip(1));
                 }
+
+                if (ring == null)
+                    continue;
 
                 if (ring.Count < 4)
                     throw new InvalidOperationException("Degenerate polygon ring.");

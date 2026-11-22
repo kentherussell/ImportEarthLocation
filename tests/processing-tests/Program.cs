@@ -28,8 +28,16 @@ static class Program
                 false,
                 0);
 
-    static void Main()
+    static void Main(string[] args)
     {
+        // --osm-parser-tiles <folder> [groups]: the two OSM parsers on real cached tiles.
+        if (args.Length >= 2 && args[0] == "--osm-parser-tiles")
+        {
+            OsmParserEquivalence.RunOnTiles(args[1], args.Length > 2 ? int.Parse(args[2]) : 2);
+
+            return;
+        }
+
         var progress = new PreparationProgress();
         progress.Begin("Smoothing roads");
         Check(
@@ -352,6 +360,8 @@ static class Program
 
         TreeTests.Run();
         RockTests.Run();
+VegetationBudgetTests.Run();
+        OsmParserEquivalence.Run();
         Console.WriteLine(
             "PASS: straight/gentle curves, strict deviation, protected junctions/sharp bends, parallel rail, cancellation, malformed features, complete coverage, deterministic forest masks/holes/corridors/spacing/water, exact +1m correction");
     }
@@ -390,6 +400,8 @@ namespace ImportEarthLocation.Core
         }
 
         public void Time(string text, double seconds) { }
+
+        public void AddDuration(string text, double seconds) { }
     }
 }
 namespace ImportEarthLocation.Processing

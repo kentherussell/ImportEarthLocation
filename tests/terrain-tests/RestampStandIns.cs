@@ -9,6 +9,14 @@ namespace ImportEarthLocation.Processing
         {
             public double HeightAt(double x, double z)
                 => throw new NotSupportedException("Roadbed publication is not simulated");
+
+            public int[]? Published => null;
+
+            public int Width => 1;
+
+            public int Height => 1;
+
+            public int CellAt(double x, double z) => 0;
         }
     }
 }

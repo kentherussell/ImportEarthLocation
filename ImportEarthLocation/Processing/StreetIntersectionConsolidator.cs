@@ -30,24 +30,36 @@ public static class StreetIntersectionConsolidator
                 ? segment.Name.Trim().ToUpperInvariant()
                 : segment.Reference.Trim().ToUpperInvariant();
 
-        var incident =
-            source
-                .SelectMany(
-                    segment => new[] {
-                        (Id: segment.StartNodeId, Edge: segment),
-                        (Id: segment.EndNodeId, Edge: segment)
-                        })
-            .GroupBy(item => item.Id)
-                .ToDictionary(group => group.Key, group => group.Select(item => item.Edge).ToArray());
-
         var small =
             source
                 .Where(
-                    segment => Street(segment)
-                        && segment.OneWay
+                    segment => segment.OneWay
+                        && Street(segment)
                         && math.distance(segment.Start.xz, segment.End.xz) <= 48
                         && math.distance(segment.Start.xz, segment.End.xz) >= 2)
                 .ToArray();
+
+        // Arms are looked up only at box corners, each the start of a small section.
+        // They stay in source order, start before end, as the former GroupBy gave them.
+        var corners = new HashSet<long>(small.Select(segment => segment.StartNodeId));
+        var incident = new Dictionary<long, List<PreparedSegment>>();
+
+        void AddIncident(long id, PreparedSegment segment)
+        {
+            if (!incident.TryGetValue(id, out var list))
+                incident[id] = list = new List<PreparedSegment>();
+
+            list.Add(segment);
+        }
+
+        foreach (var segment in source)
+        {
+            if (corners.Contains(segment.StartNodeId))
+                AddIncident(segment.StartNodeId, segment);
+
+            if (corners.Contains(segment.EndNodeId))
+                AddIncident(segment.EndNodeId, segment);
+        }
 
         var outgoing =
             small.GroupBy(segment => segment.StartNodeId).ToDictionary(group => group.Key, group => group.ToArray());

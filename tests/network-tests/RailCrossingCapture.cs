@@ -91,5 +91,22 @@ static partial class VisualMetricsReplay
 
         Console.WriteLine(
             $"Rail crossings: source={expected.Count}; final={actual.Count}; exactSharedNativeOwners={rows.Count(r => r.sharedNativeOwner)}; report={output}");
+
+        // Each crossing whose arms came apart: where every arm's end is in the source and
+        // after design, to find the step that moved it.
+        foreach (var row in rows.Where(item => item.horizontalGap > .001))
+        {
+            Console.WriteLine($"  crossing {row.node}: horizontal gap {row.horizontalGap:F3} m");
+
+            foreach (var (stage, list) in new[] { ("source", otherCapture.Source), ("design", sections) })
+                foreach (var segment in list.Where(item => item.StartNodeId == row.node || item.EndNodeId == row.node))
+                {
+                    var atStart = segment.StartNodeId == row.node;
+                    var point = atStart ? segment.CourseStart : segment.CourseEnd;
+                    Console.WriteLine(
+                        FormattableString.Invariant(
+                            $"    {stage,-6} {segment.Kind} way={segment.WayId} {segment.Classification} lanes={segment.Lanes} oneWay={segment.OneWay} end={(atStart ? "start" : "end")} at={point.x:F2},{point.z:F2}"));
+                }
+        }
     }
 }

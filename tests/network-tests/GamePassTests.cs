@@ -192,6 +192,9 @@ static class GamePassTests
         TunnelElevation(log);
         Drawn(log);
         SplitRoads(log);
+        StrayingCarriageways();
+        ConflictingJunctionHalves();
+        ReversibleCentreLane(request);
         BlindOneWay(log);
         LimitedAccess(log);
         Streets(log, request);
@@ -463,6 +466,98 @@ static class GamePassTests
     }
 
     // Two opposing one-way legs leaving a node and meeting again are one road.
+    static PreparedSegment Carriageway(long way, long a, long b, float x1, float z1, float x2, float z2)
+        => Road(way, a, b, x1, z1, x2, z2) with { OneWay = true, Name = "Boulevard" };
+
+    static float OneWayLength(IEnumerable<PreparedSegment> sections)
+        => sections
+            .Where(segment => segment.OneWay)
+            .Sum(segment => math.distance(segment.Start.xz, segment.End.xz));
+
+    // Two 1.2 km carriageways of one named road, eastbound on z = 0 and westbound at the
+    // given offsets, in 100 m sections. Nodes 100-112 and 200-212 sit at x = 100 k.
+    static List<PreparedSegment> NamedPair(Func<int, float> offset)
+    {
+        var source = new List<PreparedSegment>();
+
+        for (var k = 0; k < 12; k++)
+            source.Add(Carriageway(10 + k, 100 + k, 101 + k, k * 100, 0, (k + 1) * 100, 0));
+
+        for (var k = 12; k > 0; k--)
+            source.Add(Carriageway(40 + k, 200 + k, 199 + k, k * 100, offset(k), (k - 1) * 100, offset(k - 1)));
+
+        return source;
+    }
+
+    // A named pair is not kept divided over one place where its carriageways stray apart
+    // (Quebec City's boulevards). These run 34 m apart, past the local pass's 32 m, and 70 m
+    // apart at x = 600: the stretches either side of that bulge still merge.
+    static void StrayingCarriageways()
+    {
+        var source = NamedPair(k => k == 6 ? 70 : 34);
+        var before = OneWayLength(source);
+        var oneWay = OneWayLength(AvenueConsolidator.Prepare(source, new ImportLog(), default));
+
+        Check(
+            oneWay < before / 3,
+            $"Carriageways straying apart at one place kept {oneWay:F0} of {before:F0} m divided");
+    }
+
+    // A long named pair refused for one junction conflict is split and its halves matched
+    // again. Motorway ramps fixed on both carriageways at x = 300 conflict on the merged road.
+    static void ConflictingJunctionHalves()
+    {
+        var source = NamedPair(_ => 34);
+        source.Add(Road(90, 300, 103, 300, -300, 300, 0, "motorway"));
+        source.Add(Road(91, 203, 301, 300, 34, 300, 300, "motorway"));
+        var log = new ImportLog();
+        var result = AvenueConsolidator.Prepare(source, log, default);
+
+        Check(
+            log.Metric("Avenue pairs retained for junction conflicts") > 0,
+            "The junction conflict fixture no longer conflicts");
+
+        Check(
+            !result.Any(segment => segment.OneWay && Math.Min(segment.Start.x, segment.End.x) >= 600),
+            "A junction conflict at one end kept a whole named pair divided");
+    }
+
+    // A reversible centre lane between the one-way carriageways of the same street is left
+    // out (Montreal's Rue Bridge); a reversible street with no such companions stays.
+    static void ReversibleCentreLane(ImportRequest request)
+    {
+        var nodes = new Dictionary<long, OsmNode>();
+        var ways = new Dictionary<long, OsmWay>();
+
+        OsmWay Way(long id, double latitude, string name, string oneWay, bool reverse = false)
+        {
+            var first = id * 10;
+            nodes[first] = new(first, latitude, reverse ? .004 : 0);
+            nodes[first + 1] = new(first + 1, latitude, .002);
+            nodes[first + 2] = new(first + 2, latitude, reverse ? 0 : .004);
+
+            return ways[id] =
+                new(
+                    id,
+                    new[] { first, first + 1, first + 2 },
+                    new Dictionary<string, string> { { "highway", "primary" }, { "name", name }, { "oneway", oneWay } });
+        }
+
+        Way(1, 0, "Bridge", "yes");
+        Way(2, .0002, "Bridge", "yes", reverse: true);
+        Way(3, .0001, "Bridge", "reversible");
+        Way(4, .01, "Lone", "reversible");
+
+        var log = new ImportLog();
+        var segments = NetworkProcessor.BuildSegments(new OsmDataset { Nodes = nodes, Ways = ways }, request, log);
+
+        Check(
+            !segments.Any(segment => segment.WayId == 3)
+                && segments.Count(segment => segment.WayId == 4) == 2
+                && segments.Count(segment => segment.WayId is 1 or 2) == 4,
+            "A reversible centre lane was kept, or a reversible street without companions was dropped");
+    }
+
     static void SplitRoads(ImportLog log)
     {
         var approach = Road(1, 1, 2, -300, 0, 0, 0);
@@ -561,6 +656,37 @@ static class GamePassTests
         Check(
             near.Where(segment => segment.WayId == 6).All(segment => segment.StartNodeId != segment.EndNodeId),
             "Cross street collapsed on itself");
+
+        // A junction mapped as a small box (Montreal, way 436364814): the legs flare around the
+        // cross street and rejoin 30 m on. The crossing becomes one junction on a two-way road.
+        var box =
+            new[] {
+                Road(1, 1, 2, -300, 0, 0, 0, "secondary"),
+                Road(2, 3, 4, 30, 0, 300, 0, "secondary"),
+                OneWayRoad(3, 2, 5, 0, 0, 8, -12),
+                OneWayRoad(3, 5, 6, 8, -12, 22, -10),
+                OneWayRoad(3, 6, 3, 22, -10, 30, 0),
+                OneWayRoad(4, 3, 7, 30, 0, 22, 10),
+                OneWayRoad(4, 7, 8, 22, 10, 8, 12),
+                OneWayRoad(4, 8, 2, 8, 12, 0, 0),
+                Road(5, 9, 6, 22, -100, 22, -10, "tertiary"),
+                Road(5, 6, 7, 22, -10, 22, 10, "tertiary"),
+                Road(5, 7, 10, 22, 10, 22, 100, "tertiary")
+                };
+
+        var crossing = NetworkSplitRoads.Prepare(box, log, default);
+        var south = crossing.Single(segment => segment.StartNodeId == 9);
+        var north = crossing.Single(segment => segment.EndNodeId == 10);
+        Check(crossing.All(segment => !segment.OneWay), "Box junction left as one-way legs");
+        Check(
+            south.EndNodeId == north.StartNodeId && crossing.Count(segment => segment.WayId == 5) == 2,
+            "Cross street does not meet the box's road at one junction");
+
+        // Without a road beyond the far end the same shape is a turning loop and stays.
+        var loop = box.Where(segment => segment.WayId != 2).ToArray();
+        Check(
+            NetworkSplitRoads.Prepare(loop, log, default).Count(segment => segment.OneWay) == 6,
+            "Turning loop merged as a box junction");
     }
 
     static void BlindOneWay(ImportLog log)
@@ -752,6 +878,33 @@ static class GamePassTests
                 default);
 
         Check(path.Count == 2, "Footway imported as a road");
+
+        // The road's node 4 was replaced by a merge (node 99, as an avenue merge aliases it): the
+        // street must end on the live node, not on the node no section uses any more.
+        var merged =
+            Road(2, 99, 6, 334, 0, 334, 500) with
+            {
+                SourceWayIds = new long[] { 2 },
+                SourceNodeAliases = new[] { new SourceNodeAlias(4, 99, false) }
+            };
+
+        var rejoined =
+            NetworkDeadEnds.ConnectThroughStreets(
+                new[] { ramp, merged },
+                Data(
+                    TaggedWay(1, "motorway_link", 1, 2),
+                    TaggedWay(2, "primary", 4, 6),
+                    TaggedWay(3, "residential", 2, 3, 4)),
+                request,
+                widths,
+                offsets,
+                log,
+                default);
+
+        Check(
+            rejoined.Any(segment => segment.WayId == 3 && (segment.StartNodeId == 99 || segment.EndNodeId == 99))
+                && rejoined.All(segment => segment.StartNodeId != 4 && segment.EndNodeId != 4),
+            "Street connector ended on a node a merge had replaced");
     }
 
     // Flat ground at 100 m; a bore 8 m down from x=0 to x=600 with open approaches.

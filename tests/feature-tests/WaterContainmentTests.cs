@@ -198,6 +198,8 @@ static class WaterContainmentTests
                 == 0,
             "A flowing reach concealed a submerged mapped island");
 
+        LargeLake();
+
         using var cancellation = new CancellationTokenSource();
         cancellation.Cancel();
 
@@ -209,7 +211,78 @@ static class WaterContainmentTests
         catch (OperationCanceledException) { }
 
         Console.WriteLine(
-            "PASS: whole-basin escape saddle, safe lower shared level, unsafe source omission, intended river outlet, unchanged terrain and cancellation.");
+            "PASS: whole-basin escape saddle, safe lower shared level, unsafe source omission, intended river outlet, unchanged terrain, too-large lakes and cancellation.");
+    }
+
+    // A lake larger than the bounded screen keeps its planned level when that level is above
+    // the sea (Lac Saint-Louis, Montreal); below the sea it is still omitted (Amsterdam's
+    // Markermeer, among polders).
+    static void LargeLake()
+    {
+        const int n = 2049;
+        const double width = 57344;
+        var heights = new float[n * n];
+
+        for (var z = 0; z < n; z++)
+            for (var x = 0; x < n; x++)
+            {
+                var px = (x / (double)(n - 1) - .5) * width;
+                var pz = (z / (double)(n - 1) - .5) * width;
+                heights[z * n + x] = Math.Abs(px) <= 20000 && Math.Abs(pz) <= 20000 ? 45f : 55f;
+            }
+
+        var lake =
+            new GeographicPolygon(
+                300,
+                new Dictionary<string, string> { { "natural", "water" }, { "water", "lake" } },
+                new() {
+                    new[] {
+                        new float3(-20000, 0, -20000),
+                        new float3(20000, 0, -20000),
+                        new float3(20000, 0, 20000),
+                        new float3(-20000, 0, 20000)
+                        }
+                    },
+                new());
+
+        var source =
+            new RiverSourcePlan(300, "lake", "fixture", new(0, 45, 0), 25, 5, 55, new(0, 45, 0))
+            {
+                BodyId = 300,
+                BodyKind = "lake",
+                TargetSurfaceLevel = 50
+            };
+
+        var plan =
+            new WaterPlan(false, 0, 1, 0, "fixture")
+            {
+                WaterCellSize = 14,
+                Sources = new[] { source },
+                AreaStages = new[] { new WaterAreaStage(300, "lake", 50) }
+            };
+
+        var log = new ImportLog();
+        var aboveSea =
+            WaterContainment.Validate(plan, new(heights, 100, 0, 0, 100), width, new[] { lake }, log, default);
+
+        Check(
+            aboveSea.Sources.Count == 1
+                && aboveSea.Sources[0].TargetSurfaceLevel == 50
+                && log.Metric("Lake containment bodies too large to screen") == 1,
+            "A lake too large to screen lost its controls");
+
+        var belowSea =
+            WaterContainment.Validate(
+                plan,
+                new(heights, 100, 60, 0, 100),
+                width,
+                new[] { lake },
+                new ImportLog(),
+                default);
+
+        Check(
+            belowSea.Sources.Count == 0 && belowSea.AreaStages.Count == 0,
+            "A lake too large to screen, planned below the sea, kept its controls");
     }
 }
 #endif

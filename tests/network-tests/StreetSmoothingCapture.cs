@@ -87,13 +87,26 @@ static partial class VisualMetricsReplay
                         ? segment.CourseControl1 - segment.CourseStart
                         : segment.CourseControl2 - segment.CourseEnd;
 
-                return (Direction: math.normalizesafe(d.xz), Grade: d.y / Math.Max(.001, math.length(d.xz)));
+                return (
+                    Direction: math.normalizesafe(d.xz),
+                    Grade: d.y / Math.Max(.001, math.length(d.xz)),
+                    Degenerate: math.length(d.xz) < 1e-6);
             }).ToArray();
+
+            var first = entry.Value[0].Section;
+            var second = entry.Value[1].Section;
 
             return new
             {
                 node = entry.Key.Id,
                 ways = entry.Value.Select(item => item.Section.WayId).ToArray(),
+                // A zero horizontal tangent normalizes to zero and reads as 90°; it is its own
+                // finding (report 121 §24).
+                zeroTangent = arms.Any(arm => arm.Degenerate),
+                // Both arms join the same two nodes, one reversed: an out-and-back pair, which a
+                // 180° reading does not by itself make wrong or redundant (report 121 §24).
+                reversedPair =
+                    first.StartNodeId == second.EndNodeId && first.EndNodeId == second.StartNodeId,
                 angle = math.degrees(Math.Acos(math.clamp(-math.dot(arms[0].Direction, arms[1].Direction), -1, 1))),
                 gradeJump = Math.Abs(arms[0].Grade + arms[1].Grade),
                 position = Point(
@@ -212,6 +225,8 @@ static partial class VisualMetricsReplay
             plainNodeKinksOver1Degree = kinks.Count(k => k.angle > 1),
             plainNodeKinksOver5Degrees = kinks.Count(k => k.angle > 5),
             plainNodeGradeJumpsOver1Percent = kinks.Count(k => k.gradeJump > .01),
+            plainNodeKinksWithZeroTangent = kinks.Count(k => k.zeroTangent),
+            plainNodeKinksOver5DegreesReversedPairs = kinks.Count(k => k.angle > 5 && k.reversedPair),
             highwayGeometryHash = GeometryHash(
                 sections.Where(segment => segment.Kind == NetworkKind.Road && NativeAssetKeys.IsHighway(segment))),
             railGeometryHash = GeometryHash(sections.Where(segment => segment.Kind == NetworkKind.Rail)),

@@ -17,6 +17,22 @@ static partial class VisualMetricsReplay
         IEnumerable<string>? with = null)
     {
         var otherCapture = Load(folder);
+
+        // ROAD_REPLAY_TERRAIN=file: design the roads on another ground of the same size, raw
+        // float metres as the water replay's WATER_REPLAY_GROUND writes it (report 117).
+        if (Environment.GetEnvironmentVariable("ROAD_REPLAY_TERRAIN") is string groundFile && groundFile.Length > 0)
+        {
+            var groundBytes = File.ReadAllBytes(groundFile);
+
+            if (groundBytes.Length != otherCapture.Terrain.Length * sizeof(float))
+                throw new InvalidDataException("ROAD_REPLAY_TERRAIN does not match the capture's terrain size");
+
+            var heights = new float[otherCapture.Terrain.Length];
+            Buffer.BlockCopy(groundBytes, 0, heights, 0, groundBytes.Length);
+            otherCapture = otherCapture with { Terrain = heights };
+            Console.WriteLine("terrain replaced by " + groundFile);
+        }
+
         var request = otherCapture.Input["request"]!.ToObject<ImportRequest>()!;
 
         // The switches the capture was designed with, plus any asked for (report 112, 11.4).
@@ -83,6 +99,8 @@ static partial class VisualMetricsReplay
         if (!string.IsNullOrEmpty(logFilter))
             foreach (var line in log.Lines.Where(text => text.Contains(logFilter, StringComparison.Ordinal)))
                 Console.WriteLine(line);
+
+        DumpNear("cleanup", source.Sections);
 
         var structures = NetworkStructureIntervals.UnmappedCrossingBridges(source.Sections, log, default);
         var bridgeSteps =
@@ -248,6 +266,11 @@ static partial class VisualMetricsReplay
                 foreach (var metric in otherLog.Metrics().Where(metric => metric.Key.StartsWith("Smooth roads")))
                     Console.WriteLine($"  {metric.Key}: {metric.Value:0.##}");
 
+                // The design's phase times (report 118).
+                foreach (var metric in otherLog.Metrics().Where(metric => metric.Key.StartsWith("Visual compiler ")
+                    && metric.Key.EndsWith(" time (s)", StringComparison.Ordinal)))
+                    Console.WriteLine($"  {metric.Key}: {metric.Value:0.00}");
+
                 foreach (var reason in new[] { "railway", "roundabout", "major road" })
                     Console.WriteLine(
                         $"short underpasses kept, {reason} over: {otherLog.Metric("Short underpasses kept, " + reason + " over")}");
@@ -256,6 +279,7 @@ static partial class VisualMetricsReplay
             });
 
         bridgeSteps.Add(("design", RoadBridgeKilometres(designed)));
+        DumpNear("design", designed);
 
         WriteRoadQuality(
             designCapture,
@@ -271,6 +295,33 @@ static partial class VisualMetricsReplay
             stages,
             bridgeSteps,
             log);
+    }
+
+    // IEL_DUMP_NEAR="x,z,radius" (local metres): print every road section with an end within
+    // the radius, with its nodes, flags and curve, to inspect one place at each stage.
+    private static void DumpNear(string stage, IReadOnlyList<PreparedSegment> sections)
+    {
+        var text = Environment.GetEnvironmentVariable("IEL_DUMP_NEAR");
+
+        if (string.IsNullOrEmpty(text))
+            return;
+
+        var parts =
+            text.Split(',').Select(part => float.Parse(part, System.Globalization.CultureInfo.InvariantCulture)).ToArray();
+
+        var centre = new float2(parts[0], parts[1]);
+
+        foreach (var section in sections.Where(
+            section => section.Kind == NetworkKind.Road
+                && (math.distance(section.Start.xz, centre) <= parts[2]
+                    || math.distance(section.End.xz, centre) <= parts[2])))
+        {
+            string Point(float3? point) => point.HasValue ? $"({point.Value.x:0.0},{point.Value.z:0.0})" : "-";
+
+            Console.WriteLine(
+                FormattableString.Invariant(
+                    $"  {stage}: way={section.WayId} {section.Classification} oneWay={section.OneWay} avenue={section.ConsolidatedAvenue} lanes={section.Lanes} nodes={section.StartNodeId}->{section.EndNodeId} {Point(section.Start)} c1={Point(section.Control1)} c2={Point(section.Control2)} {Point(section.End)} {section.Name}"));
+        }
     }
 
     // The cleaning window for the B1 sweep (TERRAIN_CLEANING_WINDOW, metres).
@@ -328,7 +379,12 @@ static partial class VisualMetricsReplay
                 NativeEndpointPolicy.SnapToBorder(final, otherCapture.Width, new ImportLog()),
                 new ImportLog());
 
+        // Avenue kinks as designed and as placed, measured on curve tangents (report 120).
+        SourceReplay.PrintAvenueKinks(designed, " after design");
+        SourceReplay.PrintAvenueKinks(final, " final");
+
         var quality = RoadQualityReport.Measure(final, dataset, request, default);
+        var roadbedClock = System.Diagnostics.Stopwatch.StartNew();
         var roadbed =
             NetworkRoadbed.Prepare(
                 otherCapture.Terrain,
@@ -339,6 +395,9 @@ static partial class VisualMetricsReplay
                 otherCapture.Lines,
                 log,
                 default);
+
+        log.Time("Final roadbed construction", roadbedClock.Elapsed.TotalSeconds);
+        Console.WriteLine($"Final roadbed construction (s): {roadbedClock.Elapsed.TotalSeconds:0.000}");
 
         if (crests != null)
         {

@@ -638,6 +638,16 @@
   opacity: 0.4;
   pointer-events: none;
 }
+// An action that can't be used now. The game's UI does not always apply :disabled, so this
+// class greys the button itself and drops its hover and press colours.
+.unavailable,
+.unavailable:hover,
+.unavailable:active {
+  background: #2a3237;
+  color: #7f8b93;
+  border-color: #3a454c;
+  pointer-events: none;
+}
 .feedback {
   height: 78rem;
   margin-top: 10rem;
@@ -672,6 +682,11 @@
   margin-top: 12rem;
 }
 .actions button {
+  flex: 1;
+  min-width: 100rem;
+}
+// A button wrapped for its tooltip takes the same share of the row as a bare one.
+.actions > .tipHost {
   flex: 1;
   min-width: 100rem;
 }

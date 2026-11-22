@@ -19,6 +19,7 @@ public static class NetworkProcessor
     {
         var segments = new List<PreparedSegment>();
         var dedupe = new HashSet<string>(StringComparer.Ordinal);
+        var centreLanes = ReversibleCentreLanes(dataset, request);
 
         // Underground-link omission belongs to TunnelIntervals on the selected,
         // clipped segment graph. Whole-way flood filling here crossed branches
@@ -39,6 +40,12 @@ public static class NetworkProcessor
                 if (request.RoadLevel != RoadImportLevel.None && way.Tags.ContainsKey("highway"))
                     log.Count("Roads excluded by selected tier");
 
+                continue;
+            }
+
+            if (centreLanes.Contains(way.Id))
+            {
+                log.Count("Reversible centre lanes beside one-way carriageways omitted");
                 continue;
             }
 
@@ -441,6 +448,107 @@ public static class NetworkProcessor
 
     private static bool IsYes(IReadOnlyDictionary<string, string> tags, string key) =>
         tags.TryGetValue(key, out var value) && value is not ("no" or "0" or "false");
+
+    // A reversible lane on an ordinary street (Montreal's Rue Bridge) is a
+    // centre carriageway whose direction changes with the time of day. The game
+    // has no such lanes, and imported as a two-way road it lands a few metres
+    // from the one-way carriageways on either side. It is left out when every
+    // node and segment midpoint lies within this many metres of a one-way way
+    // with the same name or ref. A reversible street without such companions
+    // stays a two-way road; motorway and trunk lanes keep the Reversible policy.
+    private const float CentreLaneCompanionDistance = 30;
+
+    private static HashSet<long> ReversibleCentreLanes(OsmDataset dataset, ImportRequest request)
+    {
+        var centreLanes = new HashSet<long>();
+
+        var reversible = dataset.Ways.Values
+            .Where(way => way.Tags.TryGetValue("highway", out var highway)
+                && !highway.StartsWith("motorway", StringComparison.Ordinal)
+                && !highway.StartsWith("trunk", StringComparison.Ordinal)
+                && way.Tags.TryGetValue("oneway", out var direction)
+                && direction == "reversible"
+                && RoadLabel(way) != null)
+            .ToList();
+
+        if (reversible.Count == 0)
+            return centreLanes;
+
+        var labels = new HashSet<string>(reversible.Select(RoadLabel), StringComparer.Ordinal);
+
+        var companions = dataset.Ways.Values
+            .Where(way => way.Tags.ContainsKey("highway")
+                && way.Tags.TryGetValue("oneway", out var direction)
+                && direction is "yes" or "1" or "true" or "-1"
+                && labels.Contains(RoadLabel(way)))
+            .GroupBy(RoadLabel)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Select(Points).Where(points => points != null).ToList());
+
+        float3[] Points(OsmWay way)
+        {
+            var points = new float3[way.NodeIds.Length];
+
+            for (var index = 0; index < points.Length; index++)
+            {
+                if (!dataset.Nodes.TryGetValue(way.NodeIds[index], out var node))
+                    return null;
+
+                points[index] = GeoMath.ToLocalMeters(node.Latitude, node.Longitude, request.Latitude, request.Longitude);
+            }
+
+            return points;
+        }
+
+        bool Accompanied(float3 point, List<float3[]> lines)
+        {
+            foreach (var line in lines)
+            {
+                for (var index = 0; index < line.Length - 1; index++)
+                {
+                    var start = line[index].xz;
+                    var along = line[index + 1].xz - start;
+                    var length = math.lengthsq(along);
+                    var t = length > 0 ? math.saturate(math.dot(point.xz - start, along) / length) : 0;
+
+                    if (math.distance(point.xz, start + t * along) <= CentreLaneCompanionDistance)
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        foreach (var way in reversible)
+        {
+            var points = Points(way);
+
+            if (points == null || points.Length < 2 || !companions.TryGetValue(RoadLabel(way), out var lines))
+                continue;
+
+            var accompanied = true;
+
+            for (var index = 0; index < points.Length && accompanied; index++)
+            {
+                accompanied = Accompanied(points[index], lines)
+                    && (index == 0 || Accompanied((points[index - 1] + points[index]) / 2, lines));
+            }
+
+            if (accompanied)
+                centreLanes.Add(way.Id);
+        }
+
+        return centreLanes;
+    }
+
+    private static string RoadLabel(OsmWay way)
+    {
+        if (way.Tags.TryGetValue("name", out var name))
+            return name;
+
+        return way.Tags.TryGetValue("ref", out var reference) ? reference : null;
+    }
 
     private static bool Reversible(IReadOnlyDictionary<string, string> tags, string classification) =>
         (classification.StartsWith("motorway", StringComparison.Ordinal)

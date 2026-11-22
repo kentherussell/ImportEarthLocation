@@ -72,6 +72,11 @@ namespace ImportEarthLocation.Systems
     private double _nativeAuditSeconds;
         private Task<Processing.NativeJunctionReconciliation.Result>? _localRefitTask;
         private CancellationTokenSource? _localRefitCancellation;
+
+        // What this submission plan's refits measured once and share (report 121 §3). Made with
+        // the first refit and dropped with the plan; a worker still unwinding after a reset keeps
+        // the instance it captured, so a new import never shares it.
+        private Processing.NetworkRoadbed.LocalPatchCache? _localPatchCache;
         private float[]? _roadbedRaster;
         private Processing.NativeJunctionReconciliation.Result? _groundRevision;
         private Processing.ForestProcessor.CorridorIndex _localVegetationExclusions = new();
@@ -130,6 +135,52 @@ namespace ImportEarthLocation.Systems
         private int _networkDefinitionsQueued;
         private int _settledNetworkDefinitions, _currentBatchDefinitions;
         private int _networkBatchStart;
+
+        // The road placement schedule, one record per batch outcome, kept with diagnostics on
+        // and written once at the end (native-schedule.ndjson, report 121 §12.4). A later
+        // packing change can then be compared with this baseline range by range: where a
+        // batch started and ended (section index and native unit), the size it was allowed,
+        // its recovery attempt, whether its Apply was issued, and what became of it.
+        private readonly record struct ScheduleRecord(
+            int Ordinal,
+            long Generation,
+            int Start,
+            int Count,
+            long FirstUnit,
+            long LastUnit,
+            int Target,
+            int Attempt,
+            bool ApplyIssued,
+            string Disposition,
+            int FrameMilliseconds);
+
+        private readonly List<ScheduleRecord> _schedule = new();
+
+        private void RecordSchedule(
+            PreparedImport prepared,
+            int start,
+            IReadOnlyList<PreparedSegment> batch,
+            bool applyIssued,
+            string disposition,
+            int frameMilliseconds)
+        {
+            if (s_Log?.DiagnosticsEnabled != true || batch.Count == 0)
+                return;
+
+            _schedule.Add(
+                new ScheduleRecord(
+                    _schedule.Count,
+                    prepared.Request.Generation,
+                    start,
+                    batch.Count,
+                    batch[0].NativeUnitId,
+                    batch[batch.Count - 1].NativeUnitId,
+                    _batchSizeLimit,
+                    _recoveryAttempts,
+                    applyIssued,
+                    disposition,
+                    frameMilliseconds));
+        }
         private DateTime _nextNetworkProgressUtc;
         private readonly Stopwatch _networkBatchClock = new();
         private bool _stopRequested, _stopCleanupStarted, _stopAppliedBatch;
@@ -242,10 +293,12 @@ namespace ImportEarthLocation.Systems
                     $"PLACEMENT PROFILE phase={entry.Key}; frames={entry.Value.Frames}; frameSeconds={entry.Value.FrameSeconds:0.0}; importCodeSeconds={Milliseconds(entry.Value.CodeTicks) / 1000:0.0}");
 
             s_Log?.Diagnostic(
-                $"PLACEMENT PROFILE commitCodeSeconds={Milliseconds(NetworkCommitSystem.UpdateTicks) / 1000:0.0}; sections={_networkIndex}; batches={_networkBatches}");
+                $"PLACEMENT PROFILE commitCodeSeconds={Milliseconds(NetworkCommitSystem.UpdateTicks) / 1000:0.0}; jobWaitSeconds={Milliseconds(NetworkCommitSystem.JobWaitTicks) / 1000:0.0}; qualificationSeconds={Milliseconds(NetworkCommitSystem.QualificationTicks) / 1000:0.0}; sections={_networkIndex}; batches={_networkBatches}");
 
             _phaseProfile.Clear();
             NetworkCommitSystem.UpdateTicks = 0;
+            NetworkCommitSystem.JobWaitTicks = 0;
+            NetworkCommitSystem.QualificationTicks = 0;
         }
 
         private void EndAfterUnhandledFailure(Exception error)
@@ -440,6 +493,7 @@ namespace ImportEarthLocation.Systems
                     _networkPlacement = new NativeNetworkPlacement(EntityManager, _prefabSystem, s_Log!);
                     NativeNetworkDiagnostics.SetSelectedTopology(prepared.Design?.Source?.Topology);
                     _submissionPlan = new NativeSubmissionPlan(prepared.Segments);
+                    _localPatchCache = null;
                     s_Log?.DiagnosticRecordChunks(
                         "native-submission-order.ndjson",
                         DiagnosticArtifacts.NetworkRecords(_submissionPlan.Sections));
@@ -723,12 +777,17 @@ namespace ImportEarthLocation.Systems
                         var plan = _submissionPlan!.Sections.ToArray();
                         var start = _networkIndex;
                         var current = _roadbedRaster ?? prepared.Heights;
+                        var patchCache = _localPatchCache ??= new Processing.NetworkRoadbed.LocalPatchCache();
                         _localRefitTask = Task.Run(() =>
                         {
                             var baseline =
                                 prepared.RoadbedBaseline.Length == current.Length ? prepared.RoadbedBaseline : current;
 
                             var water = prepared.NetworkWaterSurface;
+
+                            // The worker's two parts are timed: Kathmandu makes about 90 refits and
+                            // spends 100 s of frames waiting for them (report 119).
+                            var workerClock = System.Diagnostics.Stopwatch.StartNew();
                             var result =
                                 Processing.NativeJunctionReconciliation.Refit(
                                     unit,
@@ -737,6 +796,9 @@ namespace ImportEarthLocation.Systems
                                     prepared.Request.MapSize.WidthMeters,
                                     log,
                                     cancellation);
+
+                            log.AddDuration("Local refit design", workerClock.Elapsed.TotalSeconds);
+                            workerClock.Restart();
 
                             if (result.NativeSafe && result.NeedsTerrainRestamp && result.ChangedSections > 0)
                                 result =
@@ -750,8 +812,11 @@ namespace ImportEarthLocation.Systems
                                                 start,
                                                 result.Sections,
                                                 log,
-                                                cancellation)
+                                                cancellation,
+                                                patchCache)
                                     };
+
+                            log.AddDuration("Local refit ground patch", workerClock.Elapsed.TotalSeconds);
 
                             return result;
                         }, cancellation);
@@ -939,6 +1004,14 @@ namespace ImportEarthLocation.Systems
                                 noApplyReplay = true
                             });
                     }
+
+                    RecordSchedule(
+                        prepared,
+                        _networkBatchStart,
+                        _networkBatch,
+                        applyIssued: true,
+                        "settled",
+                        (int)(UnityEngine.Time.unscaledDeltaTime * 1000));
 
                     _recoveryAttempts = 0;
                     _attemptedInputs.Clear();
@@ -1692,6 +1765,9 @@ namespace ImportEarthLocation.Systems
             var originalIndex = _networkIndex;
             var start = preflight ? 0 : _networkIndex - _networkBatch.Count;
             var details = NetworkCommitSystem.PreviewFailure;
+
+            if (!preflight)
+                RecordSchedule(prepared, start, originalBatch, applyIssued: false, "rejected-before-apply", 0);
             var gathered =
                 preflight
                     ? 0
@@ -2111,6 +2187,25 @@ namespace ImportEarthLocation.Systems
                     nativeRenderingNotVerified = true
                 });
 
+            if (_schedule.Count > 0)
+                s_Log?.DiagnosticRecordChunks(
+                    "native-schedule.ndjson",
+                    _schedule.Select(
+                        record => (object)new
+                        {
+                            ordinal = record.Ordinal,
+                            generation = record.Generation,
+                            start = record.Start,
+                            count = record.Count,
+                            firstUnit = record.FirstUnit,
+                            lastUnit = record.LastUnit,
+                            target = record.Target,
+                            attempt = record.Attempt,
+                            applyIssued = record.ApplyIssued,
+                            disposition = record.Disposition,
+                            frameMilliseconds = record.FrameMilliseconds
+                        }));
+
             if (prepared != null && s_Log != null)
                 ImportEarthLocation.Integration.SiteShots.Begin(prepared, s_Log);
 
@@ -2152,11 +2247,13 @@ namespace ImportEarthLocation.Systems
             _stopPreviewEntities.Clear();
             _networkPlacement = null;
             _submissionPlan = null;
+            _localPatchCache = null;
             _networkIndex = 0;
             _nativeAuditIndex = 0;
             _nativeAuditSeconds = 0;
             _networkBatch = Array.Empty<PreparedSegment>();
             _settledNetworkDefinitions = _currentBatchDefinitions = _networkBatchStart = 0;
+            _schedule.Clear();
             _nextNetworkProgressUtc = DateTime.MinValue;
             _networkBatchClock.Reset();
             _vegetationPlacement = null;

@@ -66,6 +66,35 @@ public static class NativeWaterBridge
 
         var created = 0;
 
+        // One row per planned source, with what became of it. The per-source log lines are
+        // lost when many arrive at once (the archive keeps 500 pending lines), so on 11-14
+        // nothing said which 24 of Marseille's 1,943 sources were not created (report 117).
+        var outcomes = new List<object>(plans.Count);
+
+        void Record(RiverSourcePlan plan, string outcome, float3 position, float target, float bank)
+        {
+            outcomes.Add(
+                new
+                {
+                    plan.WayId,
+                    plan.BodyId,
+                    plan.BodyKind,
+                    x = plan.Position.x,
+                    z = plan.Position.z,
+                    plannedBed = plan.Position.y,
+                    nativeBed = position.y,
+                    plannedTarget = plan.TargetSurfaceLevel ?? plan.Position.y + plan.Depth,
+                    target,
+                    nativeBank = bank,
+                    plan.Radius,
+                    plan.GridSnapped,
+                    outcome
+                });
+
+            if (outcome != "created" && outcome != "lowered-to-bank")
+                log.Count("River water sources skipped: " + outcome);
+        }
+
         foreach (var plan in plans)
         {
             var entity = Entity.Null;
@@ -79,6 +108,30 @@ public static class NativeWaterBridge
 
                 foreach (var bankProbe in plan.BankProbes)
                     nativeBank = Math.Min(nativeBank, TerrainUtils.SampleHeight(ref heights, bankProbe));
+
+                // The game's terrain differs a little from the planned one (its grid is one
+                // cell narrower, and road earthworks are resampled onto it), so a bank probe
+                // can stand a few decimetres lower there. As in the final revalidation, the
+                // source then stands 0.35 m under that bank instead of being skipped, when that
+                // lowers it by at most a metre and leaves water over its bed. On Marseille this
+                // kept 11 sources and cut the dry channel at 6 minutes from 3.0 to 1.9 km
+                // (report 117).
+                var lowered = false;
+
+                if (math.isfinite(position.y)
+                    && math.isfinite(target)
+                    && math.isfinite(nativeBank)
+                    && target > nativeBank - .25f
+                    && target - (nativeBank - .35f) <= 1
+                    && nativeBank - .35f - position.y >= .4f)
+                {
+                    log.Diagnostic(
+                        $"WATER APPLY LOWERED way={plan.WayId}; body={plan.BodyId}; planned={target:R}; nativeBank={nativeBank:R}; target={nativeBank - .35f:R}");
+
+                    target = nativeBank - .35f;
+                    lowered = true;
+                    log.Count("River water sources lowered to the game's bank");
+                }
 
                 var unsafeReason =
                     !math.isfinite(position.y) || !math.isfinite(target) || !math.isfinite(nativeBank)
@@ -99,6 +152,7 @@ public static class NativeWaterBridge
                     log.Diagnostic(
                         $"WATER APPLY SKIP way={plan.WayId}; body={plan.BodyId}; nativeBed={position.y:R}; plannedBed={plan.Position.y:R}; target={target:R}; nativeBank={nativeBank:R}; radius={plan.Radius:R}; reason={unsafeReason}");
 
+                    Record(plan, unsafeReason, position, target, nativeBank);
                     continue;
                 }
 
@@ -172,11 +226,12 @@ public static class NativeWaterBridge
                     log.Diagnostic(
                         $"WATER APPLY SKIP way={plan.WayId}; body={plan.BodyId}; position={position}; radius={plan.Radius}; depth={plan.Depth}; bankLevel={nativeBank}; reason=native-footprint-higher-than-stage; floodingBypass=false");
 
+                    Record(plan, "native-footprint-higher-than-stage", position, target, nativeBank);
                     continue;
                 }
 
                 var nativeDepth =
-                    plan.TargetSurfaceLevel.HasValue ? plan.TargetSurfaceLevel.Value - position.y : plan.Depth;
+                    lowered || plan.TargetSurfaceLevel.HasValue ? target - position.y : plan.Depth;
 
                 if (!math.isfinite(nativeDepth) || nativeDepth <= 0)
                 {
@@ -186,6 +241,7 @@ public static class NativeWaterBridge
                     log.Diagnostic(
                         $"WATER APPLY SKIP way={plan.WayId}; body={plan.BodyId}; reason=native-bed-above-target; nativeDepth={nativeDepth:R}");
 
+                    Record(plan, "native-bed-above-target", position, target, nativeBank);
                     continue;
                 }
 
@@ -223,8 +279,14 @@ public static class NativeWaterBridge
                     || !math.all(actualPosition == position))
                     throw new InvalidOperationException("Native water-source component readback did not match.");
 
-                NativeDiagnostics.RememberWater(actualPosition, actual, plan with { Radius = radius });
+                NativeDiagnostics.RememberWater(
+                    actualPosition,
+                    actual,
+                    lowered
+                        ? plan with { Radius = radius, TargetSurfaceLevel = target }
+                        : plan with { Radius = radius });
                 created++;
+                Record(plan, lowered ? "lowered-to-bank" : "created", position, target, nativeBank);
                 createdByBody.TryGetValue(plan.BodyId, out var previous);
                 createdByBody[plan.BodyId] = previous + 1;
                 log.Diagnostic(
@@ -237,10 +299,12 @@ public static class NativeWaterBridge
                     manager.DestroyEntity(entity);
 
                 log.Warn($"River source {plan.WayId} failed safely: {exception.GetBaseException().Message}");
+                Record(plan, "failed", plan.Position, float.NaN, float.NaN);
                 log.Diagnostic($"WATER FAILURE way={plan.WayId}: {exception}");
             }
         }
 
+        log.DiagnosticRecords("water-apply.ndjson", outcomes, critical: true);
         NativeDiagnostics.WaterApplied = created > 0;
         ReportBodies("native-plan-revalidation");
         log.Count("River water sources created", created);

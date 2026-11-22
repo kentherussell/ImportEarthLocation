@@ -91,11 +91,24 @@ static class AvenueTests
                 }).All(segment => segment.ConsolidatedAvenue),
             "A wide same-street median prevented consolidation");
 
+        // Since 2026-11-17 (report 120) differently named streets are never paired, and the local
+        // pass keeps carriageways more than 32 m apart separate. Since 2026-11-19 (report 122)
+        // carriageways of one named road merge up to 40 m apart (Quebec City's boulevards).
         Check(
             Run(
                 firstSegment,
                 secondSegment with { Start = new(100, 0, 40), End = new(0, 0, 40) }).All(segment => !segment.OneWay),
-            "A 40 m divided street escaped strict consolidation");
+            "Named carriageways 40 m apart were not merged into one avenue");
+
+        Check(
+            Run(
+                firstSegment,
+                secondSegment with { Start = new(100, 0, 48), End = new(0, 0, 48) }).All(segment => segment.OneWay),
+            "Carriageways 48 m apart were merged into one avenue");
+
+        Check(
+            Run(firstSegment, secondSegment with { Name = "" }).All(segment => !segment.OneWay),
+            "An unnamed carriageway was not paired with its named opposite");
 
         Check(
             pair.Count > 0
@@ -136,8 +149,8 @@ static class AvenueTests
             "Input ordering changes consolidation");
 
         Check(
-            Run(firstSegment, secondSegment with { Name = "Different" }).All(segment => !segment.OneWay),
-            "Opposing geometric counterparts remained split because their names differ");
+            Run(firstSegment, secondSegment with { Name = "Different" }).All(segment => segment.OneWay),
+            "Two differently named one-way streets were merged into one avenue");
 
         Check(
             Run(

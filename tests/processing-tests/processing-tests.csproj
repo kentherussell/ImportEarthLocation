@@ -27,6 +27,14 @@
     <Compile Include="..\..\ImportEarthLocation\Processing\ClimateMath.cs" Link="ClimateMath.cs" />
     <Compile Include="..\..\ImportEarthLocation\Processing\GeographyPolygons.cs" Link="GeographyPolygons.cs" />
     <Compile Include="..\..\ImportEarthLocation\Processing\RockPlanner.cs" Link="RockPlanner.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\WaterBodyPlanner.cs" Link="WaterBodyPlanner.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Core\DesignSwitches.cs" Link="DesignSwitches.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\NetworkVerticalProfiles.cs" Link="NetworkVerticalProfiles.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\TerrainArtifactRepair.cs" Link="TerrainArtifactRepair.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\WaterContainment.cs" Link="WaterContainment.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\WaterCutSmoothing.cs" Link="WaterCutSmoothing.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\WaterPlanner.cs" Link="WaterPlanner.cs" />
+    <Compile Include="..\..\ImportEarthLocation\Processing\VegetationBudget.cs" Link="VegetationBudget.cs" />
     <Reference Include="Unity.Mathematics"><HintPath>$(GameManagedPath)\Unity.Mathematics.dll</HintPath></Reference>
     <Reference Include="UnityEngine.CoreModule"><HintPath>$(GameManagedPath)\UnityEngine.CoreModule.dll</HintPath></Reference>
   </ItemGroup>

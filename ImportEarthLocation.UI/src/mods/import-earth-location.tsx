@@ -642,7 +642,7 @@ export const ImportEarthLocationContent = () => {
                     "Prepare import",
                     <Button
                       variant="flat"
-                      className={`${styles.actionButton} ${styles.primary}`}
+                      className={`${styles.actionButton} ${styles.unavailable}`}
                       focusKey="iel-prepare"
                       disabled
                     >
@@ -652,7 +652,9 @@ export const ImportEarthLocationContent = () => {
                   {!ready && !busy && !mapBuilt && (
                     <Button
                       variant="flat"
-                      className={`${styles.actionButton} ${styles.primary}`}
+                      className={`${styles.actionButton} ${
+                        busy || starting || !hasLocation ? styles.unavailable : styles.primary
+                      }`}
                       focusKey="iel-prepare"
                       disabled={busy || starting || !hasLocation}
                       onSelect={() => {

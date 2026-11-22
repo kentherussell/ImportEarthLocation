@@ -44,8 +44,13 @@ public static class DesignSwitches
     // by the fit, and planned cuts (report 113).
     public const string SmoothRoads = "smooth-roads";
 
+    // Diagnostics only, no design change: the whole map's water depth is read a second time
+    // 15 minutes after the sources are applied (native-water-depth-late.json).
+    public const string LateWaterReadback = "late-water-readback";
+
     public static readonly string[] All =
     {
+        LateWaterReadback,
         SourceCleaning,
         WideApproaches,
         StructureDepth,

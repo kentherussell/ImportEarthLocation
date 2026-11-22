@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -93,6 +94,29 @@ public static class AvenueConsolidator
 
     // Addis Ababa, the longest seen, settles in 14 passes.
     private const int MaximumPasses = 64;
+
+    // A pass that turns less than this share of the remaining one-way road into avenue is the
+    // last of its group. Zero restores merging until a pass merges nothing.
+    private const double MinimumPassGain = .002;
+
+    // Carriageways farther apart than this (metres) at any point are separate roads in the
+    // local pass. The local pass also needs this much common length (metres) and its carriageways
+    // within about 18 degrees of parallel (the cosine). Until 2026-11-17 the local pass took
+    // 40 m, 8 m and 23 degrees, and paired differently named streets (report 120).
+    private const float MaximumSeparation = 32, LocalOverlap = 20, LocalAlignment = .95f;
+
+    // Carriageways sharing a name or ref may stand this far apart (metres) in the named pass: a
+    // wide median is still one road, and Quebec City's boulevards run 33 to 40 m apart for
+    // kilometres.
+    private const float NamedSeparation = 40;
+
+    // A named pair refused for separation or alignment somewhere still merges its longest
+    // stretch with carriageways at most NarrowedSeparation metres apart and parallel, if that
+    // stretch is at least NarrowedMinimum metres long. The margin under NamedSeparation keeps
+    // the carriageways' step onto the merged centre line at each cut short. A named pair at
+    // least twice NarrowedMinimum long refused for its junctions is split at its middle node,
+    // and each half is matched again on the next pass.
+    private const float NarrowedSeparation = 36, NarrowedMinimum = 100;
 
     private static bool Eligible(PreparedSegment segment) => segment.Kind == NetworkKind.Road && segment.OneWay
         && !segment.Classification.EndsWith("_link", StringComparison.OrdinalIgnoreCase)
@@ -230,17 +254,27 @@ public static class AvenueConsolidator
         CancellationToken token)
     {
         const float spacing = 10, laneSpacing = 4;
+
+        // Nothing moved: no section is replaced or reshaped.
+        if (shifted.Count == 0)
+            return;
+
         var incident = new Dictionary<long, List<int>>();
+
+        void AddIncident(long id, int index)
+        {
+            if (!incident.TryGetValue(id, out var list))
+                incident[id] = list = new();
+
+            list.Add(index);
+        }
 
         for (var i = 0; i < sections.Count; i++)
             if (sections[i].Kind == NetworkKind.Road)
-                foreach (var id in new[] { sections[i].StartNodeId, sections[i].EndNodeId })
-                {
-                    if (!incident.TryGetValue(id, out var list))
-                        incident[id] = list = new();
-
-                    list.Add(i);
-                }
+            {
+                AddIncident(sections[i].StartNodeId, i);
+                AddIncident(sections[i].EndNodeId, i);
+            }
 
         var ends =
             new HashSet<long>(
@@ -472,14 +506,27 @@ public static class AvenueConsolidator
         const string Merges = "Opposing road pairs consolidated into avenues";
         const string Junctions = "Avenue median junction connectors canonicalized";
 
+        // Each pass's result is the next pass's source, so its length carries over.
+        var after = OneWayLength(source);
+
+        // Nodes where named carriageway chains are cut, kept across passes (NarrowedMinimum).
+        var breaks = new HashSet<long>();
+
         for (var pass = 0; pass < MaximumPasses; pass++)
         {
             var merges = log.Metric(Merges);
             var junctions = log.Metric(Junctions);
-            var next = PreparePass(source, log, token, localMatching);
+            var breaksBefore = breaks.Count;
+            var next = PreparePass(source, log, token, localMatching, breaks: breaks);
             var merged = log.Metric(Merges) != merges;
+            var bisected = breaks.Count != breaksBefore;
+            var before = after;
+            after = OneWayLength(next);
 
-            if (merged && OneWayLength(next) >= OneWayLength(source))
+            log.Diagnostic(
+                $"AVENUE TIMES pass={pass + 1}; local={localMatching}; merges={log.Metric(Merges) - merges:0}; junctionConnectors={log.Metric(Junctions) - junctions:0}; oneWayKilometres={before / 1000:0.0}->{after / 1000:0.0}; sections={source.Count}->{next.Count}");
+
+            if (merged && after >= before)
             {
                 log.Warn($"Avenue merging stopped at pass {pass + 1}: the last pass reduced no one-way road.");
 
@@ -488,7 +535,14 @@ public static class AvenueConsolidator
 
             source = next;
 
-            if (!merged && (!localMatching || log.Metric(Junctions) == junctions))
+            if (!merged && !bisected && (!localMatching || log.Metric(Junctions) == junctions))
+                return source;
+
+            // Each pass costs the same whatever it merges, and the late ones merge next to
+            // nothing: in Paris passes 5 to 7 of each group merged 1.3 km of 2,100 km for 40% of
+            // the stage's time (report 119). The pass is kept; the group ends with it, unless it
+            // split chains whose halves are still to be matched.
+            if (merged && !bisected && before - after < MinimumPassGain * before)
                 return source;
         }
 
@@ -611,6 +665,196 @@ public static class AvenueConsolidator
             .ToArray();
     }
 
+    // Two avenue pieces merged separately can end a few metres apart sideways, joined only by
+    // what is left of the carriageways: two opposite one-way stubs between the two ends. The
+    // design drew that step as an S-bend of 10-20 m radius (Central Avenue in DC; 191 such
+    // steps in DC, 130 in Paris, 22 in Marseille; report 120). Where each end node carries
+    // one avenue piece (a different one at each end) besides the two stubs, the stubs go and
+    // the two ends join at their midpoint, so the avenue continues; SmoothAvenues then relaxes
+    // the join. A side street at either end moves with it, by under MaximumStub / 2, and meets
+    // the avenue at the one junction instead of two a few metres apart; a bridge or tunnel
+    // step joins like any other. Until 11-18 a side street or a structure kept the step, and
+    // Quebec City had 26 of these pieces at its boulevards' junctions and bridge ends. The
+    // removed node stays known as an alias of the one kept.
+    internal static IReadOnlyList<PreparedSegment> JoinAvenueSteps(
+        IReadOnlyList<PreparedSegment> source,
+        ImportLog log)
+    {
+        const float MaximumStub = 20;
+
+        var arms = new Dictionary<long, List<int>>();
+
+        for (var i = 0; i < source.Count; i++)
+            if (source[i].Kind == NetworkKind.Road)
+                foreach (var node in new[] { source[i].StartNodeId, source[i].EndNodeId })
+                {
+                    if (!arms.TryGetValue(node, out var list))
+                        arms[node] = list = new List<int>();
+
+                    list.Add(i);
+                }
+
+        bool Stub(PreparedSegment segment)
+            => segment.Kind == NetworkKind.Road
+                && segment.OneWay
+                && !segment.ConsolidatedAvenue
+                && !segment.Roundabout
+                && math.distance(segment.Start.xz, segment.End.xz) < MaximumStub;
+
+        bool AvenuePiece(PreparedSegment segment) => segment.ConsolidatedAvenue && !segment.OneWay;
+
+        var removed = new HashSet<int>();
+        var moved = new Dictionary<long, (long Node, float3 Point)>();
+
+        // A stub may run through nodes with nothing else attached (Quebec City's Chemin des
+        // Quatre-Bourgeois: 10 m and 8 m east, one 7 m stub back west). Its sections in order
+        // from one in its first, while they stay stubs, under MaximumStub together, and four
+        // at most; null where it does not continue as a stub.
+        List<int>? Run(int start)
+        {
+            var run = new List<int> { start };
+            var length = math.distance(source[start].Start.xz, source[start].End.xz);
+            var at = source[start].EndNodeId;
+
+            while (arms[at].Count == 2)
+            {
+                var next = arms[at][0] == run[run.Count - 1] ? arms[at][1] : arms[at][0];
+
+                if (removed.Contains(next) || !Stub(source[next]) || source[next].StartNodeId != at || run.Count == 4)
+                    return null;
+
+                length += math.distance(source[next].Start.xz, source[next].End.xz);
+
+                if (length >= MaximumStub)
+                    return null;
+
+                run.Add(next);
+                at = source[next].EndNodeId;
+            }
+
+            return run;
+        }
+
+        for (var i = 0; i < source.Count; i++)
+        {
+            var stub = source[i];
+
+            if (removed.Contains(i) || !Stub(stub) || stub.StartNodeId == stub.EndNodeId)
+                continue;
+
+            var outward = Run(i);
+
+            if (outward == null)
+                continue;
+
+            var first = stub.StartNodeId;
+            var second = source[outward[outward.Count - 1]].EndNodeId;
+
+            if (first == second || moved.ContainsKey(first) || moved.ContainsKey(second))
+                continue;
+
+            List<int>? inward = null;
+
+            foreach (var j in arms[second])
+                if (!outward.Contains(j)
+                    && !removed.Contains(j)
+                    && Stub(source[j])
+                    && source[j].StartNodeId == second
+                    && Run(j) is { } candidate
+                    && source[candidate[candidate.Count - 1]].EndNodeId == first)
+                {
+                    inward = candidate;
+                    break;
+                }
+
+            if (inward == null)
+                continue;
+
+            var step = new HashSet<int>(outward.Concat(inward));
+            var firstPieces = arms[first].Where(j => !step.Contains(j) && AvenuePiece(source[j])).ToArray();
+            var secondPieces = arms[second].Where(j => !step.Contains(j) && AvenuePiece(source[j])).ToArray();
+
+            if (firstPieces.Length != 1
+                || secondPieces.Length != 1
+                || firstPieces[0] == secondPieces[0]
+                || removed.Contains(firstPieces[0])
+                || removed.Contains(secondPieces[0]))
+                continue;
+
+            var point = (stub.Start + source[outward[outward.Count - 1]].End) * .5f;
+            removed.UnionWith(step);
+
+            foreach (var j in step)
+            {
+                moved[source[j].StartNodeId] = (first, point);
+                moved[source[j].EndNodeId] = (first, point);
+            }
+        }
+
+        if (removed.Count == 0)
+            return source;
+
+        log.Count("Avenue steps joined", removed.Count / 2);
+
+        // An end moves with its adjacent curve control, so the piece keeps its direction there.
+        var result = new List<PreparedSegment>();
+
+        for (var i = 0; i < source.Count; i++)
+        {
+            if (removed.Contains(i))
+                continue;
+
+            var segment = source[i];
+
+            if (moved.TryGetValue(segment.StartNodeId, out var start))
+            {
+                var delta = start.Point - segment.Start;
+                segment = segment with
+                {
+                    StartNodeId = start.Node,
+                    Start = start.Point,
+                    Control1 = segment.Control1 + delta,
+                    SourceGeometry = MoveEnd(segment.SourceGeometry, start.Point, true),
+                    HorizontalParent = null
+                };
+            }
+
+            if (moved.TryGetValue(segment.EndNodeId, out var end))
+            {
+                var delta = end.Point - segment.End;
+                segment = segment with
+                {
+                    EndNodeId = end.Node,
+                    End = end.Point,
+                    Control2 = segment.Control2 + delta,
+                    SourceGeometry = MoveEnd(segment.SourceGeometry, end.Point, false),
+                    HorizontalParent = null
+                };
+            }
+
+            result.Add(segment);
+        }
+
+        static IReadOnlyList<float3> MoveEnd(IReadOnlyList<float3> geometry, float3 point, bool atStart)
+        {
+            if (geometry.Count == 0)
+                return geometry;
+
+            var copy = geometry.ToArray();
+            copy[atStart ? 0 : copy.Length - 1] = point;
+
+            return copy;
+        }
+
+        var aliases = new Dictionary<long, long>();
+
+        foreach (var pair in moved)
+            if (pair.Key != pair.Value.Node)
+                aliases[pair.Key] = pair.Value.Node;
+
+        return SourceTopologyObligations.Transfer(source, result, NetworkKind.Road, aliases);
+    }
+
     private static double OneWayLength(IReadOnlyList<PreparedSegment> sections)
         => sections.Where(segment => segment.OneWay).Sum(segment => (double)math.distance(segment.Start.xz, segment.End.xz));
 
@@ -631,6 +875,7 @@ public static class AvenueConsolidator
         // must not veto the otherwise parallel portions of a divided street.
         // Geometry, rather than naming, owns these remaining short matches.
         source = RepeatPasses(source, log, token, localMatching: true);
+        source = JoinAvenueSteps(source, log);
         source = SmoothAvenues(source, log, token);
 
         return source
@@ -646,7 +891,8 @@ public static class AvenueConsolidator
         ImportLog log,
         CancellationToken token,
         bool localMatching = false,
-        bool trunk = false)
+        bool trunk = false,
+        HashSet<long> breaks = null)
     {
         token.ThrowIfCancellationRequested();
         var clock = Stopwatch.StartNew();
@@ -722,29 +968,39 @@ public static class AvenueConsolidator
             return math.dot(Away(edges[0]), Away(edges[1])) < -.995f;
         }
 
-        var twoWayPorts = new HashSet<(long Node, string Identity)>();
-
-        foreach (var segment in source)
-            if (segment.Kind == NetworkKind.Road && !segment.OneWay)
-            {
-                var identity = Identity(segment);
-                twoWayPorts.Add((segment.StartNodeId, identity));
-                twoWayPorts.Add((segment.EndNodeId, identity));
-            }
-
         // Keep the actual structural tie-in edge, not an entire avenue just because
         // a distant end meets a bridge. The retained edge becomes the transition.
-        var eligible =
+        var unordered =
             source
                 .Where(
                     segment => (trunk ? TrunkEligible(segment) && Clear(segment) : Eligible(segment))
                         && (!localMatching || !NetworkStructure.IsStructure(segment))
                         && (!structureNodes.Contains(segment.StartNodeId) || RailPort(segment.StartNodeId))
                 && (!structureNodes.Contains(segment.EndNodeId) || RailPort(segment.EndNodeId)))
-            .OrderBy(Identity, StringComparer.Ordinal)
-                .ThenBy(segment => segment.WayId)
-                .ThenBy(segment => segment.StartNodeId)
                 .ToArray();
+
+        // Each identity is built once, for the sort and for the corridor groups below.
+        var unorderedIdentities = new string[unordered.Length];
+
+        for (var i = 0; i < unordered.Length; i++)
+            unorderedIdentities[i] = Identity(unordered[i]);
+
+        var order =
+            Enumerable
+                .Range(0, unordered.Length)
+                .OrderBy(i => unorderedIdentities[i], StringComparer.Ordinal)
+                .ThenBy(i => unordered[i].WayId)
+                .ThenBy(i => unordered[i].StartNodeId)
+                .ToArray();
+
+        var eligible = new PreparedSegment[order.Length];
+        var identities = new string[order.Length];
+
+        for (var k = 0; k < order.Length; k++)
+        {
+            eligible[k] = unordered[order[k]];
+            identities[k] = unorderedIdentities[order[k]];
+        }
 
         if (trunk)
             log.Diagnostic(
@@ -752,6 +1008,32 @@ public static class AvenueConsolidator
 
         if (eligible.Length == 0)
             return source;
+
+        // Named corridors stop where a two-way road of their own identity continues them.
+        // Only that chaining reads these ports, and only at the nodes of eligible sections,
+        // so the identity of any other two-way road is never needed.
+        var twoWayPorts = new HashSet<(long Node, string Identity)>();
+
+        if (!localMatching)
+        {
+            var eligibleNodes = new HashSet<long>();
+
+            foreach (var segment in eligible)
+            {
+                eligibleNodes.Add(segment.StartNodeId);
+                eligibleNodes.Add(segment.EndNodeId);
+            }
+
+            foreach (var segment in source)
+                if (segment.Kind == NetworkKind.Road
+                    && !segment.OneWay
+                    && (eligibleNodes.Contains(segment.StartNodeId) || eligibleNodes.Contains(segment.EndNodeId)))
+                {
+                    var identity = Identity(segment);
+                    twoWayPorts.Add((segment.StartNodeId, identity));
+                    twoWayPorts.Add((segment.EndNodeId, identity));
+                }
+        }
 
         var chains = new List<Chain>();
 
@@ -764,28 +1046,50 @@ public static class AvenueConsolidator
                     chains.Add(new Chain { Edges = new[] { edge }, Distances = new[] { 0f, length } });
             }
         else
-            foreach (var group in eligible.GroupBy(Identity))
+        {
+            // Sorted by identity, so each corridor is one run of equal identities, in the
+            // order and with the sections the former GroupBy gave.
+            static Dictionary<long, List<PreparedSegment>> ByNode(
+                PreparedSegment[] edges,
+                Func<PreparedSegment, long> node)
+            {
+                var result = new Dictionary<long, List<PreparedSegment>>();
+
+                foreach (var edge in edges)
+                {
+                    if (!result.TryGetValue(node(edge), out var list))
+                        result[node(edge)] = list = new List<PreparedSegment>();
+
+                    list.Add(edge);
+                }
+
+                return result;
+            }
+
+            var groupEnd = 0;
+
+            for (var groupStart = 0; groupStart < eligible.Length; groupStart = groupEnd)
             {
                 token.ThrowIfCancellationRequested();
-                var edges = group.ToArray();
-                var outgoing =
-                    edges
-                        .GroupBy(segment => segment.StartNodeId)
-                        .ToDictionary(otherGroup => otherGroup.Key, otherGroup => otherGroup.ToArray());
+                var identity = identities[groupStart];
+                groupEnd = groupStart + 1;
 
-                var incoming =
-                    edges
-                        .GroupBy(segment => segment.EndNodeId)
-                        .ToDictionary(otherGroup => otherGroup.Key, otherGroup => otherGroup.ToArray());
+                while (groupEnd < eligible.Length && identities[groupEnd] == identity)
+                    groupEnd++;
 
+                var edges = new PreparedSegment[groupEnd - groupStart];
+                Array.Copy(eligible, groupStart, edges, 0, edges.Length);
+                var outgoing = ByNode(edges, segment => segment.StartNodeId);
+                var incoming = ByNode(edges, segment => segment.EndNodeId);
                 var visited = new HashSet<PreparedSegment>();
 
                 foreach (var seed in edges
                     .Where(
-                        segment => twoWayPorts.Contains((segment.StartNodeId, group.Key))
+                        segment => twoWayPorts.Contains((segment.StartNodeId, identity))
+                            || breaks != null && breaks.Contains(segment.StartNodeId)
                             || !incoming.TryGetValue(segment.StartNodeId, out var before)
-                            || before.Length != 1
-                            || outgoing[segment.StartNodeId].Length != 1)
+                            || before.Count != 1
+                            || outgoing[segment.StartNodeId].Count != 1)
                     .Concat(edges))
                 {
                     if (visited.Contains(seed))
@@ -799,13 +1103,14 @@ public static class AvenueConsolidator
                         token.ThrowIfCancellationRequested();
                         list.Add(current);
 
-                        if (twoWayPorts.Contains((current.EndNodeId, group.Key))
+                        if (twoWayPorts.Contains((current.EndNodeId, identity))
+                            || breaks != null && breaks.Contains(current.EndNodeId)
                             || !outgoing.TryGetValue(current.EndNodeId, out var next))
                             break;
 
                         var direction = math.normalizesafe(current.End.xz - current.Start.xz);
 
-                        if (next.Length == 1 && incoming[current.EndNodeId].Length == 1)
+                        if (next.Count == 1 && incoming[current.EndNodeId].Count == 1)
                         {
                             if (math.dot(direction, math.normalizesafe(next[0].End.xz - next[0].Start.xz)) < .5f)
                                 break;
@@ -849,6 +1154,7 @@ public static class AvenueConsolidator
                         chains.Add(new Chain { Edges = list.ToArray(), Distances = distances });
                 }
             }
+        }
 
         // Search near the opposite chain's end, not all pairs or only their midpoints.
         var grid = new Dictionary<(int, int), List<int>>();
@@ -875,6 +1181,11 @@ public static class AvenueConsolidator
         var matches =
             new List<(int other, float score, float a0, float a1, float b0, float b1, bool tapered)>[chains.Count];
 
+        var mirrored =
+            new ConcurrentBag<(int Owner, (int other, float score, float a0, float a1, float b0, float b1, bool tapered)
+                Match)>();
+
+
         var comparisons = 0;
         var rejectedSamples = 0;
         var rejections = new Dictionary<string, int>();
@@ -892,6 +1203,22 @@ public static class AvenueConsolidator
 
                 rejectedSamples++;
             }
+        }
+
+        // Cuts a long named chain refused for its junctions at the node nearest its middle.
+        void Bisect(Chain chain)
+        {
+            if (breaks == null || localMatching || chain.Length < 2 * NarrowedMinimum || chain.Edges.Length < 2)
+                return;
+
+            var half = chain.Length / 2;
+            var middle = 1;
+
+            for (var k = 2; k < chain.Edges.Length; k++)
+                if (Math.Abs(chain.Distances[k] - half) < Math.Abs(chain.Distances[middle] - half))
+                    middle = k;
+
+            breaks.Add(chain.Edges[middle].StartNodeId);
         }
 
         // Each chain's matches depend only on the chains, so they run in parallel; matches[i] is per chain and the result does not depend on the order.
@@ -933,7 +1260,23 @@ public static class AvenueConsolidator
                     : first.Reference.Trim().Length > 0
                         && first.Reference.Trim().Equals(second.Reference.Trim(), StringComparison.OrdinalIgnoreCase));
 
-                            if (first.Layer != second.Layer || !sameIdentity && !localMatching)
+                            // The local pass may pair an unnamed carriageway with a named one, but
+                            // never two roads named differently: those are two streets, such as a
+                            // one-way couplet a block apart, not the halves of one avenue. A shared
+                            // ref marks one road whatever its carriageways are called.
+                            var referenceA = first.Reference.Trim();
+                            var referenceB = second.Reference.Trim();
+                            var sharedReference =
+                                referenceA.Length > 0
+                                    && referenceA.Equals(referenceB, StringComparison.OrdinalIgnoreCase);
+
+                            var conflicting =
+                                !sharedReference
+                                    && (nameA.Length > 0 && nameB.Length > 0
+                                        && !nameA.Equals(nameB, StringComparison.OrdinalIgnoreCase)
+                                        || referenceA.Length > 0 && referenceB.Length > 0);
+
+                            if (first.Layer != second.Layer || !sameIdentity && (!localMatching || conflicting))
                                 continue;
 
                             if (firstChain.Edges[0].Bridge != secondChain.Edges[0].Bridge
@@ -1026,7 +1369,7 @@ public static class AvenueConsolidator
                             var reverseOverlap = (b1 - b0) * secondChain.Length;
                             // A short merged trunk between two divided stretches is two
                             // transitions with no avenue between them.
-                            var minimumOverlap = localMatching ? 8 : trunk ? MinimumTrunkStretch : 30;
+                            var minimumOverlap = localMatching ? LocalOverlap : trunk ? MinimumTrunkStretch : 30;
 
                             if (overlap < minimumOverlap
                                 || reverseOverlap < minimumOverlap
@@ -1037,91 +1380,189 @@ public static class AvenueConsolidator
                                 continue;
                             }
 
-                            var valid = true;
-                            var separation = 0f;
-                            var sign = 0f;
-                            var tapered = false;
-                            var samples = Math.Max(32, (int)Math.Ceiling(Math.Max(overlap, reverseOverlap) / 24));
+                            var test = Test(a0, a1, b0, b1, overlap, reverseOverlap);
 
-                            for (var sample = 0; sample <= samples; sample++)
+                            // A long named pair that strays apart or out of line somewhere is
+                            // not kept divided over that one place: its longest close, parallel
+                            // stretch merges now, and the rest is matched again on the next pass
+                            // (Quebec City's Route du Président-Kennedy, 7.4 km, was refused for
+                            // one point 32.3 m apart).
+                            if (!test.Valid
+                                && !localMatching
+                                && test.Reason is "separation" or "tangent"
+                                && Narrow(ref a0, ref a1, ref b0, ref b1))
                             {
-                                token.ThrowIfCancellationRequested();
-                                var fraction = sample / (float)samples;
-                                var t = math.lerp(a0, a1, fraction);
-                                var pa = firstChain.Point(t);
-                                var u =
-                                    localMatching
-                                        ? math.lerp(b1, b0, fraction)
-                                        : math.clamp(secondChain.Project(pa), b0, b1);
+                                overlap = (a1 - a0) * firstChain.Length;
+                                reverseOverlap = (b1 - b0) * secondChain.Length;
 
-                                var pb = secondChain.Point(u);
-                                var distance = math.distance(pa.xz, pb.xz);
-
-                                if (distance > (localMatching ? 40 : 32))
+                                if (overlap >= Math.Max(minimumOverlap, NarrowedMinimum)
+                                    && reverseOverlap >= Math.Max(minimumOverlap, NarrowedMinimum)
+                                    && overlap / reverseOverlap >= .8f
+                                    && overlap / reverseOverlap <= 1.25f)
                                 {
-                                    Reject(firstChain, secondChain, "separation", distance);
-                                    valid = false;
-                                    break;
-                                }
+                                    var narrowed = Test(a0, a1, b0, b1, overlap, reverseOverlap);
 
-                                separation += distance;
-                                var tangent =
-                                    math.normalizesafe(
-                                        firstChain.Point(Math.Min(1, t + .01f)).xz
-                                            - firstChain.Point(Math.Max(0, t - .01f)).xz);
-
-                                var reverse =
-                                    math.normalizesafe(
-                                        secondChain.Point(Math.Max(0, u - .01f)).xz
-                                            - secondChain.Point(Math.Min(1, u + .01f)).xz);
-
-                                // At a shared split/join the carriageways converge, so
-                                // their endpoint tangents need not be parallel. Preserve
-                                // that exact connection while testing the divided body.
-                                var sharedStart =
-                                    firstChain.Edges[0].StartNodeId
-                                        == secondChain.Edges[secondChain.Edges.Length - 1].EndNodeId;
-
-                                var sharedEnd =
-                                    firstChain.Edges[firstChain.Edges.Length - 1].EndNodeId
-                                        == secondChain.Edges[0].StartNodeId;
-
-                                var taper =
-                                    sharedStart && t * firstChain.Length < 32 && (1 - u) * secondChain.Length < 32
-                                        || sharedEnd && (1 - t) * firstChain.Length < 32 && u * secondChain.Length < 32;
-
-                                var endpoint =
-                                    Math.Min(fraction, 1 - fraction) * Math.Min(overlap, reverseOverlap)
-                                        < Math.Min(32, .2f * Math.Min(overlap, reverseOverlap));
-
-                                var alignment = math.dot(tangent, reverse);
-
-                                if (!taper && alignment < (localMatching ? .92f : endpoint ? .82f : .97f))
-                                {
-                                    Reject(firstChain, secondChain, "tangent", alignment);
-                                    valid = false;
-                                    break;
-                                }
-
-                                if (!taper && alignment < .97f)
-                                    tapered = true;
-
-                                var delta = pb.xz - pa.xz;
-                                var side = tangent.x * delta.y - tangent.y * delta.x;
-
-                                if (Math.Abs(side) > 1)
-                                {
-                                    if (sign != 0 && Math.Sign(side) != Math.Sign(sign))
-                                    {
-                                        valid = false;
-                                        break;
-                                    }
-
-                                    sign = side;
+                                    if (narrowed.Valid)
+                                        test = narrowed;
                                 }
                             }
 
-                            separation /= samples + 1;
+                            if (!test.Valid)
+                            {
+                                if (test.Reason != null)
+                                    Reject(firstChain, secondChain, test.Reason, test.Value);
+
+                                continue;
+                            }
+
+                            // The longest run of samples about 8 m apart where the partner lies
+                            // within NarrowedSeparation and runs parallel, as new intervals.
+                            bool Narrow(ref float from, ref float to, ref float partnerFrom, ref float partnerTo)
+                            {
+                                var steps = Math.Max(2, (int)Math.Ceiling((to - from) * firstChain.Length / 8));
+                                var runStart = -1;
+                                var bestStart = 0;
+                                var bestEnd = -1;
+
+                                for (var k = 0; k <= steps; k++)
+                                {
+                                    var t = math.lerp(from, to, k / (float)steps);
+                                    var pa = firstChain.Point(t);
+                                    var u = math.clamp(secondChain.Project(pa), partnerFrom, partnerTo);
+                                    var pb = secondChain.Point(u);
+
+                                    var tangent =
+                                        math.normalizesafe(
+                                            firstChain.Point(Math.Min(1, t + .01f)).xz
+                                                - firstChain.Point(Math.Max(0, t - .01f)).xz);
+
+                                    var reverse =
+                                        math.normalizesafe(
+                                            secondChain.Point(Math.Max(0, u - .01f)).xz
+                                                - secondChain.Point(Math.Min(1, u + .01f)).xz);
+
+                                    if (math.distance(pa.xz, pb.xz) > NarrowedSeparation
+                                        || math.dot(tangent, reverse) < .97f)
+                                    {
+                                        runStart = -1;
+                                        continue;
+                                    }
+
+                                    if (runStart < 0)
+                                        runStart = k;
+
+                                    if (k - runStart > bestEnd - bestStart)
+                                    {
+                                        bestStart = runStart;
+                                        bestEnd = k;
+                                    }
+                                }
+
+                                if (bestEnd <= bestStart)
+                                    return false;
+
+                                var low = math.lerp(from, to, bestStart / (float)steps);
+                                var high = math.lerp(from, to, bestEnd / (float)steps);
+                                var newPartnerFrom = secondChain.Project(firstChain.Point(high));
+                                var newPartnerTo = secondChain.Project(firstChain.Point(low));
+
+                                if (newPartnerTo <= newPartnerFrom)
+                                    return false;
+
+                                from = low;
+                                to = high;
+                                partnerFrom = newPartnerFrom;
+                                partnerTo = newPartnerTo;
+
+                                return true;
+                            }
+
+                            // Samples the common interval: every point within MaximumSeparation,
+                            // parallel, and the partner always on one side. Reason names a failure
+                            // worth reporting; a side change is not reported.
+                            (bool Valid, string Reason, float Value, float Separation, bool Tapered) Test(
+                                float from,
+                                float to,
+                                float partnerFrom,
+                                float partnerTo,
+                                float length,
+                                float partnerLength)
+                            {
+                                var separation = 0f;
+                                var sign = 0f;
+                                var tapered = false;
+                                var samples = Math.Max(32, (int)Math.Ceiling(Math.Max(length, partnerLength) / 24));
+
+                                for (var sample = 0; sample <= samples; sample++)
+                                {
+                                    token.ThrowIfCancellationRequested();
+                                    var fraction = sample / (float)samples;
+                                    var t = math.lerp(from, to, fraction);
+                                    var pa = firstChain.Point(t);
+                                    var u =
+                                        localMatching
+                                            ? math.lerp(partnerTo, partnerFrom, fraction)
+                                            : math.clamp(secondChain.Project(pa), partnerFrom, partnerTo);
+
+                                    var pb = secondChain.Point(u);
+                                    var distance = math.distance(pa.xz, pb.xz);
+
+                                    if (distance > (localMatching ? MaximumSeparation : NamedSeparation))
+                                        return (false, "separation", distance, 0, false);
+
+                                    separation += distance;
+                                    var tangent =
+                                        math.normalizesafe(
+                                            firstChain.Point(Math.Min(1, t + .01f)).xz
+                                                - firstChain.Point(Math.Max(0, t - .01f)).xz);
+
+                                    var reverse =
+                                        math.normalizesafe(
+                                            secondChain.Point(Math.Max(0, u - .01f)).xz
+                                                - secondChain.Point(Math.Min(1, u + .01f)).xz);
+
+                                    // At a shared split/join the carriageways converge, so
+                                    // their endpoint tangents need not be parallel. Preserve
+                                    // that exact connection while testing the divided body.
+                                    var sharedStart =
+                                        firstChain.Edges[0].StartNodeId
+                                            == secondChain.Edges[secondChain.Edges.Length - 1].EndNodeId;
+
+                                    var sharedEnd =
+                                        firstChain.Edges[firstChain.Edges.Length - 1].EndNodeId
+                                            == secondChain.Edges[0].StartNodeId;
+
+                                    var taper =
+                                        sharedStart && t * firstChain.Length < 32 && (1 - u) * secondChain.Length < 32
+                                            || sharedEnd && (1 - t) * firstChain.Length < 32 && u * secondChain.Length < 32;
+
+                                    var endpoint =
+                                        Math.Min(fraction, 1 - fraction) * Math.Min(length, partnerLength)
+                                            < Math.Min(32, .2f * Math.Min(length, partnerLength));
+
+                                    var alignment = math.dot(tangent, reverse);
+
+                                    if (!taper && alignment < (localMatching ? LocalAlignment : endpoint ? .82f : .97f))
+                                        return (false, "tangent", alignment, 0, false);
+
+                                    if (!taper && alignment < .97f)
+                                        tapered = true;
+
+                                    var delta = pb.xz - pa.xz;
+                                    var side = tangent.x * delta.y - tangent.y * delta.x;
+
+                                    if (Math.Abs(side) > 1)
+                                    {
+                                        if (sign != 0 && Math.Sign(side) != Math.Sign(sign))
+                                            return (false, null, 0, 0, false);
+
+                                        sign = side;
+                                    }
+                                }
+
+                                return (true, null, 0, separation / (samples + 1), tapered);
+                            }
+
                             var unnamed =
                                 firstChain.Edges[0].Name.Length == 0 && firstChain.Edges[0].Reference.Length == 0;
 
@@ -1129,20 +1570,16 @@ public static class AvenueConsolidator
                             // must not displace a slightly farther full corridor match.
                             var coverage = Math.Min(overlap / firstChain.Length, reverseOverlap / secondChain.Length);
 
-                            if (valid
-                                && (localMatching || separation >= 2)
-                                && (localMatching || !unnamed || overlap >= 120 && separation <= 18))
-                                matches[i].Add((j, separation + 12 * (1 - coverage), a0, a1, b0, b1, tapered));
-                        }
+                            if ((localMatching || test.Separation >= 2)
+                                && (localMatching || !unnamed || overlap >= 120 && test.Separation <= 18))
+                            {
+                                var score = test.Separation + 12 * (1 - coverage);
+                                matches[i].Add((j, score, a0, a1, b0, b1, test.Tapered));
 
-                        // A newly tolerated end taper must not displace an existing fully
-                        // parallel counterpart merely because its partial interval is closer.
-                        matches[i] =
-                            matches[i]
-                                .OrderBy(item => item.tapered)
-                                .ThenBy(item => item.score)
-                                .ThenBy(item => item.other)
-                                .ToList();
+                                if (!localMatching)
+                                    mirrored.Add((j, (i, score, b0, b1, a0, a1, test.Tapered)));
+                            }
+                        }
                     });
         }
         catch (AggregateException exception) when (exception.InnerExceptions.All(
@@ -1151,6 +1588,26 @@ public static class AvenueConsolidator
             token.ThrowIfCancellationRequested();
             throw;
         }
+
+        // A named pair is tested from each chain. The two tests can disagree: from the shorter
+        // chain, the far end of a longer partner on a bend projects onto the wrong part of it,
+        // and narrowing can find a different stretch. Then neither chain was the other's best
+        // and neither merged: Boulevard René-Lévesque's 345 m carriageway took its 1.3 km
+        // partner's far end as 15 m in. A chain whose own test found no match takes the
+        // partner's, mirrored.
+        foreach (var (owner, match) in mirrored)
+            if (!matches[owner].Any(item => item.other == match.other))
+                matches[owner].Add(match);
+
+        // A newly tolerated end taper must not displace an existing fully
+        // parallel counterpart merely because its partial interval is closer.
+        for (var i = 0; i < chains.Count; i++)
+            matches[i] =
+                matches[i]
+                    .OrderBy(item => item.tapered)
+                    .ThenBy(item => item.score)
+                    .ThenBy(item => item.other)
+                    .ToList();
 
         var matchSeconds = clock.Elapsed.TotalSeconds - chainSeconds;
 
@@ -1181,26 +1638,23 @@ public static class AvenueConsolidator
         var createdStations = new List<(int Pair, int Index)>();
         var stations = new Dictionary<long, (int Pair, int Index)>();
         // Road sections at each node, in source order (as the former GroupBy kept them).
-        var roadArms = new Dictionary<long, List<PreparedSegment>>();
+        var incident = new Dictionary<long, List<PreparedSegment>>(source.Count);
+
+        void AddArm(long node, PreparedSegment segment)
+        {
+            if (!incident.TryGetValue(node, out var list))
+                incident[node] = list = new List<PreparedSegment>();
+
+            list.Add(segment);
+        }
 
         foreach (var segment in source)
             if (segment.Kind == NetworkKind.Road)
-                foreach (var node in new[] { segment.StartNodeId, segment.EndNodeId })
-                {
-                    if (!roadArms.TryGetValue(node, out var list))
-                        roadArms[node] = list = new List<PreparedSegment>();
+            {
+                AddArm(segment.StartNodeId, segment);
+                AddArm(segment.EndNodeId, segment);
+            }
 
-                    list.Add(segment);
-                }
-
-        var incident = new Dictionary<long, PreparedSegment[]>(roadArms.Count);
-        var degree = new Dictionary<long, int>(roadArms.Count);
-
-        foreach (var entry in roadArms)
-        {
-            incident[entry.Key] = entry.Value.ToArray();
-            degree[entry.Key] = entry.Value.Count;
-        }
         var junctionAnchors = new Dictionary<long, float3>();
 
         // Keep mainline junctions fixed. Ramp ends still follow the ordinary
@@ -1215,25 +1669,39 @@ public static class AvenueConsolidator
             junctionAnchors[segment.EndNodeId] = segment.End;
         }
 
+        long nextNode = -8_000_000_000_000_000_000;
+        long nextWay = -7_900_000_000_000_000_000;
+
         // Retired junction IDs remain live provenance through aliases. Reusing
         // one on a later pass makes that new junction resolve to the old one.
+        // New IDs count up from nextNode and nextWay and would need some 8·10^18
+        // of them to reach zero, so only IDs in [start, 0) can collide; the
+        // positive OSM IDs, nearly all of them, need not be stored.
         var ids = new HashSet<long>();
+
+        void AddId(long id)
+        {
+            if (id >= nextNode && id < 0)
+                ids.Add(id);
+        }
 
         foreach (var segment in source)
         {
-            ids.Add(segment.StartNodeId);
-            ids.Add(segment.EndNodeId);
+            AddId(segment.StartNodeId);
+            AddId(segment.EndNodeId);
 
             foreach (var alias in segment.SourceNodeAliases)
             {
-                ids.Add(alias.SourceNodeId);
-                ids.Add(alias.CanonicalNodeId);
+                AddId(alias.SourceNodeId);
+                AddId(alias.CanonicalNodeId);
             }
         }
 
-        long nextNode = -8_000_000_000_000_000_000;
-        long nextWay = -7_900_000_000_000_000_000;
-        var wayIds = new HashSet<long>(source.Select(segment => segment.WayId));
+        var wayIds = new HashSet<long>();
+
+        foreach (var segment in source)
+            if (segment.WayId >= nextWay && segment.WayId < 0)
+                wayIds.Add(segment.WayId);
 
         long NewNode()
         {
@@ -1387,7 +1855,7 @@ public static class AvenueConsolidator
             void Stations(Chain chain, bool reverse)
             {
                 for (var k = 1; k < chain.Edges.Length; k++)
-                    if (degree.TryGetValue(chain.Edges[k].StartNodeId, out var d) && d > 2
+                    if (incident.TryGetValue(chain.Edges[k].StartNodeId, out var nodeArms) && nodeArms.Count > 2
                         || chain.Edges[k - 1].Lanes != chain.Edges[k].Lanes)
                     {
                         var t = chain.Distances[k] / chain.Length;
@@ -1517,6 +1985,8 @@ public static class AvenueConsolidator
             {
                 log.Count("Avenue pairs retained for junction conflicts");
                 Reject(originalA, originalB, "junction-conflict");
+                Bisect(originalA);
+                Bisect(originalB);
                 continue;
             }
 
@@ -1728,6 +2198,8 @@ public static class AvenueConsolidator
                 {
                     log.Count("Avenue taper matches retained for acute attachments");
                     Reject(originalA, originalB, "acute-attachment");
+                    Bisect(originalA);
+                    Bisect(originalB);
                     continue;
                 }
             }
@@ -1749,9 +2221,17 @@ public static class AvenueConsolidator
                     ? mapped.node
                     : remap.TryGetValue(id, out mapped) ? mapped.node : id;
 
+            // Only a structure outside the pair can collapse: the pair's own sections are what the
+            // merge replaces. Counting them rejected every divided bridge with a short piece whose
+            // two ends land on one station (Quebec City's Route du Président-Kennedy over the
+            // autoroute, a 7 m piece of way 13864014), leaving its two carriageways as one-way
+            // stubs between merged avenue on both sides.
+            var pairSections = new HashSet<PreparedSegment>(originalA.Edges.Concat(originalB.Edges));
+
             if (local.Keys.Where(incident.ContainsKey).SelectMany(id => incident[id]).Distinct()
                 .Any(
                     segment => (segment.Bridge || segment.Tunnel)
+                        && !pairSections.Contains(segment)
                         && Mapped(segment.StartNodeId) == Mapped(segment.EndNodeId)))
             {
                 log.Count("Avenue pairs retained for collapsed structure connections");

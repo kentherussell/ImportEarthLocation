@@ -197,8 +197,9 @@ static class TreeTests
                 && diagnostic.Contains("limit=none;"),
             "Fixed-density/full uncapped enumeration diagnostics missing");
 
-        // Natural thinning: interior gaps and density variation remove roughly a
-        // tenth to a third, and the woodland edge is sparser than its interior.
+        // Natural thinning: interior gaps and density variation remove a few percent to
+        // a third (interior infill, report 121 §16.2, brought this map's share from about
+        // a tenth to 7%), and the woodland edge is sparser than its interior.
         int Field(string text, string key)
         {
             var i = text.IndexOf(key + "=", StringComparison.Ordinal) + key.Length + 1;
@@ -207,7 +208,7 @@ static class TreeTests
 
         var thinnedShare = Field(diagnostic, "woodlandThinned") / (double)Field(diagnostic, "woodlandCandidates");
         Check(
-            thinnedShare is > .08 and < .35,
+            thinnedShare is > .03 and < .35,
             $"Woodland thinning removed {thinnedShare:P0}, outside the intended natural range");
 
         var square =
@@ -250,6 +251,8 @@ static class TreeTests
 
         Check(dense.SequenceEqual(overlapped), "Overlapping polygons or polygon order change local density/output");
 
+        Habitats(Node, request, terrain);
+
         if (ForestProcessor.PlantInferredTrees)
             Inferred(Node, request, terrain);
 
@@ -272,6 +275,69 @@ static class TreeTests
 
         Console.WriteLine(
             "PASS: tagged-node XML/cache preservation, uncapped center-out mapped/woodland trees, mapped-tree priority, rows across vertices, overlap deduplication, standalone trees, bounds/network/water guards and determinism.");
+    }
+
+    // The inferred habitats that are on (report 121 §16.1): mapped orchards in rows, and a
+    // row along park edges with the interior and any pitch left bare. Residential land
+    // and streets stay bare.
+    static void Habitats(Func<long, float, float, OsmNode> node, ImportRequest request, TerrainBuilder.Result terrain)
+    {
+        var nodes = new Dictionary<long, OsmNode>();
+        var ways = new Dictionary<long, OsmWay>();
+        long next = 1;
+
+        void Area(long id, float x0, float z0, float x1, float z1, params (string, string)[] tags)
+        {
+            var ids = new long[5];
+
+            foreach (var (i, x, z) in new[] { (0, x0, z0), (1, x1, z0), (2, x1, z1), (3, x0, z1) })
+            {
+                ids[i] = next;
+                nodes[next] = node(next, x, z);
+                next++;
+            }
+
+            ids[4] = ids[0];
+            ways[id] = new OsmWay(id, ids, tags.ToDictionary(item => item.Item1, item => item.Item2));
+        }
+
+        IReadOnlyList<float3> Plant(IReadOnlyList<PreparedSegment>? roads = null) =>
+            ForestProcessor.Prepare(
+                new OsmDataset { Nodes = nodes, Ways = ways },
+                request,
+                terrain,
+                roads ?? Array.Empty<PreparedSegment>(),
+                new ImportLog(),
+                default);
+
+        Area(1, -50, -35, 50, 35, ("landuse", "orchard"));
+        var orchard = Plant();
+        Check(
+            orchard.Count is >= 140 and <= 180 && orchard.All(point => Math.Abs(point.x) <= 50 && Math.Abs(point.z) <= 35),
+            $"Mapped orchard was not planted in rows ({orchard.Count} trees)");
+
+        ways.Clear();
+        Area(1, -200, -200, 200, 200, ("leisure", "park"));
+        Area(2, -190, -30, -110, 30, ("leisure", "pitch"));
+        var park = Plant();
+        double Inset(float3 point) => 200 - Math.Max(Math.Abs(point.x), Math.Abs(point.z));
+
+        // The pitch's boundary is a park edge too, so a row may ring it.
+        bool NearPitch(float3 point) => point.x > -222 && point.x < -78 && Math.Abs(point.z) < 62;
+
+        Check(park.Count > 40, $"Park edges got no trees ({park.Count})");
+        Check(
+            park.All(point => Inset(point) <= 32 || NearPitch(point)),
+            "Trees were planted inside a park, away from its edge");
+        Check(
+            !park.Any(point => point.x > -190 && point.x < -110 && Math.Abs(point.z) < 30),
+            "Trees planted on a mapped pitch");
+
+        Check(park.SequenceEqual(Plant()), "Park edge trees are nondeterministic");
+
+        ways.Clear();
+        Area(1, -200, -200, 200, 200, ("landuse", "residential"));
+        Check(Plant().Count == 0, "Residential land got guessed trees");
     }
 
     // Trees inferred from land use: orchard rows, parks with open pitches,

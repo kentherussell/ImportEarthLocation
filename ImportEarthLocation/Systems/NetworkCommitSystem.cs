@@ -129,6 +129,21 @@ namespace ImportEarthLocation.Systems
         // Time in this system's update since the last placement profile; see ImportApplySystem.
         public static long UpdateTicks { get; set; }
 
+        // Parts of UpdateTicks: waiting for the game's jobs before reading the preview, and
+        // the placement's own qualification callback, so the rest is ours (report 118).
+        public static long JobWaitTicks { get; set; }
+
+        public static long QualificationTicks { get; set; }
+
+        // Adds the time since started to the running batch's metric "<part> time (s)". The parts of
+        // this system's own code, outside the job wait and the qualification callback, are timed so
+        // that a placement run shows where its per-batch cost goes.
+        private static void AddCommitDuration(string part, long started)
+        {
+            var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - started;
+            s_Log?.AddDuration(part, (double)elapsed / System.Diagnostics.Stopwatch.Frequency);
+        }
+
         protected override void OnGamePreload(Colossal.Serialization.Entities.Purpose purpose, GameMode mode)
         {
             base.OnGamePreload(purpose, mode);
@@ -398,8 +413,15 @@ namespace ImportEarthLocation.Systems
                 return;
             }
 
-            if (_hasLease && !s_Applied && !s_ClearingPreview && !ObserveExclusiveWindow(false))
-                return;
+            if (_hasLease && !s_Applied && !s_ClearingPreview)
+            {
+                var windowStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                var exclusive = ObserveExclusiveWindow(false);
+                AddCommitDuration("Commit exclusive window", windowStarted);
+
+                if (!exclusive)
+                    return;
+            }
 
             if (!s_Requested)
                 return;
@@ -412,67 +434,29 @@ namespace ImportEarthLocation.Systems
                 return;
             }
 
+            var queryStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             using var temporary = _previewQuery.ToEntityArray(Allocator.Temp);
+            AddCommitDuration("Commit preview query", queryStarted);
 
             if (s_Applied || s_ClearingPreview)
             {
-                // Only entity identities are read while settling, so game jobs may keep running.
-                // Setting ApplyMode only requests native application. Wait until the
-                // exact submitted Temp entities retire; do not mistake it for commit.
-                var remaining = 0;
+                var settleStarted = System.Diagnostics.Stopwatch.GetTimestamp();
 
-                foreach (var entity in temporary)
-                    if (s_Submitted.Contains(entity))
-                        remaining++;
-
-                s_SettledFrames = remaining == 0 ? s_SettledFrames + 1 : 0;
-
-                if (s_SettledFrames >= 2)
+                try
                 {
-                    LastDisposition =
-                        s_Applied
-                            ? NativeBatchDisposition.AppliedAndSettled
-                            : NativeBatchDisposition.ClearedWithoutApply;
-
-                    RecordSettlement();
-                    s_Log?.Diagnostic(
-                        $"NATIVE {(s_ClearingPreview ? "PREFLIGHT" : "COMMIT")} settled submitted={s_Submitted.Count}; disposition={LastDisposition}; pendingTemps=0; frames={s_WaitFrames}; definitionCountNotAcceptance=true");
-
-                    s_Log?.Checkpoint(
-                        s_ClearingPreview ? "native-preflight/cleared" : "native-commit/settled",
-                        new
-                        {
-                            context = s_Context,
-                            submitted = s_Submitted.Count,
-                            frames = s_WaitFrames,
-                            applied = s_Applied,
-                            liveRenderingNotVerified = true
-                        });
-
-                    s_Requested = false;
-                    s_WaitFrames = -1;
-
-                    return;
+                    SettleIssuedBatch(temporary);
+                }
+                finally
+                {
+                    AddCommitDuration("Commit settlement", settleStarted);
                 }
 
-                if (++s_WaitFrames < 180)
-                    return;
-
-                TransactionState = NativeTransactionState.SettlementOverdue;
-                LastDisposition = NativeBatchDisposition.Unresolved;
-                s_Failure =
-                    $"Native {(s_ClearingPreview ? "preview clearing" : "application")} did not settle: {remaining} of {s_Submitted.Count} submitted temporary entities remain. No duplicate retry was attempted.";
-
-                if (!s_OverdueReported)
-                {
-                    s_OverdueReported = true;
-                    s_Log?.Event(TelemetryEvent.Failure, TelemetryReason.WaitOverdue, s_Failure);
-                }
-
-                return; // Keep the lease and poll; never continue placement at timeout.
+                return;
             }
 
+            var jobWaitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             EntityManager.CompleteAllTrackedJobs();
+            JobWaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - jobWaitStarted;
 
             if (temporary.Length == 0)
             {
@@ -491,10 +475,16 @@ namespace ImportEarthLocation.Systems
 
             try
             {
-                if (!ObserveExclusiveWindow(true))
+                var partStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                var exclusive = ObserveExclusiveWindow(true);
+                AddCommitDuration("Commit exclusive window", partStarted);
+
+                if (!exclusive)
                     return;
 
+                partStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 var temporaryEntities = temporary.ToArray();
+                AddCommitDuration("Commit preview query", partStarted);
                 var lastTool = _lastToolField?.GetValue(_toolSystem) as ToolBaseSystem;
 
                 if (lastTool == null || _applyModeSetter == null)
@@ -503,7 +493,7 @@ namespace ImportEarthLocation.Systems
                 // Native ECB faults are outside managed exception recovery. Reject an
                 // oversized or malformed temporary graph BEFORE setting ApplyMode.
                 if (temporary.Length > 8192)
-                    s_Log?.Warn(
+                    s_Log?.Diagnostic(
                         $"Large native preview: {temporary.Length} temporary entities; diagnostic only, not a generation gate.");
 
                 // One batch-local graph instead of two identical serialized copies.
@@ -514,6 +504,8 @@ namespace ImportEarthLocation.Systems
                     (s_ArtifactStem ?? "last-native-temp-batch")
                         + (s_ArtifactStem == null ? ".ndjson" : "-temp.ndjson");
 
+                partStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+
                 if (s_Log?.DiagnosticsEnabled == true)
                     s_Log.DiagnosticRecords(
                         batchArtifact,
@@ -522,6 +514,8 @@ namespace ImportEarthLocation.Systems
                             temporaryEntities,
                             World.GetExistingSystemManaged<Game.Prefabs.PrefabSystem>()));
 
+                AddCommitDuration("Commit diagnostics capture", partStarted);
+                partStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 var originalTargets = new HashSet<Entity>();
                 var mutationTargets = new HashSet<Entity>();
                 var originalMutations = 0;
@@ -557,8 +551,9 @@ namespace ImportEarthLocation.Systems
                             0);
                 }
 
-                s_Log?.Diagnostic(
-                    $"NATIVE APPLY WORKLOAD temporaryEntities={temporary.Length}; originalMutationTargets={originalMutations}; originalMutationLimit=disabled; rejectedBeforeApply=false; downstreamLaneAcceptanceUnverified=true");
+                if (s_Log?.DiagnosticsEnabled == true)
+                    s_Log.Diagnostic(
+                        $"NATIVE APPLY WORKLOAD temporaryEntities={temporary.Length}; originalMutationTargets={originalMutations}; originalMutationLimit=disabled; rejectedBeforeApply=false; downstreamLaneAcceptanceUnverified=true");
 
                 LastMutationTargets = originalMutations;
 
@@ -567,6 +562,9 @@ namespace ImportEarthLocation.Systems
                 // including flags=0 updates, rather than Apply then retry it.
                 if (originalMutations > 64)
                     s_Log?.Count("Native batches above former mutation guard");
+
+                AddCommitDuration("Commit preview contract checks", partStarted);
+                partStarted = System.Diagnostics.Stopwatch.GetTimestamp();
 
                 if (s_ArtifactStem != null && s_Log?.DiagnosticsEnabled == true)
                     s_Log.DiagnosticRecords(
@@ -591,6 +589,8 @@ namespace ImportEarthLocation.Systems
                     AuditLaneContracts(EntityManager, allPreview.ToArray(), temporaryEntities, s_Log);
                 }
 
+                AddCommitDuration("Commit diagnostics capture", partStarted);
+                partStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 var invalidNativeGraph = false;
 
                 foreach (var entity in temporary)
@@ -644,6 +644,8 @@ namespace ImportEarthLocation.Systems
                     }
                 }
 
+                AddCommitDuration("Commit preview contract checks", partStarted);
+
                 if (invalidNativeGraph)
                 {
                     if (s_ArtifactStem != null)
@@ -665,6 +667,8 @@ namespace ImportEarthLocation.Systems
 
                     return;
                 }
+
+                var qualificationStarted = System.Diagnostics.Stopwatch.GetTimestamp();
 
                 try
                 {
@@ -707,12 +711,14 @@ namespace ImportEarthLocation.Systems
                         "Native source qualification requires review; retaining safe preview for visual inspection. "
                             + error.GetBaseException().Message);
 
-                    s_Log?.Diagnostic(
-                        $"NATIVE QUALIFICATION CALLBACK ADVISORY artifact={s_ArtifactStem}; exception={error}; nativeApplyAllowed=true; sourceVerified=false; retry=false");
+                    if (s_Log?.DiagnosticsEnabled == true)
+                        s_Log.Diagnostic(
+                            $"NATIVE QUALIFICATION CALLBACK ADVISORY artifact={s_ArtifactStem}; exception={error}; nativeApplyAllowed=true; sourceVerified=false; retry=false");
                 }
                 finally
                 {
                     s_BeforeApply = null;
+                    QualificationTicks += System.Diagnostics.Stopwatch.GetTimestamp() - qualificationStarted;
                 }
 
                 foreach (var entity in _claimedTemps)
@@ -760,11 +766,16 @@ namespace ImportEarthLocation.Systems
                     }
                 }
 
-                if (!ObserveExclusiveWindow(true))
+                partStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                exclusive = ObserveExclusiveWindow(true);
+                AddCommitDuration("Commit exclusive window", partStarted);
+
+                if (!exclusive)
                     return;
 
                 // Reflective invocation can throw after setting the native backing
                 // field. Mark issued BEFORE entering it, with no logging in between.
+                partStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 CaptureFoliageCandidates();
                 CaptureOwnershipCandidates();
                 SplitWholeLaneCutsForCrosswalkWidth();
@@ -774,15 +785,18 @@ namespace ImportEarthLocation.Systems
                 TransactionState = NativeTransactionState.ApplyIssued;
                 _applyModeSetter.Invoke(lastTool, new object[] { ApplyMode.Apply });
                 TransactionState = NativeTransactionState.AwaitingRetirement;
-                s_Log?.Diagnostic(
-                    $"NATIVE COMMIT requested temporaryEntities={s_Submitted.Count}; waitingForRetirement=true; includesBushPlants=true");
+                AddCommitDuration("Commit apply preparation", partStarted);
+
+                if (s_Log?.DiagnosticsEnabled == true)
+                    s_Log.Diagnostic(
+                        $"NATIVE COMMIT requested temporaryEntities={s_Submitted.Count}; waitingForRetirement=true; includesBushPlants=true");
             }
             catch (Exception exception)
             {
                 try
                 {
-                    if (s_ArtifactStem != null)
-                        s_Log?.DiagnosticRecords(
+                    if (s_ArtifactStem != null && s_Log?.DiagnosticsEnabled == true)
+                        s_Log.DiagnosticRecords(
                             s_ArtifactStem + "-failure-contracts.ndjson",
                             MutationRecords(EntityManager, temporary.ToArray()),
                             32L * 1024 * 1024);
@@ -798,20 +812,22 @@ namespace ImportEarthLocation.Systems
                 s_PreviewFailure = exception as NativePreviewException;
 
                 if (s_Log?.DiagnosticsEnabled == true)
+                {
                     s_Log.Diagnostic(
                         $"NATIVE COMMIT FAILURE context={Newtonsoft.Json.JsonConvert.SerializeObject(s_Context)}; exception={exception}");
 
-                s_Log?.Checkpoint(
-                    "native-commit/managed-failure",
-                    new
-                    {
-                        context = s_Context,
-                        exception = exception.ToString(),
-                        submitted = s_Submitted.Count,
-                        recoverable = s_Recoverable,
-                        applied = s_Applied,
-                        artifactStem = s_ArtifactStem
-                    });
+                    s_Log.Checkpoint(
+                        "native-commit/managed-failure",
+                        new
+                        {
+                            context = s_Context,
+                            exception = exception.ToString(),
+                            submitted = s_Submitted.Count,
+                            recoverable = s_Recoverable,
+                            applied = s_Applied,
+                            artifactStem = s_ArtifactStem
+                        });
+                }
 
                 s_Failure = $"Native network commit failed: {exception.GetBaseException().Message}";
 
@@ -830,6 +846,68 @@ namespace ImportEarthLocation.Systems
                 if (!s_ClearingPreview)
                     s_Requested = false;
             }
+        }
+
+        private void SettleIssuedBatch(NativeArray<Entity> temporary)
+        {
+            // Only entity identities are read while settling, so game jobs may keep running.
+            // Setting ApplyMode only requests native application. Wait until the
+            // exact submitted Temp entities retire; do not mistake it for commit.
+            var remaining = 0;
+
+            foreach (var entity in temporary)
+                if (s_Submitted.Contains(entity))
+                    remaining++;
+
+            s_SettledFrames = remaining == 0 ? s_SettledFrames + 1 : 0;
+
+            if (s_SettledFrames >= 2)
+            {
+                LastDisposition =
+                    s_Applied
+                        ? NativeBatchDisposition.AppliedAndSettled
+                        : NativeBatchDisposition.ClearedWithoutApply;
+
+                RecordSettlement();
+
+                if (s_Log?.DiagnosticsEnabled == true)
+                {
+                    s_Log.Diagnostic(
+                        $"NATIVE {(s_ClearingPreview ? "PREFLIGHT" : "COMMIT")} settled submitted={s_Submitted.Count}; disposition={LastDisposition}; pendingTemps=0; frames={s_WaitFrames}; definitionCountNotAcceptance=true");
+
+                    s_Log.Checkpoint(
+                        s_ClearingPreview ? "native-preflight/cleared" : "native-commit/settled",
+                        new
+                        {
+                            context = s_Context,
+                            submitted = s_Submitted.Count,
+                            frames = s_WaitFrames,
+                            applied = s_Applied,
+                            liveRenderingNotVerified = true
+                        });
+                }
+
+                s_Requested = false;
+                s_WaitFrames = -1;
+
+                return;
+            }
+
+            if (++s_WaitFrames < 180)
+                return;
+
+            TransactionState = NativeTransactionState.SettlementOverdue;
+            LastDisposition = NativeBatchDisposition.Unresolved;
+            s_Failure =
+                $"Native {(s_ClearingPreview ? "preview clearing" : "application")} did not settle: {remaining} of {s_Submitted.Count} submitted temporary entities remain. No duplicate retry was attempted.";
+
+            if (!s_OverdueReported)
+            {
+                s_OverdueReported = true;
+                s_Log?.Event(TelemetryEvent.Failure, TelemetryReason.WaitOverdue, s_Failure);
+            }
+
+            // Keep the lease and poll; never continue placement at timeout.
         }
 
         private static IEnumerable<object> TempRecords(

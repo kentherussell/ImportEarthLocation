@@ -28,6 +28,10 @@ public static class NativeDiagnostics
     public static bool SurfaceApplied, AirApplied, ClimateApplied, WaterApplied;
     private static string _run = "";
     private static string? _phase;
+
+    // Bodies already warned about in this import: the last water check ran twice and logged
+    // every warning twice (Montreal, 11-19).
+    private static readonly System.Collections.Generic.HashSet<(long Body, bool Coverage)> WaterWarned = new();
     private static long _map, _generation;
     private static DateTime _due;
     private static ImportLog? _log;
@@ -64,6 +68,9 @@ public static class NativeDiagnostics
 
     // True while a snapshot, a water check or a readback slice is still queued for this map.
     public static bool Busy => _work != null || _waterLog != null || _phase != null;
+
+    // Wall seconds after the water sources are applied for the late-water-readback reading.
+    private const double LateWaterSeconds = 900;
 
     public static void ResetMap()
     {
@@ -200,6 +207,7 @@ public static class NativeDiagnostics
             _waterGeneration = ImportSession.Generation;
             _waterChecks = 0;
             _waterLog = log;
+            WaterWarned.Clear();
         }
 
         _phase = phase;
@@ -271,10 +279,14 @@ public static class NativeDiagnostics
                 _workGeneration = ImportSession.Generation;
                 _workLog = _waterLog;
 
-                if (++_waterChecks >= 2)
+                // The late reading is a third check, long after the settled one, to tell slow
+                // filling from water that never arrives. The autorun waits for it.
+                var checks = DesignSwitches.On(DesignSwitches.LateWaterReadback) ? 3 : 2;
+
+                if (++_waterChecks >= checks)
                     _waterLog = null;
                 else
-                    _waterDue = _waterStarted.AddSeconds(180);
+                    _waterDue = _waterStarted.AddSeconds(_waterChecks == 1 ? 180 : LateWaterSeconds);
 
                 return;
             }
@@ -878,11 +890,13 @@ public static class NativeDiagnostics
                     });
                 }
 
-                if (flooded > 0)
+                if (flooded > 0 && WaterWarned.Add((body.Key, false)))
                     log.Warn(
                         $"Water containment not verified for body {body.Key}: {flooded} outer-bank probes are wet. No automatic source increase is permitted; check neighbouring bodies and sea level.");
 
-                if (elapsed >= 179 && (sourceDepths.Length == 0 || sourceDepths.Min() <= .05f || wet < probes.Length))
+                if (elapsed >= 179
+                    && (sourceDepths.Length == 0 || sourceDepths.Min() <= .05f || wet < probes.Length)
+                    && WaterWarned.Add((body.Key, true)))
                     log.Warn(
                         $"Water coverage not verified for body {body.Key}: {wet}/{probes.Length} channel samples wet after {elapsed:0} seconds. Native source existence and wall time do not prove simulation advancement; inspect WATER SIMULATION/CACHE diagnostics.");
             }
@@ -956,6 +970,26 @@ public static class NativeDiagnostics
                             wetCells = waterDepths.Count(depth => depth > 5)
                         });
                 }
+            }
+
+            if (!settled
+                && bodyOffset == 0
+                && elapsed >= LateWaterSeconds - 1
+                && NativeWaterPlacement.DepthCentimetres(water, out var lateCells) is { } lateDepths)
+            {
+                log.DiagnosticHeights("native-water-depth-late-cm.u16", lateDepths);
+                log.DiagnosticJson(
+                    "native-water-depth-late.json",
+                    new
+                    {
+                        file = "native-water-depth-late-cm.u16",
+                        cells = lateCells,
+                        cellMeters = water.CellSize,
+                        units = "centimetres",
+                        rowZero = "south",
+                        elapsedWallSeconds = elapsed,
+                        wetCells = lateDepths.Count(depth => depth > 5)
+                    });
             }
 
             log.DiagnosticRecords(

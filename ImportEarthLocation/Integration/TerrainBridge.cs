@@ -111,10 +111,14 @@ public sealed class TerrainBridge
         if (!ImportSession.Matches(request.MapSessionId, request.Generation))
             return false;
 
+        // Each restamp's parts are timed: Kathmandu's 79 cost about 1.9 s each (report 118).
+        var restampClock = System.Diagnostics.Stopwatch.StartNew();
         _terrainSystem.GetHeightData(true);
         CompleteReaders();
         var data = _terrainSystem.GetHeightData(false);
         var bounds = TerrainUtils.GetBounds(ref data);
+        log.AddDuration("Restamp height readback wait", restampClock.Elapsed.TotalSeconds);
+        restampClock.Restart();
         var half = request.MapSize.WidthMeters / 2;
         var tolerance = request.MapSize.WidthMeters / (target.width - 1) * 2;
 
@@ -143,15 +147,6 @@ public sealed class TerrainBridge
         var width = x1 - x0 + 1;
         var height = z1 - z0 + 1;
         var samples = new ushort[width * height];
-
-        for (var z = 0; z < height; z++)
-            for (var x = 0; x < width; x++)
-            {
-                var wx = math.lerp(bounds.min.x, bounds.max.x, (x0 + x) / (float)(target.width - 1));
-                var wz = math.lerp(bounds.min.z, bounds.max.z, (z0 + z) / (float)(target.height - 1));
-                samples[z * width + x] = TerrainEncoding.Encode((float)patch.HeightAt(wx, wz), scale);
-            }
-
         var backup = new Texture2D(width, height, TextureFormat.R16, false, true);
         var active = RenderTexture.active;
         Texture2D? upload = null;
@@ -161,14 +156,61 @@ public sealed class TerrainBridge
             RenderTexture.active = target;
             backup.ReadPixels(new Rect(x0, z0, width, height), 0, 0, false);
             backup.Apply(false, false);
+            log.AddDuration("Restamp backup read", restampClock.Elapsed.TotalSeconds);
+            restampClock.Restart();
             _restamp = new(backup, x0, z0, Time.frameCount, request, patch, scale);
+
+            float PixelX(int x) => math.lerp(bounds.min.x, bounds.max.x, (x0 + x) / (float)(target.width - 1));
+
+            float PixelZ(int z) => math.lerp(bounds.min.z, bounds.max.z, (z0 + z) / (float)(target.height - 1));
+
+            // Only the cells the refit rebuilt (with a one-cell ring for interpolation) are
+            // encoded; the rest keep the game's own values, read back just above. A unit's
+            // bounding box spans kilometres, and encoding all of it took 171 s over
+            // Kathmandu's 90 restamps (report 118). The patch and the game share one grid, so
+            // a patch cell is a pixel at a fixed offset; if they do not line up, every pixel
+            // is encoded as before.
+            var firstColumn = patch.CellAt(PixelX(0), PixelZ(0)) % patch.Width;
+            var firstRow = patch.CellAt(PixelX(0), PixelZ(0)) / patch.Width;
+            var lastCell = patch.CellAt(PixelX(width - 1), PixelZ(height - 1));
+            var aligned =
+                patch.Published != null
+                    && patch.Width == width
+                    && patch.Height == height
+                    && firstColumn == 0
+                    && firstRow == 0
+                    && lastCell == patch.Width * patch.Height - 1;
+
+            if (aligned)
+            {
+                Buffer.BlockCopy(backup.GetRawTextureData(), 0, samples, 0, samples.Length * 2);
+
+                foreach (var cell in patch.Published!)
+                {
+                    var x = cell % width;
+                    var z = cell / width;
+                    samples[cell] = TerrainEncoding.Encode((float)patch.HeightAt(PixelX(x), PixelZ(z)), scale);
+                }
+            }
+            else
+                for (var z = 0; z < height; z++)
+                    for (var x = 0; x < width; x++)
+                        samples[z * width + x] =
+                            TerrainEncoding.Encode((float)patch.HeightAt(PixelX(x), PixelZ(z)), scale);
+
+            log.Count(aligned ? "Restamps encoding rebuilt cells only" : "Restamps encoding every cell");
+            log.AddDuration("Restamp patch encoding", restampClock.Elapsed.TotalSeconds);
+            restampClock.Restart();
             upload = new Texture2D(width, height, TextureFormat.R16, false, true);
             var bytes = new byte[samples.Length * 2];
             Buffer.BlockCopy(samples, 0, bytes, 0, bytes.Length);
             upload.LoadRawTextureData(bytes);
             upload.Apply(false, false);
             Graphics.CopyTexture(upload, 0, 0, 0, 0, width, height, target, 0, 0, x0, z0);
+            log.AddDuration("Restamp upload", restampClock.Elapsed.TotalSeconds);
+            restampClock.Restart();
             PublishDirty(patch);
+            log.AddDuration("Restamp dirty-region publish", restampClock.Elapsed.TotalSeconds);
             log.Diagnostic(
                 $"LOCAL TERRAIN published nativeRect={x0},{z0},{width},{height}; outsidePixelsPreserved=true; CPUReadbackPending=true; fullMapReplacement=false");
 

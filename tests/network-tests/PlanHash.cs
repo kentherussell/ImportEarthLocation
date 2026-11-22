@@ -72,6 +72,22 @@ static class PlanHash
         return Convert.ToHexString(hash.Hash!);
     }
 
+    // Everything a water plan hands on, in order: sources with their probes and repair
+    // cells, area and reach stages, bed edit masks, moved waterway nodes and the report;
+    // the two height grids are hashed by their bits beside it.
+    public static string Water(WaterPlan plan)
+    {
+        var rest = plan with { ConditionedHeights = null, PlannedBedHeights = null };
+        var text = JsonConvert.SerializeObject(rest, Settings);
+
+        var parts =
+            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))
+            + (plan.ConditionedHeights == null ? "-" : Heights(plan.ConditionedHeights))
+            + (plan.PlannedBedHeights == null ? "-" : Heights(plan.PlannedBedHeights));
+
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(parts)));
+    }
+
     public static string Heights(float[] heights)
     {
         var bytes = new byte[heights.Length * 4];

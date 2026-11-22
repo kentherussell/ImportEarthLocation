@@ -65,6 +65,8 @@ public sealed class ImportLog
 
     private RunArchive? _archive;
     private readonly List<string> _archivePending = new();
+
+    private const int ArchiveWarningLimit = 20000;
     // Lines waiting for the main thread to pass them to the game's log (DrainToGameLog).
     // Shared by every ImportLog, so a log the UI system doesn't own still reaches the game.
     private static readonly List<(string Level, string Line)> _gameLogPending = new();
@@ -918,8 +920,17 @@ public sealed class ImportLog
                 _lineHead = (_lineHead + 1) % 500;
             }
 
-            if (_archive != null && _archivePending.Count < 500)
+            // Between flushes the archive keeps 500 lines. Warnings and errors are kept past that,
+            // up to ArchiveWarningLimit: a burst of diagnostics while water was planned dropped
+            // every lake containment warning from events.log (Montreal, 11-19).
+            if (_archive != null
+                && (_archivePending.Count < 500 || level != "INFO" && _archivePending.Count < ArchiveWarningLimit))
                 _archivePending.Add(line);
+            else if (_archive != null)
+            {
+                _metrics.TryGetValue("Archive lines dropped", out var droppedLines);
+                _metrics["Archive lines dropped"] = droppedLines + 1;
+            }
 
             // With diagnostics on, every line is already in events.log; the game's log gets
             // errors only. Its logger failed even on the main thread (one warning on DC,

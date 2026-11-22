@@ -29,11 +29,24 @@ public static class ForestProcessor
     public const float OrchardRowSpacing = 7f;
     public const float StreetSpacing = 10f;
     public const float StreetSetback = 4f;
-    // Guessed (inferred) trees — orchard, avenue, street, park, cemetery, golf,
-    // grounds and garden — are off: in DC they added 1.64M of 4.1M trees and the
-    // editor crashed near 3.86M. Woodland, mapped trees and rows remain.
-    // A switch, not a constant, so the code it turns off still compiles without warnings.
+    // Guessed (inferred) trees, by habitat (report 121 §16.1). All together they added
+    // 1.64M of DC's 4.1M trees and the editor crashed near 3.86M, so they come back one
+    // habitat at a time, where the evidence is strongest:
+    //   PlantOrchards   rows in mapped orchards (someone mapped trees standing there);
+    //   PlantParkEdges  a row of trees along park edges (within one cell, 15 m); park
+    //                   interiors can be plazas or playing fields, so they stay bare
+    //                   until a survey shows where trees can stand;
+    //   PlantInferredTrees  the rest: park interiors, golf, cemeteries, grounds,
+    //                   gardens, avenues and streets, still off.
+    // Switches, not constants, so the code they turn off still compiles without warnings.
+    public static readonly bool PlantOrchards = true;
+    public static readonly bool PlantParkEdges = true;
     public static readonly bool PlantInferredTrees = false;
+
+    // Woodland infill (report 121 §16.2): inside a wood, at least EdgeCells cells from
+    // its edge and outside a clearing, the keep threshold rises by this much on the same
+    // draw, so a sparse wood fills in while its edges and clearings keep their character.
+    public const float InteriorInfill = .15f;
 
     // Areas in ascending precedence where polygons overlap. Orchards and open
     // areas get no cell trees: orchards are planted in rows, and pitches,
@@ -70,10 +83,18 @@ public static class ForestProcessor
         private readonly int[][]? _bands;
 
         public RingIndex(float3[] points)
+            : this(points, DirectLimit)
+        {
+        }
+
+        // Rings of up to directLimit points are walked whole. Vegetation planning tests
+        // most points against several habitats of a hundred or more points each, so it
+        // bands smaller rings than tree selection does.
+        public RingIndex(float3[] points, int directLimit)
         {
             _points = points;
 
-            if (points.Length <= DirectLimit)
+            if (points.Length <= directLimit)
                 return;
 
             _minimumZ = points.Min(point => point.z);
@@ -97,15 +118,30 @@ public static class ForestProcessor
 
         public bool Contains(float3 point)
         {
+            var inside = false;
+
+            // Inside's walk, over the array directly rather than through IReadOnlyList,
+            // which costs an interface call per point (far more on Mono).
             if (_bands == null)
-                return Inside(point, _points);
+            {
+                for (var i = 0; i < _points.Length; i++)
+                {
+                    var vectorA = _points[i];
+                    var vectorB = _points[(i + 1) % _points.Length];
+
+                    if ((vectorA.z > point.z) != (vectorB.z > point.z)
+                        && point.x
+                            < (vectorB.x - vectorA.x) * (point.z - vectorA.z) / (vectorB.z - vectorA.z) + vectorA.x)
+                        inside = !inside;
+                }
+
+                return inside;
+            }
 
             var band = Band(point.z);
 
             if (band < 0 || band >= _bands.Length)
                 return false;
-
-            var inside = false;
 
             foreach (var i in _bands[band])
             {
@@ -121,22 +157,38 @@ public static class ForestProcessor
         }
     }
 
+    // A tree category with its own counters, so the per-tree path neither builds string keys
+    // nor looks them up; the counters join the named counts before reporting.
+    private sealed class TreeCategory
+    {
+        public readonly string Name;
+        public readonly int Priority;
+        public int Candidates;
+        public int Accepted;
+
+        public TreeCategory(string name, int priority)
+        {
+            Name = name;
+            Priority = priority;
+        }
+    }
+
     // A tree waiting for its turn in centre-out order. The squared distance is computed
     // once, exactly as math.lengthsq(point.xz), rather than on every comparison.
     private readonly struct PendingTree
     {
         public readonly float3 Point;
-        public readonly string Category;
+        public readonly TreeCategory Category;
         public readonly float DistanceSquared;
         public readonly int Priority;
         public readonly long Serial;
 
-        public PendingTree(float3 point, string category, int priority, long serial)
+        public PendingTree(float3 point, TreeCategory category, long serial)
         {
             Point = point;
             Category = category;
             DistanceSquared = math.lengthsq(point.xz);
-            Priority = priority;
+            Priority = category.Priority;
             Serial = serial;
         }
 
@@ -330,6 +382,16 @@ public static class ForestProcessor
     {
         token.ThrowIfCancellationRequested();
         var timer = Stopwatch.StartNew();
+
+        // Per-part times for the run report, recorded between parts, never per tree.
+        var partTimer = Stopwatch.StartNew();
+
+        void EndPart(string name)
+        {
+            log.AddDuration(name, partTimer.Elapsed.TotalSeconds);
+            partTimer.Restart();
+        }
+
         var masks = new List<Mask>();
         var members = new HashSet<(long, AreaKind)>();
         var incompleteAreas = 0;
@@ -442,6 +504,7 @@ public static class ForestProcessor
             return rings;
         }
 
+        EndPart("Forest masks");
         var half = (float)(request.MapSize.WidthMeters / 2);
         // Woodland and other area trees keep the wide corridor. Trees that stand
         // beside a road (mapped, rows and street trees) need only the 3 m verge
@@ -472,27 +535,44 @@ public static class ForestProcessor
             }
         }
 
+        EndPart("Forest clearance index");
+
         var output = new List<float3>();
         var candidates = new List<(float3 point, string category)>();
         var spacing = new Dictionary<(int, int), List<float3>>();
         var explicitTrees = new Dictionary<(int, int), List<float3>>();
         var counts = new Dictionary<string, int>();
+        var categories = new Dictionary<string, TreeCategory>();
 
-        void Count(string key)
+        // Per-tree outcomes are counted here and join the named counts before reporting.
+        var outsideOrInvalid = 0;
+        var waterRejected = 0;
+        var networkRejected = 0;
+        var spacingRejected = 0;
+
+        void Count(string key, int amount = 1)
         {
             counts.TryGetValue(key, out var value);
-            counts[key] = value + 1;
+            counts[key] = value + amount;
+        }
+
+        TreeCategory CategoryNamed(string name)
+        {
+            if (!categories.TryGetValue(name, out var category))
+                categories[name] = category = new TreeCategory(name, Priority(name));
+
+            return category;
         }
 
         void Add(float3 point, string category) => candidates.Add((point, category));
 
-        bool Accept(float3 point, string category)
+        bool Accept(float3 point, TreeCategory category)
         {
-            Count(category + "Candidates");
+            category.Candidates++;
 
             if (!math.all(math.isfinite(point)) || Math.Abs(point.x) > half || Math.Abs(point.z) > half)
             {
-                Count("outsideOrInvalid");
+                outsideOrInvalid++;
                 return false;
             }
 
@@ -505,55 +585,60 @@ public static class ForestProcessor
 
             if (!math.isfinite(point.y) || point.y <= WaterLevels.Effective(terrain.SeaLevelMeters) + 0.5f)
             {
-                Count("waterRejected");
+                waterRejected++;
                 return false;
             }
 
             if (excludeWater?.Invoke(point) == true)
             {
-                Count("waterRejected");
+                waterRejected++;
                 return false;
             }
 
-            if ((category is "mappedTree" or "rowTree" or "streetTree" or "avenueTree"
+            var name = category.Name;
+
+            if ((name is "mappedTree" or "rowTree" or "streetTree" or "avenueTree"
                 ? verges
                 : corridors).Contains(point))
             {
-                Count("networkRejected");
+                networkRejected++;
                 return false;
             }
 
             // Buckets stay MinimumSpacing wide, so the 3×3 scan covers either radius.
-            var minimum = category == "woodlandTree" ? WoodlandSpacing : MappedSpacing;
-            var bucket = ((int)Math.Floor(point.x / MinimumSpacing), (int)Math.Floor(point.z / MinimumSpacing));
+            var minimum = name == "woodlandTree" ? WoodlandSpacing : MappedSpacing;
+            var bucketX = (int)Math.Floor(point.x / MinimumSpacing);
+            var bucketZ = (int)Math.Floor(point.z / MinimumSpacing);
 
             // Inferred trees give way to mapped trees and rows wherever they would
             // crowd one, even if they come first in the center-out order.
-            if (category is not ("mappedTree" or "rowTree" or "woodlandTree"))
+            if (name is not ("mappedTree" or "rowTree" or "woodlandTree"))
                 for (var dx = -1; dx <= 1; dx++)
                     for (var dz = -1; dz <= 1; dz++)
-                        if (explicitTrees.TryGetValue((bucket.Item1 + dx, bucket.Item2 + dz), out var mapped)
-                            && mapped.Any(other => math.distance(other.xz, point.xz) < MappedSpacing))
+                        if (explicitTrees.TryGetValue(BucketKey(bucketX + dx, bucketZ + dz), out var mapped)
+                            && AnyCloser(mapped, point, MappedSpacing))
                         {
-                            Count("spacingRejected");
+                            spacingRejected++;
                             return false;
                         }
 
             for (var dx = -1; dx <= 1; dx++)
                 for (var dz = -1; dz <= 1; dz++)
-                    if (spacing.TryGetValue((bucket.Item1 + dx, bucket.Item2 + dz), out var neighbors)
-                        && neighbors.Any(other => math.distance(other.xz, point.xz) < minimum))
+                    if (spacing.TryGetValue(BucketKey(bucketX + dx, bucketZ + dz), out var neighbors)
+                        && AnyCloser(neighbors, point, minimum))
                     {
-                        Count("spacingRejected");
+                        spacingRejected++;
                         return false;
                     }
+
+            var bucket = BucketKey(bucketX, bucketZ);
 
             if (!spacing.TryGetValue(bucket, out var bucketTrees))
                 spacing[bucket] = bucketTrees = new List<float3>();
 
             bucketTrees.Add(point);
             output.Add(point);
-            Count(category + "Accepted");
+            category.Accepted++;
 
             return true;
         }
@@ -641,6 +726,8 @@ public static class ForestProcessor
             }
         }
 
+        EndPart("Forest mapped trees");
+
         // Fixed density. Retain lazy center-out ordering even without a count cap,
         // so a future cap can reuse the same deterministic placement policy.
         // Block distance is a lower bound, so no unvisited block can hide a closer eligible tree.
@@ -662,9 +749,13 @@ public static class ForestProcessor
                             points.Max(point => point.z)))
                     .ToArray();
 
-        // With inferred trees off, only woodland yields cell trees, and a tree only needs to know
-        // that a cell is not woodland, so the areas ranked below woodland need no tests at all.
-        foreach (var mask in masks.Where(mask => PlantInferredTrees || mask.Kind >= AreaKind.Woodland))
+        // With inferred trees off, only woodland (and park edges) yield cell trees, and a tree
+        // only needs to know that a cell is not one of them, so the other areas ranked below
+        // woodland need no tests at all.
+        foreach (var mask in masks.Where(
+            mask => PlantInferredTrees
+                || mask.Kind >= AreaKind.Woodland
+                || PlantParkEdges && mask.Kind == AreaKind.Park))
             foreach (var ring in mask.Outer)
             {
                 var bounds =
@@ -705,7 +796,11 @@ public static class ForestProcessor
 
         var blocks =
             index.Values
-                .Where(block => PlantInferredTrees || block.Rings.Any(ring => ring.Mask.Kind == AreaKind.Woodland))
+                .Where(
+                    block => PlantInferredTrees
+                        || block.Rings.Any(
+                            ring => ring.Mask.Kind == AreaKind.Woodland
+                                || PlantParkEdges && ring.Mask.Kind == AreaKind.Park))
                 .OrderBy(block => block.MinimumDistanceSquared)
                 .ThenBy(block => block.X)
                 .ThenBy(block => block.Z)
@@ -755,6 +850,8 @@ public static class ForestProcessor
                 out var block)
                 ? KindAt(point, block.Rings)
                 : AreaKind.None;
+
+        EndPart("Forest woodland index");
 
         // Garden and street trees are watered, so a dry climate keeps at least
         // half of them. Unknown climate takes a middle value.
@@ -865,7 +962,8 @@ public static class ForestProcessor
         foreach (var item in candidates.Where(
             otherItem => otherItem.category is "mappedTree" or "rowTree" && math.all(math.isfinite(otherItem.point))))
         {
-            var key = ((int)Math.Floor(item.point.x / MinimumSpacing), (int)Math.Floor(item.point.z / MinimumSpacing));
+            var key =
+                BucketKey((int)Math.Floor(item.point.x / MinimumSpacing), (int)Math.Floor(item.point.z / MinimumSpacing));
 
             if (!explicitTrees.TryGetValue(key, out var list))
                 explicitTrees[key] = list = new();
@@ -1034,11 +1132,13 @@ public static class ForestProcessor
         {
             token.ThrowIfCancellationRequested();
 
-            if (!PlantInferredTrees && candidate.category is not ("mappedTree" or "rowTree"))
+            if (!PlantInferredTrees
+                && candidate.category is not ("mappedTree" or "rowTree")
+                && !(PlantOrchards && candidate.category == "orchardTree"))
                 continue;
 
             if (math.all(math.isfinite(candidate.point)))
-                pending.Add(new PendingTree(candidate.point, candidate.category, Priority(candidate.category), serial++));
+                pending.Add(new PendingTree(candidate.point, CategoryNamed(candidate.category), serial++));
             else
             {
                 Count(candidate.category + "Candidates");
@@ -1046,6 +1146,8 @@ public static class ForestProcessor
             }
         }
 
+        EndPart("Forest candidate grids");
+        var surveySeconds = 0.0;
         var nextBlock = 0;
         var woodlandCandidates = 0;
         var woodlandCellsVisited = 0;
@@ -1134,15 +1236,21 @@ public static class ForestProcessor
 
         // Count keys per category, built once rather than for every cell.
         var categoryKeys = new Dictionary<AreaKind, (string Category, string Cells, string Thinned)>();
+        var woodlandCategory = CategoryNamed("woodlandTree");
 
         void Generate(int number)
         {
             if (surveys[number].Points == null)
+            {
+                var surveyStart = timer.Elapsed.TotalSeconds;
                 System.Threading.Tasks.Parallel.For(
                     number,
                     Math.Min(blocks.Length, number + surveyAhead),
                     new System.Threading.Tasks.ParallelOptions { CancellationToken = token },
                     next => surveys[next] = Survey(blocks[next]));
+
+                surveySeconds += timer.Elapsed.TotalSeconds - surveyStart;
+            }
 
             var (points, kinds, edges) = surveys[number];
             surveys[number] = default;
@@ -1170,11 +1278,12 @@ public static class ForestProcessor
                             continue;
                         }
 
-                        pending.Add(new PendingTree(point, "woodlandTree", Priority("woodlandTree"), serial++));
+                        pending.Add(new PendingTree(point, woodlandCategory, serial++));
                         continue;
                     }
 
-                    if (!PlantInferredTrees)
+                    // Park edges alone: a park cell more than one cell from the edge stays bare.
+                    if (!PlantInferredTrees && !(PlantParkEdges && kind == AreaKind.Park && edge <= 1))
                         continue;
 
                     if (!categoryKeys.TryGetValue(kind, out var keys))
@@ -1191,7 +1300,7 @@ public static class ForestProcessor
                         continue;
                     }
 
-                    pending.Add(new PendingTree(point, keys.Category, Priority(keys.Category), serial++));
+                    pending.Add(new PendingTree(point, CategoryNamed(keys.Category), serial++));
                 }
         }
 
@@ -1233,11 +1342,35 @@ public static class ForestProcessor
             Accept(candidate.Point, candidate.Category);
         }
 
+        // The survey runs inside the placement loop; its parallel batches are timed apart.
+        log.AddDuration("Forest woodland survey", surveySeconds);
+        log.AddDuration("Forest placement", partTimer.Elapsed.TotalSeconds - surveySeconds);
+        partTimer.Restart();
+
         log.Info(
             $"Forest clearance index: {corridors.CellCount:N0} cells (50m); {corridors.CandidateChecks:N0} nearby checks; {corridors.ExactChecks:N0} exact distance checks; original clearance distances retained.");
 
         log.Diagnostic(
             $"FOREST INDEX cellMeters=50; cells={corridors.CellCount}; nearbyChecks={corridors.CandidateChecks}; exactChecks={corridors.ExactChecks}; trees={output.Count}; elapsedSeconds={timer.Elapsed.TotalSeconds:0.###}");
+
+        // The per-tree counters join the named counts. A name is added only when its count is
+        // above zero, as the per-tree Count calls did, so the same names exist with the same values.
+        void Join(string key, int amount)
+        {
+            if (amount > 0)
+                Count(key, amount);
+        }
+
+        foreach (var category in categories.Values)
+        {
+            Join(category.Name + "Candidates", category.Candidates);
+            Join(category.Name + "Accepted", category.Accepted);
+        }
+
+        Join("outsideOrInvalid", outsideOrInvalid);
+        Join("waterRejected", waterRejected);
+        Join("networkRejected", networkRejected);
+        Join("spacingRejected", spacingRejected);
 
         int Total(string key) => counts.TryGetValue(key, out var value) ? value : 0;
 
@@ -1268,6 +1401,7 @@ public static class ForestProcessor
             $"Trees prepared: {Total("mappedTreeAccepted"):N0} mapped individual trees, {Total("rowTreeAccepted"):N0} row trees, {Total("woodlandTreeAccepted"):N0} woodland trees ({Total("thinned"):N0} thinned for natural edges and gaps), {inferred.Sum(text => Total(text + "Accepted")):N0} inferred ({string.Join(", ", inferred.Select(text => $"{Total(text + "Accepted"):N0} {text}"))}); {output.Count:N0} total. Spacing woodland {WoodlandSpacing:0} m, mapped/rows {MappedSpacing:0} m; {Total("spacingRejected"):N0} spacing rejections.");
 
         log.Count("Trees prepared", output.Count);
+        EndPart("Forest summary");
         log.Time("Vegetation preparation", timer.Elapsed.TotalSeconds);
 
         foreach (var text in inferred)
@@ -1283,7 +1417,8 @@ public static class ForestProcessor
     // Natural thinning, deterministic per position. Edges feather out over three
     // cells (keep ~45% at the rim), but only where a slow 150 m pattern says so,
     // so some edges stay crisp; a 250 m pattern varies interior density by up
-    // to 25%; and a 90 m pattern opens occasional small clearings.
+    // to 25%; and a 90 m pattern opens occasional small clearings. The interior,
+    // away from edges and clearings, keeps InteriorInfill more.
     internal static bool WoodlandKeep(float3 point, float edgeDistance)
     {
         var x = point.x;
@@ -1294,6 +1429,9 @@ public static class ForestProcessor
         var density = .75f + .25f * Noise(x / 250, z / 250, 0x85ebca6bu);
         var clearing = Noise(x / 90, z / 90, 0xc2b2ae35u) > .82f ? .3f : 1f;
         var keep = edge * density * clearing;
+
+        if (rim >= 1 && clearing >= 1)
+            keep = Math.Min(1, keep + InteriorInfill);
 
         return Roll(point) < keep;
     }
@@ -1376,6 +1514,22 @@ public static class ForestProcessor
 
             return value ^ (value >> 16);
         }
+    }
+
+    // One dictionary key per spacing bucket. A tuple, not two ints packed into a long: a long's
+    // hash folds its halves together with XOR, so x and z collided and the forest ran three
+    // times slower (report 119).
+    private static (int, int) BucketKey(int x, int z) => (x, z);
+
+    // Whether any of the points stands closer than distance to point in the plane: the
+    // spacing test as a plain loop, without a closure, delegate and enumerator per bucket.
+    private static bool AnyCloser(List<float3> points, float3 point, float distance)
+    {
+        for (var i = 0; i < points.Count; i++)
+            if (math.distance(points[i].xz, point.xz) < distance)
+                return true;
+
+        return false;
     }
 
     private static bool ClipRow(float3 vectorA, float3 vectorB, float half, out float entry, out float exit)

@@ -45,5 +45,12 @@
   {"name":"Marseille Catalans beach","lat":43.2906,"lon":5.3536,"zoom":250},
   {"name":"Santa Barbara East Beach","lat":34.4148,"lon":-119.6740,"zoom":350},
   {"name":"Santa Barbara overview","lat":34.4208,"lon":-119.6982,"zoom":4000},
-  {"name":"Santa Barbara Leadbetter Beach","lat":34.4027,"lon":-119.6988,"zoom":300}
+  {"name":"Santa Barbara Leadbetter Beach","lat":34.4027,"lon":-119.6988,"zoom":300},
+  {"name":"Montreal Lac Saint-Louis overview","lat":45.42,"lon":-73.84,"zoom":5000},
+  {"name":"Montreal Old Port Rue Bridge","lat":45.4905,"lon":-73.553,"zoom":600},
+  {"name":"Montreal Old Port","lat":45.5025,"lon":-73.5525,"zoom":800},
+  {"name":"Montreal Longueuil Route 132 junction","lat":45.51035,"lon":-73.49374,"zoom":700},
+  {"name":"Montreal Verdun Rene-Levesque","lat":45.4709,"lon":-73.5363,"zoom":800},
+  {"name":"Quebec City centre","lat":46.811,"lon":-71.2075,"zoom":1500},
+  {"name":"Quebec City Boulevard Laurier","lat":46.7765,"lon":-71.2785,"zoom":800}
 ]

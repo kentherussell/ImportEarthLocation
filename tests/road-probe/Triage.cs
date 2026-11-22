@@ -111,8 +111,9 @@ public static class Triage
                 var key = $"{Hw.Group(section.Cls),-14} {reason}";
                 rows[key] = rows.GetValueOrDefault(key) + 1;
 
-                if (Hw.Group(section.Cls) is "motorway" or "motorway_link" or "trunk" or "trunk_link"
-                    && sites.Count < 30)
+                if ((Hw.Group(section.Cls) is "motorway" or "motorway_link" or "trunk" or "trunk_link"
+                        || reason == "synthetic node")
+                    && sites.Count < 40)
                 {
                     var item = capture.ToGeographic(point.x, point.z);
                     sites.Add(

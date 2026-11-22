@@ -30,19 +30,37 @@ public static class NetworkStructureIntervals
         var result = source.ToArray();
         var nodes = new Dictionary<(NetworkKind, long), List<int>>();
 
+        void Touch((NetworkKind, long) key, int index)
+        {
+            if (!nodes.TryGetValue(key, out var list))
+                nodes[key] = list = new();
+
+            list.Add(index);
+        }
+
         for (var i = 0; i < result.Length; i++)
-            foreach (var id in new[] { result[i].StartNodeId, result[i].EndNodeId })
-            {
-                var key = (result[i].Kind, id);
-
-                if (!nodes.TryGetValue(key, out var list))
-                    nodes[key] = list = new();
-
-                list.Add(i);
-            }
+        {
+            Touch((result[i].Kind, result[i].StartNodeId), i);
+            Touch((result[i].Kind, result[i].EndNodeId), i);
+        }
 
         var filled = 0;
-        var visited = new HashSet<int>();
+        var visited = new bool[result.Length];
+
+        // Neighbouring seeds walk over the same sections again; each one's length is measured once.
+        var arcLengths = new float[result.Length];
+        var measured = new bool[result.Length];
+
+        float ArcLength(int index)
+        {
+            if (!measured[index])
+            {
+                arcLengths[index] = NetworkVerticalProfiles.ArcLength(result[index]);
+                measured[index] = true;
+            }
+
+            return arcLengths[index];
+        }
 
         for (var seed = 0; seed < result.Length; seed++)
         {
@@ -53,13 +71,13 @@ public static class NetworkStructureIntervals
                 || first.ProtectedLink
                 || !IsMainline(first)
                 || ExplicitStructure(first)
-                || visited.Contains(seed))
+                || visited[seed])
                 continue;
 
             token.ThrowIfCancellationRequested();
             var run = new HashSet<int> { seed };
             var boundary = new List<int>();
-            var length = NetworkVerticalProfiles.ArcLength(first);
+            var length = ArcLength(seed);
 
             foreach (var end in new[] { first.StartNodeId, first.EndNodeId })
             {
@@ -68,22 +86,28 @@ public static class NetworkStructureIntervals
 
                 while (length <= 220)
                 {
-                    if (nodes[(first.Kind, node)].Count != 2)
+                    var arms = nodes[(first.Kind, node)];
+
+                    if (arms.Count != 2)
                         break;
 
-                    var options =
-                        nodes[(first.Kind, node)]
-                            .Where(
-                                i => i != current
-                                    && !result[i].ProtectedLink
-                                    && result[i].OneWay == first.OneWay
-                                    && result[i].Classification == first.Classification)
-                            .ToArray();
+                    var next = -1;
+                    var options = 0;
 
-                    if (options.Length != 1)
+                    foreach (var i in arms)
+                        if (i != current
+                            && !result[i].ProtectedLink
+                            && result[i].OneWay == first.OneWay
+                            && result[i].Classification == first.Classification)
+                        {
+                            if (options == 0)
+                                next = i;
+
+                            options++;
+                        }
+
+                    if (options != 1)
                         break;
-
-                    var next = options[0];
 
                     if (run.Contains(next))
                         break;
@@ -109,13 +133,14 @@ public static class NetworkStructureIntervals
                         break;
 
                     run.Add(next);
-                    length += NetworkVerticalProfiles.ArcLength(result[next]);
+                    length += ArcLength(next);
                     current = next;
                     node = result[next].StartNodeId == node ? result[next].EndNodeId : result[next].StartNodeId;
                 }
             }
 
-            visited.UnionWith(run);
+            foreach (var index in run)
+                visited[index] = true;
 
             if (length > 220 || boundary.Count != 2 || result[boundary[0]].Layer != result[boundary[1]].Layer)
                 continue;
